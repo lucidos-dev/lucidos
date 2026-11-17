@@ -1,8 +1,11 @@
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 use lucidos_engine::api::{create_router, SharedEngine};
 use lucidos_engine::engine::thread_lifecycle::ThreadStatus;
 use lucidos_engine::engine::LucidosEngine;
+use lucidos_engine::engine_runtime::build_runtime;
 use lucidos_engine::llm::ProviderBuildContext;
-use lucidos_engine::log;
+use lucidos_engine::log_legacy;
 use lucidos_engine::net_config;
 use lucidos_engine::scheduler::SchedulerManager;
 use std::path::PathBuf;
@@ -25,7 +28,7 @@ const TEARDOWN_DEADLINE: Duration = Duration::from_secs(20);
 fn arm_teardown_deadline(deadline: Duration, on_expiry: impl FnOnce() + Send + 'static) {
     std::thread::spawn(move || {
         std::thread::sleep(deadline);
-        log!(
+        log_legacy!(
             "[Shutdown] Teardown still running after {}s; exiting so a successor can own the workspace",
             deadline.as_secs()
         );
@@ -73,7 +76,7 @@ async fn shutdown_signal(
             .expect("failed to install SIGTERM ignorer");
         loop {
             sigterm.recv().await;
-            log!(
+            log_legacy!(
                 "[Shutdown] Received SIGTERM — ignored. Use SIGUSR1 to stop \
                  (web-dev.sh kill_stale_processes / stop.sh / /api/v1/restart \
                  all do this) or send SIGKILL to force-terminate."
@@ -86,7 +89,7 @@ async fn shutdown_signal(
         _ = usr1 => {},
     }
 
-    log!("\n[Shutdown] Shutting down gracefully...");
+    log_legacy!("\n[Shutdown] Shutting down gracefully...");
     arm_teardown_deadline(TEARDOWN_DEADLINE, || std::process::exit(0));
 
     // Open the teardown. Two things happen here, and both must happen before
@@ -156,14 +159,14 @@ async fn shutdown_signal(
     shutdown_mcp_servers(&engine).await;
 
     if let Err(e) = main_check_stopped.await {
-        log!("[Shutdown] Stopping the main check panicked: {}", e);
+        log_legacy!("[Shutdown] Stopping the main check panicked: {}", e);
     }
 
     if let Err(e) = scheduler.lock().await.shutdown().await {
-        log!("[Shutdown] Error shutting down scheduler: {}", e);
+        log_legacy!("[Shutdown] Error shutting down scheduler: {}", e);
     }
 
-    log!("[Shutdown] Shutdown complete.");
+    log_legacy!("[Shutdown] Shutdown complete.");
 }
 
 /// Stop every running MCP server child, so none of them outlives this engine.
@@ -185,7 +188,7 @@ async fn shutdown_mcp_servers(engine: &SharedEngine) {
             .map(|s| s.id)
             .collect(),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Shutdown] Could not read the MCP servers to stop them: {}",
                 e
             );
@@ -195,10 +198,10 @@ async fn shutdown_mcp_servers(engine: &SharedEngine) {
     if running.is_empty() {
         return;
     }
-    log!("[Shutdown] Stopping {} MCP server(s)...", running.len());
+    log_legacy!("[Shutdown] Stopping {} MCP server(s)...", running.len());
     futures::future::join_all(running.iter().map(|id| async move {
         if let Err(e) = engine.mcp_manager.stop_server(id).await {
-            log!("[Shutdown] Error stopping MCP server '{}': {}", id, e);
+            log_legacy!("[Shutdown] Error stopping MCP server '{}': {}", id, e);
         }
     }))
     .await;
@@ -295,17 +298,17 @@ fn raise_fd_limit() {
 fn git_preflight() {
     match std::process::Command::new("git").arg("--version").output() {
         Ok(out) if out.status.success() => {
-            log!(
+            log_legacy!(
                 "[Startup] git: {}",
                 String::from_utf8_lossy(&out.stdout).trim()
             );
         }
-        Ok(out) => log!(
+        Ok(out) => log_legacy!(
             "[Startup] WARNING: `git --version` exited {} — coding agents, Apply, and repo \
              operations will fail. On macOS install the Command Line Tools: `xcode-select --install`",
             out.status
         ),
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Startup] WARNING: `git` not found ({e}) — coding agents, Apply, and repo \
              operations will fail. On macOS install the Command Line Tools: `xcode-select --install`"
         ),
@@ -323,46 +326,26 @@ fn python_preflight() {
         .output()
     {
         Ok(out) if out.status.success() => {
-            log!(
+            log_legacy!(
                 "[Startup] python3: {}",
                 String::from_utf8_lossy(&out.stdout).trim()
             );
         }
-        Ok(out) => log!(
+        Ok(out) => log_legacy!(
             "[Startup] WARNING: `python3 --version` exited {} — the run_python tool will fail. \
              On macOS install the Command Line Tools: `xcode-select --install`",
             out.status
         ),
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Startup] WARNING: `python3` not found ({e}) — the run_python tool will fail. \
              On macOS install the Command Line Tools: `xcode-select --install`"
         ),
     }
 }
 
-/// Worker-thread stack size for the Tokio runtime.
-///
-/// The engine polls deeply-nested async chains on a single worker thread. A
-/// trigger fire descends the scheduler, the Thread Queue executor, the agentic
-/// loop and a tool, all as one un-spawned future. Tokio's default 2 MiB worker
-/// stack once overflowed on a deeper chain and aborted the engine.
-///
-/// 16 MiB is reserved virtual address space committed lazily per touched page,
-/// so the headroom is effectively free. Shrinking it gains nothing.
-const WORKER_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
-
-/// Build the multi-threaded Tokio runtime the engine runs on. What
-/// `#[tokio::main]` produces, plus a larger worker-thread stack (see
-/// [`WORKER_THREAD_STACK_SIZE`]). Shared with the runtime test, so it exercises
-/// the exact production config.
-fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(WORKER_THREAD_STACK_SIZE)
-        .build()
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+// Machine-readable version/build probes are the CLI output exception.
+#[allow(clippy::print_stdout)]
+fn metadata_probe() -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     // Handled before any heavy startup. Bare `println!` rather than `log!`,
     // because tooling parses this and the `log!` prefix would break callers.
     if std::env::args()
@@ -374,7 +357,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             lucidos_engine::LUCIDOS_RELEASE,
             env!("CARGO_PKG_VERSION"),
         );
-        return Ok(());
+        return Ok(true);
     }
 
     // A running engine forks the on-disk binary with this flag to compare build
@@ -391,6 +374,14 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             println!("{}", lucidos_engine::ENGINE_BUILD_ID);
         }
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if metadata_probe()? {
         return Ok(());
     }
 
@@ -402,7 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if std::env::args().skip(1).any(|a| a == "--wasm-selftest") {
         return match build_runtime()?.block_on(lucidos_engine::jit_selftest()) {
             Ok(()) => {
-                log!("[Selftest] wasm JIT selftest passed");
+                log_legacy!("[Selftest] wasm JIT selftest passed");
                 Ok(())
             }
             Err(e) => Err(format!("wasm JIT selftest failed: {e}").into()),
@@ -457,6 +448,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return build_runtime()?.block_on(run_preflight());
     }
 
+    // Before the runtime starts any thread: this edits the environment.
+    lucidos_engine::api::gateway_stamp::take_stamp_key_from_starter();
     build_runtime()?.block_on(run())
 }
 
@@ -478,7 +471,7 @@ async fn run_preflight() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
         store.as_ref(),
     )
     .await?;
-    log!("[Preflight] This binary boots on a copy of the workspace database");
+    log_legacy!("[Preflight] This binary boots on a copy of the workspace database");
     Ok(())
 }
 
@@ -506,15 +499,15 @@ async fn run_secrets() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         ["import-key", "--key-file", path] => {
             let key = SecretKey::from_base64(&std::fs::read_to_string(path)?)?;
             boot::import_key(&pool, &database, store.as_ref(), &key).await?;
-            log!("[SecretStore] Installed key {} for {database}.", key.id());
+            log_legacy!("[SecretStore] Installed key {} for {database}.", key.id());
         }
         ["discard"] => {
             let removed = boot::discard(&pool, &database, store.as_ref()).await?;
             if removed.is_empty() {
-                log!("[SecretStore] Nothing to discard: every secret in {database} opens.");
+                log_legacy!("[SecretStore] Nothing to discard: every secret in {database} opens.");
             }
             for line in removed {
-                log!("[SecretStore] Discarded {line}");
+                log_legacy!("[SecretStore] Discarded {line}");
             }
         }
         _ => {
@@ -628,7 +621,7 @@ async fn resolve_bind_choice(engine: &SharedEngine) -> net_config::BindChoice {
         {
             Ok(stored) => stored,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Startup] WARNING: could not read the network_bind setting ({}), \
                      falling back",
                     e
@@ -672,7 +665,9 @@ async fn own_workspace(
         let lock = match OwnerLock::try_acquire(&lock_path)? {
             Some(lock) => lock,
             None => {
-                log!("[Startup] Another engine still owns this workspace; waiting for it to exit");
+                log_legacy!(
+                    "[Startup] Another engine still owns this workspace; waiting for it to exit"
+                );
                 OwnerLock::acquire(&lock_path)?
             }
         };
@@ -680,7 +675,7 @@ async fn own_workspace(
         // landing in between finds neither.
         lock.publish_pid(&engine::pid_path(&workspace))?;
         drop(successor);
-        log!("[Startup] Acquired the workspace's owner lock");
+        log_legacy!("[Startup] Acquired the workspace's owner lock");
         Ok(lock)
     })
     .await
@@ -694,15 +689,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Before any TLS use, and before anything that might reach the network.
     lucidos_engine::net_config::install_crypto_provider();
 
-    let _ = dotenvy::dotenv();
     // Before anything spawns: no child may inherit the engine's database.
-    lucidos_engine::core::scrub_database_url_from_process_env();
+    lucidos_engine::core::load_database_environment();
 
     // macOS defaults to 256, too low for concurrent coding-agent sessions, SSE
     // streams, the DB pool and static file serving.
     raise_fd_limit();
 
-    log!("[Startup] Lucidos Engine starting...");
+    log_legacy!("[Startup] Lucidos Engine starting...");
 
     // So a post-mortem can verify the supervisor chain from the log alone. The
     // `log!` macro already prepends this process's own pid.
@@ -713,7 +707,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let ppid = unsafe { libc::getppid() };
         let pgid = unsafe { libc::getpgrp() };
         let sid = unsafe { libc::getsid(0) };
-        log!("[Startup] ppid={} pgid={} sid={}", ppid, pgid, sid);
+        log_legacy!("[Startup] ppid={} pgid={} sid={}", ppid, pgid, sid);
     }
 
     // Prepend the common user-install bin dirs before anything spawns or probes
@@ -734,11 +728,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         });
 
+    lucidos_engine::internal_faults::install(&workspace_path);
+
     lucidos_engine::core::snapshot::boot_guard::ensure_boot_entry(
         &lucidos_engine::core::database_url(),
     )?;
     lucidos_home::ensure_storage_root(&workspace_path)?;
-    log!("[Startup] Using workspace: {}", workspace_path.display());
+    log_legacy!("[Startup] Using workspace: {}", workspace_path.display());
     // Before the wait for a predecessor, which still holds its own consumer
     // lock, so the build-watch never sees a moment with no consumer.
     if let Some(static_dir) = std::env::var_os("LUCIDOS_STATIC_DIR") {
@@ -777,7 +773,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the router can answer: a socket bound early would queue the gateway's
     // requests against an engine still booting, instead of refusing them.
     let socket_path = lucidos_engine_socket::path_for(&workspace_path).inspect_err(|e| {
-        log!("[Startup] this workspace has no engine socket: {e}");
+        log_legacy!("[Startup] this workspace has no engine socket: {e}");
     })?;
     // Names the keep-awake assertion, so `pmset -g assertions` tells one
     // workspace's engine from another's.
@@ -800,13 +796,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // then refuses. See ADR 0135.
     match lucidos_engine::api::proxy_migration::migrate_apis_json_if_needed(&workspace_path) {
         Ok(lucidos_engine::api::proxy_migration::MigrationOutcome::Migrated { backup_path }) => {
-            log!(
+            log_legacy!(
                 "[Startup] migrated apis.json to pipeline shape (backup at {})",
                 backup_path.display()
             );
         }
         Ok(_) => {}
-        Err(e) => log!("[Startup] apis.json migration skipped: {}", e),
+        Err(e) => log_legacy!("[Startup] apis.json migration skipped: {}", e),
     }
 
     // Read the config once here so a refused entry is named in the startup
@@ -823,12 +819,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     ) {
         Ok(seeded) => seeded,
         Err(e) => {
-            log!("[Startup] could not seed handshake approvals: {}", e);
+            log_legacy!("[Startup] could not seed handshake approvals: {}", e);
             Vec::new()
         }
     };
     for path in &seeded_handshake_scripts {
-        log!(
+        log_legacy!(
             "[Startup] approved the handshake script already in use: {}",
             path
         );
@@ -838,7 +834,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let configured_credential_scopes = proxy_load.credential_scopes();
     let proxy_config_rejections = proxy_load.rejected;
     for rejected in &proxy_config_rejections {
-        log!(
+        log_legacy!(
             "[Startup] apis.json: refusing '{}': {}",
             rejected.label(),
             rejected.reason
@@ -846,7 +842,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let proxy_insecure_transports = proxy_load.insecure;
     for insecure in &proxy_insecure_transports {
-        log!(
+        log_legacy!(
             "[Startup] apis.json: '{}' has an unauthenticated transport: {}",
             insecure.provider,
             insecure.reason
@@ -854,7 +850,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let database_url = lucidos_engine::core::database_url();
-    log!("[Startup] Connecting to PostgreSQL...");
+    log_legacy!("[Startup] Connecting to PostgreSQL...");
     let mut boot_stages = lucidos_engine::boot_report::BootStageTimer::start();
 
     // Resolve the Vertex project WITHOUT requiring the `gcloud` binary, so a
@@ -876,7 +872,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(e) => {
             // Falls back exactly as an absent setting does, but says so. A
             // silent fallback here reads as "you never set a region".
-            log!(
+            log_legacy!(
                 "[Startup] WARNING: could not read the vertex_region setting ({}), \
                  falling back",
                 e
@@ -892,7 +888,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .to_string()
     });
 
-    log!("[Startup] Using default model: {}", model);
+    log_legacy!("[Startup] Using default model: {}", model);
 
     // Shared model→provider routing map. The engine loads it after migrations
     // and hands it to the reload subscriber, which hot-swaps it on Model* events.
@@ -905,9 +901,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     if !model_is_mock {
         if project_id.is_empty() {
-            log!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
+            log_legacy!("[Startup] Vertex AI not configured — Claude/Gemini models unavailable");
         } else {
-            log!(
+            log_legacy!(
                 "[Startup] Vertex AI configured (project: {}, region: {} from {})",
                 project_id,
                 initial_region,
@@ -955,7 +951,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
         None => LucidosEngine::new(workspace_path.clone(), &database_url, provider_ctx).await?,
     };
-    log!("[Startup] PostgreSQL connected");
+    lucidos_engine::internal_faults::start(&workspace_path, engine.event_bus.clone());
+    log_legacy!("[Startup] PostgreSQL connected");
     boot_stages.lap("engine setup");
 
     // Retire the legacy per-workspace `data/.env` into the
@@ -983,6 +980,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // migration, so just-migrated vars are included. Reserved names are
     // filtered, so engine-critical process vars are never clobbered.
     lucidos_engine::core::environment_variables::apply_to_process_env(engine.pool()).await;
+    // After the stored vars reach the env, so the sink masks their values. A
+    // failure leaves the query route answering `diagnostic_log_unavailable`.
+    if let Err(e) = lucidos_engine::diagnostic_log::start(&workspace_path) {
+        log_legacy!("[Startup] diagnostic log not started: {e}");
+    }
 
     // Tell the workspace about any `apis.json` entry the load refused above.
     // The read happened before the DB was up, so this is the first point with
@@ -1084,10 +1086,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     {
         Ok(scoped) => {
             for (name, base_url) in scoped {
-                log!("[Startup] scoped credential '{}' to {}", name, base_url);
+                log_legacy!("[Startup] scoped credential '{}' to {}", name, base_url);
             }
         }
-        Err(e) => log!("[Startup] could not infer credential scopes: {}", e),
+        Err(e) => log_legacy!("[Startup] could not infer credential scopes: {}", e),
     }
 
     // Same two surfaces as the rejection announce above, and for the same
@@ -1146,6 +1148,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let shared_engine: SharedEngine = Arc::new(engine);
     shared_engine.set_self_arc(&shared_engine);
+    lucidos_engine::engine::user_only_message_delivery::start(&shared_engine);
     // Recovery below emits child terminals, and the fan-in turns each into a
     // parent wake. Queue them until recovery is over, or the woken turn races
     // the sweeps, which read it as a dead one. Released after the event-wait
@@ -1155,7 +1158,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     shared_engine.start_apply_all_driver();
     shared_engine.start_landing_lane_driver();
     lucidos_engine::landing_gateway::enable();
-    lucidos_engine::gateway_operators::enable();
+    lucidos_engine::gateway_users::enable();
     shared_engine.start_follow_main();
     shared_engine.start_main_check_driver();
     shared_engine.start_standing_apply_resolver();
@@ -1177,6 +1180,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await;
 
+    // Each grant file becomes tool grants once, and each mirror is reconciled
+    // before a resumed session can spawn and freeze its `--allowedTools`.
+    lucidos_engine::engine::permission::tool_grants::reconcile_all_mirrors(
+        &shared_engine.event_bus,
+        &shared_engine.grants_dir(),
+    )
+    .await;
     // Auto-resolve permission cards orphaned by the previous engine's death.
     // Must run before recovery: emitting Resolved flips status to 'running',
     // which the recovery sweeps and the final settle then resolve.
@@ -1232,7 +1242,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .execute(shared_engine.pool())
     .await
     {
-        log!("[Startup] Failed to reset orphaned waiting threads: {}", e);
+        log_legacy!("[Startup] Failed to reset orphaned waiting threads: {}", e);
     }
 
     // Place this workspace in the release-notice sequence, once. Both inputs
@@ -1253,7 +1263,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await
     {
-        log!("[Startup] Failed to create the home thread: {}", e);
+        log_legacy!("[Startup] Failed to create the home thread: {}", e);
     }
 
     // Started BEFORE the recovery sweep below. Recovery broadcasts terminators
@@ -1315,7 +1325,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         lucidos_engine::engine::event_bus::EventBus::rebuild_children_counts(shared_engine.pool())
             .await
     {
-        log!("[Startup] Failed to reconcile the child counts: {}", e);
+        log_legacy!("[Startup] Failed to reconcile the child counts: {}", e);
     }
 
     // Reconcile blocking_descendant_count, for the settle's direct `idle`
@@ -1327,7 +1337,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )
     .await
     {
-        log!(
+        log_legacy!(
             "[Startup] Failed to reconcile blocking_descendant_count: {}",
             e
         );
@@ -1376,6 +1386,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::agent_recovery::reconcile_emptied_changes_on_startup(&shared_engine)
         .await;
     boot_stages.lap("change reconcile");
+
+    // A batch a restart cut off between items names the items it never ran.
+    lucidos_engine::engine::permission::batch::close_cut_off_batches_on_startup(
+        &shared_engine.event_bus,
+    )
+    .await;
 
     // Archived threads whose branch still holds work no change carries: set it
     // aside so it stays reachable (ADR 0328). Git work, so off the boot path.
@@ -1451,7 +1467,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // just had that wait resolved, and the fan-in then stands down for it.
     let released = shared_engine.event_bus.release_held_parent_wakes();
     if released > 0 {
-        log!("[Startup] Released {released} parent wake(s) held during recovery");
+        log_legacy!("[Startup] Released {released} parent wake(s) held during recovery");
     }
 
     // Rebuild the Apply-All batch registry from the durable table and resolve
@@ -1485,6 +1501,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     lucidos_engine::engine::config_change::spawn(shared_engine.clone());
     lucidos_engine::engine::change_summary_consumer::spawn(shared_engine.clone());
     lucidos_engine::engine::pending_change_watch::spawn(shared_engine.clone());
+    lucidos_engine::engine::permission::words::spawn(shared_engine.clone());
     lucidos_engine::engine::summary_tree::spawn(shared_engine.clone());
     lucidos_engine::engine::agent_recovery::spawn_branch_work_net(shared_engine.clone());
     // A handoff this engine's predecessor recorded and never acted on.
@@ -1639,11 +1656,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await
         {
             Ok(0) => {}
-            Ok(n) => log!(
+            Ok(n) => log_legacy!(
                 "[AuxContextBackfill] reconstructed {} auxiliary model call(s)",
                 n
             ),
-            Err(e) => log!("[AuxContextBackfill] failed: {}", e),
+            Err(e) => log_legacy!("[AuxContextBackfill] failed: {}", e),
         }
     });
     // An unparseable value says so before falling back, the way a malformed
@@ -1658,7 +1675,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .filter(|s| !s.is_empty());
     let api_port = match api_port_raw {
         Some(raw) => raw.parse::<u16>().unwrap_or_else(|e| {
-            log!("[Startup] LUCIDOS_API_PORT={raw:?} is not a port ({e}); using 3000");
+            log_legacy!("[Startup] LUCIDOS_API_PORT={raw:?} is not a port ({e}); using 3000");
             3000
         }),
         None => 3000,
@@ -1671,19 +1688,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let addr = addrs[0];
     let bind_label = net_config::bind_scope_label(&bind_choice);
 
-    lucidos_engine::gateway_operators::await_first_answer().await;
+    lucidos_engine::gateway_users::await_first_answer().await;
 
     // The gateway reaches this engine here, never on the TCP port (ADR 0445).
     // Bound well after the owner lock, so removing a stale socket file can
     // never unlink a live engine's. A failure stops the boot: a gateway could
     // not reach an engine without it.
     let socket_listener = lucidos_engine_socket::bind(&socket_path).inspect_err(|e| {
-        log!("[Startup] cannot bind the engine socket: {e}");
+        log_legacy!("[Startup] cannot bind the engine socket: {e}");
     })?;
-    log!("[Startup] Engine socket at {}", socket_path.display());
+    log_legacy!("[Startup] Engine socket at {}", socket_path.display());
     let (socket_drain, socket_draining) = tokio::sync::watch::channel(false);
     let socket_server = lucidos_engine::api::engine_socket::serve(
         socket_listener,
+        socket_path.clone(),
         app.clone(),
         socket_draining,
         HTTP_DRAIN,
@@ -1712,7 +1730,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(|v| v.trim().to_string());
     let scheme = net_config::tls_scheme_from(tls_cert.as_deref(), tls_key.as_deref());
     boot_stages.lap("router");
-    log!("[Startup] Boot stages: {}", boot_stages.summary());
+    log_legacy!("[Startup] Boot stages: {}", boot_stages.summary());
 
     // Serve every resolved address concurrently, sharing the one graceful-shutdown
     // `Handle` so a single shutdown stops all sockets. A bind failure on any
@@ -1722,7 +1740,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let (cert_path, key_path) = (tls_cert.unwrap_or_default(), tls_key.unwrap_or_default());
         let tls_config =
             axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert_path, &key_path).await?;
-        log!(
+        log_legacy!(
             "[Startup] API server listening on {}://{}  (HTTP/2 + TLS, {})",
             scheme,
             addr,
@@ -1735,7 +1753,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }));
         serve_until_shutdown(tcp, socket_server).await?;
     } else {
-        log!(
+        log_legacy!(
             "[Startup] API server listening on {}://{}  ({})",
             scheme,
             addr,
@@ -1753,7 +1771,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // preview and the MCP children are stopped. Returning now would drop the
     // runtime and cancel that cleanup, orphaning them.
     if let Err(e) = shutdown.await {
-        log!("[Shutdown] teardown task failed: {e}");
+        log_legacy!("[Shutdown] teardown task failed: {e}");
     }
     Ok(())
 }
@@ -1886,57 +1904,5 @@ mod ownership_tests {
         );
         assert_eq!(lucidos_owner_lock::engine::waiting_pid(dir.path()), None);
         drop(lock);
-    }
-}
-
-#[cfg(test)]
-mod runtime_tests {
-    use super::{build_runtime, WORKER_THREAD_STACK_SIZE};
-
-    /// Recurse with a large live stack frame per level, emulating the engine's
-    /// deep un-spawned async poll chain. `#[inline(never)]`, `black_box` and
-    /// reading `buf` AFTER the recursive call together defeat tail-call and
-    /// dead-store optimization, so every level genuinely consumes stack.
-    #[inline(never)]
-    fn consume_stack(depth: usize) -> u64 {
-        let mut buf = [0u8; 64 * 1024]; // 64 KiB of stack per frame
-        let idx = depth % buf.len();
-        buf[idx] = depth as u8;
-        std::hint::black_box(&buf);
-        let deeper = if depth == 0 {
-            0
-        } else {
-            consume_stack(depth - 1)
-        };
-        deeper.wrapping_add(buf[idx] as u64)
-    }
-
-    /// The engine's runtime must give its bounded-but-deep poll chain real
-    /// headroom. See [`super::WORKER_THREAD_STACK_SIZE`].
-    #[test]
-    fn worker_stack_holds_deep_nested_async_chain() {
-        // Must comfortably exceed tokio's 2 MiB default. Checked at compile
-        // time, because the invariant is over a const.
-        const {
-            assert!(
-                WORKER_THREAD_STACK_SIZE >= 8 * 1024 * 1024,
-                "worker stack must exceed tokio's 2 MiB default with headroom"
-            );
-        }
-
-        // A chain needing ~4 MiB of stack, on a worker thread of the
-        // *production* runtime builder. On a 2 MiB stack this aborts the
-        // process; on the configured stack it completes cleanly.
-        let rt = build_runtime().expect("runtime builds");
-        let sum = rt.block_on(async {
-            tokio::spawn(async { consume_stack(64) })
-                .await
-                .expect("deep-stack task joins without overflowing the worker stack")
-        });
-        let expected: u64 = (0..=64).sum();
-        assert_eq!(
-            sum, expected,
-            "deep recursion ran every level to completion"
-        );
     }
 }

@@ -1,3 +1,4 @@
+import { hasUpdateChannelChoice } from '../../utils/updateChannel';
 import { enginePackaged, releaseCheck, aliasRetiredSettingsAnchor, type SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText, shortcutSearchAnchor } from '../../utils/shortcuts';
@@ -90,10 +91,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan pairing code pair device add' },
   { id: 'webhooks', label: 'Webhooks', subview: 'webhooks', path: 'Settings', keywords: 'webhook inbound hook endpoint github stripe slack signature hmac token funnel event' },
   { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings', keywords: 'device phone laptop push notifications rename remove last seen' },
+  { id: 'users', label: 'Users', subview: 'users', path: 'Settings', keywords: 'people person operator team member teammate user email add remove offboard whose device', gatewayOnly: true },
   // Pairing lives on the same row as push now, so Revoke is found on the
   // Devices page rather than under Access. Still gateway-gated: with none, no
   // row carries a Revoke button and the word would land on nothing.
-  { id: 'devices:people', label: 'People', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:people', keywords: 'people person operator team member teammate email add remove offboard whose device', gatewayOnly: true },
   { id: 'devices:paired', label: 'Paired devices', subview: 'devices', path: 'Settings → Devices', anchor: 'devices:list', keywords: 'paired pairing device revoke unpair sign out cut off network access', gatewayOnly: true },
   { id: 'system', label: 'System', subview: 'system', path: 'Settings' },
   { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
@@ -126,7 +127,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system:versions', label: 'Versions', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
   { id: 'system:update-check', label: 'Check for updates automatically', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-check', keywords: 'update check automatic new version release', when: () => releaseCheck.value?.supported === true },
-  { id: 'system:update-address', label: 'Update address', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-address', keywords: 'update address url latest.json release candidate rc staged test override', when: () => releaseCheck.value?.update_address !== undefined },
+  { id: 'system:update-channel', label: 'Update channel', subview: 'system-overview', path: 'Settings → System → Overview → Maintenance', anchor: 'system:update-channel', keywords: 'update channel stable beta local custom address url latest.json release candidate staged test', when: () => hasUpdateChannelChoice(releaseCheck.value) },
   { id: 'system:installs', label: 'Installs', subview: 'system-overview', path: 'Settings → System → Overview', anchor: 'system:installs', keywords: 'installs install machines desktop app versions' },
 
   // What's New, and the Communication Surfaces sample page Debugging opens
@@ -145,6 +146,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
   { id: 'coding-agents:permissions', label: 'Permissions', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:permissions', keywords: 'permission mode claude code auto accept edits classifier approve prompt card ask' },
   { id: 'coding-agents:context-ceiling', label: 'Context ceiling', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:context-ceiling', keywords: 'context ceiling hand off handoff fresh session successor size tokens 300k window' },
+  { id: 'coding-agents:main-check', label: 'Main check', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:main-check', keywords: 'main check harden github slow suites here another host off repair red' },
   { id: 'models:cache-keep-alive', label: 'Cache keep-alive', subview: 'models', path: 'Settings → Models', anchor: 'models:cache-keep-alive', keywords: 'cache keep-alive keep warm prompt cache reread rewrite ping beat prefill give up reread cap on off cost claude code lucidos agent' },
   // Like Region below: the Cache cards row renders only while the keep-alive
   // is on, so this lands on the section title that carries its switch.
@@ -191,6 +193,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:command-judge', label: 'Command judge', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:command-judge', keywords: 'command guard judge model safety flash lite luna haiku typesafe jev clef system one judgment backend auto answer coding agent' },
   { id: 'models:wake-decision', label: 'Wake decision', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:wake-decision', keywords: 'wake decision sub-thread child parent filed report typesafe jev openai decisions openrouter system one judgment' },
   { id: 'models:expected-wake-decision', label: 'Expected wake', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:expected-wake-decision', keywords: 'expected wake decision cache keep-alive waiting estimate when the thread wakes typesafe jev openai decisions openrouter system one judgment' },
+  { id: 'models:permission-answer', label: 'Permission answer', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:permission-answer', keywords: 'permission answer words voice spoken typed grant allow request judgment typesafe jev openai decisions openrouter system one' },
   { id: 'models:voice', label: 'Voice', subview: 'models', path: 'Settings → Models', anchor: 'models:voice', keywords: 'voice call talk speak speech audio microphone realtime talker transcriber experimental' },
   { id: 'models:voice-enabled', label: 'Voice (experimental)', subview: 'models', path: 'Settings → Models → Voice', anchor: 'models:voice-enabled', keywords: 'voice call enable turn on off home thread', when: voiceReachable },
   // The rows below render only while voice is on. So they land on the
@@ -237,6 +240,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Experimental categories, so its two rows keep their own platform flags)
   { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:theme', keywords: 'theme themes look looks colour color scheme palette nord catppuccin gruvbox solarized minimal header focus accent customize' },
   { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:mode', keywords: 'theme mode dark mode light mode dark light system appearance night' },
+  { id: 'appearance:agent-brand-colours', label: 'Agent brand colours', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:agent-brand-colours', keywords: 'agent brand colours colors icons marks muted claude codex lucidos' },
   { id: 'appearance:theme-effects', label: 'Effects', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:theme-effects', keywords: 'glow shadow scanlines effects theme reduce contrast transparency battery sharp text' },
   { id: 'appearance:motion', label: 'Motion', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:motion', keywords: 'reduce motion reduced animation animations calm still accessibility vestibular dizzy spinner pulse slide' },
   { id: 'appearance:typography', label: 'Typography', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:typography' },
@@ -274,7 +278,9 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // old word stays searchable via keywords so nobody loses the entry.
   { id: 'accounts:connected', label: 'Connected accounts', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:connected', keywords: 'oauth connect sign in google microsoft github dropbox account authorize reconnect disconnect' },
 
-  // Permissions subview (Command safety + the two allowlist editors)
+  // Permissions subview (Agent sandbox, Command safety, the two allowlist editors)
+  { id: 'agent-sandbox', label: 'Agent sandbox', subview: 'permissions', path: 'Settings → Permissions', anchor: 'agent-sandbox', keywords: 'sandbox seatbelt landlock secrets isolation agents' },
+  { id: 'agent-sandbox:unsandboxed', label: 'Sandbox agents', subview: 'permissions', path: 'Settings → Permissions → Agent sandbox', anchor: 'agent-sandbox:unsandboxed', keywords: 'sandbox on enable protection off disable unsandboxed seatbelt landlock agents unavailable' },
   { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
   { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
   { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
@@ -347,14 +353,16 @@ export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
   return allSettingsEntries().find(e => e.id === current);
 }
 
-/** The anchor a `settings:<view>#<fragment>` link lands on. The fragment is a
- *  row's search id after its colon, so a page whose anchors carry another
- *  prefix still resolves. A row inside a fold lands on the ancestor its entry
- *  names. A fragment the index lacks stays `<view>:<fragment>`. */
+/** Resolve a full anchor, search id, or short row name within its Settings page.
+ *  Retired anchors resolve before rows inside folds land on their ancestor.
+ *  Unknown full anchors stay intact;
+ *  unknown short names get the page prefix. */
 export function settingsLinkAnchor(view: string, fragment: string): string {
-  const entry = allSettingsEntries().find(e =>
-    e.subview === view && e.anchor !== undefined && e.id.slice(e.id.indexOf(':') + 1) === fragment);
-  return entry?.anchor ?? `${view}:${fragment}`;
+  const current = aliasRetiredSettingsAnchor(fragment);
+  const entries = allSettingsEntries().filter(e => e.subview === view && e.anchor !== undefined);
+  const entry = entries.find(e => e.id === current || e.anchor === current)
+    ?? entries.find(e => e.id.slice(e.id.indexOf(':') + 1) === current);
+  return entry?.anchor ?? (fragment.includes(':') ? current : `${view}:${current}`);
 }
 
 /** Whether some entry lands on `anchor`, or takes it as its id and lands on an

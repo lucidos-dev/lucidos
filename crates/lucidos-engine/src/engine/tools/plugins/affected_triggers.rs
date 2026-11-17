@@ -161,7 +161,7 @@ pub(crate) async fn notify(
         }))
         .await;
     if let Err(e) = emitted {
-        log!(@Plugins, "affected-trigger notification failed: {}", e);
+        log_legacy!(@Plugins, "affected-trigger notification failed: {}", e);
     }
 }
 

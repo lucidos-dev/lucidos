@@ -31,6 +31,10 @@ outside `artifacts/`), so an open app showing that file re-reads it.
 background script feeds an app, end it with `lucidos data write` for the file the
 app reads. See `system-knowhow/building-an-app.md` § Live data.
 
+Artifact announcements resolve the writer from the calling thread when the staged write commits.
+An unattended trigger's announced files remain on disk and in history but do not become workspace memory leaves.
+A person joining the trigger thread changes attribution for later writes only.
+
 ## The drain pattern: never poll with `time.sleep`
 
 WRONG (burns two tool calls per wait, doubles context, stalls the turn):
@@ -205,10 +209,15 @@ database destruction, and HTTP calls that delete workspaces or operate cleanup
 and Trash routes. The caller's own coding-agent worktree is exempt from workspace
 root protection. Reading the local token or shared Postgres password is a secret
 read, which grants also cannot cover. Coding-agent permission checks and
-background tasks enforce this floor too.
+background tasks enforce this floor too. Each shell or Python call classifies
+and executes with the same sandbox snapshot, including background calls.
+Secret roots and enforced workspace carve-outs follow that snapshot's policy;
+see `agent-sandbox` for the boundary and secret-read outcome guidance.
 
-The floor reads command text and workspace paths. It is not an OS sandbox:
-a program that builds a target at runtime can escape its text checks. Agents
+The floor reads command text and workspace paths, so a program that builds a
+target at runtime can escape its text checks. Beneath it, each of these calls
+runs in the OS agent sandbox, which no command text escapes. What the sandbox
+hides and what fails inside it: the `agent-sandbox` knowhow. Agents
 may report cleanup candidates. A protected workspace deletion needs a paired
 device and its exact typed name. A harness may delete only an ephemeral entry
 whose registration minted its owner token.
@@ -243,6 +252,10 @@ A workspace can turn the guard off. Its other checks then stop, but the catastro
 **With the judge turned off, the static pass decides alone, and it asks more often.** A command it cannot see through asks the user, and on a trigger it needs the `other` grant. That covers a command substitution (`$(…)`), a path-qualified head (`data/bin/tool`) and a code-injecting `VAR=` preamble. It also covers Python that installs packages, shells out, or uses a network or mail library. A head it simply does not know (`cargo build`) still runs. An in-workspace deletion keeps the Undo lane, unless the same command holds one of those shapes.
 
 ## The per-workspace venv
+
+On macOS, the sandbox keeps ancestor metadata readable so framework Python
+can resolve the venv inside a gateway workspace. Hidden contents stay denied.
+See `agent-sandbox` for the boundary and workspace-scoped opt-out.
 
 Lucidos provisions one Python venv per workspace at `.lucidos/runtime/python/venv/`. The `run_python*` tools run scripts inside it automatically. Don't activate it, reference it, or reach for `subprocess.run(["python", ...])`. Pass plain Python as the `code` arg.
 
@@ -298,3 +311,10 @@ timed out after 300s`. The code was fine; the budget was not. Never retry it
 as-is: move it to `run_python_background`, or cut the work down.
 
 The trimmed (or short) form is enough to act on: diagnose the exception class and the user-frame line, fix the script, retry once. Don't cycle through sys.path / chdir variants; check what's importable first.
+
+## Diagnostic evidence
+
+Legacy engine log lines for tool execution remain private in maintainer diagnostics.
+Tool output is not automatically classified as shareable metadata.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

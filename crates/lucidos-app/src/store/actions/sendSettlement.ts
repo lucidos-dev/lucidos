@@ -6,8 +6,7 @@
 
 import type { ChatRequestBody } from '../../api/types';
 import { endUnsentMessage, type SendSettlement } from '../unsentMessages';
-import { appendMessagesToCompose } from './chat';
-import { composeInFreshDraft, rollBackFirstSend, settleAcceptedFirstSend } from './compose';
+import { appendMessagesToCompose, composeInFreshDraft, rollBackFirstSend, settleAcceptedFirstSend } from './compose';
 
 export function settleAcceptedSend(threadId: string, settlement: SendSettlement): void {
   if (settlement.kind === 'first-send') settleAcceptedFirstSend(threadId);

@@ -365,8 +365,8 @@ fn an_ordinary_wait_raises_no_priority_flag() {
 
 #[test]
 fn the_slot_class_comes_from_the_environment_value() {
-    assert_eq!(resolve_class(Some("1")), SlotClass::Priority);
-    assert_eq!(resolve_class(Some(" 1 ")), SlotClass::Priority);
+    assert_eq!(resolve_class(Some("priority")), SlotClass::Priority);
+    assert_eq!(resolve_class(Some(" priority ")), SlotClass::Priority);
     for other in [None, Some(""), Some("0"), Some("yes"), Some("true")] {
         assert_eq!(resolve_class(other), SlotClass::Ordinary, "{other:?}");
     }
@@ -625,4 +625,83 @@ fn the_pool_dir_override_wins_over_home() {
         std::env::remove_var(ENV_POOL_DIR);
     }
     assert_eq!(resolved, dir.path());
+}
+
+#[test]
+fn background_builds_leave_freed_slots_to_waiting_chosen_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let held = p.try_acquire("existing build").unwrap();
+    let ordinary = p.mark_waiting().unwrap();
+    drop(held);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    let chosen = p.try_acquire_as("chosen", SlotClass::Ordinary).unwrap();
+    drop(chosen);
+    drop(ordinary);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+}
+
+#[test]
+fn priority_builds_beat_ordinary_and_background_waiters() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let priority = p.mark_priority_waiting().unwrap();
+    assert!(p.try_acquire_as("ordinary", SlotClass::Ordinary).is_none());
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    assert!(p.try_acquire_as("apply", SlotClass::Priority).is_some());
+    drop(priority);
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+}
+
+#[test]
+fn build_classes_have_distinct_defaults() {
+    assert_eq!(resolve_class(Some("background")), SlotClass::Background);
+    assert_eq!(resolve_class(Some("priority")), SlotClass::Priority);
+    assert_eq!(resolve_class(None), SlotClass::Ordinary);
+    assert_eq!(resolve_nice(None, SlotClass::Background), 15);
+    assert_eq!(resolve_nice(None, SlotClass::Ordinary), 10);
+    assert_eq!(resolve_nice(None, SlotClass::Priority), 0);
+}
+
+#[test]
+fn background_waiters_observe_older_brokers_without_blocking_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    let legacy = p.mark_waiting().unwrap();
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_none());
+    drop(legacy);
+    let background = p.mark_background_waiting().unwrap();
+    assert!(p.anyone_waiting());
+    assert!(p.try_acquire_as("repair", SlotClass::Background).is_some());
+    drop(background);
+    assert!(!p.anyone_waiting());
+}
+
+#[test]
+fn the_new_class_overrides_the_older_engines_priority_input() {
+    assert_eq!(
+        resolve_class_with_legacy(None, Some("1")),
+        SlotClass::Priority
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("background"), Some("1")),
+        SlotClass::Background
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("ordinary"), Some("1")),
+        SlotClass::Ordinary
+    );
+    assert_eq!(
+        resolve_class_with_legacy(Some("invalid"), Some("1")),
+        SlotClass::Ordinary
+    );
+}
+
+#[test]
+fn unreadable_waiter_state_is_explicit_for_admission_and_conservative_for_builds() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = pool(&dir, 1);
+    std::fs::create_dir(dir.path().join(WAITING_FILE)).unwrap();
+    assert!(p.try_anyone_waiting().is_err());
+    assert!(p.anyone_waiting());
 }

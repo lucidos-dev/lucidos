@@ -9,6 +9,9 @@
 //! which turns each cost into a `ContextCaptured` row.
 
 use async_trait::async_trait;
+use std::sync::Arc;
+
+use crate::llm::spend_cap::SpendCapPolicy;
 
 use crate::llm::call_trace::{self, CallFailure};
 use crate::llm::image::{ImageProvider, ImageResult, ImageSize};
@@ -58,7 +61,7 @@ pub(crate) enum Reported<'a> {
         input_tokens: Option<u32>,
         output_tokens: Option<u32>,
     },
-    Usage(Option<crate::llm::api_usage::ApiUsage>),
+    Search(&'a WebSearchResult),
 }
 
 impl Reported<'_> {
@@ -68,15 +71,16 @@ impl Reported<'_> {
         match self {
             Self::Chat(response) => response.served_model.as_deref(),
             Self::Judgment(judgment) => judgment.served_model.as_deref(),
-            Self::Image { .. } | Self::Usage(_) => None,
+            Self::Image { .. } | Self::Search(_) => None,
         }
     }
 
-    /// The backend a routed chat call went to. Every other shape names none.
-    pub(crate) fn provider(&self) -> Option<crate::llm::ProviderKind> {
+    /// The serving backend proved by a chat route or search result.
+    pub(crate) fn provider(&self) -> Option<&'static str> {
         match self {
-            Self::Chat(response) => response.provider,
-            Self::Judgment(_) | Self::Image { .. } | Self::Usage(_) => None,
+            Self::Chat(response) => response.provider.map(|kind| kind.as_str()),
+            Self::Search(result) => result.provider.map(|provider| provider.id()),
+            Self::Judgment(_) | Self::Image { .. } => None,
         }
     }
 }
@@ -122,6 +126,9 @@ pub(crate) struct CallFailed<'a> {
 /// Where a call's cost goes. Every metered function takes one.
 #[async_trait]
 pub(crate) trait CostSink: Send + Sync {
+    fn spend_cap_policy(&self) -> Option<(Arc<dyn SpendCapPolicy>, bool)> {
+        None
+    }
     async fn record(&self, cost: CallCost<'_>);
 
     /// Note a chat call that failed. It spent nothing a rollup should bill, so
@@ -135,18 +142,69 @@ pub(crate) trait CostSink: Send + Sync {
     }
 }
 
+tokio::task_local! {
+    static SPEND_POLICY: (Arc<dyn SpendCapPolicy>, bool, std::sync::Mutex<Option<crate::llm::ProviderKind>>);
+}
+
+/// Every actual route checks here, including a fallback inside one call.
+pub(crate) async fn check_provider(provider: crate::llm::ProviderKind) -> Result<(), BoxError> {
+    if let Ok((policy, interactive)) =
+        SPEND_POLICY.try_with(|(policy, interactive, _)| (policy.clone(), *interactive))
+    {
+        policy.check(Some(provider), interactive).await?;
+        SPEND_POLICY.with(|(_, _, selected)| *selected.lock().unwrap() = Some(provider));
+    }
+    Ok(())
+}
+
+/// Observe a refusal before a search or routing fallback can consume it.
+pub(crate) async fn http_spend_cap(
+    provider: crate::llm::ProviderKind,
+    status: u16,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Option<crate::llm::spend_cap::SpendCapReached> {
+    let cap = crate::llm::spend_cap::SpendCapReached::from_http(provider, status, headers, body)?;
+    if let Ok(policy) = SPEND_POLICY.try_with(|(policy, _, _)| policy.clone()) {
+        policy.failed(&cap).await;
+    }
+    Some(cap)
+}
+
 /// Run one provider call under the sink's deadline. A call that runs out
 /// returns a boxed [`tokio::time::error::Elapsed`] and reported nothing.
 async fn within<T>(
     sink: &dyn CostSink,
     call: impl std::future::Future<Output = Result<T, BoxError>>,
 ) -> Result<T, BoxError> {
-    match sink.deadline() {
-        Some(deadline) => tokio::time::timeout_at(deadline, call)
-            .await
-            .map_err(|elapsed| Box::new(elapsed) as BoxError)?,
-        None => call.await,
-    }
+    let bounded = async {
+        match sink.deadline() {
+            Some(deadline) => tokio::time::timeout_at(deadline, call)
+                .await
+                .map_err(|elapsed| Box::new(elapsed) as BoxError)?,
+            None => call.await,
+        }
+    };
+    let Some((policy, interactive)) = sink.spend_cap_policy() else {
+        return bounded.await;
+    };
+    SPEND_POLICY
+        .scope(
+            (policy.clone(), interactive, std::sync::Mutex::new(None)),
+            async {
+                let result = bounded.await;
+                match &result {
+                    Ok(_) => {
+                        let provider =
+                            SPEND_POLICY.with(|(_, _, selected)| *selected.lock().unwrap());
+                        policy.succeeded(provider).await;
+                    }
+                    Err(error) => policy.failed(error.as_ref()).await,
+                }
+                result
+            },
+        )
+        .await
 }
 
 /// Make one chat call and record what it cost.
@@ -167,6 +225,15 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
     system_prompt: Option<&str>,
     on_token: Option<TokenCallback>,
 ) -> Result<LlmResponse, BoxError> {
+    // Route failures must pass through the call's normal failure recording.
+    let resolved = if sink.spend_cap_policy().is_some() {
+        provider.resolved_provider_kind(&selection).unwrap_or(None)
+    } else {
+        None
+    };
+    if let Some((policy, interactive)) = sink.spend_cap_policy() {
+        policy.check(resolved, interactive).await?;
+    }
     let started = std::time::Instant::now();
     let call = provider.chat(
         messages,
@@ -185,6 +252,9 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
     let response = match outcome {
         Ok(response) => response,
         Err(error) => {
+            if let Some((policy, _)) = sink.spend_cap_policy() {
+                policy.failed(error.as_ref()).await;
+            }
             let timed_out = error.is::<tokio::time::error::Elapsed>();
             sink.record_failure(CallFailed {
                 model: &model,
@@ -200,6 +270,11 @@ pub(crate) async fn chat<P: LlmProvider + ?Sized>(
             return Err(error);
         }
     };
+    if let Some((policy, _)) = sink.spend_cap_policy() {
+        policy
+            .succeeded(response.provider.or(trace.provider).or(resolved))
+            .await;
+    }
     sink.record(CallCost {
         model: &model,
         request_chars,
@@ -224,6 +299,9 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
     provider: &P,
     body: &PrefillBody,
 ) -> Result<LlmResponse, BoxError> {
+    if let Some((policy, interactive)) = sink.spend_cap_policy() {
+        policy.check(body.provider, interactive).await?;
+    }
     let started = std::time::Instant::now();
     let call = provider.prefill(body, CallToken::mint());
     let (outcome, trace) = call_trace::scoped(within(sink, call)).await;
@@ -231,6 +309,9 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
     let mut response = match outcome {
         Ok(response) => response,
         Err(error) => {
+            if let Some((policy, _)) = sink.spend_cap_policy() {
+                policy.failed(error.as_ref()).await;
+            }
             sink.record_failure(CallFailed {
                 model: &body.model,
                 reasoning_effort: effort,
@@ -246,6 +327,9 @@ pub(crate) async fn prefill<P: LlmProvider + ?Sized>(
         }
     };
     response.stable_prefix_fingerprint = body.stable_prefix_fingerprint.clone();
+    if let Some((policy, _)) = sink.spend_cap_policy() {
+        policy.succeeded(body.provider).await;
+    }
     sink.record(CallCost {
         model: &body.model,
         request_chars: body.request_chars(),
@@ -330,19 +414,19 @@ pub(crate) async fn search(
     let started = std::time::Instant::now();
     let call = within(sink, chain.search(query, max_results, CallToken::mint()));
     let (outcome, trace) = call_trace::scoped(call).await;
-    let WebSearchResult { text, usage, model } = outcome?;
+    let result = outcome?;
     sink.record(CallCost {
-        model: &model,
+        model: &result.model,
         request_chars: query.chars().count(),
-        reported: Reported::Usage(usage),
+        reported: Reported::Search(&result),
         reasoning_effort: None,
         duration_ms: Some(elapsed_ms(started)),
         ttft_ms: None,
         request_id: trace.request_id.as_deref(),
-        provider: trace.provider,
+        provider: None,
     })
     .await;
-    Ok(text)
+    Ok(result.text)
 }
 
 fn elapsed_ms(started: std::time::Instant) -> u64 {

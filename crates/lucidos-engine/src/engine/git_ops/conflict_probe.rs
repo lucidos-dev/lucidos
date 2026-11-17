@@ -42,7 +42,7 @@ pub(crate) async fn probe_merge(dir: &Path, ours: &str, theirs: &str) -> MergePr
         Ok(o) => {
             let probe = classify_merge_tree(o.status.code(), &String::from_utf8_lossy(&o.stdout));
             if probe == MergeProbe::Unknown {
-                log!(
+                log_legacy!(
                     "[Git] `git {}` failed in {}: {}",
                     args.join(" "),
                     dir.display(),
@@ -52,7 +52,7 @@ pub(crate) async fn probe_merge(dir: &Path, ours: &str, theirs: &str) -> MergePr
             probe
         }
         Err(e) => {
-            log!("[Git] cannot probe a merge in {}: {}", dir.display(), e);
+            log_legacy!("[Git] cannot probe a merge in {}: {}", dir.display(), e);
             MergeProbe::Unknown
         }
     }

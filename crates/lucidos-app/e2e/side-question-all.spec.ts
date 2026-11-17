@@ -63,14 +63,14 @@ async function askByToggle(page: Page, question: string): Promise<void> {
  *  and no turn of the thread shows it. Runs on desktop and on the mobile
  *  projects, since the card must work on the iOS PWA too.
  *
- *  It runs against the real Claude Code: a copy of the session that persists
- *  nothing (ADR 0324). */
+ *  The fake CLI supplies a deterministic answer through the real endpoint
+ *  and subprocess path; this scenario does not test provider recall. */
 test.describe('side questions in a Claude Code thread', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
-  test('a side question answers on a card and never enters the thread', { tag: '@real-claude-code' }, async ({ page }) => {
+  test('a side question answers on a card and never enters the thread', async ({ page }) => {
     const chatPosts: string[] = [];
     page.on('request', (req) => {
       if (req.method() === 'POST' && /\/api\/v1\/chat\b/.test(req.url())) chatPosts.push(req.url());
@@ -85,15 +85,17 @@ test.describe('side questions in a Claude Code thread', () => {
     const exchangesBefore = await countExchanges(page);
     const postsBefore = chatPosts.length;
 
-    await askByToggle(page, 'What codeword did you just say? Reply with the codeword only.');
+    const sideToken = uniqueMessage('side-answer');
+    const question = `Say exactly: "${sideToken}" and nothing else.`;
+    await askByToggle(page, question);
 
     const card = page.locator('[data-role="side-question-card"]:visible').first();
     await expect(card).toBeVisible();
     await expect(card.locator('.side-question-question')).toHaveText(
-      'What codeword did you just say? Reply with the codeword only.',
+      question,
     );
     await expect(card).toHaveAttribute('data-status', 'answered', { timeout: 150_000 });
-    await expect(card.locator('.side-question-body > .markdown-content')).toContainText(token);
+    await expect(card.locator('.side-question-body > .markdown-content')).toContainText(sideToken);
     await expect(card).toContainText('Not added to the conversation');
 
     // The side Q&A is not a turn: no new exchange, no user message, no chat POST.
@@ -117,7 +119,7 @@ test.describe('side questions in a Claude Code thread', () => {
     expect((await dismissed).ok()).toBe(true);
     await expect(card).toHaveAttribute('data-collapsed', '');
     await expect(head).toHaveAttribute('aria-expanded', 'false');
-    await expect(card.locator('.side-question-summary')).toContainText('What codeword did you just say?');
+    await expect(card.locator('.side-question-summary')).toContainText(question);
     await expect(card.locator('.side-question-question')).toHaveCount(0);
 
     // Recorded as events, so the card is still folded after a reload, and a
@@ -126,7 +128,7 @@ test.describe('side questions in a Claude Code thread', () => {
     const folded = page.locator('[data-role="side-question-card"][data-collapsed]:visible').first();
     await expect(folded).toBeVisible({ timeout: 30_000 });
     await folded.locator('button.side-question-head').click();
-    await expect(page.locator('[data-role="side-question-card"]:visible .side-question-body > .markdown-content')).toContainText(token);
+    await expect(page.locator('[data-role="side-question-card"]:visible .side-question-body > .markdown-content')).toContainText(sideToken);
     expect(await countExchanges(page)).toBe(exchangesBefore);
   });
 

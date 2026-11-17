@@ -23,10 +23,11 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, Request, StatusCode
 use axum::response::{IntoResponse, Response};
 
 use crate::engine_hop::{self, Credential, EngineAddress};
+use lucidos_gateway_stamp::StampKey;
 
 /// Trusted hop provenance, consumed by the engine's restore generation fence.
 /// Every inbound value is stripped, including on WebSocket upgrades.
-const HEADER_CALLER_KIND: &str = "x-lucidos-caller-kind";
+pub(crate) const HEADER_CALLER_KIND: &str = "x-lucidos-caller-kind";
 
 fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'static str {
     if extensions
@@ -41,6 +42,15 @@ fn caller_kind(headers: &HeaderMap, extensions: &axum::http::Extensions) -> &'st
     } else if extensions
         .get::<crate::auth::AuthenticatedLocalProcess>()
         .is_some()
+        // `enforce` admits an agent restore caller only from a loopback peer,
+        // so it is a local process too, just one the sandbox keeps tokenless.
+        || extensions.get::<crate::auth::AgentRestoreCaller>().is_some()
+        // A verified workspace call is an engine's own, even when a paired
+        // gateway relayed it, and an engine holds no restore generation.
+        || extensions
+            .get::<crate::workspace_calls::AttestedWorkspaceCall>()
+            .is_some()
+        || extensions.get::<crate::diagnostic_transport::AttestedDiagnosticDelivery>().is_some()
     {
         "local-process"
     } else {
@@ -67,9 +77,9 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Does the gateway own this request header, rather than forwarding it?
 ///
-/// The trust boundary, and one definition for every hop. Eleven names are the
-/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id and label,
-/// the two engine credentials, the gateway credential, the relay claim, its
+/// The trust boundary, and one definition for every hop. These names are the
+/// gateway's: `x-forwarded-prefix`, `x-forwarded-host`, the device id, label
+/// and gateway stamp, a workspace call's claim, the two engine credentials, the gateway credential, the relay claim, its
 /// signature, and the local-browser stamp in both its forms. A client-supplied
 /// one must never reach the engine, nor another gateway. The caller re-injects
 /// the prefix, the device headers, the stamp and the local token itself. Whoever sends the upstream request
@@ -89,21 +99,30 @@ pub(crate) fn is_hop_by_hop(name: &HeaderName) -> bool {
 /// consumes it.
 pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> bool {
     let n = name.as_str();
-    if name == header::HOST
+    if crate::diagnostic_transport::owns_header(n)
+        || name == header::HOST
         || name == header::CONTENT_LENGTH
         || n.eq_ignore_ascii_case("x-forwarded-prefix")
         || n.eq_ignore_ascii_case("x-forwarded-host")
         || n.eq_ignore_ascii_case(HEADER_CALLER_KIND)
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_ID)
         || n.eq_ignore_ascii_case(crate::stack::HEADER_DEVICE_LABEL)
+        || n.eq_ignore_ascii_case(lucidos_gateway_stamp::HEADER_GATEWAY_STAMP)
+        || n.eq_ignore_ascii_case(lucidos_gateway_stamp::HEADER_DEVICE_SESSION)
+        || n.eq_ignore_ascii_case(lucidos_gateway_stamp::HEADER_CALLER_WORKSPACE)
+        || n.eq_ignore_ascii_case(lucidos_gateway_stamp::HEADER_CALLER_THREAD)
+        || n.eq_ignore_ascii_case(lucidos_gateway_stamp::HEADER_CALLER_VERDICT)
+        || n.eq_ignore_ascii_case(crate::workspace_calls::HEADER_RELAYED_CALL_SIGNATURE)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_LOCAL_TOKEN)
         || n.eq_ignore_ascii_case(crate::auth::HEADER_HOOK_SOCKET_TOKEN)
+        || n.eq_ignore_ascii_case(lucidos_engine_socket::CREDENTIAL_HEADER)
         || n.eq_ignore_ascii_case(crate::gateway_protocol::HEADER_GATEWAY_CREDENTIAL)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_CLAIM)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_SIGNATURE)
         || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_LOCAL_BROWSER)
-        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_OPERATOR)
-        || n.eq_ignore_ascii_case(crate::relay::HEADER_RELAY_OPERATOR_SIGNATURE)
+        || crate::relay::RELAY_USER_HEADERS
+            .iter()
+            .any(|h| n.eq_ignore_ascii_case(h))
         || n.eq_ignore_ascii_case(crate::oauth_callback::HEADER_LOCAL_BROWSER)
     {
         return true;
@@ -134,7 +153,7 @@ pub(crate) fn gateway_owns_header(name: &HeaderName, keep_handover: bool) -> boo
 ///
 /// A `Host` carries no scheme, and every topology sending a portless one reaches
 /// us on 443. So `http://name` is a page on port 80, not this origin.
-fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
+pub(crate) fn origin_authority_matches_host(origin: &str, host: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(origin) else {
         return false;
     };
@@ -279,6 +298,7 @@ pub async fn proxy(
     prefix: &str,
     boot_label: &str,
     local_token: &str,
+    stamp_key: Option<&StampKey>,
     req: axum::extract::Request,
 ) -> Response {
     let path_and_query = req
@@ -301,7 +321,7 @@ pub async fn proxy(
     let rest = rest.as_ref();
 
     if is_websocket_upgrade(&req) {
-        return proxy_upgrade(engine, rest, slug, prefix, local_token, req).await;
+        return proxy_upgrade(engine, rest, slug, prefix, local_token, stamp_key, req).await;
     }
 
     // Forward request headers verbatim except the ones the gateway owns
@@ -315,10 +335,11 @@ pub async fn proxy(
     //     guard uses `Sec-Fetch-Site`, not a reconstructed host. It is still
     //     stripped so a forged value cannot reach an upstream that trusts it.
     //   - `x-lucidos-device-id` and `x-lucidos-device-label` are re-injected
-    //     from the AUTHENTICATED device, and only when there is one. The engine
-    //     keys push, preferences and actor attribution on the id, so a forged
-    //     value would let a caller act as any device. `enforce` stamps the
+    //     from the AUTHENTICATED device, and only when there is one, with the
+    //     gateway stamp that proves it to the engine. `enforce` sets the
     //     extension; a client cannot.
+    //   - A workspace call's claim is re-injected, stamped, only from the call
+    //     `workspace_calls` verified.
     //   - `origin` is consumed when [`vouches_for_origin`] answers the engine's
     //     same-origin question here. Otherwise the engine's gate reads it.
     let (parts, body) = req.into_parts();
@@ -343,7 +364,23 @@ pub async fn proxy(
         upstream = upstream.header(crate::oauth_callback::HEADER_LOCAL_BROWSER, "1");
     }
     if let Some(device) = parts.extensions.get::<crate::auth::AuthenticatedDevice>() {
-        for (name, value) in device.forwarded_headers() {
+        for (name, value) in device.forwarded_headers(slug, stamp_key) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    if let Some(call) = parts
+        .extensions
+        .get::<crate::workspace_calls::AttestedWorkspaceCall>()
+    {
+        for (name, value) in call.forwarded_headers(slug, stamp_key) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    if let Some(delivery) = parts
+        .extensions
+        .get::<crate::diagnostic_transport::AttestedDiagnosticDelivery>()
+    {
+        for (name, value) in delivery.forwarded_headers(slug, stamp_key) {
             upstream = upstream.header(name, value);
         }
     }
@@ -364,7 +401,7 @@ pub async fn proxy(
     let upstream = match engine_hop::send(engine, upstream, Credential::Local(local_token)).await {
         Ok(r) => r,
         Err(e) if e.is_foreign() => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] proxy {} -> {} refused: {}",
                 request_path_for_log(&path_and_query),
                 engine,
@@ -377,7 +414,7 @@ pub async fn proxy(
                 .into_response();
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] proxy {} -> {} failed: {}",
                 request_path_for_log(&path_and_query),
                 engine,
@@ -436,6 +473,7 @@ async fn proxy_upgrade(
     slug: &str,
     prefix: &str,
     local_token: &str,
+    stamp_key: Option<&StampKey>,
     mut req: axum::extract::Request,
 ) -> Response {
     // The same-origin question, answered where the client's own authority still
@@ -445,7 +483,7 @@ async fn proxy_upgrade(
     if let Some(origin) = foreign_origin(req.headers()) {
         // Named in full, because the browser hides a refused handshake's
         // response and this log line is the only place the reason appears.
-        crate::log!(
+        crate::log_legacy!(
             "[Gateway] websocket upgrade to /{}{} refused: it came from {}, and this gateway \
              is reached at {:?}",
             slug,
@@ -486,7 +524,7 @@ async fn proxy_upgrade(
         upstream = upstream.header(crate::oauth_callback::HEADER_LOCAL_BROWSER, "1");
     }
     if let Some(device) = req.extensions().get::<crate::auth::AuthenticatedDevice>() {
-        for (name, value) in device.forwarded_headers() {
+        for (name, value) in device.forwarded_headers(slug, stamp_key) {
             upstream = upstream.header(name, value);
         }
     }
@@ -503,7 +541,7 @@ async fn proxy_upgrade(
             // A cold-booting engine looks exactly like this, so 503 rather than
             // 502: the condition clears by itself and a client may retry.
             Err(e) if e.is_unreachable() => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Gateway] websocket upgrade to {}{} could not connect: {}",
                     engine,
                     request_path_for_log(rest),
@@ -512,7 +550,7 @@ async fn proxy_upgrade(
                 return (StatusCode::SERVICE_UNAVAILABLE, "engine unreachable").into_response();
             }
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Gateway] websocket upgrade to {}{} failed: {}",
                     engine,
                     request_path_for_log(rest),
@@ -549,7 +587,7 @@ async fn proxy_upgrade(
         let (client_io, engine_io) = match tokio::try_join!(client_upgrade, upstream_upgrade) {
             Ok(pair) => pair,
             Err(e) => {
-                crate::log!("[Gateway] websocket upgrade never completed: {}", e);
+                crate::log_legacy!("[Gateway] websocket upgrade never completed: {}", e);
                 return;
             }
         };
@@ -561,7 +599,7 @@ async fn proxy_upgrade(
             if e.kind() != std::io::ErrorKind::ConnectionReset
                 && e.kind() != std::io::ErrorKind::BrokenPipe
             {
-                crate::log!("[Gateway] websocket relay ended: {}", e);
+                crate::log_legacy!("[Gateway] websocket relay ended: {}", e);
             }
         }
     });
@@ -603,6 +641,21 @@ pub fn starting_page(label: &str) -> Response {
         splash_page_html(label, Some(STARTING_POLL_SECS), false),
         STARTING_POLL_SECS,
     )
+}
+
+/// Reuse the trusted boot screen while A retires legacy browser state. The
+/// caller supplies only A-authored script with a JSON-escaped destination.
+pub fn client_upgrade_page(script: &str) -> Response {
+    let html = splash_page_html("Updating remote workspace access…", None, true)
+        .replace("</head>", &format!("<script>{script}</script></head>"));
+    (
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        html,
+    )
+        .into_response()
 }
 
 /// The boot-splash TERMINAL-FAILURE page: the engine reported a boot failure it
@@ -1481,6 +1534,7 @@ mod proxy_tests {
                 "/dev/",
                 DEFAULT_LABEL,
                 TEST_LOCAL_TOKEN,
+                None,
                 req,
             )
             .await;
@@ -1503,6 +1557,9 @@ mod proxy_tests {
         assert_eq!(caller_kind(&headers, &extensions), "external");
         extensions.insert(crate::auth::AuthenticatedLocalProcess);
         assert_eq!(caller_kind(&headers, &extensions), "local-process");
+        let mut agent = axum::http::Extensions::new();
+        agent.insert(crate::auth::AgentRestoreCaller);
+        assert_eq!(caller_kind(&headers, &agent), "local-process");
         extensions.insert(test_device("paired"));
         assert_eq!(caller_kind(&headers, &extensions), "browser");
     }
@@ -1523,6 +1580,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1554,6 +1612,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             request(
                 "GET",
                 "/dev/~cap/6a0b~site-publisher~00/app/x/s.css?v=2",
@@ -1621,6 +1680,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1657,6 +1717,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1692,6 +1753,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1756,6 +1818,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1793,6 +1856,7 @@ mod proxy_tests {
                 "/dev/",
                 DEFAULT_LABEL,
                 TEST_LOCAL_TOKEN,
+                None,
                 req,
             )
             .await;
@@ -1817,6 +1881,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1841,6 +1906,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1875,6 +1941,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1912,6 +1979,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -1923,6 +1991,129 @@ mod proxy_tests {
         );
     }
 
+    /// The stamp header value the upstream saw, if any.
+    fn captured_stamp(got: &str) -> Option<String> {
+        got.lines().find_map(|line| {
+            line.strip_prefix(&format!(
+                "{}: ",
+                lucidos_gateway_stamp::HEADER_GATEWAY_STAMP
+            ))
+            .map(|v| v.trim().to_string())
+        })
+    }
+
+    /// The engine trusts a device only with a stamp under its own key. So the
+    /// proxy signs the device it authenticated, for this workspace.
+    #[tokio::test]
+    async fn signs_the_authenticated_device_for_the_engine() {
+        let (_dir, target, captured) = capturing_upstream().await;
+        let key = StampKey::generate().unwrap();
+        let mut req = request("GET", "/dev/", Body::empty());
+        req.extensions_mut().insert(test_device("device-1"));
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            Some(&key),
+            req,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        let stamp = captured_stamp(&got).expect("the forwarded device carries a stamp");
+        let claim = |device_id| lucidos_gateway_stamp::Claim::Device {
+            workspace_id: "dev",
+            device_id,
+        };
+        assert!(key.verify_now(&stamp, claim("device-1")), "{stamp}");
+        assert!(!key.verify_now(&stamp, claim("device-2")), "{stamp}");
+    }
+
+    /// A client's own stamp never reaches the engine, whatever else holds. With
+    /// no authenticated device nothing replaces it, and with no key (an engine
+    /// adopted keyless) the device goes unstamped.
+    #[tokio::test]
+    async fn strips_a_client_stamp_and_signs_nothing_without_a_key() {
+        for device in [None, Some("device-1")] {
+            let (_dir, target, captured) = capturing_upstream().await;
+            let mut req = axum::http::Request::builder()
+                .method("GET")
+                .uri("/dev/")
+                .header(lucidos_gateway_stamp::HEADER_GATEWAY_STAMP, "v1.1.forged")
+                .body(Body::empty())
+                .unwrap();
+            if let Some(id) = device {
+                req.extensions_mut().insert(test_device(id));
+            }
+            let resp = proxy(
+                &target,
+                "dev",
+                "/dev/",
+                DEFAULT_LABEL,
+                TEST_LOCAL_TOKEN,
+                None,
+                req,
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let got = captured.lock().await.to_lowercase();
+            assert_eq!(
+                captured_stamp(&got),
+                None,
+                "{device:?}: upstream saw:\n{got}"
+            );
+        }
+    }
+
+    /// A workspace call's claim is the gateway's to send. A client's copy never
+    /// reaches the engine, so no client can name a verdict.
+    #[tokio::test]
+    async fn strips_a_client_workspace_call_claim() {
+        let (_dir, target, captured) = capturing_upstream().await;
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/dev/api/v1/chat/stream")
+            .header(lucidos_gateway_stamp::HEADER_CALLER_WORKSPACE, "work2")
+            .header(lucidos_gateway_stamp::HEADER_CALLER_THREAD, "t1")
+            .header(lucidos_gateway_stamp::HEADER_CALLER_VERDICT, "allowed")
+            .header(lucidos_gateway_stamp::HEADER_DIAGNOSTIC_ORIGIN, "source")
+            .header(lucidos_gateway_stamp::HEADER_DIAGNOSTIC_DELIVERY, "once")
+            .header(
+                lucidos_gateway_stamp::HEADER_DIAGNOSTIC_DIGEST,
+                "a".repeat(64),
+            )
+            .header("x-lucidos-diagnostic-relay-signature", "forged")
+            .body(Body::empty())
+            .unwrap();
+        let key = StampKey::generate().unwrap();
+        let resp = proxy(
+            &target,
+            "dev",
+            "/dev/",
+            DEFAULT_LABEL,
+            TEST_LOCAL_TOKEN,
+            Some(&key),
+            req,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let got = captured.lock().await.to_lowercase();
+        for name in [
+            lucidos_gateway_stamp::HEADER_DIAGNOSTIC_ORIGIN,
+            lucidos_gateway_stamp::HEADER_DIAGNOSTIC_DELIVERY,
+            lucidos_gateway_stamp::HEADER_DIAGNOSTIC_DIGEST,
+            "x-lucidos-diagnostic-relay-signature",
+            lucidos_gateway_stamp::HEADER_CALLER_WORKSPACE,
+            lucidos_gateway_stamp::HEADER_CALLER_THREAD,
+            lucidos_gateway_stamp::HEADER_CALLER_VERDICT,
+        ] {
+            assert!(!got.contains(name), "{name}: upstream saw:\n{got}");
+        }
+        assert_eq!(captured_stamp(&got), None, "upstream saw:\n{got}");
+    }
+
     #[tokio::test]
     async fn no_trailing_slash_redirects() {
         let resp = proxy(
@@ -1931,6 +2122,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             request("GET", "/dev", Body::empty()),
         )
         .await;
@@ -1954,6 +2146,7 @@ mod proxy_tests {
             "/dev/",
             "Running migrations…",
             TEST_LOCAL_TOKEN,
+            None,
             request("GET", "/dev/", Body::empty()),
         )
         .await;
@@ -1991,6 +2184,7 @@ mod proxy_tests {
             "/dev/",
             "Starting engine…",
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -2042,6 +2236,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             request("GET", "/dev/api/v1/events", Body::empty()),
         )
         .await;
@@ -2078,6 +2273,7 @@ mod proxy_tests {
             "/dev/",
             DEFAULT_LABEL,
             TEST_LOCAL_TOKEN,
+            None,
             req,
         )
         .await;
@@ -2187,6 +2383,7 @@ mod upgrade_tests {
                     "/dev/",
                     DEFAULT_LABEL,
                     TEST_LOCAL_TOKEN,
+                    None,
                     req,
                 )
                 .await
@@ -2489,6 +2686,8 @@ mod upgrade_tests {
             "x-forwarded-prefix",
             "x-forwarded-host",
             crate::stack::HEADER_DEVICE_ID,
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+            lucidos_gateway_stamp::HEADER_DEVICE_SESSION,
             "transfer-encoding",
             "te",
         ] {

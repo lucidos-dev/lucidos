@@ -10,6 +10,8 @@ export interface RungPosition {
 }
 
 export interface ShownRung {
+  /** Saved selection for the next turn while this rung is running. */
+  nextTurn?: string;
   /** A rung's label, an off-ladder model's own name, or the backend's name
    *  when its own config picks the model. */
   name: string;

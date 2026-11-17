@@ -25,6 +25,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
 
 # shellcheck source=scripts/lib/storage_root.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/storage_root.sh"
+# shellcheck source=scripts/lib/e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 
 LUCIDOS_PORT_REGISTRY="$(lucidos_home_dir)/port-registry"
 LUCIDOS_PORT_WALK_LIMIT=1000
@@ -177,9 +179,9 @@ _ensure_passwd_home() {
 #     these from the engine (api/actor.rs host_protection_env_vars). Even when
 #     a test script invokes ports.sh for a different workspace (e.g. e2e-test),
 #     they still identify the dev-workspace engine that is running the test.
-#  2. A scan of every workspace's engine under the user's home, covering the
-#     case where the env vars are absent (manual dev script invocation, no CC
-#     chain) but sibling workspaces are alive. A pid counts only while its
+#  2. A scan of every workspace's engine under the user's home and its e2e
+#     root, covering the case where the env vars are absent (manual dev script
+#     invocation, no CC chain) but sibling workspaces are alive. A pid counts only while its
 #     engine.lock is held, so a stale pidfile naming a recycled PID can't
 #     protect an unrelated process.
 #  3. ANCESTOR — this process and everything it descends from. A process cannot
@@ -214,10 +216,17 @@ is_protected_host_pid() {
     esac
 
     _ensure_passwd_home
-    local root pidfile ws
+    local dirs=() root pidfile ws
     for root in "${HOME:-}" "$_LUCIDOS_PASSWD_HOME"; do
-        [ -n "$root" ] || continue
-        for pidfile in "$root"/workspaces/*/.lucidos/engine.pid; do
+        if [ -n "$root" ]; then
+            dirs+=("$root/workspaces" "$root/$E2E_ROOT_HOME_SUBPATH/workspaces")
+        fi
+    done
+    if [ -n "${LUCIDOS_E2E_ROOT:-}" ]; then
+        dirs+=("$LUCIDOS_E2E_ROOT/workspaces")
+    fi
+    for root in "${dirs[@]}"; do
+        for pidfile in "$root"/*/.lucidos/engine.pid; do
             [ "$(cat "$pidfile" 2>/dev/null)" = "$pid" ] || continue
             ws="${pidfile%/.lucidos/engine.pid}"
             [ "$(engine_live_pid "$ws")" = "$pid" ] && return 0

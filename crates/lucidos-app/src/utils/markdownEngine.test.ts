@@ -12,6 +12,7 @@ const base = vi.hoisted(() => ({ workspaceId: null as string | null }));
 vi.mock('./basePath', async () => {
   const actual = await vi.importActual<typeof import('./basePath')>('./basePath');
   return {
+    get BASE_PATH() { return base.workspaceId === null ? '' : `/${base.workspaceId}`; },
     workspaceRouteSegment: actual.workspaceRouteSegment,
     workspaceRouteUrlSegment: actual.workspaceRouteUrlSegment,
     get WORKSPACE_ID() {
@@ -1023,6 +1024,13 @@ Use this pattern for all prompts.`;
   });
 
   describe('thread reference links — on and to a remote gateway', () => {
+    it('scopes remote authored resources and CSS before insertion into the host', () => {
+      base.workspaceId = 'notes@cloud';
+      const html = sanitizeHtmlFragments('<img src="/~/api/v1/control/workspaces"><span style="background:url(/private)">text</span>');
+      expect(html).not.toContain('src=');
+      expect(html).not.toContain('style=');
+      expect(html).toContain('text');
+    });
     beforeEach(() => {
       vi.stubGlobal('location', { origin: 'https://localhost:5251' });
     });

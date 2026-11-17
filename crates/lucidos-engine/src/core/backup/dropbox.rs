@@ -285,7 +285,7 @@ impl DropboxBackupProvider {
         {
             Ok(resp) if resp.status().is_success() => resp.json::<SpaceUsage>().await,
             Ok(resp) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Backup] Skipping the Dropbox free-space check (HTTP {}); \
                      it needs the optional account_info.read scope",
                     resp.status()
@@ -293,14 +293,14 @@ impl DropboxBackupProvider {
                 return Ok(());
             }
             Err(e) => {
-                crate::log!("[Backup] Skipping the Dropbox free-space check: {}", e);
+                crate::log_legacy!("[Backup] Skipping the Dropbox free-space check: {}", e);
                 return Ok(());
             }
         };
         let usage = match usage {
             Ok(usage) => usage,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Backup] Unreadable Dropbox space usage, not blocking: {}",
                     e
                 );
@@ -368,7 +368,7 @@ impl DropboxBackupProvider {
         match super::get_oauth_token(&self.pool, "dropbox").await {
             Ok(token) => Some(token),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Backup] Keeping the current Dropbox token, refresh lookup failed: {}",
                     e
                 );
@@ -586,7 +586,7 @@ impl DropboxBackupProvider {
                     offset = next.min(total);
                     stalls = 0;
                     progress(offset, total);
-                    crate::log!("[Backup] Uploaded chunk: {} / {} bytes", offset, total);
+                    crate::log_legacy!("[Backup] Uploaded chunk: {} / {} bytes", offset, total);
                 }
                 Ok(next) => {
                     // Dropbox resynced us to a byte we have already sent past.
@@ -596,7 +596,7 @@ impl DropboxBackupProvider {
                     if let Some(e) = stalled_error(stalls, offset, "session kept resyncing") {
                         return Err(e);
                     }
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Backup] Dropbox resynced the upload session from byte {} to {}",
                         offset,
                         next
@@ -613,7 +613,7 @@ impl DropboxBackupProvider {
                         return Err(e);
                     }
                     let backoff = backoff_secs(stalls - 1, retry_after);
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Backup] Chunk failed at byte {} (retry {}/{} after {}s): {}",
                         offset,
                         stalls,
@@ -638,7 +638,7 @@ impl DropboxBackupProvider {
             // whether the file landed before believing the error.
             Err(e) => match self.committed_file_id(&token, dropbox_path).await {
                 Some(id) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Backup] Dropbox reported '{}' but the archive is committed at {}",
                         e,
                         dropbox_path
@@ -649,7 +649,7 @@ impl DropboxBackupProvider {
             },
         };
         progress(total, total);
-        crate::log!("[Backup] Upload complete: {} / {} bytes", total, total);
+        crate::log_legacy!("[Backup] Upload complete: {} / {} bytes", total, total);
         Ok(id)
     }
 
@@ -848,7 +848,7 @@ where
                     .into());
                 }
                 let backoff = backoff_secs(retry, retry_after);
-                crate::log!(
+                crate::log_legacy!(
                     "[Backup] Could not {} (retry {}/{} after {}s): {}",
                     context,
                     retry + 1,
@@ -986,7 +986,7 @@ impl BackupProvider for DropboxBackupProvider {
         let dropbox_path = format!("{}/{}", BACKUP_FOLDER, filename);
 
         if fits_single_shot(total) {
-            crate::log!(
+            crate::log_legacy!(
                 "[Backup] Starting single-shot upload: {} ({} bytes)",
                 filename,
                 total
@@ -996,7 +996,7 @@ impl BackupProvider for DropboxBackupProvider {
                 .await;
         }
 
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] Starting upload session: {} ({} bytes, chunk {} bytes)",
             filename,
             total,

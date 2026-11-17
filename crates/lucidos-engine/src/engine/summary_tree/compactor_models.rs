@@ -508,51 +508,6 @@ mod tests {
         ("claude-sonnet-5-5", "Sonnet 5.5"),
     ];
 
-    /// Prose names the default models and tier for the agent, Settings and
-    /// readers: the two preferences' texts, `preferences.md` and the glossary.
-    /// A pin, since prose cannot import the list.
-    #[test]
-    fn every_prose_copy_names_the_defaults() {
-        let unset = |spec: &prefs::PrefSpec| match spec.default {
-            prefs::PrefDefault::Unset(text) => text,
-            _ => panic!("{} must be unset by default", spec.key),
-        };
-        let doc = |path: &str| {
-            std::fs::read_to_string(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR")))
-                .unwrap_or_else(|e| panic!("{path}: {e}"))
-        };
-        let model_copies = [
-            (
-                "the model description",
-                prefs::MODEL_SUMMARY_COMPACTION.spec.description.to_string(),
-            ),
-            (
-                "the model's unset text",
-                unset(&prefs::MODEL_SUMMARY_COMPACTION.spec).to_string(),
-            ),
-            ("preferences.md", doc("system-knowhow/preferences.md")),
-            ("the glossary", doc("docs/glossary.md")),
-        ];
-        for entry in COMPACTOR_DEFAULTS {
-            let label = PROSE_LABELS
-                .iter()
-                .find(|(id, _)| *id == entry.model)
-                .map_or(entry.model, |(_, label)| *label);
-            for (name, text) in &model_copies {
-                assert!(
-                    text.contains(entry.model) || text.contains(label),
-                    "{name} omits {}",
-                    entry.model
-                );
-            }
-            assert!(
-                unset(&prefs::REASONING_SUMMARY_COMPACTION.spec).contains(entry.effort),
-                "the tier's unset text omits {}",
-                entry.effort
-            );
-        }
-    }
-
     /// The selection reads the two stored keys, and nothing they inherit.
     #[tokio::test]
     async fn the_selection_reads_the_stored_keys() {
@@ -684,5 +639,54 @@ mod tests {
         }
         pool.close().await;
         teardown_test_db(&db_name).await;
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// Prose names the default models and tier for the agent, Settings and
+        /// readers: the two preferences' texts, `preferences.md` and the glossary.
+        /// A pin, since prose cannot import the list.
+        #[test]
+        fn every_prose_copy_names_the_defaults() {
+            let unset = |spec: &prefs::PrefSpec| match spec.default {
+                prefs::PrefDefault::Unset(text) => text,
+                _ => panic!("{} must be unset by default", spec.key),
+            };
+            let doc = |path: &str| {
+                std::fs::read_to_string(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap_or_else(|e| panic!("{path}: {e}"))
+            };
+            let model_copies = [
+                (
+                    "the model description",
+                    prefs::MODEL_SUMMARY_COMPACTION.spec.description.to_string(),
+                ),
+                (
+                    "the model's unset text",
+                    unset(&prefs::MODEL_SUMMARY_COMPACTION.spec).to_string(),
+                ),
+                ("preferences.md", doc("system-knowhow/preferences.md")),
+                ("the glossary", doc("docs/glossary.md")),
+            ];
+            for entry in COMPACTOR_DEFAULTS {
+                let label = PROSE_LABELS
+                    .iter()
+                    .find(|(id, _)| *id == entry.model)
+                    .map_or(entry.model, |(_, label)| *label);
+                for (name, text) in &model_copies {
+                    assert!(
+                        text.contains(entry.model) || text.contains(label),
+                        "{name} omits {}",
+                        entry.model
+                    );
+                }
+                assert!(
+                    unset(&prefs::REASONING_SUMMARY_COMPACTION.spec).contains(entry.effort),
+                    "the tier's unset text omits {}",
+                    entry.effort
+                );
+            }
+        }
     }
 }

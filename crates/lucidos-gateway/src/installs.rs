@@ -12,24 +12,24 @@
 use lucidos_installs::{Inventory, RunningProcess, ScanRoots};
 use std::path::{Path, PathBuf};
 
-/// Every install this user can see, with this gateway marked as the live one.
+/// Every install under `roots`, with this gateway marked as the live one.
 ///
 /// `app_data` is what separates two installer instances sharing one runtime:
 /// their executables are the same file, and only the data dir differs.
-pub fn inventory(exe: Option<PathBuf>, app_data: &Path) -> Inventory {
-    let Some(roots) = ScanRoots::for_machine() else {
+pub fn inventory(roots: Option<&ScanRoots>, exe: Option<PathBuf>, app_data: &Path) -> Inventory {
+    let Some(roots) = roots else {
         // Unreachable in practice: the gateway already refuses to boot without
         // `HOME`. Logged rather than returned silently. An empty
         // inventory renders as "this machine has no installs", the opposite of
         // what this surface exists to say.
-        crate::log!("[Installs] HOME is not set; cannot enumerate installs");
+        crate::log_legacy!("[Installs] HOME is not set; cannot enumerate installs");
         return Inventory::default();
     };
     let running = RunningProcess {
         exe,
         data_dir: Some(app_data.to_path_buf()),
     };
-    lucidos_installs::scan(&roots, &running)
+    lucidos_installs::scan(roots, &running)
 }
 
 /// Say what is on the machine, once, at boot.
@@ -39,7 +39,7 @@ pub fn inventory(exe: Option<PathBuf>, app_data: &Path) -> Inventory {
 /// version number they can find looks current.
 pub fn log_boot_summary(inv: &Inventory) {
     for install in &inv.installs {
-        crate::log!(
+        crate::log_legacy!(
             "[Installs] {} [{}]{}{}{}",
             install.name,
             install.kind.label(),
@@ -60,7 +60,7 @@ pub fn log_boot_summary(inv: &Inventory) {
         );
     }
     for conflict in &inv.conflicts {
-        crate::log!(
+        crate::log_legacy!(
             "[Installs] WARNING: {} Lucidos installs are configured for port {}: {}. \
              Only one can bind it, and whichever started first wins. \
              So this client may be driving an engine from a different install. \

@@ -24,6 +24,7 @@ export function ProviderBlockFrame(props: {
   /** Header-row controls, left of the switch. Remove lives here, so a parked
    *  key can still be deleted without switching the provider back on. */
   actions?: ComponentChildren;
+  status?: ComponentChildren;
   /** Whether the header says the provider is parked rather than never set up.
    *  The note is the only thing that makes a stored key visible while off. */
   switchedOff: boolean;
@@ -67,6 +68,7 @@ export function ProviderBlockFrame(props: {
           />
         </div>
       </div>
+      {props.status}
       <Disclosure open={props.open}>{props.children}</Disclosure>
     </>
   );

@@ -79,7 +79,7 @@ impl StoredChatGptPlanTokens {
                 {
                     return Err(not_signed_in());
                 }
-                crate::log!("[ChatGptPlan] Refreshed the token");
+                crate::log_legacy!("[ChatGptPlan] Refreshed the token");
                 return Ok(tokens.access_token);
             }
             Ok(TokenReply::Refused(refusal)) => refusal,
@@ -89,7 +89,7 @@ impl StoredChatGptPlanTokens {
                 )
             }
         };
-        crate::log!("[ChatGptPlan] OpenAI refused the token refresh: {refusal}");
+        crate::log_legacy!("[ChatGptPlan] OpenAI refused the token refresh: {refusal}");
         if !refusal.ends_sign_in() {
             return Err(format!(
                 "OpenAI refused to renew the ChatGPT sign-in ({refusal}). Try again, or sign in \
@@ -104,7 +104,7 @@ impl StoredChatGptPlanTokens {
         )
         .await
         {
-            crate::log!("[ChatGptPlan] Could not clear the refused sign-in: {e}");
+            crate::log_legacy!("[ChatGptPlan] Could not clear the refused sign-in: {e}");
         }
         Err(sign_in_again())
     }

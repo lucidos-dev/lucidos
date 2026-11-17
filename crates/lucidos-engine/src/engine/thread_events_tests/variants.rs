@@ -152,6 +152,7 @@ fn context_captured_event_type_and_persistence() {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     };
     assert_eq!(event.event_type(), "ContextCaptured");
@@ -320,6 +321,7 @@ fn a_turn_capture_writes_neither_new_key() {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     };
     let json = serde_json::to_value(&event).unwrap();
@@ -715,6 +717,8 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::CodingAgentPermissionRequest {
@@ -772,6 +776,7 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
     .is_per_token_streaming());
     assert!(!ThreadEvent::ThreadArchived.is_per_token_streaming());

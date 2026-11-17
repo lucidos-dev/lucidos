@@ -433,6 +433,7 @@ async fn the_home_thread_cannot_follow_up_an_unsent_draft() {
         thread_id: draft,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -1251,6 +1252,7 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),
@@ -1281,6 +1283,7 @@ async fn parent_redirects_a_coding_agent_child_and_the_card_count_matches() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: EventMeta::NONE,
         })
@@ -1431,6 +1434,7 @@ async fn a_coding_agent_child_ending_with_response_generated_reports_nothing() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),

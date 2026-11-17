@@ -51,7 +51,7 @@ pub async fn recover_orphan_cc_permission_requests(
     {
         Ok(r) => r,
         Err(e) => {
-            log!("[Recovery] orphan CC permission query failed: {}", e);
+            log_legacy!("[Recovery] orphan CC permission query failed: {}", e);
             return;
         }
     };
@@ -60,7 +60,7 @@ pub async fn recover_orphan_cc_permission_requests(
         return;
     }
 
-    log!(
+    log_legacy!(
         "[Recovery] Auto-resolving {} orphan CC permission request(s) (Claude Code session gone after restart)",
         rows.len()
     );
@@ -71,7 +71,7 @@ pub async fn recover_orphan_cc_permission_requests(
             thread_id,
             request_id,
             false,
-            Some("Coding agent terminated before answering: request expired".to_string()),
+            Some(crate::engine::cc_permission::RESTART_CLOSED_REASON.to_string()),
             None,
             EventMeta::NONE,
             "[Recovery] CodingAgentPermissionResolved (orphan)",
@@ -140,7 +140,7 @@ pub(crate) async fn reconcile_thread_branch_work(
         .execute(pool)
         .await
         {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to clear the branch work for thread {} (missing worktree {}): {}",
                 thread_id,
                 worktree_path.display(),
@@ -205,7 +205,7 @@ pub(crate) async fn refresh_branch_work_for_active_cc_threads(
             }
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to list repositories for the branch-work sweep: {}",
                 e
             );
@@ -233,7 +233,7 @@ pub(crate) async fn refresh_branch_work_for_active_cc_threads(
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to enumerate active CC threads for the branch-work sweep: {}",
                 e
             );
@@ -272,7 +272,7 @@ pub(crate) async fn refresh_branch_work_for_active_cc_threads(
     let visited = count(HasDiffOutcome::Visited) + missing_worktree;
     let skipped_no_branch = count(HasDiffOutcome::NoBranch);
 
-    log!(
+    log_legacy!(
         "[Recovery] branch-work sweep: visited {}/{} active CC threads ({} skipped (no branch), {} missing worktree, {}ms)",
         visited,
         total,
@@ -315,7 +315,7 @@ async fn reconcile_one_active_thread(
     {
         Ok(b) => b,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to look up branch for thread {} during the branch-work sweep: {}",
                 thread_id,
                 e
@@ -330,7 +330,7 @@ async fn reconcile_one_active_thread(
             // Every active CC thread MUST have a SessionStarted with a
             // branch. A thread without one violates a projection invariant,
             // so surface it rather than skip it silently.
-            log!(
+            log_legacy!(
                 "[Recovery WARN] active CC thread {} has no SessionStarted with branch: projection invariant violated, skipping",
                 thread_id
             );
@@ -350,7 +350,7 @@ async fn reconcile_one_active_thread(
     } else {
         match cc_repo_id.as_deref() {
             Some(rid) => repo_root_by_id.get(rid).cloned().unwrap_or_else(|| {
-                log!(
+                log_legacy!(
                     "[Recovery WARN] cc_repo_id {} not found in repositories map for thread {}; falling back to lucidos_repo_root",
                     rid,
                     thread_id
@@ -466,7 +466,7 @@ pub async fn withdraw_incomplete_pending_changes_on_startup(
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to list incomplete pending changes: {}",
                 e
             );
@@ -475,7 +475,7 @@ pub async fn withdraw_incomplete_pending_changes_on_startup(
     };
     for (change_id, thread_id, branch_name, files) in rows {
         let Some(thread_id) = thread_id else { continue };
-        log!(
+        log_legacy!(
             "[Recovery] Withdrawing incomplete change {} on branch {}",
             change_id,
             branch_name
@@ -488,7 +488,7 @@ pub async fn withdraw_incomplete_pending_changes_on_startup(
         )
         .await
         {
-            log!("[Recovery] {}", e);
+            log_legacy!("[Recovery] {}", e);
             continue;
         }
         emit_proposal_withheld(
@@ -521,7 +521,7 @@ pub(crate) async fn select_unproposed_idle_cc_threads(pool: &sqlx::PgPool) -> Ve
     {
         Ok(ids) => ids,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to select unproposed idle CC threads: {}",
                 e
             );
@@ -565,7 +565,7 @@ pub async fn propose_held_back_changes_on_startup_with_roots(
         {
             Ok(true) => proposed += 1,
             Ok(false) => {}
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Recovery] Failed to propose held-back change for thread {}: {}",
                 thread_id,
                 e
@@ -573,7 +573,7 @@ pub async fn propose_held_back_changes_on_startup_with_roots(
         }
     }
     if proposed > 0 {
-        log!(
+        log_legacy!(
             "[Recovery] Proposed held-back changes for {}/{} candidate thread(s) in {}ms",
             proposed,
             thread_ids.len(),
@@ -614,6 +614,18 @@ async fn propose_one_held_back_change(
     workspace_path: &Path,
     thread_id: Uuid,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if crate::engine::landing_lane::lane_batch_of_stale_session(
+        pool,
+        workspace_path,
+        thread_id,
+        None,
+        false,
+    )
+    .await?
+    .is_some()
+    {
+        return Ok(false);
+    }
     // Eligibility: re-read from the projection. The sweep narrowed by
     // is_coding_agent + archive_state, but the per-thread shape
     // (change state/external/waiting/kind) still has to be checked here.
@@ -669,7 +681,7 @@ async fn propose_one_held_back_change(
         _ => return Ok(false),
     };
     if crate::engine::git_ops::is_lane_branch(&branch_name) {
-        log!(
+        log_legacy!(
             "[Recovery] Skipping held-back lane branch {} for thread {}: the landing lane lands it",
             branch_name,
             thread_id
@@ -711,7 +723,7 @@ async fn propose_one_held_back_change(
         if projected_reason.as_deref() == Some(reason.as_str()) {
             return Ok(false);
         }
-        log!(
+        log_legacy!(
             "[Recovery] Withholding held-back branch {} for thread {}: {}",
             branch_name,
             thread_id,
@@ -739,6 +751,9 @@ async fn propose_one_held_back_change(
             BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::ChangeProposed {
+                    content: crate::engine::thread_events::ChangeContent::from_files(
+                        &changed_files,
+                    ),
                     change_id: change_id.to_string(),
                     description: Some(description),
                     files: changed_files,
@@ -794,7 +809,7 @@ pub async fn reconcile_emptied_changes_on_startup(engine: &crate::engine::Lucido
     let pending = match engine.changes().list_pending().await {
         Ok(p) => p,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] emptied-change sweep: list_pending: {}, skipping",
                 e
             );
@@ -818,7 +833,7 @@ pub async fn reconcile_emptied_changes_on_startup(engine: &crate::engine::Lucido
             )
             .await;
     }
-    log!(
+    log_legacy!(
         "[Recovery] emptied-change sweep finished in {}ms",
         started.elapsed().as_millis()
     );

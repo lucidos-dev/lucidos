@@ -13,6 +13,10 @@
 - **Amended by**: [0475: Any thread creates a top-thread](0475-any-thread-creates-a-top-thread.md).
   Creating a top-thread, and an agent's detach of its own child, leave clause
   4. Any thread does either with no owner authority.
+- **Amended by**: [0664: Permissions and the pause family](0664-permissions-and-the-pause-family.md).
+  A card answer leaves clauses 3 and 5. No thread answers a card on its own
+  subtree or on a standing instruction, only through a batch the owner
+  confirms.
 
 ## Context
 

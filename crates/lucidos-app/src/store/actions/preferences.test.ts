@@ -1,8 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { preferences, toasts, llmConfigured } from '../store';
-import { applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
+import { preferences, toasts, llmConfigured, selectedCodingAgent, threadMap, lastSuccessfulBackup } from '../store';
+import { makeThreadState } from './threads-test-helpers';
+import { getComposeSelectionOverride, resolveCodingAgent, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { currentAgentBrandColours, setAgentBrandColours, applyStyleOverrides, currentComposerEnterKey, setComposerEnterKey } from './preferences';
 import { PREF_COMPOSER_ENTER_KEY } from '@lucidos/preference-catalog';
-import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
+import { applyThemeMode, applyFontFamily, applyUiScale, currentThemeMode, currentFontFamily, refreshActiveTheme, loadPreferences, currentMobileDynamicBars, setMobileDynamicBars, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, retireWelcomeAfterUse, WELCOME_RETIRES_AFTER_THREADS, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MAX, MAX_TOOL_CALLS_MIN, backupIsConfigured, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupBanner, backupBannerIn, backupOverdueHiddenByDismissal, dismissBackupOverdueReminder, BACKUP_OVERDUE_SNOOZE_MS, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS, currentNotificationToasts, setNotificationToasts, VOICE_RESIDENT_SECTIONS, DEFAULT_VOICE_RESIDENT_SECTIONS, voiceSectionEnabled, setVoiceSectionEnabled, storedBackgroundSelection, currentAutocorrect, setAutocorrect, currentMotion, setMotion, currentMemoryModule, setMemoryModule, storedMemoryModule } from './preferences';
 import { motionPreference } from '../../utils/motion';
 import { MEMORY_MODULE_WHILE_UNSET } from '@lucidos/engine-constants';
 import { SYSTEM_THEME_MODE_CONFIRM_MS, SYSTEM_THEME_MODE_SETTLE_MS, THEME_MODE_HEADER_TOP } from '@lucidos/appearance';
@@ -318,6 +320,26 @@ describe('loadPreferences — no flash when refetching after PreferencesChanged'
 
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('establishes the saved agent on startup before preserving drafts on later refreshes', async () => {
+    const previousThreads = threadMap.value;
+    threadMap.value = new Map([['legacy', makeThreadState('legacy', { meta: { state: 'composing' } })]]);
+    selectedCodingAgent.value = 'claude-code';
+    const read = vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { coding_agent_default: 'codex' } });
+    try {
+      await loadPreferences();
+      expect(resolveCodingAgent('legacy')).toBe('codex');
+      expect(getComposeSelectionOverride('legacy').codingAgent).toBeUndefined();
+      read.mockResolvedValue({ preferences: { coding_agent_default: 'claude-code' } });
+      await loadPreferences();
+      expect(resolveCodingAgent('legacy')).toBe('codex');
+      expect(selectedCodingAgent.value).toBe('claude-code');
+    } finally {
+      threadMap.value = previousThreads;
+      selectedCodingAgent.value = 'claude-code';
+      _resetComposeSelectionsForTesting();
+    }
   });
 
   it('does not wipe loaded state to "loading" on a refetch', async () => {
@@ -1108,7 +1130,7 @@ describe('retireWelcomeAfterUse: the welcome retires itself after enough threads
 describe('backup reminder: is backup actually on?', () => {
   const T0 = Date.parse('2026-08-04T09:00:00Z');
   const DAY_MS = 24 * 60 * 60 * 1000;
-  /** A workspace with automatic backup switched on. */
+  /** A workspace with backup set up. */
   const BACKUP_ON = { backup_schedule: '0 0 3 * * *', backup_provider: 'google_drive' };
 
   beforeEach(() => {
@@ -1119,23 +1141,14 @@ describe('backup reminder: is backup actually on?', () => {
     vi.restoreAllMocks();
   });
 
-  it('mirrors core::backup::is_schedule_active for the cron half', () => {
-    expect(isBackupScheduleActive(undefined)).toBe(false);
-    expect(isBackupScheduleActive('')).toBe(false);
-    expect(isBackupScheduleActive('off')).toBe(false);
-    expect(isBackupScheduleActive('0 0 3 * * *')).toBe(true);
-    expect(isBackupScheduleActive('0 0 */12 * * *')).toBe(true);
-  });
-
-  it('requires BOTH an active cron and a provider', () => {
-    expect(backupIsActive(BACKUP_ON)).toBe(true);
-    expect(backupIsActive({})).toBe(false);
+  it('counts backup as set up once a provider is chosen, whatever the schedule', () => {
+    expect(backupIsConfigured(BACKUP_ON)).toBe(true);
+    expect(backupIsConfigured({})).toBe(false);
     // A cron with nowhere to upload to.
-    expect(backupIsActive({ backup_schedule: '0 0 3 * * *' })).toBe(false);
-    // The shape left behind by picking a provider in Settings and never
-    // choosing a schedule, which backs up nothing.
-    expect(backupIsActive({ backup_provider: 'google_drive' })).toBe(false);
-    expect(backupIsActive({ backup_provider: 'google_drive', backup_schedule: 'off' })).toBe(false);
+    expect(backupIsConfigured({ backup_schedule: '0 0 3 * * *' })).toBe(false);
+    // "Manual only": backups run from "Back up now", so this is not "off".
+    expect(backupIsConfigured({ backup_provider: 'google_drive', backup_schedule: 'off' })).toBe(true);
+    expect(backupIsConfigured({ backup_provider: 'google_drive' })).toBe(true);
   });
 
   it('an unset dismissal is not a dismissal', () => {
@@ -1191,10 +1204,83 @@ describe('backup reminder: is backup actually on?', () => {
       { status: 'failed', error: 'network error' } as const,
     ]) {
       preferences.value = state;
-      expect(backupReminderVisible(T0)).toBe(false);
+      expect(backupBanner(T0)).toBeNull();
     }
     preferences.value = { status: 'loaded', data: {} };
-    expect(backupReminderVisible(T0)).toBe(true);
+    expect(backupBanner(T0)).toEqual({ state: 'setup' });
+  });
+
+  describe('the overdue state', () => {
+    const OVERDUE = { status: 'loaded', data: { at: null, stale: true, configured: true, overdue: true, overdue_at: null } } as const;
+    const FRESH = { status: 'loaded', data: { at: null, stale: false, configured: true, overdue: false, overdue_at: null } } as const;
+    const MANUAL_ONLY = { backup_provider: 'google_drive', backup_schedule: 'off' };
+
+    it('shows when a provider is set and the engine says overdue, schedule or not', () => {
+      expect(backupBannerIn(MANUAL_ONLY, OVERDUE, T0)).toEqual({ state: 'overdue', provider: 'google_drive', lastBackupAt: null });
+      expect(backupBannerIn(BACKUP_ON, OVERDUE, T0)?.state).toBe('overdue');
+    });
+
+    it('carries the last backup instant for the sentence', () => {
+      const at = new Date(T0 - 12 * DAY_MS).toISOString();
+      const loaded = { status: 'loaded', data: { at, stale: true, configured: true, overdue: true, overdue_at: null } } as const;
+      expect(backupBannerIn(BACKUP_ON, loaded, T0)).toMatchObject({ lastBackupAt: at });
+    });
+
+    it('stays hidden when the engine says the backup is recent', () => {
+      expect(backupBannerIn(BACKUP_ON, FRESH, T0)).toBeNull();
+    });
+
+    it('appears once an open tab passes overdue_at, with no re-read', () => {
+      const due = new Date(T0 + DAY_MS).toISOString();
+      const read = { status: 'loaded', data: { ...FRESH.data, at: new Date(T0 - 6 * DAY_MS).toISOString(), overdue_at: due } } as const;
+      expect(backupBannerIn(BACKUP_ON, read, T0 + DAY_MS)).toBeNull();
+      expect(backupBannerIn(BACKUP_ON, read, T0 + DAY_MS + 1)?.state).toBe('overdue');
+    });
+
+    it('setup wins, and overdue never shows without a provider', () => {
+      expect(backupBannerIn({}, OVERDUE, T0)).toEqual({ state: 'setup' });
+      const dismissedSetup = { backup_reminder_dismissed: new Date(T0).toISOString() };
+      expect(backupBannerIn(dismissedSetup, OVERDUE, T0)).toBeNull();
+    });
+
+    it('fails closed while the verdict is unloaded or failed', () => {
+      for (const state of [
+        { status: 'not-loaded' } as const,
+        { status: 'loading' } as const,
+        { status: 'failed', error: 'HTTP 500' } as const,
+      ]) {
+        expect(backupBannerIn(BACKUP_ON, state, T0)).toBeNull();
+      }
+    });
+
+    it('a dismissal snoozes it for 7 days, then it returns', () => {
+      const at = new Date(T0).toISOString();
+      const dismissed = { ...BACKUP_ON, backup_overdue_reminder_dismissed: at };
+      expect(backupBannerIn(dismissed, OVERDUE, T0 + 6 * DAY_MS)).toBeNull();
+      expect(backupBannerIn(dismissed, OVERDUE, T0 + BACKUP_OVERDUE_SNOOZE_MS)?.state).toBe('overdue');
+      expect(backupOverdueHiddenByDismissal('yesterday', T0)).toBe(false);
+      expect(backupOverdueHiddenByDismissal('', T0)).toBe(false);
+    });
+
+    it('the setup dismissal does not silence overdue, and the reverse', () => {
+      const setupDismissed = { ...BACKUP_ON, backup_reminder_dismissed: 'forever' };
+      expect(backupBannerIn(setupDismissed, OVERDUE, T0)?.state).toBe('overdue');
+    });
+
+    it('dismissBackupOverdueReminder writes the instant to its own preference', async () => {
+      preferences.value = { status: 'loaded', data: BACKUP_ON };
+      const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+      await dismissBackupOverdueReminder(T0);
+      expect(spy).toHaveBeenCalledWith('backup_overdue_reminder_dismissed', new Date(T0).toISOString(), undefined);
+    });
+
+    it('reads the live signals through backupBanner', () => {
+      preferences.value = { status: 'loaded', data: BACKUP_ON };
+      lastSuccessfulBackup.value = OVERDUE;
+      expect(backupBanner(T0)?.state).toBe('overdue');
+      lastSuccessfulBackup.value = { status: 'not-loaded' };
+      expect(backupBanner(T0)).toBeNull();
+    });
   });
 
   it('dismissBackupReminder writes the instant, then forever', async () => {
@@ -2368,5 +2454,53 @@ describe('the resident-block sections a call opens with', () => {
     preferences.value = { status: 'loaded', data: { [KEY]: 'this-thread,from-the-future' } };
     await setVoiceSectionEnabled('who-and-where', true);
     expect(stored()).toBe('who-and-where,this-thread,from-the-future');
+  });
+});
+
+
+describe('agent brand colours', () => {
+  it('keeps a saved Off choice during reload and a failed preference fetch', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    await setAgentBrandColours(false);
+    preferences.value = { status: 'loading' };
+    expect(currentAgentBrandColours()).toBe(false);
+    vi.spyOn(apiClient, 'getPreferences').mockRejectedValue(new Error('offline'));
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(false);
+  });
+
+  it('repaints shared marks when preferences refresh', () => {
+    const stamp = vi.spyOn(document.documentElement, 'setAttribute');
+    preferences.value = { status: 'loaded', data: { 'agent-brand-colours': 'false' } };
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'off');
+    preferences.value = { status: 'loaded', data: {} };
+    expect(stamp).toHaveBeenLastCalledWith('data-agent-brand-colours', 'on');
+  });
+
+  it('loads a saved choice and restores the default after reset', async () => {
+    vi.spyOn(apiClient, 'getPreferences').mockResolvedValue({ preferences: { 'agent-brand-colours': 'false' } });
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(false);
+    vi.mocked(apiClient.getPreferences).mockResolvedValue({ preferences: {} });
+    await loadPreferences();
+    expect(currentAgentBrandColours()).toBe(true);
+  });
+
+  beforeEach(() => {
+    localStorage.clear();
+    preferences.value = { status: 'loaded', data: {} };
+    _resetPendingPreferenceWritesForTesting();
+  });
+  afterEach(() => vi.restoreAllMocks());
+
+  it('defaults to normal colours', () => {
+    expect(currentAgentBrandColours()).toBe(true);
+  });
+
+  it('persists a device choice through the preference pipeline', async () => {
+    const save = vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true } as ApiResult);
+    await setAgentBrandColours(false);
+    expect(currentAgentBrandColours()).toBe(false);
+    expect(save).toHaveBeenCalledWith('agent-brand-colours', 'false', expect.any(String));
   });
 });

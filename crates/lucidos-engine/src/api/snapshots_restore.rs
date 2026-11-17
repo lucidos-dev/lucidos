@@ -87,6 +87,7 @@ pub(super) async fn restore(
                 event_id: None,
                 user_agent: None,
                 mode: crate::engine::thread_events::ActorMode::Agent,
+                verdict: None,
             }
         } else {
             let actor = super::super::actor::require_owner_device_for(
@@ -94,6 +95,9 @@ pub(super) async fn restore(
                 &state.pool,
                 None,
                 "snapshot_restore_owner_device_required",
+                crate::api::owner_door::OnUnattested::Ask(crate::api::owner_door::OwnerAct::new(
+                    "restore a snapshot of this workspace",
+                )),
             )
             .await?;
             if !request.confirmed {
@@ -153,7 +157,7 @@ pub(super) async fn restore(
                     port,
                     &target.gateway_slug,
                     target.restore_id,
-                    crate::net_config::peer_scheme_order(),
+                    crate::net_config::gateway_scheme_order(),
                 )
                 .await
             }

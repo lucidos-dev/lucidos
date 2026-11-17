@@ -72,7 +72,7 @@ impl Fixture {
 
     /// The dev source checkout, its data dir registered with `entries`.
     fn source_checkout(&self, entries: &[Entry]) -> PathBuf {
-        let data = self.home.join(".lucidos/gateway");
+        let data = self.home.join(".lucidos/private/gateway");
         self.register(&data, entries);
         data
     }

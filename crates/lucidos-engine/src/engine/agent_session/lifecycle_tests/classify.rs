@@ -235,6 +235,35 @@ fn shutdown_wins_over_empty_text() {
     );
 }
 
+/// An interrupt Codex sent on its own fails the turn. When the user stopped
+/// or redirected the turn, the Stop latch still ranks above that error.
+#[test]
+fn an_unrequested_interrupt_fails_unless_the_user_stopped() {
+    use crate::engine::thread_events::CancelCause;
+    let err = || Some(crate::runtime::codex::UNREQUESTED_INTERRUPT_ERROR.to_string());
+    let (stopped, _) = classify_result(true, None, false, err(), false);
+    assert_eq!(stopped, TerminalKind::Canceled(CancelCause::UserStop));
+    let (redirected, _) = classify_result(
+        true,
+        Some(CancelCause::SupersededByFollowup),
+        false,
+        err(),
+        false,
+    );
+    assert_eq!(
+        redirected,
+        TerminalKind::Canceled(CancelCause::SupersededByFollowup)
+    );
+    let (unrequested, emit_idle) = classify_result(false, None, false, err(), false);
+    assert_eq!(
+        unrequested,
+        TerminalKind::Failed {
+            error: err().unwrap()
+        }
+    );
+    assert!(emit_idle);
+}
+
 /// Empty-text Result on an otherwise-clean turn classifies as `Failed`
 /// (the OOM-killed Bash / SIGTERM'd subprocess scenario). A failed turn is
 /// unfinished, so its work is withheld and never surfaces as a pending
@@ -1237,4 +1266,52 @@ fn only_a_clean_turn_end_arms_the_background_wait() {
         );
     }
     assert!(!turn_ended_cleanly(&None, false, false));
+}
+
+#[test]
+fn context_ceiling_turn_ends_settle_debt_by_kind() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+    assert_eq!(
+        ceiling_turn_end(Some(&TerminalKind::Generated), false),
+        CeilingTurnEnd::Reenter
+    );
+    assert_eq!(
+        ceiling_turn_end(
+            Some(&TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
+            false
+        ),
+        CeilingTurnEnd::Reenter
+    );
+    assert_eq!(
+        ceiling_turn_end(Some(&TerminalKind::Canceled(CancelCause::UserStop)), false),
+        CeilingTurnEnd::Brief
+    );
+    assert_eq!(
+        ceiling_turn_end(
+            Some(&TerminalKind::Failed {
+                error: "failure".into()
+            }),
+            false
+        ),
+        CeilingTurnEnd::Brief
+    );
+    assert_eq!(
+        ceiling_turn_end(
+            Some(&TerminalKind::Aborted(AbortCause::EngineShutdown)),
+            false
+        ),
+        CeilingTurnEnd::Wait
+    );
+    assert_eq!(
+        ceiling_turn_end(Some(&TerminalKind::Generated), true),
+        CeilingTurnEnd::Wait
+    );
+    assert_eq!(
+        ceiling_turn_end(
+            Some(&TerminalKind::Canceled(CancelCause::UserAction)),
+            false
+        ),
+        CeilingTurnEnd::Wait
+    );
+    assert_eq!(ceiling_turn_end(None, false), CeilingTurnEnd::Wait);
 }

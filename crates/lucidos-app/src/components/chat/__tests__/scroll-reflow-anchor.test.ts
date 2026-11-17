@@ -69,7 +69,7 @@ function installDeepLinkStubs() {
  *  the clamp it forces is the case a delta-based anchor gets wrong). The
  *  container's own viewport top is 0, so a turn's `getBoundingClientRect().top`
  *  IS its offset from the viewport top. */
-function makeTranscript(opts: { turns: number[]; width: number; clientHeight: number; feed?: boolean }) {
+function makeTranscript(opts: { turns: number[]; width: number; clientHeight: number; feed?: boolean; blocks?: number }) {
   const baseWidth = opts.width;
   const turns = [...opts.turns];
   let width = opts.width;
@@ -83,8 +83,16 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
     return sum;
   };
 
+  /** `blocks` equal paragraphs per turn, re-wrapping with it. */
+  const blockCount = opts.blocks ?? 0;
+  const blockTop = (i: number, k: number) => docTop(i) + (k * heightOf(i)) / blockCount - scrollTop;
   const turnEls = turns.map((_, i) => ({
     isConnected: true,
+    children: Array.from({ length: blockCount }, (_, k) => ({
+      isConnected: true,
+      children: [],
+      getBoundingClientRect: () => ({ top: blockTop(i, k), height: heightOf(i) / blockCount }),
+    })),
     getBoundingClientRect: () => ({ top: docTop(i) - scrollTop, height: heightOf(i) }),
   }));
   /** ThreadView's `.thread-feed`: one box around every turn, whose own top
@@ -124,6 +132,8 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
     growLastTurn(px: number) { turns[turns.length - 1] += px; el.scrollTop = scrollTop; },
     /** A turn's top relative to the viewport top (negative once scrolled past). */
     turnTop(i: number) { return docTop(i) - scrollTop; },
+    /** Paragraph `k` of turn `i`, relative to the viewport top. */
+    blockTop,
   };
   return el;
 }
@@ -164,6 +174,40 @@ describe('transcript reflow anchoring across a pane-width change', () => {
 
     expect(el.turnTop(3)).toBe(-100);
     expect(el.scrollTop).toBe(3700);
+  });
+
+  it('keeps the paragraph the reader is on in place, not only its turn', () => {
+    // A long answer re-wraps above the reader's line inside the same turn.
+    // Holding the turn's top would let that growth push the line down.
+    const el = makeTranscript({ ...SIX_TURNS, feed: true, blocks: 6 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+
+    el.scrollTop = 1950;
+    onScroll();
+    onResize();
+    expect(el.blockTop(3, 1)).toBe(-50);
+
+    el.setWidth(400);
+    onResize();
+
+    expect(el.blockTop(3, 1)).toBe(-50);
+  });
+
+  it('keeps the turn in place once a re-set reply replaced the paragraph', () => {
+    const el = makeTranscript({ ...SIX_TURNS, feed: true, blocks: 6 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+
+    el.scrollTop = 1950;
+    onScroll();
+    onResize();
+    const turnTop = el.turnTop(3);
+    // The reply's html was set again, so the recorded paragraph left the DOM.
+    for (const block of el.children[0].children[3].children) block.isConnected = false;
+
+    el.setWidth(400);
+    onResize();
+
+    expect(el.turnTop(3)).toBe(turnTop);
   });
 
   it('anchors on a turn inside the feed box, not on the feed itself', () => {

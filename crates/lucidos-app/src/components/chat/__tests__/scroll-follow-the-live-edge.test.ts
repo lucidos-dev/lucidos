@@ -13,6 +13,7 @@ if (typeof globalThis.HTMLElement === 'undefined') {
 
 import {
   awayFromBottom,
+  showScrollToBottom,
   followAnsweredQuestion,
   followCanceledTurn,
   followConfirmedCard,
@@ -5153,5 +5154,56 @@ describe("the follow's carry holds the mobile dynamic bars", () => {
     setTranscriptLive(false);
 
     expect(dispatchEvent.mock.calls.filter(([e]) => e.type === 'reveal-mobile-bars')).toHaveLength(0);
+  });
+});
+
+
+describe('down chevron visibility', () => {
+  beforeEach(() => { resetFollow(); vi.useFakeTimers(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); resetFollow(); });
+
+  it('hides throughout a riding follow-up glide despite the geometric gap', () => {
+    const el = makeEl({ scrollTop: 2500, scrollHeight: 3000 });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    followSentMessage();
+    el.addUserMessage({ top: 3100, height: 120 });
+    el.scrollHeight = 3700;
+    onResize();
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(false);
+    vi.advanceTimersByTime(80);
+    onScroll();
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(false);
+    vi.advanceTimersByTime(1500);
+    onScroll();
+    expect(awayFromBottom.value).toBe(false);
+    expect(showScrollToBottom.value).toBe(false);
+  });
+
+  it.each([true, false])('offers a jump immediately after interruption, live=%s', (live) => {
+    const el = makeEl({ scrollTop: 2500, scrollHeight: 3000 });
+    const { onScroll } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    setFollowLiveEdge(true);
+    setTranscriptLive(live);
+    readerScrollsTo(el, 1000, onScroll);
+    expect(followingLiveEdge.value).toBe(!live);
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(true);
+    readerScrollsTo(el, 2500, onScroll);
+    expect(showScrollToBottom.value).toBe(false);
+  });
+
+  it('offers an unarmed reader a jump when growth leaves them behind', () => {
+    const el = makeEl({ scrollTop: 2500, scrollHeight: 3000 });
+    const { onResize } = makeScrollObservers(el);
+    setActiveScrollElement(el);
+    el.scrollHeight = 3700;
+    onResize();
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(true);
   });
 });

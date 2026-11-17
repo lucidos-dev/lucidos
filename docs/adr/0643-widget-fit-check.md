@@ -78,3 +78,27 @@ declared size plus 6 s, since each surface walks its sizes in turn.
   the worst case covers them.
 - **Measuring in the engine from the HTML.** Layout depends on fonts, the UI
   scale and the theme. Only a real renderer knows what it cut.
+
+## Amendment: an explicitly selected agent renderer
+
+A local-token automation window has a logical device id but cannot answer as
+an attested Device (ADR 0647). It may instead register a fit renderer session
+under a verified origin token for the exact source thread. The engine binds
+that session to its workspace, thread, widget and logical device, for one
+selected fit request. The ordinary Device path is unchanged.
+
+The launcher holds a fit-only credential in memory. Only its public selection
+handle reaches the shell and the transient event. The credential belongs on
+the exact top-frame fit-report request, never in an app frame, URL, event,
+artifact or log. It is not an actor or an owner credential. Registration and
+selection still require the verified source; reporting still owes the usual
+door credential. Local-token-only reporting cannot answer a Device check.
+
+Sessions expire after two minutes; there are at most 128 per engine, and each
+answers once. Canceling the wait or restarting invalidates its credential.
+Wrong-session or wrong-device reports leave the genuine check open. The real
+shell and SDK still render both surfaces at every declared size and the largest
+UI scale. The engine still writes all measurement and params caveats.
+
+The credential proves the responder, never the truth of client measurements.
+Lucidos neither ships Chrome nor starts a headless renderer in the engine.

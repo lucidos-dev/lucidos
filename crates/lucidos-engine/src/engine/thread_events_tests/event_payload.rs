@@ -2,6 +2,25 @@ use super::*;
 use serde_json::json;
 
 #[test]
+fn coding_agent_billing_wire_contract_replays_without_credentials() {
+    let launch_id = uuid::Uuid::new_v4();
+    for attribution in [
+        json!({"status":"known", "provider":"claude-gateway", "source":"claude-initialize"}),
+        json!({"status":"unresolved", "reason":"missing-evidence", "source":"unavailable"}),
+    ] {
+        let mut wire = json!({
+            "type":"CodingAgentBillingObserved", "coding_agent":"claude-code",
+            "launch_id":launch_id, "attribution":attribution,
+        });
+        let event: ThreadEvent = serde_json::from_value(wire.clone()).unwrap();
+        assert!(event.is_persisted());
+        assert_eq!(event.event_type(), "CodingAgentBillingObserved");
+        wire["billing_mode"] = json!("unknown");
+        assert_eq!(serde_json::to_value(event).unwrap(), wire);
+    }
+}
+
+#[test]
 fn trigger_retry_wire_shapes_survive_replay() {
     let thread_id = uuid::Uuid::new_v4();
     let entry_id = uuid::Uuid::new_v4();
@@ -69,6 +88,7 @@ fn claude_code_idled_has_changes_serialization() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     let serialized = serde_json::to_value(&event).unwrap();
     assert_eq!(serialized["type"], "CodingAgentIdled");
@@ -85,6 +105,7 @@ fn claude_code_idled_has_changes_serialization() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     let serialized2 = serde_json::to_value(&event2).unwrap();
     assert_eq!(serialized2["type"], "CodingAgentIdled");
@@ -519,6 +540,7 @@ fn trigger_started_legacy_task_id_alias_deserializes() {
 #[test]
 fn change_proposed_new_format() {
     let event = ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: "c-1".into(),
         description: Some("Fix the bug".into()),
         files: vec!["src/main.rs".into()],
@@ -559,6 +581,7 @@ fn response_failed_reads_old_rows_and_round_trips_agent_exit() {
         old,
         ThreadEvent::ResponseFailed {
             agent_exit: None,
+            provider_error: None,
             ..
         }
     ));
@@ -570,13 +593,75 @@ fn response_failed_reads_old_rows_and_round_trips_agent_exit() {
 
     let exit = ThreadEvent::ResponseFailed {
         error: "could not load settings".into(),
+        spend_cap: None,
         agent_exit: Some(CodingAgentExit {
             stage: CodingAgentExitStage::Startup,
             code: Some(1),
         }),
+        provider_error: None,
     };
     let wire = serde_json::to_value(&exit).unwrap();
     assert_eq!(wire["agent_exit"], json!({ "stage": "startup", "code": 1 }));
+    assert!(wire.get("provider_error").is_none());
     let read_back = serde_json::from_value::<ThreadEvent>(wire.clone()).unwrap();
     assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
+}
+
+#[test]
+fn a_failure_with_a_provider_error_round_trips_and_an_old_row_still_reads() {
+    let blocked = ThreadEvent::ResponseFailed {
+        error: "This request was blocked by our safety systems.".into(),
+        spend_cap: None,
+        agent_exit: None,
+        provider_error: Some(ProviderError {
+            code: "misalignment_policy_violation".into(),
+            detail: None,
+        }),
+    };
+    let wire = serde_json::to_value(&blocked).unwrap();
+    assert_eq!(
+        wire["provider_error"],
+        json!({ "code": "misalignment_policy_violation" })
+    );
+    let read_back = serde_json::from_value::<ThreadEvent>(wire.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&read_back).unwrap(), wire);
+
+    let old_row = json!({ "type": "ResponseFailed", "error": "boom" });
+    let ThreadEvent::ResponseFailed { provider_error, .. } =
+        serde_json::from_value::<ThreadEvent>(old_row).unwrap()
+    else {
+        panic!("expected ResponseFailed");
+    };
+    assert_eq!(provider_error, None);
+}
+
+#[test]
+fn change_content_wire_contract_and_legacy_default() {
+    use crate::engine::thread_events::ChangeContent;
+    for event_type in ["ChangeProposed", "ChangeApplied"] {
+        let legacy: ThreadEvent = serde_json::from_value(json!({"type": event_type})).unwrap();
+        assert_eq!(serde_json::to_value(legacy).unwrap()["content"], "code");
+        let event: ThreadEvent =
+            serde_json::from_value(json!({"type": event_type, "content": "plan-only"})).unwrap();
+        match &event {
+            ThreadEvent::ChangeProposed { content, .. }
+            | ThreadEvent::ChangeApplied { content, .. } => {
+                assert_eq!(*content, ChangeContent::PlanOnly)
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(serde_json::to_value(event).unwrap()["content"], "plan-only");
+    }
+}
+
+#[test]
+fn change_apply_failed_accepts_legacy_rows_without_landing_metadata() {
+    let event: ThreadEvent = serde_json::from_value(json!({
+        "type": "ChangeApplyFailed", "change_id": "change", "error": "merge refused",
+    }))
+    .unwrap();
+    let wire = serde_json::to_value(event).unwrap();
+    assert!(wire.get("pre_merge_sha").is_none());
+    assert!(wire.get("post_merge_sha").is_none());
+    assert!(wire.get("landing_merge_sha").is_none());
 }

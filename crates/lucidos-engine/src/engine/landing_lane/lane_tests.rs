@@ -57,6 +57,7 @@ async fn propose(bus: &EventBus, thread_id: Uuid, change_id: Uuid, branch: &str)
         bus,
         thread_id,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("work".into()),
             files: vec!["a.rs".into()],
@@ -84,6 +85,7 @@ fn queued_event(change_id: Uuid, snapshot: &str) -> ThreadEvent {
 
 fn applied(change_id: Uuid, landing: Option<&str>) -> ThreadEvent {
     ThreadEvent::ChangeApplied {
+        content: Default::default(),
         change_id: change_id.to_string(),
         requires_restart: false,
         client_update: false,
@@ -297,47 +299,68 @@ async fn recovery_rebuilds_the_lane_from_stored_events() {
     teardown_test_db(&db).await;
 }
 
-/// Only the lane moves `main` for Lucidos source. This test names each
-/// production caller of a primitive that moves `main`, with its reason. A new
-/// caller fails it until someone decides it may.
-#[test]
-fn only_the_lane_and_the_app_path_move_main() {
-    use crate::test_support::source_scan::production_sources;
-    const PRIMITIVES: &[&str] = &[
-        "ff_main_to_locked(",
-        "ff_main_to_branch(",
-        "catchup_and_ff_to_main(",
-        "ff_merge_to_main(",
-        "move_local_main(",
-        "follow_origin_main(",
-    ];
-    // (file, why it may move `main`)
-    const ALLOWED: &[(&str, &str)] = &[
-        ("engine/git_ops/merge.rs", "the primitives themselves"),
-        ("engine/landing_lane/landing.rs", "the landing lane"),
-        ("engine/landing_lane/integration.rs", "the landing lane"),
-        (
-            "engine/follow_main.rs",
-            "following origin/main, a fast-forward only (ADR 0589)",
-        ),
-        ("engine/change_ops/apply.rs", "the app path's Tiers 1 to 3"),
-        (
-            "engine/agent_session/apply_now.rs",
-            "the app path's live-session Apply Now and Tier-1 recovery",
-        ),
-        (
-            "engine/agent_session/run_session/completion.rs",
-            "the app path's Tier-2 and Tier-3 resolution completion",
-        ),
-    ];
-    let callers: Vec<String> = production_sources()
-        .into_iter()
-        .filter(|(_, source)| PRIMITIVES.iter().any(|p| calls(source, p)))
-        .map(|(rel, _)| rel)
-        .collect();
-    let mut allowed: Vec<String> = ALLOWED.iter().map(|(f, _)| f.to_string()).collect();
-    allowed.sort();
-    assert_eq!(callers, allowed, "a new caller moves main outside the lane");
+/// I11 against stored events. A restart during a hold holds the same two
+/// arrivals in order, and counts the cap from the stored hold. The pass after
+/// the batch lands takes both, in order.
+#[tokio::test]
+async fn a_restart_during_a_hold_lands_its_arrivals_in_order_after_the_batch() {
+    use super::recovery::LaneRestore;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let [resolving, first, second] = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    for (change, branch) in [(resolving, "b1"), (first, "b2"), (second, "b3")] {
+        start_cc_session(&bus, change, branch, None).await;
+        propose(&bus, change, change, branch).await;
+    }
+    emit(&bus, resolving, queued_event(resolving, "s1")).await;
+    let batch_id = Uuid::new_v4();
+    let member = |change_id, snapshot: &str| LaneMember {
+        change_id,
+        snapshot_sha: snapshot.into(),
+    };
+    emit_system(
+        &bus,
+        started(batch_id, Uuid::new_v4(), vec![member(resolving, "s1")]),
+    )
+    .await;
+    emit_system(&bus, SystemEvent::LaneArrivalsHeld { batch_id }).await;
+    emit(&bus, first, queued_event(first, "s2")).await;
+    emit(&bus, second, queued_event(second, "s3")).await;
+
+    let records = load_lane_records(&pool).await.unwrap();
+    let mut restore = LaneRestore::of(&records, |_| true);
+    let hold = restore.lane.arrival_hold().expect("the hold survives");
+    assert_eq!(hold.arrivals(), &[first, second]);
+    let age = restore.hold_age_secs.expect("its age is read");
+    assert!(age < 60, "the hold began moments ago: {age}s");
+
+    assert!(
+        restore.lane.take_pass().is_empty(),
+        "nothing passes during it"
+    );
+    restore.lane.end_batch(batch_id).expect("the batch lands");
+    assert_eq!(
+        restore.lane.take_pass(),
+        vec![member(first, "s2"), member(second, "s3")]
+    );
+
+    emit_system(
+        &bus,
+        SystemEvent::LaneArrivalsReleased {
+            batch_id,
+            cause: LaneHoldRelease::CapReached,
+            arrivals: vec![first, second],
+        },
+    )
+    .await;
+    let restore = LaneRestore::of(&load_lane_records(&pool).await.unwrap(), |_| true);
+    assert!(
+        restore.lane.arrival_hold().is_none(),
+        "a released hold stays closed"
+    );
+    assert_eq!(restore.lane.waiting().len(), 2, "its arrivals still wait");
+
+    teardown_test_db(&db).await;
 }
 
 /// A call, not a definition or a mention in a comment.
@@ -481,254 +504,8 @@ fn fn_body(source: &str, name: &str) -> String {
     panic!("fn {name} never closes");
 }
 
-fn production(rel: &str) -> String {
-    use crate::test_support::source_scan::{read_production_source, src_root};
-    read_production_source(&src_root().join(rel))
-}
-
-/// The lane holds each resolving member's apply claim until the batch lands
-/// or fails. Apply, Discard and Set aside each take the claim before anything
-/// else, so the lane's claim refuses each with its reason before it acts.
-///
-/// No in-process harness builds a whole engine: its repo root is the source
-/// checkout, so a test engine would land on the real `main`. So this pins the
-/// order in each surface's source, and the claim itself below.
-#[test]
-fn a_landing_member_refuses_apply_discard_and_set_aside() {
-    use crate::engine::change_ops::apply_claim::{ApplyClaims, APPLY_IN_PROGRESS_MESSAGE};
-    for (file, surface) in [
-        ("engine/change_ops/apply.rs", "apply_change_inner"),
-        ("engine/change_ops/discard.rs", "discard_change"),
-        ("engine/change_ops/discard.rs", "discard_change_quietly"),
-        ("engine/change_ops/set_aside.rs", "set_aside_change"),
-    ] {
-        let body: String = fn_body(&production(file), surface)
-            .split_whitespace()
-            .collect();
-        let first_act = body
-            .find("self.")
-            .unwrap_or_else(|| panic!("{surface} does nothing"));
-        assert!(
-            body[first_act..].starts_with("self.apply_claims.try_claim(change_id)"),
-            "{surface} takes the claim before anything else"
-        );
-        assert!(
-            body.contains("APPLY_IN_PROGRESS_MESSAGE"),
-            "{surface} refuses with the claim's reason"
-        );
-    }
-    assert!(!APPLY_IN_PROGRESS_MESSAGE.is_empty());
-    let claims = std::sync::Arc::new(ApplyClaims::default());
-    let member = Uuid::new_v4();
-    let held_by_lane = claims
-        .try_claim(member)
-        .expect("the lane claims at batch start");
-    assert!(
-        claims.try_claim(member).is_none(),
-        "every other surface is refused"
-    );
-    drop(held_by_lane);
-    assert!(
-        claims.try_claim(member).is_some(),
-        "free once the batch lands or fails"
-    );
-}
-
-/// Every Apply surface hands a Lucidos-source change to the lane before any
-/// app-path tier can move `main`, and only the lane announces a queued change.
-/// So an app change, which `takes_landing_lane` refuses, keeps the old tiers
-/// and never reads `ChangeQueued`.
-///
-/// Pinned in the source for the reason the claim test gives: no test engine
-/// can run these surfaces without landing on the real `main`.
-#[test]
-fn every_apply_surface_queues_lucidos_source_before_any_tier() {
-    use crate::test_support::source_scan::production_sources;
-    const MAIN_MOVERS: &[&str] = &[
-        "catchup_and_ff_to_main(",
-        "ff_main_to_branch(",
-        "ff_main_to_locked(",
-        "ff_merge_to_main(",
-    ];
-    // (file, function, the call that queues, the tier calls it must precede)
-    let routes: [(&str, &str, &str, &[&str]); 2] = [
-        (
-            "engine/change_ops/apply.rs",
-            "apply_change_inner",
-            "return self.queue_in_landing_lane(",
-            &[
-                "begin_in_place_merge(",
-                "hold_thread_for_worktree_reset(",
-                "apply_change_tier3(",
-            ],
-        ),
-        (
-            "engine/agent_session/apply_now.rs",
-            "apply_now_inner",
-            "self.apply_now_through_lane(",
-            &["merge_via_cc_session("],
-        ),
-    ];
-    for (file, surface, queue, tiers) in routes {
-        let body = fn_body(&production(file), surface);
-        let route = body
-            .find("takes_landing_lane(")
-            .unwrap_or_else(|| panic!("{surface} never asks whether the lane takes the change"));
-        let queued = body
-            .find(queue)
-            .unwrap_or_else(|| panic!("{surface} never queues"));
-        assert!(route < queued, "{surface} queues only behind the check");
-        for tier in tiers {
-            let at = body
-                .find(tier)
-                .unwrap_or_else(|| panic!("{surface} has no {tier}"));
-            assert!(queued < at, "{surface} reaches {tier} before the lane");
-        }
-        for mover in MAIN_MOVERS {
-            assert!(
-                !body[..route].contains(mover),
-                "{surface} moves main with {mover} before the lane check"
-            );
-        }
-    }
-
-    // Apply Now with no live session, and Apply All, go through `apply_change`.
-    assert!(fn_body(
-        &production("engine/agent_session/apply_now.rs"),
-        "apply_pending_now"
-    )
-    .contains(".apply_change("));
-    assert!(production("engine/apply_all_driver.rs").contains(".apply_change("));
-
-    let files = |matches: &dyn Fn(&str) -> bool| -> Vec<String> {
-        production_sources()
-            .into_iter()
-            .filter(|(_, source)| matches(source))
-            .map(|(rel, _)| rel)
-            .collect()
-    };
-    let builds_change_queued = |source: &str| {
-        source.lines().any(|line| {
-            let code = line.split("//").next().unwrap_or("").trim_end();
-            code.ends_with("ThreadEvent::ChangeQueued {")
-        })
-    };
-    assert_eq!(
-        files(&builds_change_queued),
-        vec!["engine/landing_lane/driver.rs".to_string()],
-        "only the lane announces a queued change"
-    );
-    assert_eq!(
-        files(&|source| calls(source, "queue_in_landing_lane(")),
-        vec![
-            "engine/agent_session/apply_now.rs".to_string(),
-            "engine/change_ops/apply.rs".to_string()
-        ],
-        "only the two routes above reach the lane"
-    );
-}
-
-/// Every arrival tries `main` in a clean pass, whatever batch resolves. Only
-/// the pass sets a change aside: nothing queues one before it (ADR 0480).
-#[test]
-fn every_arrival_gets_a_clean_pass() {
-    let arrive = fn_body(&production("engine/landing_lane/driver.rs"), "arrive");
-    assert!(
-        arrive.contains("self.pass_answer("),
-        "the arrival runs a pass"
-    );
-    assert!(
-        !arrive.contains("self.lane.wait("),
-        "no arrival waits before its pass"
-    );
-}
-
-/// Apply All opens its press in the lane before the first member applies,
-/// and submits it wherever the press can start nothing more: an advance that
-/// leaves it submitted, and Cancel. A press left open would hold every
-/// conflict back for good (ADR 0480).
-#[test]
-fn apply_all_opens_its_press_first_and_always_submits_it() {
-    let driver = production("engine/apply_all_driver.rs");
-    let seed = fn_body(&driver, "start_apply_all_batch");
-    assert!(seed.contains("self.open_lane_press(batch_id)"));
-    let run = fn_body(&driver, "run_apply_all");
-    let seeded = run.find(".start_apply_all_batch(").expect("seeds");
-    let first = run.find(".apply_batch_member(").expect("applies");
-    assert!(seeded < first, "the press opens before its first member");
-    let filtered = run
-        .find(".drop_changes_already_applying(")
-        .expect("filters out what the lane holds");
-    assert!(filtered < seeded, "the filter runs before the batch seeds");
-
-    let advance = fn_body(&driver, "advance_apply_all_batch");
-    let submitted = advance
-        .find("batch.is_submitted()")
-        .expect("advance asks whether the press is in");
-    let told = advance
-        .find("self.submit_lane_press(batch_id)")
-        .expect("advance tells the lane");
-    assert!(submitted < told);
-
-    let cancel = fn_body(&driver, "cancel_apply_all_batches");
-    let left = cancel.find(".cancel_lane_members(").expect("cancel");
-    let told = cancel
-        .find("self.submit_lane_press(")
-        .expect("cancel submits the press");
-    assert!(
-        left < told,
-        "its members leave the lane before the queue passes"
-    );
-}
-
-/// A restart never hands the lane's member back to `apply_change`: recovery
-/// asks the lane before it drives anything, and a laned member only waits.
-/// Applying it would take the claim the restored lane needs, and fail the
-/// lane batch with "being applied elsewhere".
-#[test]
-fn recovery_leaves_a_laned_member_to_the_lane() {
-    let driver = production("engine/apply_all_driver.rs");
-    let recover = fn_body(&driver, "recover_apply_all_batches");
-    let asked = recover.find("lane_held_changes(").expect("asks the lane");
-    let restored = recover
-        .find("progress.restore_laned(")
-        .expect("restores a laned member beside the queue");
-    let owner = recover.find("self.recovered_owner(").expect("owners");
-    let driven = recover.find("self.spawn_batch_member(").expect("drives");
-    assert!(asked < restored && restored < owner && owner < driven);
-}
-
-/// A change the lane queues tells its Apply All press, whoever handed it
-/// over. The auto-apply after hardening is such a caller. Without it the press
-/// would wait for the member to land, and the lane would wait for the press
-/// (ADR 0480).
-#[test]
-fn a_queued_answer_tells_apply_all_whoever_queued_the_change() {
-    let submit = fn_body(
-        &production("engine/landing_lane/driver.rs"),
-        "submit_to_landing_lane",
-    );
-    let queued = submit
-        .find("ApplyStatus::Queued")
-        .expect("the hand-off reads a Queued answer");
-    let laned = submit
-        .find("ApplyAllDriveMsg::Laned")
-        .expect("the hand-off tells Apply All");
-    assert!(queued < laned, "it tells Apply All only of a Queued answer");
-
-    let member = fn_body(
-        &production("engine/apply_all_driver.rs"),
-        "apply_batch_member",
-    );
-    assert!(
-        !member.contains("ApplyAllDriveMsg::Laned"),
-        "the hand-off reports it, once"
-    );
-}
-
-/// A run on the lane thread carries its batch while the batch is open. Once
-/// it closes, a run is refused until the integration branch is gone, then
-/// runs as an ordinary thread.
+/// Every run carries the open batch. A closed lane thread refuses ordinary
+/// duty even after its integration branch is gone.
 #[tokio::test]
 async fn a_run_on_the_lane_thread_carries_the_open_batch() {
     let (pool, db) = setup_test_db().await;
@@ -816,7 +593,7 @@ async fn a_run_on_the_lane_thread_carries_the_open_batch() {
         crate::engine::git_ops::GitAnswer::Yes
     );
 
-    // Each run tries the removal again, so a refusal cannot last.
+    // A later request retries cleanup but never gains ordinary duty.
     let out = crate::engine::git_ops::git_cmd(
         &["worktree", "remove", "--force", &holder_str],
         repo.path(),
@@ -824,10 +601,9 @@ async fn a_run_on_the_lane_thread_carries_the_open_batch() {
     .await
     .unwrap();
     assert!(out.status.success());
-    assert_eq!(
-        duty_for_run().await.unwrap(),
-        None,
-        "the run retires the branch, then runs as an ordinary thread"
+    assert!(
+        duty_for_run().await.is_err(),
+        "cleanup never grants ordinary duty"
     );
     assert_eq!(branch_exists().await, crate::engine::git_ops::GitAnswer::No);
     teardown_test_db(&db).await;
@@ -926,22 +702,6 @@ fn every_member_leaving_a_pass_settles_its_source_thread() {
     }
 }
 
-/// The lane branch prefix has one definition, in `git_ops`. The lane reads
-/// it rather than spelling the prefix again.
-#[test]
-fn the_lane_branch_prefix_is_written_once() {
-    use crate::test_support::source_scan::production_sources;
-    let respelled: Vec<String> = production_sources()
-        .into_iter()
-        .filter(|(rel, source)| {
-            rel != "engine/git_ops/branch_name.rs"
-                && (source.contains("\"lane/") || source.contains("refs/heads/lane/"))
-        })
-        .map(|(rel, _)| rel)
-        .collect();
-    assert!(respelled.is_empty(), "{respelled:?}");
-}
-
 /// Recovery reads where the lane thread stood. Killed at batch open, it was
 /// never prompted. Killed mid-resolution, or by a shutdown boundary, its turn
 /// is unfinished. Killed after a clean finish, it is finished and lands.
@@ -1030,6 +790,7 @@ async fn recovery_reads_where_the_lane_thread_stood() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         done,
     ))
@@ -1209,72 +970,95 @@ async fn a_restart_reads_an_archived_or_deleted_lane_thread_as_closed() {
     teardown_test_db(&db).await;
 }
 
-/// A Stop or Discard on a stale lane thread answers the lane while the thread
-/// is the lane's: its batch is open, or its last session still ran on the
-/// integration branch. A former lane thread that has since run as an
-/// ordinary thread on its own branch gets its ordinary teardown.
+/// Stale cleanup retains lane identity even for historical ordinary sessions.
 #[tokio::test]
-async fn a_stale_session_goes_to_the_lane_only_while_it_is_the_lanes() {
+async fn a_stale_lane_session_never_gets_ordinary_teardown() {
     let (pool, db) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let workspace = tempfile::tempdir().unwrap();
-    let route = |thread: Uuid, branch: Option<String>| {
-        let pool = pool.clone();
-        let workspace = workspace.path().to_path_buf();
-        async move {
-            lane_batch_of_stale_session(&pool, &workspace, thread, branch.as_deref())
-                .await
-                .unwrap()
-        }
-    };
-
     let ordinary = Uuid::new_v4();
     assert_eq!(
-        route(ordinary, Some("lucidos-own".into())).await,
-        None,
-        "not a lane thread"
+        lane_batch_of_stale_session(&pool, workspace.path(), ordinary, None, false)
+            .await
+            .unwrap(),
+        None
     );
-
-    let lane_thread = Uuid::new_v4();
-    let batch_id = Uuid::new_v4();
-    let lane = crate::engine::git_ops::lane_branch(batch_id);
-    let own = format!("lucidos-claude-code-{lane_thread}");
-    emit_system(&bus, started(batch_id, lane_thread, vec![])).await;
-    for branch in [Some(lane.clone()), Some(own.clone()), None] {
-        assert_eq!(
-            route(lane_thread, branch.clone()).await,
-            Some(batch_id),
-            "an open batch's lane thread is the lane's, on {branch:?}"
-        );
-    }
-
+    let thread = Uuid::new_v4();
+    let batch = Uuid::new_v4();
+    emit_system(&bus, started(batch, thread, vec![])).await;
+    assert_eq!(
+        lane_batch_of_stale_session(
+            &pool,
+            workspace.path(),
+            thread,
+            Some("historical-ordinary-branch"),
+            false
+        )
+        .await
+        .unwrap(),
+        Some(batch)
+    );
+    assert_eq!(
+        lane_batch_of_stale_session(&pool, workspace.path(), thread, None, true)
+            .await
+            .unwrap(),
+        Some(batch),
+        "discard on an open batch still ends its lane duty",
+    );
     emit_system(
         &bus,
         SystemEvent::LaneBatchFailed {
-            batch_id,
+            batch_id: batch,
             reason: "Canceled from the landing lane.".into(),
             actor: None,
         },
     )
     .await;
     assert_eq!(
-        route(lane_thread, Some(lane)).await,
-        Some(batch_id),
-        "its last session still ran on the integration branch"
+        lane_batch_of_stale_session(
+            &pool,
+            workspace.path(),
+            thread,
+            Some(&crate::engine::git_ops::lane_branch(batch)),
+            true
+        )
+        .await
+        .unwrap(),
+        Some(batch),
+        "discard on an integration session stays with the lane",
+    );
+    start_cc_session(&bus, thread, "historical-ordinary-branch", None).await;
+    assert_eq!(
+        lane_batch_of_stale_session(
+            &pool,
+            workspace.path(),
+            thread,
+            Some("historical-ordinary-branch"),
+            false
+        )
+        .await
+        .unwrap(),
+        Some(batch)
     );
     assert_eq!(
-        route(lane_thread, Some(own)).await,
+        lane_batch_of_stale_session(
+            &pool,
+            workspace.path(),
+            thread,
+            Some("historical-ordinary-branch"),
+            true
+        )
+        .await
+        .unwrap(),
         None,
-        "it has run as an ordinary thread since, so its own teardown runs"
+        "explicit discard still cleans up historical ordinary work",
     );
-    assert_eq!(route(lane_thread, None).await, None);
     teardown_test_db(&db).await;
 }
 
 /// A Cancel can end a batch while the lane's first turn still waits on its
 /// worktree. That turn then never runs, not even as an ordinary thread: it
-/// would merge every member and propose them again. A turn the user typed
-/// runs as an ordinary thread, as before.
+/// would merge every member and propose them again. Typed turns are fenced too.
 #[tokio::test]
 async fn a_turn_the_lane_sent_never_outlives_its_batch() {
     use crate::engine::thread_events::{ActorMode, MessageOrigin};
@@ -1333,10 +1117,9 @@ async fn a_turn_the_lane_sent_never_outlives_its_batch() {
         refused.is_err_and(|e| e.to_string() == super::lane_thread::LANE_TURN_OUTLIVED_BATCH),
         "the lane's turn is refused once its batch ended"
     );
-    assert_eq!(
-        duty(typed_turn).await.unwrap(),
-        None,
-        "a typed turn runs as an ordinary thread"
+    assert!(
+        duty(typed_turn).await.is_err(),
+        "typed turns cannot outlive the batch"
     );
     teardown_test_db(&db).await;
 }
@@ -1389,76 +1172,6 @@ async fn a_restart_finds_a_member_its_failed_batch_left_queued() {
     let restore = LaneRestore::of(&load_lane_records(&pool).await.unwrap(), |_| true);
     assert!(restore.stranded.is_empty());
     teardown_test_db(&db).await;
-}
-
-/// A failed batch's member leaves with `ChangeUnqueued` whatever its row read
-/// gives: a failed read once skipped it, and it read as queued for good. Only
-/// the Apply All answer and the settle wait on a pending row. The restart
-/// repairs a member a crash left queued the same way.
-///
-/// Pinned in the source: no test engine can run the driver.
-#[test]
-fn a_failed_batch_unqueues_every_member_before_reading_its_status() {
-    let driver = production("engine/landing_lane/driver.rs");
-    let body = fn_body(&driver, "unqueue_failed_member");
-    let unqueued = body
-        .find("self.emit_unqueued(")
-        .expect("every member leaves with ChangeUnqueued");
-    let gate = body.find("is_pending").expect("a pending gate");
-    assert!(unqueued < gate, "the unqueue comes before the pending gate");
-    for later in ["notify_apply_all(", "spawn_settle_source("] {
-        let at = body.find(later).unwrap_or_else(|| panic!("no {later}"));
-        assert!(gate < at, "{later} waits on a pending row");
-    }
-    assert!(!body.contains(".ok()"), "a failed read skips no member");
-    for caller in ["fail_batch", "restore"] {
-        assert!(
-            fn_body(&driver, caller).contains("self.unqueue_failed_member("),
-            "{caller} unqueues through it"
-        );
-    }
-}
-
-/// A pass that finds a waiting member's claim held keeps it queued. The
-/// holder may be refused before it reaches the lane. So the lane waits on
-/// that claim's release, not on a message from the holder.
-#[test]
-fn a_waiting_member_held_elsewhere_is_tried_again_when_its_claim_goes() {
-    let driver = production("engine/landing_lane/driver.rs");
-    let claim_members = fn_body(&driver, "claim_members");
-    assert!(claim_members.contains(".try_claim_for_lane(member.change_id)"));
-    assert!(!claim_members.contains(".try_claim(member.change_id)"));
-    assert!(fn_body(&driver, "start_landing_lane_driver").contains(".on_lane_wait_release("));
-    assert!(fn_body(&driver, "handle").contains("LaneMsg::ClaimReleased"));
-    assert!(
-        fn_body(&driver, "handle").contains("LaneMsg::OriginAnswered => self.retry_origin()"),
-        "the follow task's answer from origin retries a landing that waited for it"
-    );
-    assert!(
-        !driver.contains("tokio::time::"),
-        "the lane waits on messages, never on a clock (plan non-goal: no timers)"
-    );
-}
-
-/// A turn cut off at boot past a queued change keeps that change, and its
-/// newer work is still re-decided. That re-decide withholds the work as
-/// awaiting landing, so the thread shows why it waits.
-#[test]
-fn recovery_redecides_the_work_past_a_queued_change() {
-    let recovery = production("engine/agent_recovery/recovery.rs");
-    let body = fn_body(&recovery, "recover_orphaned_worktrees");
-    let gate = body
-        .find("if !queued {")
-        .expect("the withdraw waits on the queue");
-    let withdraw = body.find("emit_change_withdrawn(").expect("a withdraw");
-    let redecide = body.find("redecide_branch_work(").expect("a re-decide");
-    assert!(gate < withdraw, "only the withdraw is gated on the queue");
-    let gated = &body[gate..redecide];
-    assert_eq!(
-        gated.matches('{').count(),
-        gated.matches('}').count(),
-        "the re-decide sits outside the queue gate"
-    );
 }
 
 #[tokio::test]
@@ -1558,4 +1271,427 @@ async fn restored_lane_settlement_is_durable_retryable_and_preserves_fresh_apply
     assert!(load_lane_records(&pool).await.is_err());
     assert!(settle_restored_lane(&pool, &bus).await.is_err());
     teardown_test_db(&db).await;
+}
+
+/// Releasing failed members must fence the conversation that still holds
+/// their merge instructions, even after its integration branch disappeared.
+#[tokio::test]
+async fn a_failed_lane_continue_cannot_become_an_ordinary_merge_worker() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let repo = tempfile::tempdir().unwrap();
+    let initialized = crate::engine::git_ops::git_cmd(&["init", "-b", "main"], repo.path())
+        .await
+        .unwrap();
+    assert!(initialized.status.success());
+    let workspace = tempfile::tempdir().unwrap();
+    let thread = Uuid::new_v4();
+    let batch = Uuid::new_v4();
+    emit_system(&bus, started(batch, thread, vec![])).await;
+    emit_system(
+        &bus,
+        SystemEvent::LaneBatchFailed {
+            batch_id: batch,
+            reason: "Spend cap reached.".into(),
+            actor: None,
+        },
+    )
+    .await;
+    let request = bus
+        .emit(BusEvent::Thread {
+            thread_id: thread,
+            event: crate::test_support::message_received("continue"),
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .event_id;
+    let admitted = lane_duty_for_run(&pool, workspace.path(), repo.path(), thread, request).await;
+    assert!(
+        admitted.is_err(),
+        "closed lane conversation must never run ordinary duty"
+    );
+    teardown_test_db(&db).await;
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Only the lane moves `main` for Lucidos source. This test names each
+    /// production caller of a primitive that moves `main`, with its reason. A new
+    /// caller fails it until someone decides it may.
+    #[test]
+    fn only_the_lane_and_the_app_path_move_main() {
+        use crate::test_support::source_scan::production_sources;
+        const PRIMITIVES: &[&str] = &[
+            "ff_main_to_locked(",
+            "ff_main_to_branch(",
+            "catchup_and_ff_to_main(",
+            "ff_merge_to_main(",
+            "move_local_main(",
+            "follow_origin_main(",
+        ];
+        // (file, why it may move `main`)
+        const ALLOWED: &[(&str, &str)] = &[
+            ("engine/git_ops/merge.rs", "the primitives themselves"),
+            ("engine/landing_lane/landing.rs", "the landing lane"),
+            ("engine/landing_lane/integration.rs", "the landing lane"),
+            (
+                "engine/follow_main.rs",
+                "following origin/main, a fast-forward only (ADR 0589)",
+            ),
+            ("engine/change_ops/apply.rs", "the app path's Tiers 1 to 3"),
+            (
+                "engine/agent_session/apply_now.rs",
+                "the app path's live-session Apply Now and Tier-1 recovery",
+            ),
+            (
+                "engine/agent_session/run_session/completion.rs",
+                "the app path's Tier-2 and Tier-3 resolution completion",
+            ),
+        ];
+        let callers: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(_, source)| PRIMITIVES.iter().any(|p| calls(source, p)))
+            .map(|(rel, _)| rel)
+            .collect();
+        let mut allowed: Vec<String> = ALLOWED.iter().map(|(f, _)| f.to_string()).collect();
+        allowed.sort();
+        assert_eq!(callers, allowed, "a new caller moves main outside the lane");
+    }
+
+    fn production(rel: &str) -> String {
+        use crate::test_support::source_scan::{read_production_source, src_root};
+        read_production_source(&src_root().join(rel))
+    }
+
+    /// The lane holds each resolving member's apply claim until the batch lands
+    /// or fails. Apply, Discard and Set aside each take the claim before anything
+    /// else, so the lane's claim refuses each with its reason before it acts.
+    ///
+    /// No in-process harness builds a whole engine: its repo root is the source
+    /// checkout, so a test engine would land on the real `main`. So this pins the
+    /// order in each surface's source, and the claim itself below.
+    #[test]
+    fn a_landing_member_refuses_apply_discard_and_set_aside() {
+        use crate::engine::change_ops::apply_claim::{ApplyClaims, APPLY_IN_PROGRESS_MESSAGE};
+        for (file, surface) in [
+            ("engine/change_ops/apply.rs", "apply_change_inner"),
+            ("engine/change_ops/discard.rs", "discard_change"),
+            ("engine/change_ops/discard.rs", "discard_change_quietly"),
+            ("engine/change_ops/set_aside.rs", "set_aside_change"),
+        ] {
+            let body: String = fn_body(&production(file), surface)
+                .split_whitespace()
+                .collect();
+            let first_act = body
+                .find("self.")
+                .unwrap_or_else(|| panic!("{surface} does nothing"));
+            assert!(
+                body[first_act..].starts_with("self.apply_claims.try_claim(change_id)"),
+                "{surface} takes the claim before anything else"
+            );
+            assert!(
+                body.contains("APPLY_IN_PROGRESS_MESSAGE"),
+                "{surface} refuses with the claim's reason"
+            );
+        }
+        assert!(!APPLY_IN_PROGRESS_MESSAGE.is_empty());
+        let claims = std::sync::Arc::new(ApplyClaims::default());
+        let member = Uuid::new_v4();
+        let held_by_lane = claims
+            .try_claim(member)
+            .expect("the lane claims at batch start");
+        assert!(
+            claims.try_claim(member).is_none(),
+            "every other surface is refused"
+        );
+        drop(held_by_lane);
+        assert!(
+            claims.try_claim(member).is_some(),
+            "free once the batch lands or fails"
+        );
+    }
+
+    /// Every Apply surface hands a Lucidos-source change to the lane before any
+    /// app-path tier can move `main`, and only the lane announces a queued change.
+    /// So an app change, which `takes_landing_lane` refuses, keeps the old tiers
+    /// and never reads `ChangeQueued`.
+    ///
+    /// Pinned in the source for the reason the claim test gives: no test engine
+    /// can run these surfaces without landing on the real `main`.
+    #[test]
+    fn every_apply_surface_queues_lucidos_source_before_any_tier() {
+        use crate::test_support::source_scan::production_sources;
+        const MAIN_MOVERS: &[&str] = &[
+            "catchup_and_ff_to_main(",
+            "ff_main_to_branch(",
+            "ff_main_to_locked(",
+            "ff_merge_to_main(",
+        ];
+        // (file, function, the call that queues, the tier calls it must precede)
+        let routes: [(&str, &str, &str, &[&str]); 2] = [
+            (
+                "engine/change_ops/apply.rs",
+                "apply_change_inner",
+                "return self.queue_in_landing_lane(",
+                &[
+                    "begin_in_place_merge(",
+                    "hold_thread_for_worktree_reset(",
+                    "apply_change_tier3(",
+                ],
+            ),
+            (
+                "engine/agent_session/apply_now.rs",
+                "apply_now_inner",
+                "self.apply_now_through_lane(",
+                &["merge_via_cc_session("],
+            ),
+        ];
+        for (file, surface, queue, tiers) in routes {
+            let body = fn_body(&production(file), surface);
+            let route = body.find("takes_landing_lane(").unwrap_or_else(|| {
+                panic!("{surface} never asks whether the lane takes the change")
+            });
+            let queued = body
+                .find(queue)
+                .unwrap_or_else(|| panic!("{surface} never queues"));
+            assert!(route < queued, "{surface} queues only behind the check");
+            for tier in tiers {
+                let at = body
+                    .find(tier)
+                    .unwrap_or_else(|| panic!("{surface} has no {tier}"));
+                assert!(queued < at, "{surface} reaches {tier} before the lane");
+            }
+            for mover in MAIN_MOVERS {
+                assert!(
+                    !body[..route].contains(mover),
+                    "{surface} moves main with {mover} before the lane check"
+                );
+            }
+        }
+
+        // Apply Now with no live session, and Apply All, go through `apply_change`.
+        assert!(fn_body(
+            &production("engine/agent_session/apply_now.rs"),
+            "apply_pending_now"
+        )
+        .contains(".apply_change("));
+        assert!(production("engine/apply_all_driver.rs").contains(".apply_change("));
+
+        let files = |matches: &dyn Fn(&str) -> bool| -> Vec<String> {
+            production_sources()
+                .into_iter()
+                .filter(|(_, source)| matches(source))
+                .map(|(rel, _)| rel)
+                .collect()
+        };
+        let builds_change_queued = |source: &str| {
+            source.lines().any(|line| {
+                let code = line.split("//").next().unwrap_or("").trim_end();
+                code.ends_with("ThreadEvent::ChangeQueued {")
+            })
+        };
+        assert_eq!(
+            files(&builds_change_queued),
+            vec!["engine/landing_lane/driver.rs".to_string()],
+            "only the lane announces a queued change"
+        );
+        assert_eq!(
+            files(&|source| calls(source, "queue_in_landing_lane(")),
+            vec![
+                "engine/agent_session/apply_now.rs".to_string(),
+                "engine/change_ops/apply.rs".to_string()
+            ],
+            "only the two routes above reach the lane"
+        );
+    }
+
+    /// Every arrival tries `main` in a clean pass, whatever batch resolves. Only
+    /// the pass sets a change aside: nothing queues one before it (ADR 0480).
+    #[test]
+    fn every_arrival_gets_a_clean_pass() {
+        let arrive = fn_body(&production("engine/landing_lane/driver.rs"), "arrive");
+        assert!(
+            arrive.contains("self.pass_answer("),
+            "the arrival runs a pass"
+        );
+        assert!(
+            !arrive.contains("self.lane.wait("),
+            "no arrival waits before its pass"
+        );
+    }
+
+    /// Apply All opens its press in the lane before the first member applies,
+    /// and submits it wherever the press can start nothing more: an advance that
+    /// leaves it submitted, and Cancel. A press left open would hold every
+    /// conflict back for good (ADR 0480).
+    #[test]
+    fn apply_all_opens_its_press_first_and_always_submits_it() {
+        let driver = production("engine/apply_all_driver.rs");
+        let seed = fn_body(&driver, "start_apply_all_batch");
+        assert!(seed.contains("self.open_lane_press(batch_id)"));
+        let run = fn_body(&driver, "run_apply_all");
+        let seeded = run.find(".start_apply_all_batch(").expect("seeds");
+        let first = run.find(".apply_batch_member(").expect("applies");
+        assert!(seeded < first, "the press opens before its first member");
+        let filtered = run
+            .find(".drop_changes_already_applying(")
+            .expect("filters out what the lane holds");
+        assert!(filtered < seeded, "the filter runs before the batch seeds");
+
+        let advance = fn_body(&driver, "advance_apply_all_batch");
+        let submitted = advance
+            .find("batch.is_submitted()")
+            .expect("advance asks whether the press is in");
+        let told = advance
+            .find("self.submit_lane_press(batch_id)")
+            .expect("advance tells the lane");
+        assert!(submitted < told);
+
+        let cancel = fn_body(&driver, "cancel_apply_all_batches");
+        let left = cancel.find(".cancel_lane_members(").expect("cancel");
+        let told = cancel
+            .find("self.submit_lane_press(")
+            .expect("cancel submits the press");
+        assert!(
+            left < told,
+            "its members leave the lane before the queue passes"
+        );
+    }
+
+    /// A restart never hands the lane's member back to `apply_change`: recovery
+    /// asks the lane before it drives anything, and a laned member only waits.
+    /// Applying it would take the claim the restored lane needs, and fail the
+    /// lane batch with "being applied elsewhere".
+    #[test]
+    fn recovery_leaves_a_laned_member_to_the_lane() {
+        let driver = production("engine/apply_all_driver.rs");
+        let recover = fn_body(&driver, "recover_apply_all_batches");
+        let asked = recover.find("lane_held_changes(").expect("asks the lane");
+        let restored = recover
+            .find("progress.restore_laned(")
+            .expect("restores a laned member beside the queue");
+        let owner = recover.find("self.recovered_owner(").expect("owners");
+        let driven = recover.find("self.spawn_batch_member(").expect("drives");
+        assert!(asked < restored && restored < owner && owner < driven);
+    }
+
+    /// A change the lane queues tells its Apply All press, whoever handed it
+    /// over. The auto-apply after hardening is such a caller. Without it the press
+    /// would wait for the member to land, and the lane would wait for the press
+    /// (ADR 0480).
+    #[test]
+    fn a_queued_answer_tells_apply_all_whoever_queued_the_change() {
+        let submit = fn_body(
+            &production("engine/landing_lane/driver.rs"),
+            "submit_to_landing_lane",
+        );
+        let queued = submit
+            .find("ApplyStatus::Queued")
+            .expect("the hand-off reads a Queued answer");
+        let laned = submit
+            .find("ApplyAllDriveMsg::Laned")
+            .expect("the hand-off tells Apply All");
+        assert!(queued < laned, "it tells Apply All only of a Queued answer");
+
+        let member = fn_body(
+            &production("engine/apply_all_driver.rs"),
+            "apply_batch_member",
+        );
+        assert!(
+            !member.contains("ApplyAllDriveMsg::Laned"),
+            "the hand-off reports it, once"
+        );
+    }
+
+    /// The lane branch prefix has one definition, in `git_ops`. The lane reads
+    /// it rather than spelling the prefix again.
+    #[test]
+    fn the_lane_branch_prefix_is_written_once() {
+        use crate::test_support::source_scan::production_sources;
+        let respelled: Vec<String> = production_sources()
+            .into_iter()
+            .filter(|(rel, source)| {
+                rel != "engine/git_ops/branch_name.rs"
+                    && (source.contains("\"lane/") || source.contains("refs/heads/lane/"))
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(respelled.is_empty(), "{respelled:?}");
+    }
+
+    /// A failed batch's member leaves with `ChangeUnqueued` whatever its row read
+    /// gives: a failed read once skipped it, and it read as queued for good. Only
+    /// the Apply All answer and the settle wait on a pending row. The restart
+    /// repairs a member a crash left queued the same way.
+    ///
+    /// Pinned in the source: no test engine can run the driver.
+    #[test]
+    fn a_failed_batch_unqueues_every_member_before_reading_its_status() {
+        let driver = production("engine/landing_lane/driver.rs");
+        let body = fn_body(&driver, "unqueue_failed_member");
+        let unqueued = body
+            .find("self.emit_unqueued(")
+            .expect("every member leaves with ChangeUnqueued");
+        let gate = body.find("is_pending").expect("a pending gate");
+        assert!(unqueued < gate, "the unqueue comes before the pending gate");
+        for later in ["notify_apply_all(", "spawn_settle_source("] {
+            let at = body.find(later).unwrap_or_else(|| panic!("no {later}"));
+            assert!(gate < at, "{later} waits on a pending row");
+        }
+        assert!(!body.contains(".ok()"), "a failed read skips no member");
+        for caller in ["fail_batch", "restore"] {
+            assert!(
+                fn_body(&driver, caller).contains("self.unqueue_failed_member("),
+                "{caller} unqueues through it"
+            );
+        }
+    }
+
+    /// A pass that finds a waiting member's claim held keeps it queued. The
+    /// holder may be refused before it reaches the lane. So the lane waits on
+    /// that claim's release, not on a message from the holder.
+    #[test]
+    fn a_waiting_member_held_elsewhere_is_tried_again_when_its_claim_goes() {
+        let driver = production("engine/landing_lane/driver.rs");
+        let claim_members = fn_body(&driver, "claim_members");
+        assert!(claim_members.contains(".try_claim_for_lane(member.change_id)"));
+        assert!(!claim_members.contains(".try_claim(member.change_id)"));
+        assert!(fn_body(&driver, "start_landing_lane_driver").contains(".on_lane_wait_release("));
+        assert!(fn_body(&driver, "handle").contains("LaneMsg::ClaimReleased"));
+        assert!(
+            fn_body(&driver, "handle").contains("LaneMsg::OriginAnswered => self.retry_origin()"),
+            "the follow task's answer from origin retries a landing that waited for it"
+        );
+        let arm = fn_body(&driver, "arm_hold_cap");
+        assert_eq!(
+            driver.matches("tokio::time::").count(),
+            arm.matches("tokio::time::").count(),
+            "the lane waits on messages, never on a clock. Only the arrival hold's cap \
+             counts time (ADR 0694)"
+        );
+    }
+
+    /// A turn cut off at boot past a queued change keeps that change, and its
+    /// newer work is still re-decided. That re-decide withholds the work as
+    /// awaiting landing, so the thread shows why it waits.
+    #[test]
+    fn recovery_redecides_the_work_past_a_queued_change() {
+        let recovery = production("engine/agent_recovery/recovery.rs");
+        let body = fn_body(&recovery, "recover_orphaned_worktrees");
+        let gate = body
+            .find("if !queued {")
+            .expect("the withdraw waits on the queue");
+        let withdraw = body.find("emit_change_withdrawn(").expect("a withdraw");
+        let redecide = body.find("redecide_branch_work(").expect("a re-decide");
+        assert!(gate < withdraw, "only the withdraw is gated on the queue");
+        let gated = &body[gate..redecide];
+        assert_eq!(
+            gated.matches('{').count(),
+            gated.matches('}').count(),
+            "the re-decide sits outside the queue gate"
+        );
+    }
 }

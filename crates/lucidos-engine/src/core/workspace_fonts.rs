@@ -22,7 +22,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use super::fonts::{weight_reaches_bold, FontGroup, FontKind};
+use super::fonts::{weight_reaches_bold, FontGroup, FontKind, NATIVE_MONO_STACK};
 
 /// The `data/` subdirectory, and plugin content folder, that holds fonts.
 pub const FONTS_DIR: &str = "fonts";
@@ -61,7 +61,7 @@ pub fn fallback(group: FontGroup) -> &'static str {
     match group {
         FontGroup::Sans => "system-ui, -apple-system, 'Segoe UI', sans-serif",
         FontGroup::Serif => "Georgia, 'Times New Roman', serif",
-        FontGroup::Mono => "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        FontGroup::Mono => NATIVE_MONO_STACK,
     }
 }
 

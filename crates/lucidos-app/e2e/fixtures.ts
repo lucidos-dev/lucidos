@@ -2,6 +2,7 @@ import { test as base, request as pwRequest } from '@playwright/test';
 import type { APIRequestContext, BrowserContext, Page as PlaywrightPage } from '@playwright/test';
 import { coverageDir, recordCoverage, type CoverageRecorder } from './coverage';
 import { HARNESS_DEVICE_ID, registerHarnessDevice } from './harnessDevice';
+import { stampPageRequests, withDeviceStamp } from './harnessStamp';
 import { TAB_WINDOW_ID_KEY } from '../src/utils/windowIdKey';
 
 export { expect } from '@playwright/test';
@@ -26,7 +27,27 @@ async function newIdentifiedContext(options?: NewContextOptions): Promise<APIReq
     },
   });
   await registerHarnessDevice(ctx);
-  return ctx;
+  return stampedRequests(ctx, HARNESS_DEVICE_ID);
+}
+
+const REQUEST_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'head', 'fetch']);
+
+/** `ctx`, signing a fresh stamp on each request, as the gateway would. A
+ *  context's headers are fixed when it is built, and a stamp expires, so each
+ *  call carries its own. A caller's own device id gets that device's stamp. */
+function stampedRequests(ctx: APIRequestContext, deviceId: string): APIRequestContext {
+  return new Proxy(ctx, {
+    get(target, prop) {
+      const value: unknown = Reflect.get(target, prop, target);
+      if (typeof value !== 'function') return value;
+      if (typeof prop !== 'string' || !REQUEST_METHODS.has(prop)) return value.bind(target);
+      return (url: unknown, options?: { headers?: Record<string, string> }) =>
+        value.call(target, url, {
+          ...options,
+          headers: withDeviceStamp({ 'x-lucidos-device-id': deviceId, ...options?.headers }),
+        });
+    },
+  });
 }
 
 /** `request.newContext`, pre-identified, under the name specs already import.
@@ -94,6 +115,7 @@ export const test = base.extend({
 
     if (!isMobileWebKit) {
       const ready = await createContext();
+      await stampPageRequests(ready.context);
       const dir = coverageDir();
       const recorder = dir && browserName === 'chromium' ? recordCoverage(ready.context, dir) : undefined;
       if (recorder) coverageRecorders.set(ready.context, recorder);
@@ -129,6 +151,7 @@ export const test = base.extend({
     }
 
     if (!ready) throw lastErr;
+    await stampPageRequests(ready.context);
 
     try {
       await use(ready.context);

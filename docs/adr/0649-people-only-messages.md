@@ -18,7 +18,7 @@ never an entity of its own, yet it had its own routes, SDK namespace and term.
 
 ## Decision
 
-1. **Each message is addressed by mentions.** A *person mention* (`@Name`)
+1. **Each message is addressed by mentions.** A *person mention* (`@Name`, excluding the sender)
    pushes that operator and makes them a watcher of the root thread. The
    *agent mention* (`@agent`) wakes the agent. One message may carry both.
 2. **The agent pause is shared thread state, held in events.** A message
@@ -30,7 +30,7 @@ never an entity of its own, yet it had its own routes, SDK namespace and term.
    the event records cause `chip`. Pausing never stops a running turn.
 3. **A people-only message is its own event, `PeopleMessagePosted`.** It is
    metadata and never starts a turn. The engine alone decides wake or not,
-   from the mentions and the pause state. Non-human input (trigger fires,
+   from the mentions and the pause state. Only device-origin human sends take that route. Other input (trigger fires,
    child reports, event-wait deliveries, API callers, question answers)
    always wakes the agent.
 4. **The agent sees everything, with names.** People-only messages are
@@ -125,3 +125,42 @@ one known caller: the Factory app template, which a team copies again.
   thread.
 - **Renaming the stored event types.** Lost: events are immutable, and rows
   already carry the old names.
+
+## Delivery recovery
+
+Mention intent is persisted before the send acknowledges and is released only
+when its message event is recorded. This includes messages that wake the agent.
+A worker drains recorded intent at startup and during normal operation, waiting
+for the operator snapshot. A database lock serializes workers. Auto-watch is
+idempotent, and the resolved device audiences and driver actions are frozen
+before watch events and notifications are emitted. Thread deletion removes pending intent.
+
+Recovery retains person scoping after membership shrinks, including before the
+first delivery plan is frozen (the exception in ADR 0623, decision 6).
+
+Each message/person pair has one stable notification identity. The frozen plan
+retains the recipient key and devices. One person handling a toast cannot
+suppress another person's OS push.
+
+Notification creation
+and awaited push completion have separate durable receipts: recovery skips
+completed dispatches, rather than treating NotificationCreated as proof of a
+push. Web subscriptions complete independently.
+
+Native completion follows the
+client acknowledgement of OS acceptance or in-app handling. Native delivery
+requires an explicit positive acceptance result from updated clients. Older
+clients returning no result retain their existing successful-completion semantics.
+They can still lose a banner rejected by the OS; preserving that compatibility
+was an explicit product decision.
+
+The first presence
+decision is retained, so retries do not repeat in-app checks.
+This closes the acknowledgement-to-task and notification-to-task gaps.
+
+External push transport is not an exactly-once protocol. A crash after external
+acceptance but before the local completion receipt can retry the same identity.
+Existing notification tags replace the same visible notification rather than
+stacking it; a transport retry can still alert again. Recording completion before
+transport would silently lose the push instead. No startup sweep can remove this
+external ambiguity without an end-to-end receiver receipt.

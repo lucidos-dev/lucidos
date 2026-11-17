@@ -10,6 +10,7 @@
 # two defaults that make sense for *using* Lucidos rather than developing it:
 #
 #   • RELEASE engine build by default (slower to build, faster at runtime).
+#     It compiles with the local-release cargo profile (ADR 0669).
 #     web-dev.sh defaults to a debug build for fast iteration; set
 #     LUCIDOS_DEBUG_BUILD=1 to fall back to that quicker (debug) build here too.
 #   • ONE-SHOT frontend build (a single `vite build`) instead of the developer
@@ -31,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # scripts/lib/workspace.sh, which branches to build_frontend_oneshot when set.
 export LUCIDOS_FRONTEND_ONESHOT=1
 
-# Build the engine in release mode by default; LUCIDOS_DEBUG_BUILD=1 opts back
+# Build an optimised engine by default; LUCIDOS_DEBUG_BUILD=1 opts back
 # into a faster debug build. -b is always passed so a fresh install builds the
 # engine (and a later `git pull` rebuild picks up new source; cargo is
 # incremental, so an unchanged tree rebuilds cheaply).

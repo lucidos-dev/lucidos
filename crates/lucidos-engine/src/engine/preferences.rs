@@ -112,7 +112,7 @@ impl LucidosEngine {
                     )
                     .await
                     {
-                        log!("[Preferences] Failed to set devices.push_enabled: {}", e);
+                        log_legacy!("[Preferences] Failed to set devices.push_enabled: {}", e);
                     }
                 }
             }

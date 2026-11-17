@@ -9,7 +9,7 @@ vi.mock('../../../utils/clientLog', () => ({ postClientLog }));
 const { isImageRetryPending } = vi.hoisted(() => ({ isImageRetryPending: vi.fn(() => false) }));
 vi.mock('../../../utils/markdownImageRetry', () => ({ isImageRetryPending }));
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
+import { awayFromBottom, showScrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, honourAnchoredMutation, markAnchorScroll, clearPendingEventScroll, followingLiveEdge, followSurvivesScroll, makeScrollObservers, scrollToBottom, scrollToTop, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement, setFollowLiveEdge, setTranscriptLive, readerGestureForTest, stopFollowingBottom, resumeFollowingBottom, EVENT_RESOLVE_DEADLINE_MS, EVENT_RESOLVE_MAX_WAIT_MS } from '../scrollState';
 import { navFocusElement, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** Is a marker the CURRENT landing? Asked the way `scrollState` asks it. */
@@ -651,11 +651,25 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+    onResize();                       // a stable round releases the hold
 
     at.top = 4200;
     onResize();
 
     expect(container.scrollTop).toBe(3000);
+  });
+
+  it.each([4100, 10_000])('corrects a landed question on its first growth round at %d ms', delay => {
+    const { el, at } = makeMovableEl(3000);
+    restore = installFakeDom({ dataEventMatches: [el] });
+    const { onResize } = makeScrollObservers(container);
+
+    scrollToEventAndPulse('e-7');
+    vi.advanceTimersByTime(1500 + delay);
+    at.top = 4200;
+    onResize();
+
+    expect(container.scrollTop).toBe(4200);
   });
 
   it('lets go of a landed question at the cap, even while growth keeps arriving', () => {
@@ -708,6 +722,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
     expect(container.scrollTop).toBe(4200);
 
     vi.advanceTimersByTime(EVENT_RESOLVE_DEADLINE_MS);   // quiet again, and loaded
+    onResize();                       // settle before later growth
     at.top = 4600;
     onResize();
 
@@ -759,6 +774,7 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     scrollToEventAndPulse('e-7');
     vi.advanceTimersByTime(1500 + EVENT_RESOLVE_DEADLINE_MS);
+    onResize();                       // a stable round releases the hold
 
     at.top = 4200;
     onResize();
@@ -993,6 +1009,23 @@ describe('a deep-link landing retires a standing follow only when it lands OFF t
 
     expect(followingLiveEdge.value).toBe(false);
     expect(container.scrollTop).toBe(3000);
+  });
+
+  it('offers the down chevron while a deep link pauses an in-place ride', () => {
+    restore = installFakeDom({ dataEventMatches: [] });
+    const { onScroll } = makeScrollObservers(container);
+    container.scrollTop = 3000;
+    scrollToEventAndPulse('e-pending');
+    resumeFollowingBottom(container, 'in-place');
+    onScroll();
+
+    expect(hasPendingEventScroll()).toBe(true);
+    expect(followingLiveEdge.value).toBe(true);
+    expect(awayFromBottom.value).toBe(true);
+    expect(showScrollToBottom.value).toBe(true);
+
+    clearPendingEventScroll();
+    expect(showScrollToBottom.value).toBe(false);
   });
 
   it('leaves a ride alone when the link never lands', () => {

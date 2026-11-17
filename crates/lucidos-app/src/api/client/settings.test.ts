@@ -8,8 +8,26 @@ import {
   verifyBackupKey,
   getCredentialValue,
   handOverDevice,
+  listResolvedFormRequests,
 } from './settings';
 import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
+
+describe('listResolvedFormRequests', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('bounds lookups and combines only proven resolutions', async () => {
+    const fetch = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify(['resolved-first'])))
+      .mockResolvedValueOnce(new Response(JSON.stringify(['resolved-last'])));
+    vi.stubGlobal('fetch', fetch);
+    expect(await listResolvedFormRequests([])).toEqual([]);
+    expect(fetch).not.toHaveBeenCalled();
+    const ids = Array.from({ length: 101 }, (_, index) => `request-${index}`);
+    expect(await listResolvedFormRequests(ids)).toEqual(['resolved-first', 'resolved-last']);
+    expect(fetch.mock.calls.map(([url]) => new URL(url, 'https://example.com').searchParams.get('request_ids')?.split(',')))
+      .toEqual([ids.slice(0, 100), ids.slice(100)]);
+  });
+});
 
 /**
  * The hand-over's subject is a change of identity. So it must claim the id it

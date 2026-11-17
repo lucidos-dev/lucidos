@@ -104,7 +104,7 @@ pub(crate) async fn harden_marker(
     {
         Ok(v) => v,
         Err(e) => {
-            log!("[Harden] Failed to read hardened_branches: {}", e);
+            log_legacy!("[Harden] Failed to read hardened_branches: {}", e);
             return HardenMarker::Missing;
         }
     };
@@ -116,9 +116,9 @@ pub(crate) async fn harden_marker(
     let tier = HardenTier::parse(&tier).unwrap_or(HardenTier::Fast);
     let fresh = branch_head_sha(repo_root, branch_name).await.as_deref() == Some(head_sha.as_str());
     if fresh {
-        log!("[Harden] Harden marker is fresh (HEAD SHA matches)");
+        log_legacy!("[Harden] Harden marker is fresh (HEAD SHA matches)");
     } else {
-        log!(
+        log_legacy!(
             "[Harden] Harden marker is STALE (stored={}…)",
             &head_sha[..head_sha.floor_char_boundary(12)]
         );
@@ -180,7 +180,7 @@ pub(crate) async fn consume_harden_marker(
             .execute(pool)
             .await
     {
-        log!(
+        log_legacy!(
             "[Harden] Failed to delete hardened_branches row for {}: {}",
             branch_name,
             e

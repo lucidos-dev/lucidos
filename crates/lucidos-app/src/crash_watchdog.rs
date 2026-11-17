@@ -10,8 +10,14 @@
 //! promises to keep. So the watchdog asks `window_screen` whether the window is
 //! on screen, and only acts when it is. ADR 0180 has the reasoning.
 //!
+//! A covered window is on screen, yet WebKit suspends its page. The page reports
+//! `document.visibilityState` in its beat, and a hidden page in a window that is
+//! not key counts as parked too. ADR 0660 has the incident.
+//!
 //! A reload that brings back no heartbeat fixed nothing, so the interval backs
-//! off and says so. A silent reload loop hides the real fault for months.
+//! off and says so. A silent reload loop hides the real fault for months. The
+//! test is a beat from a NEW document: a resumed process lets the old document
+//! beat once before the reload commits, and that beat proves nothing.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -29,10 +35,9 @@ pub(crate) struct Heartbeats {
     beats: Mutex<HashMap<String, Beat>>,
 }
 
-/// One page's liveness.
-struct Beat {
-    /// When the most recent heartbeat arrived.
-    at: Instant,
+/// What the watchdog knows about the beats it has received.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Pulse {
     /// Monotonic count of heartbeats received.
     ///
     /// The watchdog resets the timestamp itself on every reload. So the
@@ -40,30 +45,74 @@ struct Beat {
     /// one that has never beaten at all. The count can, and that distinction is
     /// what stops a pointless reload from repeating forever.
     count: u64,
+    /// The document that sent the latest beat. `None` for a page too old to say.
+    page: Option<String>,
+}
+
+impl Pulse {
+    /// Did a reload that left `earlier` behind bring anything back?
+    ///
+    /// A page id is exact: the same id means the same document is still the
+    /// one beating. Without one on both sides the count is the best evidence.
+    fn is_unchanged_since(&self, earlier: &Pulse) -> bool {
+        match (&self.page, &earlier.page) {
+            (Some(now), Some(then)) => now == then,
+            _ => self.count == earlier.count,
+        }
+    }
+}
+
+/// One page's liveness.
+struct Beat {
+    /// When the most recent heartbeat arrived.
+    at: Instant,
+    pulse: Pulse,
+    /// What the page last said about its own visibility. `None` for a page too
+    /// old to say, which counts as visible.
+    visible: Option<bool>,
+}
+
+impl Beat {
+    fn new() -> Self {
+        Beat {
+            at: Instant::now(),
+            pulse: Pulse::default(),
+            visible: None,
+        }
+    }
+}
+
+/// One window's silence and what its page last said.
+struct Reading {
+    silent_for: Duration,
+    pulse: Pulse,
+    /// WebKit told the page it is hidden, so it may suspend the process.
+    page_reported_hidden: bool,
 }
 
 impl Heartbeats {
-    /// A page said it is alive.
-    fn record(&self, label: &str) {
+    /// A page said it is alive, and optionally which document it is and whether
+    /// WebKit shows it.
+    fn record(&self, label: &str, page: Option<String>, visible: Option<bool>) {
         let mut beats = self.beats.lock().unwrap();
-        let beat = beats.entry(label.to_string()).or_insert(Beat {
-            at: Instant::now(),
-            count: 0,
-        });
+        let beat = beats.entry(label.to_string()).or_insert_with(Beat::new);
         beat.at = Instant::now();
-        beat.count += 1;
+        beat.pulse.count += 1;
+        beat.pulse.page = page;
+        beat.visible = visible;
     }
 
-    /// How long this page has been silent, and how many times it has beaten.
+    /// How long this page has been silent, and what it last reported.
     /// Starts the clock for a page nobody has heard from yet, so the warm-up is
     /// measured from first sight rather than from process start.
-    fn read(&self, label: &str) -> (Duration, u64) {
+    fn read(&self, label: &str) -> Reading {
         let mut beats = self.beats.lock().unwrap();
-        let beat = beats.entry(label.to_string()).or_insert(Beat {
-            at: Instant::now(),
-            count: 0,
-        });
-        (beat.at.elapsed(), beat.count)
+        let beat = beats.entry(label.to_string()).or_insert_with(Beat::new);
+        Reading {
+            silent_for: beat.at.elapsed(),
+            pulse: beat.pulse.clone(),
+            page_reported_hidden: beat.visible == Some(false),
+        }
     }
 
     /// Restart this page's silence clock, after a reload or a park.
@@ -143,9 +192,9 @@ struct ReloadDecision {
 /// unit-testable without a webview or a 32-minute wall clock.
 #[derive(Debug, Default)]
 struct ReloadWatchdog {
-    /// Heartbeat count observed at the last reload; `None` before the first one,
-    /// so the first reload is never judged futile.
-    heartbeats_at_last_reload: Option<u64>,
+    /// What the beats looked like at the last reload; `None` before the first
+    /// one, so the first reload is never judged futile.
+    pulse_at_last_reload: Option<Pulse>,
     /// Consecutive reloads after which the page still never beat.
     futile_reloads: u32,
 }
@@ -153,7 +202,7 @@ struct ReloadWatchdog {
 impl ReloadWatchdog {
     /// One watchdog tick for one window. The caller must restart that window's
     /// silence clock for anything but [`Verdict::Watching`].
-    fn on_tick(&mut self, on_screen: bool, silent_for: Duration, heartbeats: u64) -> Verdict {
+    fn on_tick(&mut self, on_screen: bool, silent_for: Duration, pulse: Pulse) -> Verdict {
         if !on_screen {
             // A park is a fresh start. Carrying the backoff across one would
             // let a night in the tray decide how fast a real crash is caught.
@@ -163,13 +212,16 @@ impl ReloadWatchdog {
         if silent_for <= reload_threshold(self.futile_reloads) {
             return Verdict::Watching;
         }
-        let futile = self.heartbeats_at_last_reload == Some(heartbeats);
+        let futile = self
+            .pulse_at_last_reload
+            .as_ref()
+            .is_some_and(|earlier| pulse.is_unchanged_since(earlier));
         self.futile_reloads = if futile {
             self.futile_reloads.saturating_add(1)
         } else {
             0
         };
-        self.heartbeats_at_last_reload = Some(heartbeats);
+        self.pulse_at_last_reload = Some(pulse);
         Verdict::Reload(ReloadDecision {
             futile,
             next_threshold: reload_threshold(self.futile_reloads),
@@ -182,9 +234,18 @@ impl ReloadWatchdog {
 /// It takes the calling WEBVIEW so the beat is attributed to one window. An
 /// `AppHandle` cannot say which page beat, and that is how one healthy window
 /// hid every other window's silence.
+///
+/// `page` and `visible` are optional so an older page, such as a remote gateway
+/// on an earlier release, still beats with no arguments.
 #[tauri::command]
-pub(crate) fn heartbeat(app: tauri::AppHandle, webview: tauri::Webview) {
-    app.state::<Heartbeats>().record(webview.label());
+pub(crate) fn heartbeat(
+    app: tauri::AppHandle,
+    webview: tauri::Webview,
+    page: Option<String>,
+    visible: Option<bool>,
+) {
+    app.state::<Heartbeats>()
+        .record(webview.label(), page, visible);
 }
 
 /// Start watching every app window. Its own thread, running for the life of the
@@ -215,15 +276,24 @@ fn tick(app: &tauri::AppHandle, watchdogs: &mut HashMap<String, ReloadWatchdog>)
             continue;
         }
         live.push(label.clone());
-        let miniaturized = webview.window().is_minimized().unwrap_or(false);
+        let window = webview.window();
+        let miniaturized = window.is_minimized().unwrap_or(false);
+        // An unreadable focus counts as key, so the window stays watched.
+        let key_window = window.is_focused().unwrap_or(true);
+        let Reading {
+            silent_for,
+            pulse,
+            page_reported_hidden,
+        } = state.read(&label);
         let on_screen = crate::window_screen::page_should_be_running(
             crate::window_screen::shown_by_client(&label),
             crate::window_screen::app_is_hidden(),
             miniaturized,
+            page_reported_hidden,
+            key_window,
         );
-        let (silent_for, heartbeats) = state.read(&label);
         let watchdog = watchdogs.entry(label.clone()).or_default();
-        match watchdog.on_tick(on_screen, silent_for, heartbeats) {
+        match watchdog.on_tick(on_screen, silent_for, pulse) {
             Verdict::Watching => {}
             Verdict::Parked => state.reset_clock(&label),
             Verdict::Reload(decision) => {
@@ -279,6 +349,23 @@ mod tests {
     /// test.
     const LONG_SILENCE: Duration = Duration::from_secs(60 * 60);
 
+    /// Beats from a page too old to send a document id.
+    fn beats(count: u64) -> Pulse {
+        Pulse { count, page: None }
+    }
+
+    /// Beats from a page that names its document.
+    fn doc(count: u64, page: &str) -> Pulse {
+        Pulse {
+            count,
+            page: Some(page.to_string()),
+        }
+    }
+
+    fn past_threshold(watchdog: &ReloadWatchdog) -> Duration {
+        reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1)
+    }
+
     fn reload_of(verdict: Verdict) -> ReloadDecision {
         match verdict {
             Verdict::Reload(decision) => decision,
@@ -291,17 +378,17 @@ mod tests {
         let mut watchdog = ReloadWatchdog::default();
         // Below and at the threshold: no reload (15s heartbeat cadence).
         assert_eq!(
-            watchdog.on_tick(true, Duration::from_secs(59), 100),
+            watchdog.on_tick(true, Duration::from_secs(59), beats(100)),
             Verdict::Watching
         );
         assert_eq!(
-            watchdog.on_tick(true, HEARTBEAT_TIMEOUT, 100),
+            watchdog.on_tick(true, HEARTBEAT_TIMEOUT, beats(100)),
             Verdict::Watching
         );
         // Strictly past the timeout: reload. The first one is never futile,
         // since there is no earlier reload for it to have failed to improve on.
         assert_eq!(
-            watchdog.on_tick(true, Duration::from_secs(61), 100),
+            watchdog.on_tick(true, Duration::from_secs(61), beats(100)),
             Verdict::Reload(ReloadDecision {
                 futile: false,
                 next_threshold: HEARTBEAT_TIMEOUT,
@@ -317,7 +404,10 @@ mod tests {
     fn a_parked_window_is_never_reloaded_however_long_it_is_silent() {
         let mut watchdog = ReloadWatchdog::default();
         for _ in 0..20 {
-            assert_eq!(watchdog.on_tick(false, LONG_SILENCE, 0), Verdict::Parked);
+            assert_eq!(
+                watchdog.on_tick(false, LONG_SILENCE, beats(0)),
+                Verdict::Parked
+            );
         }
     }
 
@@ -329,12 +419,15 @@ mod tests {
         let mut watchdog = ReloadWatchdog::default();
         for _ in 0..4 {
             let silent = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
-            watchdog.on_tick(true, silent, 0);
+            watchdog.on_tick(true, silent, beats(0));
         }
         assert!(watchdog.futile_reloads > 0, "expected to be backed off");
-        assert_eq!(watchdog.on_tick(false, LONG_SILENCE, 0), Verdict::Parked);
+        assert_eq!(
+            watchdog.on_tick(false, LONG_SILENCE, beats(0)),
+            Verdict::Parked
+        );
         assert_eq!(watchdog.futile_reloads, 0);
-        let decision = reload_of(watchdog.on_tick(true, Duration::from_secs(61), 0));
+        let decision = reload_of(watchdog.on_tick(true, Duration::from_secs(61), beats(0)));
         assert!(!decision.futile);
         assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
     }
@@ -349,12 +442,12 @@ mod tests {
         for _ in 0..3 {
             // The healthy one keeps beating, so it never crosses the threshold.
             assert_eq!(
-                healthy.on_tick(true, Duration::from_secs(5), 42),
+                healthy.on_tick(true, Duration::from_secs(5), beats(42)),
                 Verdict::Watching
             );
             let silent = reload_threshold(broken.futile_reloads) + Duration::from_secs(1);
             assert!(matches!(
-                broken.on_tick(true, silent, 0),
+                broken.on_tick(true, silent, beats(0)),
                 Verdict::Reload(_)
             ));
         }
@@ -368,11 +461,11 @@ mod tests {
         // Genuine content-process crash: reload, page comes back and beats, and
         // some time later it crashes again. Each recovery keeps the fast 60s
         // interval, because reloading is demonstrably working.
-        for beats in [10_u64, 25, 40] {
+        for count in [10_u64, 25, 40] {
             let decision = reload_of(watchdog.on_tick(
                 true,
                 HEARTBEAT_TIMEOUT + Duration::from_secs(1),
-                beats,
+                beats(count),
             ));
             assert!(!decision.futile);
             assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
@@ -389,7 +482,7 @@ mod tests {
         for _ in 0..8 {
             // Always just past whatever the current threshold is.
             let silent_for = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
-            thresholds.push(reload_of(watchdog.on_tick(true, silent_for, 0)).next_threshold);
+            thresholds.push(reload_of(watchdog.on_tick(true, silent_for, beats(0))).next_threshold);
         }
         // First reload is not yet futile; every one after it is, and the interval
         // doubles until it hits the ceiling and stays there.
@@ -416,12 +509,12 @@ mod tests {
         let mut watchdog = ReloadWatchdog::default();
         for _ in 0..4 {
             let silent_for = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
-            watchdog.on_tick(true, silent_for, 0);
+            watchdog.on_tick(true, silent_for, beats(0));
         }
         assert!(watchdog.futile_reloads > 0, "expected to be backed off");
         // One heartbeat arrives, then silence again.
         let silent_for = reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1);
-        let decision = reload_of(watchdog.on_tick(true, silent_for, 1));
+        let decision = reload_of(watchdog.on_tick(true, silent_for, beats(1)));
         assert!(!decision.futile);
         assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
         assert_eq!(watchdog.futile_reloads, 0);
@@ -444,24 +537,89 @@ mod tests {
     #[test]
     fn one_windows_heartbeat_does_not_speak_for_another() {
         let beats = Heartbeats::default();
-        beats.record("main");
-        beats.record("main");
-        let (main_silence, main_count) = beats.read("main");
-        let (other_silence, other_count) = beats.read("window-0");
-        assert_eq!(main_count, 2);
-        assert_eq!(other_count, 0, "a window that never beat must read zero");
-        assert!(main_silence < Duration::from_secs(1));
+        beats.record("main", None, None);
+        beats.record("main", None, None);
+        let main = beats.read("main");
+        let other = beats.read("window-0");
+        assert_eq!(main.pulse.count, 2);
+        assert_eq!(
+            other.pulse.count, 0,
+            "a window that never beat must read zero"
+        );
+        assert!(main.silent_for < Duration::from_secs(1));
         // The silent window's clock starts at FIRST SIGHT, so its warm-up is not
         // measured from process start.
-        assert!(other_silence < Duration::from_secs(1));
+        assert!(other.silent_for < Duration::from_secs(1));
     }
 
     #[test]
     fn a_window_that_is_gone_takes_its_heartbeat_with_it() {
         let beats = Heartbeats::default();
-        beats.record("window-7");
+        beats.record("window-7", None, None);
         assert_eq!(beats.labels(), vec!["window-7".to_string()]);
         beats.forget("window-7");
         assert!(beats.labels().is_empty());
+    }
+
+    /// The incident: `loadRequest` resumed the suspended process, and the OLD
+    /// document sent one overdue beat before the new one committed. The count
+    /// moved, so every reload looked like a success and the backoff never began.
+    #[test]
+    fn a_stale_beat_from_the_old_document_does_not_make_a_reload_succeed() {
+        let mut watchdog = ReloadWatchdog::default();
+        let first = reload_of(watchdog.on_tick(
+            true,
+            HEARTBEAT_TIMEOUT + Duration::from_secs(1),
+            doc(10, "old"),
+        ));
+        assert!(!first.futile);
+        // The old document beat once more. The new one never did.
+        let second = reload_of(watchdog.on_tick(true, past_threshold(&watchdog), doc(11, "old")));
+        assert!(second.futile);
+        assert_eq!(second.next_threshold, HEARTBEAT_TIMEOUT * 2);
+    }
+
+    #[test]
+    fn a_beat_from_a_new_document_resets_the_backoff() {
+        let mut watchdog = ReloadWatchdog::default();
+        for _ in 0..4 {
+            let silent = past_threshold(&watchdog);
+            watchdog.on_tick(true, silent, doc(3, "old"));
+        }
+        assert!(watchdog.futile_reloads > 0, "expected to be backed off");
+        let decision = reload_of(watchdog.on_tick(true, past_threshold(&watchdog), doc(4, "new")));
+        assert!(!decision.futile);
+        assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
+    }
+
+    /// A remote gateway on an older release sends no document id. Its futility
+    /// stays judged by the count, as before.
+    #[test]
+    fn a_page_without_an_id_falls_back_to_the_beat_count() {
+        let mut watchdog = ReloadWatchdog::default();
+        reload_of(watchdog.on_tick(true, LONG_SILENCE, beats(5)));
+        assert!(reload_of(watchdog.on_tick(true, LONG_SILENCE, beats(5))).futile);
+        assert!(!reload_of(watchdog.on_tick(true, LONG_SILENCE, beats(6))).futile);
+    }
+
+    #[test]
+    fn a_beat_records_the_document_and_what_the_page_reported() {
+        let beats = Heartbeats::default();
+        beats.record("main", Some("doc-1".into()), Some(false));
+        let hidden = beats.read("main");
+        assert_eq!(hidden.pulse.page.as_deref(), Some("doc-1"));
+        assert!(hidden.page_reported_hidden);
+        beats.record("main", Some("doc-1".into()), Some(true));
+        assert!(!beats.read("main").page_reported_hidden);
+    }
+
+    /// An old page sends neither argument, and must still be watched.
+    #[test]
+    fn a_page_that_reports_no_visibility_counts_as_visible() {
+        let beats = Heartbeats::default();
+        beats.record("main", None, None);
+        let reading = beats.read("main");
+        assert!(!reading.page_reported_hidden);
+        assert_eq!(reading.pulse.page, None);
     }
 }

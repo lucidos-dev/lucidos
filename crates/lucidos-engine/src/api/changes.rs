@@ -1,8 +1,9 @@
 use super::actor::require_user_actor;
-use super::thread_reach::{refuse_without_authority, ThreadReachVerb};
+use super::thread_reach::refuse_without_authority;
 use super::*;
 use crate::core::changes::{ChangeStatus, PendingScope};
 use crate::engine::apply_all_driver::ApplyAllOutcome;
+use crate::engine::permission::Action;
 use crate::engine::standing_apply::{DisarmScope, StandingApply, DISARMED_BY_OWNER};
 use crate::engine::LaneRemoval;
 use crate::engine::{ApplyResult, ApplyStatus};
@@ -21,7 +22,7 @@ async fn refuse_change_verb(
     state: &AppState,
     headers: &HeaderMap,
     change_id: Uuid,
-    verb: ThreadReachVerb,
+    verb: Action,
 ) -> Result<(), ApiError> {
     let row: Option<Option<Uuid>> =
         sqlx::query_scalar("SELECT thread_id FROM changes WHERE id = $1")
@@ -47,7 +48,7 @@ async fn refuse_batch_change_verb(
     state: &AppState,
     headers: &HeaderMap,
     batch: &[crate::core::changes::Change],
-    verb: ThreadReachVerb,
+    verb: Action,
 ) -> Result<(), ApiError> {
     for change in batch {
         refuse_without_authority(&state.engine.event_bus, headers, change.thread_id, verb).await?;
@@ -186,7 +187,7 @@ pub(super) async fn revert_change(
     // pending one, so it takes the same subtree-reach gate its siblings do. The
     // change keeps its `thread_id` after applying, so `refuse_change_verb` scopes
     // revert to the change's own thread exactly like discard.
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Revert).await?;
+    refuse_change_verb(&state, &headers, id, Action::Revert).await?;
     match state.engine.revert_change(id, actor).await {
         Ok(message) => {
             state.engine.broadcast_changes_updated().await;
@@ -242,7 +243,7 @@ pub(crate) enum ChangeActionRefusal {
 pub(crate) async fn change_action_refusal(
     pool: &sqlx::PgPool,
     change_id: Uuid,
-    action: crate::engine::thread_lifecycle::Action,
+    action: crate::engine::thread_lifecycle::ThreadAction,
 ) -> Result<Option<ChangeActionRefusal>, sqlx::Error> {
     let row: Option<(Option<Uuid>, ChangeStatus, i32)> =
         sqlx::query_as("SELECT thread_id, status, file_count FROM changes WHERE id = $1")
@@ -255,7 +256,7 @@ pub(crate) async fn change_action_refusal(
     // reason, and only for Apply: Discard is how the user resolves one. See
     // `core::changes::is_empty_pending_change`.
     if let Some((_, status, file_count)) = row.as_ref() {
-        let apply = action == crate::engine::thread_lifecycle::Action::Apply;
+        let apply = action == crate::engine::thread_lifecycle::ThreadAction::Apply;
         if *status == ChangeStatus::Pending && *file_count == 0 && apply {
             return Ok(Some(ChangeActionRefusal::NoFilesLeft));
         }
@@ -270,7 +271,7 @@ pub(crate) async fn change_action_refusal(
     // session may be working on. So it takes the thread-state half of the
     // gate. The selector offers no Discard without a pending change.
     let set_aside_discard = status == ChangeStatus::SetAside
-        && action == crate::engine::thread_lifecycle::Action::Discard;
+        && action == crate::engine::thread_lifecycle::ThreadAction::Discard;
     if status != ChangeStatus::Pending && !set_aside_discard {
         return Ok(None);
     }
@@ -316,7 +317,7 @@ pub(crate) async fn change_action_refusal(
 async fn guard_change_action(
     state: &AppState,
     change_id: Uuid,
-    action: crate::engine::thread_lifecycle::Action,
+    action: crate::engine::thread_lifecycle::ThreadAction,
     reject_msg: &str,
 ) -> Result<(), ApiError> {
     let refusal = change_action_refusal(&state.pool, change_id, action)
@@ -349,11 +350,11 @@ pub(super) async fn apply_change(
     headers: HeaderMap,
 ) -> Result<Json<ApplyResult>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Apply).await?;
+    refuse_change_verb(&state, &headers, id, Action::Apply).await?;
     guard_change_action(
         &state,
         id,
-        crate::engine::thread_lifecycle::Action::Apply,
+        crate::engine::thread_lifecycle::ThreadAction::Apply,
         "This change can't be applied in the thread's current state",
     )
     .await?;
@@ -376,11 +377,11 @@ pub(super) async fn discard_change(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Discard).await?;
+    refuse_change_verb(&state, &headers, id, Action::Discard).await?;
     guard_change_action(
         &state,
         id,
-        crate::engine::thread_lifecycle::Action::Discard,
+        crate::engine::thread_lifecycle::ThreadAction::Discard,
         "This change can't be discarded in the thread's current state",
     )
     .await?;
@@ -400,11 +401,11 @@ pub(super) async fn set_aside_change(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::SetAside).await?;
+    refuse_change_verb(&state, &headers, id, Action::SetAside).await?;
     guard_change_action(
         &state,
         id,
-        crate::engine::thread_lifecycle::Action::SetAside,
+        crate::engine::thread_lifecycle::ThreadAction::SetAside,
         "This change can't be set aside in the thread's current state",
     )
     .await?;
@@ -421,7 +422,7 @@ pub(super) async fn bring_back_change(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::BringBack).await?;
+    refuse_change_verb(&state, &headers, id, Action::BringBack).await?;
     match state.engine.bring_back_change(id, actor).await {
         Ok(()) => Ok(Json(
             serde_json::json!({ "message": "Change brought back." }),
@@ -457,7 +458,7 @@ pub(super) async fn arm_standing_apply(
         &state.engine.event_bus,
         &headers,
         Some(body.thread_id),
-        ThreadReachVerb::Apply,
+        Action::Apply,
     )
     .await?;
     // A change named here must be this thread's own pending one. Binding an
@@ -515,7 +516,7 @@ pub(super) async fn disarm_standing_apply(
         &state.engine.event_bus,
         &headers,
         Some(thread_id),
-        ThreadReachVerb::Apply,
+        Action::Apply,
     )
     .await?;
     // A 404 must mean "nothing was armed": the client reads it as already off.
@@ -552,13 +553,7 @@ pub(super) async fn disarm_all_standing_applies(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let actor = Some(require_user_actor(&headers, &state.pool, None).await?);
     // Workspace scope, so no subtree contains it. Same reasoning as Apply All.
-    refuse_without_authority(
-        &state.engine.event_bus,
-        &headers,
-        None,
-        ThreadReachVerb::Apply,
-    )
-    .await?;
+    refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
     let disarmed = state
         .engine
         .drop_standing_applies(DisarmScope::All, DISARMED_BY_OWNER, actor)
@@ -626,13 +621,7 @@ pub(super) async fn apply_all_changes(
     // contains that, so clause 3 cannot cover it and a thread caller needs the
     // owner's standing instruction. Before the batch record and the first
     // merge, so a refusal leaves neither.
-    refuse_without_authority(
-        &state.engine.event_bus,
-        &headers,
-        None,
-        ThreadReachVerb::Apply,
-    )
-    .await?;
+    refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
     // The rule lives on the engine, so the agent's `apply_as_they_settle` runs
     // the same press this button does.
     let outcome = state
@@ -740,13 +729,7 @@ pub(super) async fn cancel_apply_all_changes(
     // Cancel takes back the batch's Apply and the sweep's arms, so it asks the
     // gate Apply All asks, aimed at the workspace. Before the batch is touched,
     // so a refusal stops nothing and says nothing about whether one runs.
-    refuse_without_authority(
-        &state.engine.event_bus,
-        &headers,
-        None,
-        ThreadReachVerb::Apply,
-    )
-    .await?;
+    refuse_without_authority(&state.engine.event_bus, &headers, None, Action::Apply).await?;
     let canceled = state.engine.cancel_apply_all_batches(actor.clone()).await;
     let disarmed = state
         .engine
@@ -799,7 +782,7 @@ pub(super) async fn cancel_lane_batch(
             changes.push(change);
         }
     }
-    refuse_batch_change_verb(&state, &headers, &changes, ThreadReachVerb::Apply).await?;
+    refuse_batch_change_verb(&state, &headers, &changes, Action::Apply).await?;
     state
         .engine
         .cancel_lane_batch(body.batch_id, actor)
@@ -821,7 +804,7 @@ pub(super) async fn remove_from_landing_lane(
     // Remove takes an Apply back, so it asks the gate Apply asks. It skips
     // the thread-state gate: the source thread stays free while its change
     // waits, and Remove touches no branch and no worktree.
-    refuse_change_verb(&state, &headers, id, ThreadReachVerb::Apply).await?;
+    refuse_change_verb(&state, &headers, id, Action::Apply).await?;
     let known: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM changes WHERE id = $1)")
         .bind(id)
         .fetch_one(&state.pool)
@@ -945,7 +928,7 @@ pub(super) async fn discard_all_changes(
         ));
     }
     // Before the first discard, so a refusal deletes no branch and no worktree.
-    refuse_batch_change_verb(&state, &headers, &pending, ThreadReachVerb::Discard).await?;
+    refuse_batch_change_verb(&state, &headers, &pending, Action::Discard).await?;
     let mut discarded = 0;
     let mut failed = 0;
     let mut errors = Vec::new();
@@ -953,7 +936,7 @@ pub(super) async fn discard_all_changes(
         match state.engine.discard_change(change.id, actor.clone()).await {
             Ok(()) => discarded += 1,
             Err(e) => {
-                log!("[Changes] Failed to discard change {}: {}", change.id, e);
+                log_legacy!("[Changes] Failed to discard change {}: {}", change.id, e);
                 failed += 1;
                 errors.push(format!("{}: {}", change.branch_name, e));
             }
@@ -1171,7 +1154,7 @@ mod tests {
     /// look.
     #[tokio::test]
     async fn an_unsettled_thread_is_refused_and_settling_is_told_from_parked() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1196,7 +1179,7 @@ mod tests {
             seed_cc_thread(&pool, thread_id, status, waits, children).await;
             seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
-            let refusal = change_action_refusal(&pool, change_id, Action::Apply)
+            let refusal = change_action_refusal(&pool, change_id, ThreadAction::Apply)
                 .await
                 .expect("ask the gate");
             assert_eq!(
@@ -1251,7 +1234,7 @@ mod tests {
     /// pass the per-change gate.
     #[tokio::test]
     async fn a_settled_thread_is_not_refused_even_with_a_running_child() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1261,7 +1244,7 @@ mod tests {
             seed_cc_thread(&pool, thread_id, "idle", 0, children).await;
             seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
-            for action in [Action::Apply, Action::Discard] {
+            for action in [ThreadAction::Apply, ThreadAction::Discard] {
                 assert_eq!(
                     change_action_refusal(&pool, change_id, action)
                         .await
@@ -1279,7 +1262,7 @@ mod tests {
     /// to arm `apply_when_settled` here would arm a wait that never ends.
     #[tokio::test]
     async fn a_thread_that_will_never_offer_apply_says_so() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1296,7 +1279,7 @@ mod tests {
         seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
 
         assert_eq!(
-            change_action_refusal(&pool, change_id, Action::Apply)
+            change_action_refusal(&pool, change_id, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             Some(ChangeActionRefusal::ActionUnavailable),
@@ -1308,7 +1291,7 @@ mod tests {
     /// question, and Discard stays the way out of it.
     #[tokio::test]
     async fn an_empty_pending_change_is_refused_for_apply_only() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1318,13 +1301,13 @@ mod tests {
         seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 0).await;
 
         assert_eq!(
-            change_action_refusal(&pool, change_id, Action::Apply)
+            change_action_refusal(&pool, change_id, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             Some(ChangeActionRefusal::NoFilesLeft),
         );
         assert_eq!(
-            change_action_refusal(&pool, change_id, Action::Discard)
+            change_action_refusal(&pool, change_id, ThreadAction::Discard)
                 .await
                 .expect("ask the gate"),
             None,
@@ -1337,7 +1320,7 @@ mod tests {
     /// state, and granted where Discard is granted.
     #[tokio::test]
     async fn set_aside_is_refused_where_discard_is() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1354,8 +1337,8 @@ mod tests {
             seed_change(&pool, change_id, Some(thread_id), ChangeStatus::Pending, 3).await;
             let ask = |action| change_action_refusal(&pool, change_id, action);
             assert_eq!(
-                ask(Action::SetAside).await.expect("ask the gate"),
-                ask(Action::Discard).await.expect("ask the gate"),
+                ask(ThreadAction::SetAside).await.expect("ask the gate"),
+                ask(ThreadAction::Discard).await.expect("ask the gate"),
                 "status={status} waits={waits}: Set aside must follow Discard",
             );
         }
@@ -1366,7 +1349,7 @@ mod tests {
     /// thread still working on that branch, and passes on a settled one.
     #[tokio::test]
     async fn a_set_aside_change_is_not_discarded_under_a_working_thread() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1379,7 +1362,7 @@ mod tests {
             seed_cc_thread(&pool, thread_id, status, 0, 0).await;
             seed_change(&pool, change_id, Some(thread_id), ChangeStatus::SetAside, 3).await;
             assert_eq!(
-                change_action_refusal(&pool, change_id, Action::Discard)
+                change_action_refusal(&pool, change_id, ThreadAction::Discard)
                     .await
                     .expect("ask the gate"),
                 expected,
@@ -1394,7 +1377,7 @@ mod tests {
     /// idempotent retry, which the engine answers.
     #[tokio::test]
     async fn a_set_aside_change_is_refused_apply_until_brought_back() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
@@ -1404,13 +1387,13 @@ mod tests {
         seed_change(&pool, change_id, Some(thread_id), ChangeStatus::SetAside, 3).await;
 
         assert_eq!(
-            change_action_refusal(&pool, change_id, Action::Apply)
+            change_action_refusal(&pool, change_id, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             Some(ChangeActionRefusal::ChangeSetAside),
         );
         assert_eq!(
-            change_action_refusal(&pool, change_id, Action::SetAside)
+            change_action_refusal(&pool, change_id, ThreadAction::SetAside)
                 .await
                 .expect("ask the gate"),
             None,
@@ -1422,14 +1405,14 @@ mod tests {
     /// here would turn an idempotent retry into a 409.
     #[tokio::test]
     async fn unknown_threadless_and_resolved_rows_fall_through() {
-        use crate::engine::thread_lifecycle::Action;
+        use crate::engine::thread_lifecycle::ThreadAction;
         use crate::test_support::{setup_test_db, teardown_test_db};
 
         let (pool, db_name) = setup_test_db().await;
 
         let unknown = Uuid::new_v4();
         assert_eq!(
-            change_action_refusal(&pool, unknown, Action::Apply)
+            change_action_refusal(&pool, unknown, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             None,
@@ -1439,7 +1422,7 @@ mod tests {
         let threadless = Uuid::new_v4();
         seed_change(&pool, threadless, None, ChangeStatus::Pending, 2).await;
         assert_eq!(
-            change_action_refusal(&pool, threadless, Action::Apply)
+            change_action_refusal(&pool, threadless, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             None,
@@ -1452,7 +1435,7 @@ mod tests {
         seed_cc_thread(&pool, thread_id, "running", 0, 0).await;
         seed_change(&pool, resolved, Some(thread_id), ChangeStatus::Applied, 2).await;
         assert_eq!(
-            change_action_refusal(&pool, resolved, Action::Apply)
+            change_action_refusal(&pool, resolved, ThreadAction::Apply)
                 .await
                 .expect("ask the gate"),
             None,

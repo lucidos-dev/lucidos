@@ -45,44 +45,6 @@ fn todo_write_is_in_chat_agent_default_tools() {
     assert_eq!(actions, &serde_json::json!(["write", "read"]));
 }
 
-#[test]
-fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
-    let tools = get_default_tools(&ToolCapabilities::all_open());
-    let tool = tools
-        .iter()
-        .find(|t| t.name == tn::LOAD_KNOWHOW)
-        .expect("load_knowhow must be in the default chat tool set");
-    let id_description = tool
-        .parameters
-        .get("properties")
-        .and_then(|v| v.get("id"))
-        .and_then(|v| v.get("description"))
-        .and_then(|v| v.as_str())
-        .expect("load_knowhow.id must have a description");
-
-    let removed_workspace_specific_example = ["lucidos", "cross-workspace"].join("/");
-    assert!(
-        !id_description.contains(&removed_workspace_specific_example),
-        "schema must not point at the removed workspace-specific example: {id_description:?}"
-    );
-
-    let example = "system-knowhow/best-practices";
-    assert!(
-        id_description.contains(example),
-        "schema should advertise a shipped knowhow example, got: {id_description:?}"
-    );
-
-    let system_id = example
-        .strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX)
-        .expect("example must use the system knowhow prefix");
-    let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-    let doc = crate::core::SystemKnowhowStore::load(&repo.join("system-knowhow"), system_id);
-    assert!(
-        doc.is_some(),
-        "load_knowhow schema example must resolve to a shipped system knowhow doc"
-    );
-}
-
 /// Plugin management is the grouped `plugins` manifest tool (it consolidated the
 /// five flat plugin tools). It's spliced from `capability_manifest::llm_tools()`,
 /// not `get_default_tools()` — assert the grouped tool exposes the
@@ -1624,4 +1586,46 @@ fn every_repo_argument_is_the_same_schema() {
         desc.contains("manage_repositories"),
         "the arg must name how to discover a repo: {desc:?}"
     );
+}
+
+mod guard_tests {
+    use super::*;
+
+    #[test]
+    fn load_knowhow_schema_example_resolves_to_shipped_knowhow() {
+        let tools = get_default_tools(&ToolCapabilities::all_open());
+        let tool = tools
+            .iter()
+            .find(|t| t.name == tn::LOAD_KNOWHOW)
+            .expect("load_knowhow must be in the default chat tool set");
+        let id_description = tool
+            .parameters
+            .get("properties")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.get("description"))
+            .and_then(|v| v.as_str())
+            .expect("load_knowhow.id must have a description");
+
+        let removed_workspace_specific_example = ["lucidos", "cross-workspace"].join("/");
+        assert!(
+            !id_description.contains(&removed_workspace_specific_example),
+            "schema must not point at the removed workspace-specific example: {id_description:?}"
+        );
+
+        let example = "system-knowhow/best-practices";
+        assert!(
+            id_description.contains(example),
+            "schema should advertise a shipped knowhow example, got: {id_description:?}"
+        );
+
+        let system_id = example
+            .strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX)
+            .expect("example must use the system knowhow prefix");
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let doc = crate::core::SystemKnowhowStore::load(&repo.join("system-knowhow"), system_id);
+        assert!(
+            doc.is_some(),
+            "load_knowhow schema example must resolve to a shipped system knowhow doc"
+        );
+    }
 }

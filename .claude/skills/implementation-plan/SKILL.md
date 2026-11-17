@@ -81,6 +81,9 @@ The reasoning and the rejected alternatives are in
 
 ## Workflow
 
+First run `lucidos planned start --kind implementation` to record Planning. This
+records no approval and grants no source edit permission.
+
 1. **Check whether decisions are settled.**
    If material design choices are still open, use the `grill` skill first. `grill` resolves the decision tree; `implementation-plan` consumes the settled decisions and makes them executable. If a grill/design thread already exists, read it and extract the resolved choices before planning.
 
@@ -120,43 +123,79 @@ Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md`, using the struct
 
 Run the plan-approval checkpoint below first. It is Lucidos's copy of the default plan flow (`system-knowhow/coding-agent-flows/implementation-plan`), and `./scripts/check-default-flows.sh` keeps the two identical. Lucidos records an approval with `lucidos planned approve`.
 
+**This repository's plan-approval backend policy:** Prefer Codex for straightforward
+implementation with settled decisions, including from a Claude Code session.
+Choose sufficient intelligence for the remaining work before applying that
+preference. For work needing more design judgement, keep the current backend
+unless the user requests comparison or another backend. This preference chooses
+the recommendation; every readable backend remains available at plan approval.
+Users configure this policy in these flow instructions,
+not in a new CLI flag or settings layer.
+
 <!-- default-flow: implementation-plan -->
 #### Handoff checkpoints
 
 **Plan approval.** Before you ask for approval, run
 `lucidos successor offer --at plan-approval --ask --progress 0/<phases>`, where
-`<phases>` counts the plan's phases. Ask with your question tool, in the card
-shape it prints. The option to stay is `Approve here`. With no fresh-session
-option, the floor is `Approve` / `Request changes`, and a real fork takes the
-second slot. A re-plan runs this checkpoint again before it asks again.
+`<phases>` counts the plan's phases. Use your normal user question tool with
+relevant choices from the shape it prints. Follow-up questions may choose the
+backend and then the rung.
 
-**A fresh-session pick.** It approves the plan: record the approval as this
-repository does. Then run `lucidos successor start --narrative <file>` with
-the flags the checkpoint printed, and end your turn. The narrative names the
-plan's path, says the user approved it, and quotes the phase checkpoint below.
+Always include the option to approve here and `Commit plan for later`.
+
+Read the whole checkpoint output; never cut it with `head` or `tail`.
+With a readable, handoff-capable reading, always offer R, a fresh session.
+Always offer X when another backend's ladder is readable, merging it into R
+when R names that backend. A non-paying R omits `(Recommended)`.
+
+Follow the repository's backend policy to choose the recommendation, never to
+remove these options. Without a policy, prefer this thread's backend.
+Intelligence fit takes priority over backend preference.
+
+Merge an alternative into the recommendation
+when both name it. A typed reply requests changes; it needs no option. A real
+fork that has no slot is named in the question as a typed reply. A re-plan runs this checkpoint again before it asks again.
+
+**A fresh-session pick.** It approves implementation: record the approval as
+this repository does. Then run `lucidos successor start --narrative <file>`
+with the flags the checkpoint printed, and end your turn. The narrative names
+the plan's path, says the user approved implementation, and quotes the phase
+checkpoint below.
+
+**Commit plan for later.** Record plan-only approval as this repository does
+(`lucidos planned approve --plan-only` in Lucidos), commit only the plan, and
+end the turn. Never edit source or begin implementation. A later implementer
+proposes the applied plan and asks for implementation approval anew.
+
+**Approve here.** It approves building in this session. Record the approval as
+this repository does, then start the first phase in the same turn. An earlier
+instruction to stop for approval is now met.
 
 **Phase commit.** After you commit a phase that another phase follows, run
 `lucidos successor offer --at phase-commit --progress <done>/<phases>`, where
 `<done>` counts the phases committed. Follow what it prints. Skip it after the
-last phase.
+last phase. Other-backend automatic rungs are taken only when the user, plan
+or approval pick named that backend; otherwise follow the own-backend verdict.
 <!-- /default-flow: implementation-plan -->
 
-Use exactly one question, with the options the checkpoint prints. `Approve` is the first option unless that output leads with a fresh-session option (§ Implement in a fresh session). What goes in the second slot is a **floor, not a fixed shape**:
+Use normal user questions with at most four options each. Offer relevant
+choices rather than every rung. Backend and rung may be separate questions.
+The checkpoint prints example shapes. For choices sharing one question, fill
+slots in priority A, P, X, R, F, T; display R, X, T, A, P, F:
 
-| Option | Meaning | When |
+| Code | Option | Eligibility |
 |---|---|---|
-| `Approve` | Start implementing the plan as written. | First, unless the fresh-session option leads; then it reads `Approve here`, second. |
-| A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
-| `Implement in a fresh session: <implementer> (Recommended)` | Approve as written, and build in a *successor session* on that implementer. | **Only as the approval checkpoint prints**: when the *handoff estimate* pays, or when your recommended implementer is a lower rung than this thread's. It then goes FIRST, then `Approve here`. A paying card may also name this thread's implementer second. May sit beside a fork, within 4 options. |
-| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork and no fresh-session option. Never alongside either. |
+| A | `Approve here` (or `Approve` with no readable handoff) | Always |
+| P | `Commit plan for later` | Plan approval only |
+| X | `Implement in a fresh session: <rung> on <backend>` | Always with another readable backend ladder; merge into R when R names it |
+| R | `Implement in a fresh session: <rung> (Recommended)` | Always with a readable, handoff-capable reading; omit `(Recommended)` unless paying or past ceiling |
+| F | A real fork of the plan | When one exists; name it as a typed reply if slots fill |
+| T | `Implement in a fresh session: <this thread's rung>` | Paying card, only if it differs from R |
 
-**The plan as written is the thorough, long-term fix.** The maintainer always prefers it to a narrower patch. So write the thorough variant as the plan, and offer the narrower one as the fork, never the reverse. An unattended run still stops at the decision, as a plan or under `Decisions:`: the preference picks which variant to recommend, not whether to ask.
-
-Claude Code's tool requires **2-4 options**, so a lone `Approve` button cannot be expressed. That is the *only* reason `Request changes` exists as a default second option: it fills the mandatory slot while carrying a real "don't start yet" decision. A genuine fork fills the same slot better, because it satisfies the minimum **and** tells you what to do.
-
-Carrying `Request changes` as a *third* option beside a fork is the failure this rule prevents. It then means only "I will type what I want changed", which is the escape every card already has, and tapping it sends back the literal label so you have to re-ask what to change. That is precisely the dead-end shape the system prompt's NEVER AUTHOR AN "OTHER" OPTION rule bans, and a live card carried it on 2026-08-04 (`Approve` / `Frontend only` / `Request changes`).
-
-The user can type a nuanced answer straight into the prompt and it arrives as their answer to the question, so no "let me type it" option is ever needed in any form. Lucidos renders exactly the options you pass (CC's tool description promises an automatic "Other" option; Lucidos adds none). (Codex's tool allows omitting options for free text; the same shapes are still right.)
+Never include `Request changes`: the user can type a nuanced answer directly
+into the card. With no handoff available, offer `Approve`, P, and a real fork
+if any. Plan-only approval never opens the source edit gate. The plan as
+written is the thorough, long-term fix; offer a narrower variant as a fork.
 
 This is a **DECISION** question, not a post-work confirmation, so the "never ask about work you've already done" rule in the system prompt does not apply to it. The distinction is concrete: source edits are *blocked* until it is answered, and a plan is a proposal about work that has NOT been done, so there is nothing to hand off yet.
 
@@ -169,7 +208,9 @@ This is a **DECISION** question, not a post-work confirmation, so the "never ask
 
 A question typed into your final message ends the turn instead. The thread then looks finished, and nobody is told you are waiting.
 
-When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. It also rewrites the plan's `- **Status**: Proposed` line to `Approved` and commits that, so keep the line exactly as the template writes it. Lucidos checks that the user approved: `lucidos planned approve` is refused unless the user tapped an approving option, or typed a plain approval such as `approve` or `lgtm`, after you proposed the plan. **A tapped fork is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. A fork pick does not re-mark.
+When the user approves implementation, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. Then start the first phase in the same turn, unless the user picked a fresh session. It also rewrites the plan's `- **Status**: Proposed` line to `Approved` and commits that, so keep the line exactly as the template writes it.
+
+Lucidos checks that the user approved: `lucidos planned approve` is refused unless the user tapped an approving option, or typed a plain approval such as `approve` or `lgtm`, after you proposed the plan. **A tapped fork is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. A fork pick does not re-mark.
 
 **A typed reply that asks, suggests or questions is a request for changes, never an approval.** Revise the plan file, re-commit, run `lucidos planned mark --plan <path>` again, and ask again (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
 
@@ -215,71 +256,19 @@ If `Open Questions` contains a load-bearing unresolved decision, stop and ask th
 
 ### Implement in a fresh session
 
-A planning session that ran a long grill carries every question, picture and
-draft into each later turn. The plan file already holds what a builder needs, so
-a fresh session can start from it alone.
+Apply the flow's backend policy above before choosing from the ladders.
+The checkpoint reads both installed backends' ladders against one reference.
+Compare intelligence, cost and time only when both references are present and
+equal. Recommend a rung by the remaining work, never by a hardcoded model name.
+Always offer a fresh session. Recommend it when the estimate pays or the
+context ceiling is exceeded. Choose a rung by fit for the remaining work.
+A higher pick takes only one or two rungs above this thread, never the top.
 
-The plan-approval checkpoint prints the card's options. Offer exactly what it
-prints:
+A handoff needs no permission card. A fresh-session pick approves implementation. Run `lucidos planned approve`, then write the six-section narrative.
+Run `lucidos successor start --narrative <file>` with the checkpoint flags
+and the chosen backend, model id and effort.
 
-- **When the *handoff estimate* pays**, the paying card below. The estimate
-  weighs this thread's context against the calls the phases left will take.
-- **When it does not pay**, a fresh session only for a lower rung on the
-  intelligence ladder than this thread's (ADR 0497). Otherwise the plain floor.
-- **When the engine could not be read, or the thread cannot hand off**, the plain
-  floor.
-
-**Your judgement picks the implementer** (ADR 0486): one rung on the
-*intelligence ladder*, a model at an effort. The output prints the ladder with
-this thread's rung marked, and `lucidos intelligence-ladder` prints it on
-demand. This skill names no model and no effort, because the ladder carries
-them (ADR 0500). The principle:
-
-- Turn intelligence down for settled work. A fully specified plan with settled
-  decisions suits a lower rung.
-- Turn it up for hard or open work. A plan that leaves design judgement to the
-  builder keeps this thread's rung or takes a higher one.
-- Say why in one line of your message.
-
-Every call reads the whole context again, so a rung above what the work needs
-costs on every turn.
-
-The paying card reads, never more than 4 options and never `Request changes`:
-
-1. `Implement in a fresh session: <implementer> (Recommended)`, the rung named by
-   its picker label and effort as the ladder prints them.
-2. `Implement in a fresh session: <this thread's implementer>`, only when it
-   differs.
-3. `Approve here`.
-4. A real fork of the plan, if it has one.
-
-A card that does not pay drops option 2: a fresh session on this thread's
-implementer then saves nothing.
-
-Name the backend only when it is not this thread's.
-
-Picking a fresh-session option is an approval, asked once. A handoff needs no
-owner approval card. A typed reply naming another implementer counts as an
-approval too:
-
-1. Run `lucidos planned approve` in this thread.
-2. Write a handoff narrative and run `lucidos successor start --narrative
-   <file>` with the flags the checkpoint printed. Add only the flags that
-   differ from this thread's implementer: `--coding-agent`,
-   `--coding-agent-model`, `--reasoning-effort`. An omitted flag keeps this
-   thread's, and ids go in, never picker labels.
-   `lucidos successor --help` has the six sections. The narrative names the plan
-   path, says the user approved it here, and quotes the phase checkpoint. The
-   successor session then builds it phase by phase without asking again.
-3. End your turn. The successor session starts in this thread once it ends.
-
-The thread keeps its branch, so the plan and the approved marker stay in place.
-A parent keeps waiting on this thread. The same text reaches the agent through
-the checkpoint, from `card_shape` and `fresh_session_handoff` in
-`crates/lucidos-cli/src/planned.rs`.
-
-When the estimate does not pay and the thread has a rung above its own, the
-checkpoint also prints a raise clause. When no lower rung fits but the plan is hard or long, offer
-`Implement in a fresh session: <a higher rung> (Recommended)` beside `Approve
-here`. Go one or two rungs up, never to the top. If neither applies, keep
-`Approve` / `Request changes`.
+Use the full other-backend flags printed by the ladder; do not
+retain this backend's model id when changing backends. The narrative names the
+approved plan and quotes the phase checkpoint. End the turn so the successor
+continues the approved plan without another approval question.

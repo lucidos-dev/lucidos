@@ -103,7 +103,7 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
     let registered = match registered_workspace_dirs(gateway_data) {
         Ok(dirs) => dirs,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Grants] Workspace registry unreadable ({e}). \
                  Seeding nothing and retrying on the next boot."
             );
@@ -121,7 +121,7 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
         if !workspace.is_dir() {
             // A registered directory that is gone. Creating it here would
             // resurrect a workspace the user deleted.
-            crate::log!("[Grants] Skipping {}: not on disk", workspace.display());
+            crate::log_legacy!("[Grants] Skipping {}: not on disk", workspace.display());
             continue;
         }
         match seed_workspace(user_dir, workspace) {
@@ -131,7 +131,7 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
             // the door for good, so this workspace inherits nothing. Say so:
             // the alternative is retrying, and a retry is what re-adds a grant
             // the user deleted.
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[Grants] Seeding {} failed ({e}). It inherits no grants and asks on first use.",
                 workspace.display()
             ),
@@ -139,10 +139,10 @@ fn seed_from(user_dir: &Path, gateway_data: &Path, workspace_path: &Path) {
     }
 
     if let Err(e) = write_machine_record(&record, user_dir, &seeded) {
-        crate::log!("[Grants] Could not write {}: {e}", record.display());
+        crate::log_legacy!("[Grants] Could not write {}: {e}", record.display());
         return;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[Grants] Permission grants are now per workspace. Seeded {} of {} workspace(s).",
         seeded.len(),
         targets.len()
@@ -198,7 +198,7 @@ fn inheritable_global(user_dir: &Path, file: GrantFile) -> Option<String> {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            crate::log!("[Grants] Cannot read {}: {e}", path.display());
+            crate::log_legacy!("[Grants] Cannot read {}: {e}", path.display());
             return None;
         }
     };

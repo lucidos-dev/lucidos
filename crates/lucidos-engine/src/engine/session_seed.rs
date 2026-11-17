@@ -76,7 +76,7 @@ pub(crate) async fn seed_branch_work(
     .execute(pool)
     .await
     {
-        log!(
+        log_legacy!(
             "[SessionSeed] Failed to seed the branch work for thread {} branch {}: {}",
             thread_id,
             branch_name,

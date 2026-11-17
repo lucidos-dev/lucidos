@@ -1,6 +1,6 @@
 //! How an authorization's callback reaches the flow that started it.
 //!
-//! Two delivery paths end in one step, [`super::oauth::callback_received`]:
+//! Two delivery paths end in one step, [`super::oauth::parse_callback_query`]:
 //!
 //! - **Under a gateway**, the gateway owns the loopback callback port. It routes
 //!   each callback by the prefix in `state` and forwards it to
@@ -15,7 +15,9 @@ use std::sync::{LazyLock, Mutex};
 
 use axum::http::HeaderMap;
 
-use super::oauth::{callback_received, query_param, AuthorizationGrant};
+use super::oauth::{
+    callback_page, parse_callback_query, query_param, CallbackPageState, PageReply, ReceivedGrant,
+};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -169,7 +171,7 @@ impl CallbackRoute {
 /// A gateway-mode flow's open slot, keyed by its full `state`.
 struct PendingEntry {
     provider: String,
-    deliver: tokio::sync::oneshot::Sender<Result<AuthorizationGrant, BoxError>>,
+    deliver: tokio::sync::oneshot::Sender<Result<ReceivedGrant, BoxError>>,
 }
 
 static PENDING: LazyLock<Mutex<HashMap<String, PendingEntry>>> =
@@ -185,7 +187,7 @@ fn pending() -> std::sync::MutexGuard<'static, HashMap<String, PendingEntry>> {
 /// delivered to afterwards.
 pub(crate) struct PendingCallback {
     state: String,
-    received: tokio::sync::oneshot::Receiver<Result<AuthorizationGrant, BoxError>>,
+    received: tokio::sync::oneshot::Receiver<Result<ReceivedGrant, BoxError>>,
 }
 
 impl PendingCallback {
@@ -205,8 +207,9 @@ impl PendingCallback {
         }
     }
 
-    /// The grant, or the provider's reason for refusing.
-    pub(crate) async fn received(mut self) -> Result<AuthorizationGrant, BoxError> {
+    /// The grant with the reply that settles its page, or the provider's
+    /// reason for refusing.
+    pub(crate) async fn received(mut self) -> Result<ReceivedGrant, BoxError> {
         (&mut self.received)
             .await
             .unwrap_or_else(|_| Err("the OAuth callback slot closed without a result".into()))
@@ -222,9 +225,12 @@ impl Drop for PendingCallback {
 /// What the gateway's forwarded callback did here.
 #[derive(Debug)]
 pub enum CallbackDelivery {
-    /// A flow of this engine's owned the `state`. `ok` is whether the callback
-    /// carried a code.
-    Accepted { ok: bool, page: String },
+    /// A flow of this engine's owned the `state`. `state` is how far the flow
+    /// got when the page was written.
+    Accepted {
+        state: CallbackPageState,
+        page: String,
+    },
     /// No open flow here owns this `state`. The gateway may try a peer.
     Unclaimed { page: String },
 }
@@ -232,25 +238,45 @@ pub enum CallbackDelivery {
 /// Hand a forwarded callback query to the flow that owns its `state`.
 ///
 /// The full `state` must match an open slot: a forged, replayed or re-routed
-/// value finds none and is refused. Delivery closes the slot.
-pub fn deliver_callback(query: &str) -> CallbackDelivery {
+/// value finds none and is refused. Delivery closes the slot. A callback that
+/// granted access then waits, bounded, for the flow to store the account, so
+/// the page can say what happened. A refusal is answered at once.
+pub async fn deliver_callback(query: &str) -> CallbackDelivery {
     let entry = query_param(query, "state", false).and_then(|state| pending().remove(&state));
     let Some(entry) = entry else {
         return CallbackDelivery::Unclaimed {
-            page: super::oauth::callback_page("", false),
+            page: callback_page("", CallbackPageState::Refused),
         };
     };
-    let received = callback_received(&entry.provider, query);
-    let ok = received.grant.is_ok();
-    if entry.deliver.send(received.grant).is_err() {
-        crate::log!(
+    let flow_ended = || {
+        crate::log_legacy!(
             "[OAuth] A {} callback arrived as its flow ended",
             entry.provider
         );
-    }
+    };
+    // A failed send hands the grant back, its reply included. It is dropped
+    // here, so the page never waits on a reply that no flow holds.
+    let state = match parse_callback_query(query) {
+        Ok(grant) => {
+            let (reply, settled) = PageReply::pair();
+            match entry.deliver.send(Ok(ReceivedGrant { grant, reply })) {
+                Ok(()) => settled.state().await,
+                Err(_) => {
+                    flow_ended();
+                    CallbackPageState::Failed
+                }
+            }
+        }
+        Err(refusal) => {
+            if entry.deliver.send(Err(refusal)).is_err() {
+                flow_ended();
+            }
+            CallbackPageState::Refused
+        }
+    };
     CallbackDelivery::Accepted {
-        ok,
-        page: received.page,
+        page: callback_page(&entry.provider, state),
+        state,
     }
 }
 

@@ -40,7 +40,7 @@ import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { useCodeCountdown } from './useCodeCountdown';
 import { Dropdown } from '../shared/Dropdown';
-import { isTeamGateway, operatorRows, operators } from '../../store/actions/operators';
+import { isTeamGateway, gatewayUserRows, gatewayUsers } from '../../store/actions/gatewayUsers';
 
 /** A minted code, and the moment it stops working. */
 export interface MintedCode {
@@ -132,16 +132,16 @@ export function PairDeviceSection({
 }) {
   const [minted, setMinted] = useState<Loadable<MintedCode>>({ status: 'not-loaded' });
   const origin = target.kind === 'origin' ? target.url : null;
-  // Whose device this will be. Asked only with several people: with one, the
-  // gateway gives the device to its first person.
-  const people = isTeamGateway.value ? operatorRows(operators.value) : null;
-  const [chosenPerson, setChosenPerson] = useState<string | null>(null);
-  const forPerson = people === null ? null : chosenPerson ?? people[0]?.id ?? null;
+  // Whose device this will be. Asked only with several users: with one, the
+  // gateway gives the device to its first user.
+  const users = isTeamGateway.value ? gatewayUserRows(gatewayUsers.value) : null;
+  const [chosenUser, setChosenUser] = useState<string | null>(null);
+  const forUser = users === null ? null : chosenUser ?? users[0]?.id ?? null;
 
   // Mints a code, and every button in the section is wired to it.
   const mint = useCallback(() => {
     setMinted({ status: 'loading' });
-    void mintPairingCode(origin, forPerson).then(
+    void mintPairingCode(origin, forUser).then(
       (body) => {
         // The clock is read HERE, beside the expiry it is compared against.
         // Stamping it when the request went out would open the countdown at
@@ -159,7 +159,7 @@ export function PairDeviceSection({
       },
       (e) => setMinted(toFailed(e)),
     );
-  }, [origin, forPerson]);
+  }, [origin, forUser]);
 
   const left = useCodeCountdown(minted.status === 'loaded' ? minted.data.expiresAt : null);
 
@@ -190,11 +190,11 @@ export function PairDeviceSection({
             </div>
           </div>
           <div class="list-row-actions">
-            {people !== null && forPerson !== null && (
+            {users !== null && forUser !== null && (
               <Dropdown
-                options={people.map((o) => ({ value: o.id, label: `For ${o.name}` }))}
-                value={forPerson}
-                onChange={setChosenPerson}
+                options={users.map((o) => ({ value: o.id, label: `For ${o.name}` }))}
+                value={forUser}
+                onChange={setChosenUser}
               />
             )}
             <button

@@ -61,7 +61,7 @@ async fn order_for(packaged: bool, gateway_port: Option<&str>) -> LandingOrder {
 async fn gateway_paired(port: &str) -> Result<bool, String> {
     let client = gateway_client()?;
     let mut last_error = String::new();
-    for scheme in crate::net_config::peer_scheme_order() {
+    for scheme in crate::net_config::gateway_scheme_order() {
         let url = format!("{scheme}://127.0.0.1:{port}{GATEWAY_PAIRINGS_PATH}");
         match client.get(&url).send().await {
             Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => {
@@ -92,12 +92,12 @@ pub fn report_main_landed() {
         let client = match gateway_client() {
             Ok(c) => c,
             Err(e) => {
-                log!("[LandingGateway] {}", e);
+                log_legacy!("[LandingGateway] {}", e);
                 return;
             }
         };
         let mut last_error = String::new();
-        for scheme in crate::net_config::peer_scheme_order() {
+        for scheme in crate::net_config::gateway_scheme_order() {
             let url = format!("{scheme}://127.0.0.1:{port}{MAIN_LANDED_PATH}");
             match client.post(&url).send().await {
                 Ok(response) if response.status().is_success() => return,
@@ -105,7 +105,7 @@ pub fn report_main_landed() {
                 Err(e) => last_error = e.to_string(),
             }
         }
-        log!(
+        log_legacy!(
             "[LandingGateway] the gateway did not take the landing report: {}",
             last_error
         );

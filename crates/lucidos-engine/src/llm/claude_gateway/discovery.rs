@@ -100,7 +100,7 @@ fn same_origin_revocation(origin: &GatewayOrigin, endpoint: Option<String>) -> O
     if origin.owns(&url) {
         return Some(url);
     }
-    crate::log!("[ClaudeGateway] {origin} puts its revocation_endpoint on another origin, so sign-out will not revoke: {url}");
+    crate::log_legacy!("[ClaudeGateway] {origin} puts its revocation_endpoint on another origin, so sign-out will not revoke: {url}");
     None
 }
 

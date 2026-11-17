@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 /// The default. A route only leaves this list for [`is_exempt`], and only with
 /// a reason recorded there.
 const GATED_ROUTES: &[&str] = &[
+    "/models/spend-cap-holds/:provider/clear",
     "/agent-allowed-commands",
     "/app",
     "/app-capture",
@@ -73,6 +74,9 @@ const GATED_ROUTES: &[&str] = &[
     "/disk-usage/cleanup",
     "/disk-usage/worktrees/:thread_id/cleanup",
     "/email/send",
+    "/engine/host-log-transfer/prepare",
+    "/engine/host-log-transfer/:id/execute",
+    "/engine/host-log-transfer/:id/status",
     "/engine/rebuild",
     "/env-vars",
     "/events/emit",
@@ -92,9 +96,11 @@ const GATED_ROUTES: &[&str] = &[
     "/internal/request-app-capture-for-test",
     "/internal/restart-intent",
     "/internal/seed-change-for-test",
+    "/internal/start-plan",
     "/themes/resolve",
     "/mcp-allowed-tools",
     "/main-check/close",
+    "/main-check/fix-now",
     "/mcp-permission/consent",
     "/mcp/auto-approve",
     "/mcp/consent",
@@ -106,6 +112,7 @@ const GATED_ROUTES: &[&str] = &[
     "/memory/tree-backfill/cap",
     "/models",
     "/network-config",
+    "/notification/native-receipt",
     "/notifications",
     "/notifications/read-all",
     "/oauth/accounts",
@@ -113,8 +120,12 @@ const GATED_ROUTES: &[&str] = &[
     "/oauth/reauthorize",
     "/onepassword",
     "/onepassword/test",
+    "/users/changed",
     "/operators/changed",
-    "/owner-approvals",
+    "/pairing-requests/changed",
+    "/permission-requests",
+    "/permissions/:permission_id",
+    "/permissions/batches",
     "/pinned-apps",
     "/plugins/catalog/rescan",
     "/plugins/install-request",
@@ -155,15 +166,17 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/archive",
     "/threads/:thread_id/background-tasks",
     "/threads/:thread_id/background-tasks/:task_id/stop",
+    "/threads/:thread_id/automation-pause",
     "/threads/:thread_id/cache-keep-alive",
     "/threads/:thread_id/context-ceiling",
     "/threads/:thread_id/child-reports/take",
+    "/threads/:thread_id/confinement-tests",
     "/threads/:thread_id/continue",
     "/threads/:thread_id/detach",
-    "/threads/:thread_id/people/release",
-    "/threads/:thread_id/people/take",
-    "/threads/:thread_id/people/unwatch",
-    "/threads/:thread_id/people/watch",
+    "/threads/:thread_id/users/release",
+    "/threads/:thread_id/users/take",
+    "/threads/:thread_id/users/unwatch",
+    "/threads/:thread_id/users/watch",
     "/threads/:thread_id/successor",
     "/threads/:thread_id/successor/withdraw",
     "/threads/:thread_id/successor-offer/decline",
@@ -178,6 +191,7 @@ const GATED_ROUTES: &[&str] = &[
     "/threads/:thread_id/mcp-servers/:id/enable",
     "/threads/:thread_id/read-request",
     "/threads/:thread_id/read-request/seen",
+    "/threads/:thread_id/submit-draft",
     "/threads/:thread_id/wake-decision",
     "/threads/archive",
     "/threads/archive-all",
@@ -185,6 +199,7 @@ const GATED_ROUTES: &[&str] = &[
     // The handler then insists the one it did present is a registered device
     // (ADR 0192).
     "/threads/delete",
+    "/threads/drafts",
     "/threads/rename",
     "/threads/save",
     "/threads/suggest-title",
@@ -202,93 +217,24 @@ const GATED_ROUTES: &[&str] = &[
     "/widgets/dashboard-add",
     "/widgets/dashboard-remove",
     "/widgets/fit",
+    "/widgets/fit-session",
     "/widgets/fit-report",
     "/widgets/make-reusable",
     "/widgets/size",
     "/widgets/stop-reusing",
+    "/workspaces",
+    "/workspaces/trash/:id/restore",
+    "/workspaces/:id/stop",
+    "/workspaces/:id/start",
+    "/workspaces/:id/autostart",
+    "/workspaces/:id/rename",
+    "/workspaces/:id/delete",
+    "/workspaces/:id/device-session",
+    "/workspaces/:id/restart",
 ];
 
 /// Methods that write. Mirrors [`method_mutates`], which takes a `Method`.
 const MUTATING: &[&str] = &["post", "put", "delete", "patch"];
-
-/// Every mutating route the `api` modules register, read off the source.
-///
-/// The scan is shared with *route reach*, which asks a different question of
-/// the same files (`api::route_scan`). This half keeps the writes.
-///
-/// `any(...)` counts: it answers every method, mutating ones included.
-fn registered_mutating_routes() -> BTreeSet<String> {
-    crate::api::route_scan::scan_api_routes()
-        .into_iter()
-        .filter(|hit| {
-            hit.methods.contains("ANY")
-                || MUTATING
-                    .iter()
-                    .any(|m| hit.methods.contains(&m.to_uppercase()))
-        })
-        .filter(|hit| !hit.path.is_empty())
-        .map(|hit| hit.path)
-        .collect()
-}
-
-/// The scanner has to actually find routes, or every assertion below passes
-/// vacuously and the ratchet protects nothing.
-#[test]
-fn the_route_scanner_reads_the_real_router() {
-    let routes = registered_mutating_routes();
-    assert!(
-        routes.len() > 100,
-        "the scanner found only {} mutating routes, so it is not reading the router",
-        routes.len()
-    );
-    for known in ["/changes/:id/apply", "/chat/stream", "/proxy/:name/*path"] {
-        assert!(routes.contains(known), "the scanner missed {known}");
-    }
-}
-
-/// Every mutating route is on exactly one side, and adding one is a decision.
-///
-/// This is what the e2e legs used to prove by not 401ing, and it holds for a
-/// route no test exercises. A new endpoint fails here until its author says
-/// whether its caller can identify itself.
-#[test]
-fn every_mutating_route_is_gated_or_deliberately_exempt() {
-    let registered = registered_mutating_routes();
-    let gated: BTreeSet<String> = GATED_ROUTES.iter().map(|s| s.to_string()).collect();
-
-    let unaccounted: Vec<&String> = registered
-        .iter()
-        .filter(|r| !gated.contains(*r) && !is_exempt(r))
-        .collect();
-    assert!(
-        unaccounted.is_empty(),
-        "new mutating route(s) nobody has classified: {unaccounted:?}\n\
-         Add each to GATED_ROUTES if its caller can present a credential, or to \
-         `is_exempt` with the reason it cannot."
-    );
-
-    let vanished: Vec<&String> = gated.difference(&registered).collect();
-    assert!(
-        vanished.is_empty(),
-        "GATED_ROUTES names route(s) the router no longer registers: {vanished:?}"
-    );
-}
-
-/// An exemption that names nothing is one nobody can see is dead.
-///
-/// It fails LOUDLY on a rename, which is the case that matters. The route
-/// carries on under its new name, silently gated, while the exemption sits
-/// there still looking correct and its caller starts getting 401s.
-#[test]
-fn every_exemption_names_a_route_that_exists() {
-    let registered = registered_mutating_routes();
-    for route in EXEMPT_ROUTES {
-        assert!(
-            registered.contains(*route),
-            "`is_exempt` names {route}, which no api module registers as mutating"
-        );
-    }
-}
 
 /// The two sides never overlap: a route is gated or exempt, never listed twice.
 #[test]
@@ -375,6 +321,7 @@ fn a_route_that_merely_looks_exempt_is_gated() {
         "/chat/cancel",
         // Sibling of the exempt `/notification/read`, and the page's own
         // call, so it stays gated.
+        "/notification/native-receipt",
         "/notifications",
         "/notifications/read-all",
         "/threads/:thread_id/continue",
@@ -394,36 +341,6 @@ fn a_route_that_merely_looks_exempt_is_gated() {
 
 /// Socket routes that reach nothing, so a caller needs no name to open one.
 const READ_ONLY_SOCKET_ROUTES: &[&str] = &["/ws-echo"];
-
-/// Every socket route is on exactly one side, and adding one is a decision.
-///
-/// The voice socket slipped past [`every_mutating_route_is_gated_or_deliberately_exempt`]
-/// because an upgrade is a GET. A file that takes a `WebSocketUpgrade` fails
-/// here until each of its routes says whether its socket writes.
-#[test]
-fn every_socket_route_is_classified() {
-    let api_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api");
-    let mut sockets = BTreeSet::new();
-    for hit in crate::api::route_scan::scan_api_routes() {
-        let src = std::fs::read_to_string(api_dir.join(&hit.file)).expect("source is readable");
-        if src.contains("WebSocketUpgrade") {
-            sockets.insert(hit.path);
-        }
-    }
-    assert!(
-        sockets.contains("/voice"),
-        "the scan found no voice socket, so it protects nothing: {sockets:?}"
-    );
-    for route in &sockets {
-        let writes = MUTATING_SOCKET_ROUTES.contains(&route.as_str());
-        let reads = READ_ONLY_SOCKET_ROUTES.contains(&route.as_str());
-        assert!(
-            writes != reads,
-            "{route} takes a socket upgrade. List it in MUTATING_SOCKET_ROUTES if the \
-             caller writes through it, or in READ_ONLY_SOCKET_ROUTES if it reaches nothing."
-        );
-    }
-}
 
 fn voice_uri(ticket: Option<&str>) -> axum::http::Uri {
     let ticket = ticket.map_or(String::new(), |t| {
@@ -526,4 +443,117 @@ async fn a_voice_upgrade_is_named_by_its_ticket_but_never_over_the_header() {
     assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
 
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Every mutating route the `api` modules register, read off the source.
+    ///
+    /// The scan is shared with *route reach*, which asks a different question of
+    /// the same files (`api::route_scan`). This half keeps the writes.
+    ///
+    /// `any(...)` counts: it answers every method, mutating ones included.
+    fn registered_mutating_routes() -> BTreeSet<String> {
+        crate::api::route_scan::scan_api_routes()
+            .into_iter()
+            .filter(|hit| {
+                hit.methods.contains("ANY")
+                    || MUTATING
+                        .iter()
+                        .any(|m| hit.methods.contains(&m.to_uppercase()))
+            })
+            .filter(|hit| !hit.path.is_empty())
+            .map(|hit| hit.path)
+            .collect()
+    }
+
+    /// The scanner has to actually find routes, or every assertion below passes
+    /// vacuously and the ratchet protects nothing.
+    #[test]
+    fn the_route_scanner_reads_the_real_router() {
+        let routes = registered_mutating_routes();
+        assert!(
+            routes.len() > 100,
+            "the scanner found only {} mutating routes, so it is not reading the router",
+            routes.len()
+        );
+        for known in ["/changes/:id/apply", "/chat/stream", "/proxy/:name/*path"] {
+            assert!(routes.contains(known), "the scanner missed {known}");
+        }
+    }
+
+    /// Every mutating route is on exactly one side, and adding one is a decision.
+    ///
+    /// This is what the e2e legs used to prove by not 401ing, and it holds for a
+    /// route no test exercises. A new endpoint fails here until its author says
+    /// whether its caller can identify itself.
+    #[test]
+    fn every_mutating_route_is_gated_or_deliberately_exempt() {
+        let registered = registered_mutating_routes();
+        let gated: BTreeSet<String> = GATED_ROUTES.iter().map(|s| s.to_string()).collect();
+
+        let unaccounted: Vec<&String> = registered
+            .iter()
+            .filter(|r| !gated.contains(*r) && !is_exempt(r))
+            .collect();
+        assert!(
+            unaccounted.is_empty(),
+            "new mutating route(s) nobody has classified: {unaccounted:?}\n\
+         Add each to GATED_ROUTES if its caller can present a credential, or to \
+         `is_exempt` with the reason it cannot."
+        );
+
+        let vanished: Vec<&String> = gated.difference(&registered).collect();
+        assert!(
+            vanished.is_empty(),
+            "GATED_ROUTES names route(s) the router no longer registers: {vanished:?}"
+        );
+    }
+
+    /// An exemption that names nothing is one nobody can see is dead.
+    ///
+    /// It fails LOUDLY on a rename, which is the case that matters. The route
+    /// carries on under its new name, silently gated, while the exemption sits
+    /// there still looking correct and its caller starts getting 401s.
+    #[test]
+    fn every_exemption_names_a_route_that_exists() {
+        let registered = registered_mutating_routes();
+        for route in EXEMPT_ROUTES {
+            assert!(
+                registered.contains(*route),
+                "`is_exempt` names {route}, which no api module registers as mutating"
+            );
+        }
+    }
+
+    /// Every socket route is on exactly one side, and adding one is a decision.
+    ///
+    /// The voice socket slipped past [`every_mutating_route_is_gated_or_deliberately_exempt`]
+    /// because an upgrade is a GET. A file that takes a `WebSocketUpgrade` fails
+    /// here until each of its routes says whether its socket writes.
+    #[test]
+    fn every_socket_route_is_classified() {
+        let api_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api");
+        let mut sockets = BTreeSet::new();
+        for hit in crate::api::route_scan::scan_api_routes() {
+            let src = std::fs::read_to_string(api_dir.join(&hit.file)).expect("source is readable");
+            if src.contains("WebSocketUpgrade") {
+                sockets.insert(hit.path);
+            }
+        }
+        assert!(
+            sockets.contains("/voice"),
+            "the scan found no voice socket, so it protects nothing: {sockets:?}"
+        );
+        for route in &sockets {
+            let writes = MUTATING_SOCKET_ROUTES.contains(&route.as_str());
+            let reads = READ_ONLY_SOCKET_ROUTES.contains(&route.as_str());
+            assert!(
+                writes != reads,
+                "{route} takes a socket upgrade. List it in MUTATING_SOCKET_ROUTES if the \
+             caller writes through it, or in READ_ONLY_SOCKET_ROUTES if it reaches nothing."
+            );
+        }
+    }
 }

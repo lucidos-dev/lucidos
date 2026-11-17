@@ -231,6 +231,11 @@ impl LucidosEngine {
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<ContinueChatOutcome, Box<dyn std::error::Error + Send + Sync>> {
+        if !matches!(actor, Some(MessageOrigin::Device { .. }))
+            && crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await
+        {
+            return Ok(ContinueChatOutcome::NothingToContinue);
+        }
         // Find the most recent ResponseAborted for this thread.
         let abort_row: Option<(Uuid, Option<Uuid>, Option<String>)> = sqlx::query_as(
             "SELECT id, \
@@ -247,7 +252,7 @@ impl LucidosEngine {
         let (abort_event_id, abort_request_event_id, abort_channel) = match abort_row {
             Some(row) => row,
             None => {
-                log!(
+                log_legacy!(
                     "[Continue] No ResponseAborted for thread {} — nothing to continue",
                     thread_id
                 );
@@ -272,7 +277,7 @@ impl LucidosEngine {
         .fetch_one(self.pool())
         .await?;
         if resumed_unclaimed {
-            log!(
+            log_legacy!(
                 "[Continue] Abort {} on thread {} was resumed by an unclaimed boundary: no-op",
                 abort_event_id,
                 thread_id
@@ -301,7 +306,7 @@ impl LucidosEngine {
         let originating_event_id = match originating_event_id {
             Some(id) => id,
             None => {
-                log!(
+                log_legacy!(
                     "[Continue] No originating event found for abort {} in thread {} — nothing to continue",
                     abort_event_id,
                     thread_id
@@ -349,7 +354,7 @@ impl LucidosEngine {
         Ok(match claim {
             ResumeAnchorClaim::Anchored(_) => ContinueChatOutcome::Resumed,
             ResumeAnchorClaim::AlreadyResumed => {
-                log!(
+                log_legacy!(
                     "[Continue] Abort {} on thread {} was already resumed: no-op",
                     abort_event_id,
                     thread_id
@@ -400,7 +405,7 @@ impl LucidosEngine {
             let window_end = super::queued_recovery::window_end_sequence(engine.pool(), thread_id)
                 .await
                 .unwrap_or_else(|e| {
-                    log!(
+                    log_legacy!(
                         "[Continue] window-end sample failed for thread {}: {}. \
                          Any queued follow-up keeps its remove button",
                         thread_id,
@@ -482,7 +487,7 @@ impl LucidosEngine {
                     )
                     .await
                 {
-                    log!("[Continue] Rerun for thread {} failed: {}", thread_id, e);
+                    log_legacy!("[Continue] Rerun for thread {} failed: {}", thread_id, e);
                 }
             });
 
@@ -556,7 +561,7 @@ pub(crate) async fn ingest_queued_messages_for_resume(
     {
         Ok(prompts) => prompts,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Continue] queued-message read failed for thread {}: {}. \
                  Any queued follow-up keeps its remove button",
                 thread_id,
@@ -578,13 +583,14 @@ pub(crate) async fn ingest_queued_messages_for_resume(
         let Some(prompt) = still_owed.into_iter().next() else {
             continue;
         };
-        crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, &prompt).await;
-        announced.push(prompt);
+        if crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, &prompt).await {
+            announced.push(prompt);
+        }
     }
     if announced.is_empty() {
         return None;
     }
-    log!(
+    log_legacy!(
         "[Continue] Recovered {} queued follow-up(s) stranded on thread {}",
         announced.len(),
         thread_id

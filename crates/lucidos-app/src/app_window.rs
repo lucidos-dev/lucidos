@@ -296,6 +296,11 @@ pub(crate) fn is_app_window(label: &str) -> bool {
     label == MAIN_WINDOW_LABEL || label.starts_with(APP_WINDOW_PREFIX)
 }
 
+/// Whether an ordinary close retains this window in the resident client.
+pub(crate) fn should_retain_on_close(label: &str, development: bool, tearing_down: bool) -> bool {
+    !development && !tearing_down && is_app_window(label)
+}
+
 /// A label no window has had before. The page keys its window-scoped storage by
 /// the label, so a recurring one would hand a new window a closed one's state.
 fn fresh_app_window_label() -> String {
@@ -560,7 +565,7 @@ fn open_app_window(
     // Recording a failed show as on screen would leave the watchdog reloading an
     // invisible page for the life of the process.
     if on_screen {
-        window_screen::note_shown(&label);
+        note_window_shown(app, &label, true);
     }
     // Either way this window is now on screen, which is what the session gate
     // waits for. See `window_persist::note_presented`.
@@ -904,8 +909,9 @@ pub(crate) fn restore_extra_windows(app: &tauri::AppHandle, windows: &[desktop::
 /// child is a webview and never a window, so this map holds app windows only.
 pub(crate) fn hide_all_windows(app: &tauri::AppHandle) {
     for (label, window) in app.windows() {
-        let _ = window.hide();
-        window_screen::note_hidden(&label);
+        if window.hide().is_ok() {
+            note_window_shown(app, &label, false);
+        }
     }
 }
 
@@ -932,10 +938,12 @@ pub(crate) fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window)
     // menu bar.
     activation::set_menu_bar_only(&app, false);
     let _ = window.unminimize();
-    let _ = window.show();
+    if window.show().is_err() {
+        return;
+    }
     let _ = window.set_focus();
     activation::activate_app_frontmost();
-    window_screen::note_shown(window.label());
+    note_window_shown(&app, window.label(), true);
     // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit explicitly
     // so the reshow is deterministic regardless of event timing.
     emit_window_active(&app, window.label(), true);
@@ -969,6 +977,22 @@ pub(crate) fn get_native_window_active(window: tauri::Window) -> bool {
     let visible = window.is_visible().unwrap_or(false);
     let minimized = window.is_minimized().unwrap_or(false);
     focused && visible && !minimized
+}
+
+/// Seed the calling window's own hide/show intent, independently of focus.
+#[tauri::command]
+pub(crate) fn get_native_window_shown(window: tauri::Window) -> bool {
+    window_screen::shown_by_client(window.label())
+}
+
+/// Publish only successful native hide/show operations to the affected page.
+pub(crate) fn note_window_shown(app: &tauri::AppHandle, label: &str, shown: bool) {
+    if shown {
+        window_screen::note_shown(label);
+    } else {
+        window_screen::note_hidden(label);
+    }
+    let _ = app.emit_to(label, "native-window-shown", shown);
 }
 
 /// Bridge the native window's ACTIVE state, focused and on-screen, to that
@@ -1013,6 +1037,20 @@ pub(crate) fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excludin
     }
 }
 
+/// Retain a page while withdrawing only its window's notification presence.
+pub(crate) fn hide_app_window(window: &tauri::Window) {
+    let app = window.app_handle();
+    if let Err(error) = window.hide() {
+        eprintln!("[Window] Could not hide {}: {error}", window.label());
+        return;
+    }
+    // Own hide intent keeps the watchdog from reloading a parked page.
+    note_window_shown(app, window.label(), false);
+    // WKWebView cannot observe orderOut; explicitly withdraw this page's presence.
+    emit_window_active(app, window.label(), false);
+    enter_menu_bar_only_if_no_windows(app, None);
+}
+
 /// Park the whole client in the menu-bar tray. HIDES every app window, then
 /// drops to menu-bar-only. The launchd services are untouched, and the only full
 /// teardown is [`quit_lucidos`].
@@ -1020,18 +1058,21 @@ pub(crate) fn enter_menu_bar_only_if_no_windows(app: &tauri::AppHandle, excludin
 /// Hidden, never destroyed, and that is what [`reopen_client`] gives back. It is
 /// also what keeps the window session honest across a park: no `Destroyed`
 /// fires, so nothing re-captures a shrunken window set, and a relaunch after a
-/// park still restores the arrangement. `main` had this treatment alone, for the
-/// reopen speed and the page state it preserves. A secondary window earned the
-/// same the moment the session gave it a workspace identity (ADR 0123).
+/// park still restores the arrangement. Individual closes retain the same
+/// pages and use the same hide operation.
 ///
 /// Packaged only. Dev has no always-on service and no tray, so hiding and going
 /// `Accessory` would strand the window with no way to reopen it. Dev therefore
-/// closes the windows instead, matching the default close-quits behavior.
+/// closes the windows instead, matching the default close-quits behavior. That
+/// is a teardown, so the arrangement is recorded first and each close then
+/// leaves the record alone. The next launcher start restores every window.
 /// By window, not webview window, per ADR 0140. Closing and hiding are window
 /// operations, and the blind flavour skipped whichever window had a preview
 /// open. That was always `main`, so the Cmd-Q park left it on screen.
 pub(crate) fn close_all_to_tray(app: &tauri::AppHandle) {
     if tauri::is_dev() {
+        window_persist::persist_windows(app);
+        window_persist::begin_teardown();
         for (label, window) in app.windows() {
             if is_app_window(&label) {
                 let _ = window.close();
@@ -1045,9 +1086,7 @@ pub(crate) fn close_all_to_tray(app: &tauri::AppHandle) {
     window_persist::persist_windows(app);
     for (label, window) in app.windows() {
         if is_app_window(&label) {
-            let _ = window.hide();
-            window_screen::note_hidden(&label);
-            emit_window_active(app, &label, false);
+            hide_app_window(&window);
         }
     }
     enter_menu_bar_only_if_no_windows(app, None);
@@ -1128,7 +1167,7 @@ pub(crate) fn reopen_client(app: &tauri::AppHandle) {
         if let Some(window) = app.get_window(label) {
             let _ = window.unminimize();
             match window.show() {
-                Ok(()) => window_screen::note_shown(label),
+                Ok(()) => note_window_shown(app, label, true),
                 Err(e) => eprintln!("[Tauri] Failed to show the parked window {label}: {e}"),
             }
         }
@@ -1173,10 +1212,12 @@ fn front_window(app: &tauri::AppHandle, label: &str) {
     // operation, and the lookup must survive a URL preview open in the target.
     if let Some(window) = app.get_window(label) {
         let _ = window.unminimize();
-        let _ = window.show();
+        if window.show().is_err() {
+            return;
+        }
         let _ = window.set_focus();
         activation::activate_app_frontmost();
-        window_screen::note_shown(label);
+        note_window_shown(app, label, true);
         emit_window_active(app, label, true);
         // A login-started client shows nothing until the user asks, and this is
         // where they ask. From here its window set is worth recording.
@@ -1277,6 +1318,19 @@ pub(crate) fn route_native_tap(app: &tauri::AppHandle, owner: Option<&str>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_packaged_closes_retain_every_app_window() {
+        for label in ["main", "window-0", "window-secondary"] {
+            assert!(should_retain_on_close(label, false, false));
+            assert!(!should_retain_on_close(label, true, false));
+            assert!(!should_retain_on_close(label, false, true));
+            assert!(!should_retain_on_close(label, true, true));
+        }
+        for label in ["url-preview-3", "lucidos-tray", ""] {
+            assert!(!should_retain_on_close(label, false, false));
+        }
+    }
 
     /// The frame the reported window came up wrong at, remembered on the 2.0
     /// Retina panel while the 1.0 ultrawide was primary.

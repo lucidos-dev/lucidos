@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+const acknowledge = vi.fn((_url: string, _init?: RequestInit) => Promise.resolve({ ok: true }));
+vi.mock('../../api/client/_core', () => ({
+  API: '/api/v1',
+  json: (url: string, init?: RequestInit) => acknowledge(url, init),
+}));
+
 const isTauri = vi.fn(() => true);
 vi.mock('../../utils/platform', () => ({
   isTauri: () => isTauri(),
@@ -17,7 +23,7 @@ vi.mock('../../utils/basePath', () => ({
 }));
 
 const showNativeNotification = vi.fn(
-  (_opts: { title: string; body: string; deepLink: Record<string, unknown> }) => Promise.resolve(),
+  (_opts: { title: string; body: string; deepLink: Record<string, unknown> }): Promise<boolean | null> => Promise.resolve(true),
 );
 const dismissNativeNotification = vi.fn(
   (_opts: { workspace: string | null; notificationId: string | null }) => Promise.resolve(),
@@ -92,6 +98,41 @@ describe('NativePushRequested → native desktop banner', () => {
     isTauri.mockReturnValue(true);
     presentInAppNotification.mockReset().mockReturnValue('not_shown');
     showNativeNotification.mockClear();
+    acknowledge.mockClear();
+  });
+
+  it('acknowledges only after the OS accepts the banner', async () => {
+    let accept!: () => void;
+    showNativeNotification.mockImplementationOnce(() => new Promise<boolean | null>((resolve) => { accept = () => resolve(true); }));
+    emit();
+    await flush();
+    expect(acknowledge).not.toHaveBeenCalled();
+    accept();
+    await flush();
+    expect(acknowledge).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves successful legacy native completion', async () => {
+    showNativeNotification.mockResolvedValueOnce(null);
+    emit();
+    await flush();
+    expect(acknowledge).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not acknowledge native delivery rejected by an updated client', async () => {
+    showNativeNotification.mockResolvedValueOnce(false);
+    emit();
+    await flush();
+    expect(acknowledge).not.toHaveBeenCalled();
+  });
+
+  it('leaves rejected banners pending for recovery', async () => {
+    showNativeNotification.mockRejectedValueOnce(new Error('OS unavailable'));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    emit();
+    await flush();
+    expect(acknowledge).not.toHaveBeenCalled();
+    warning.mockRestore();
   });
 
   it('shows a banner and forwards the deep link in SW-message shape', async () => {

@@ -23,13 +23,13 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
 
-import { seedSuggestion, startFreshDraft, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
+import { seedSuggestion, startFreshDraft, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, awaitThreadStarted, isThreadStartPending, prefillCompose, sendCompose, sendFollowup, startSetupInterview, updateCompose, selectComposeCodingAgent, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { _resetRowIntentsForTesting } from '../rowIntents';
 import { acceptComposeReport, composeEditSeq, isComposeIntentPending, knownComposeEpoch, _resetComposeSyncForTesting } from '../composeSync';
 import { focusThread, unfocusThread } from './threads';
-import { connectionStatus, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
+import { connectionStatus, preferences, selectedCodingAgent, confirmState, effectiveThreadStatus, focusedThreadId, focusedPane, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptCaretToEndSeq } from '../../components/chat/promptValueSync';
-import { patchComposeSelection, getComposeSelectionOverride, resolveCodingAgent, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
+import { applyCodingAgentDefault, patchComposeSelection, getComposeSelectionOverride, resolveCodingAgent, resolveProvider, resolveScope, _resetComposeSelectionsForTesting } from '../composeSelections';
 import {
   _resetThreadNavForTesting,
   _threadNavStateForTesting,
@@ -43,6 +43,8 @@ import type { ThreadMeta, ThreadState } from '../thread-events';
 import { _resetComposeDraftsForTesting, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { retryUnsentMessage } from './chat';
 import { upsertThread } from './thread-loading';
+import { handleThreadEvent } from './thread-sync';
+import { composeViewActive } from '../store';
 import { unsentMessages } from '../unsentMessages';
 import type { ThreadSummary } from '../../api/threads';
 
@@ -1720,7 +1722,7 @@ describe('compose writes for a thread are serialized', () => {
   // that gap must still flush: the engine fences a stale generation itself.
   it('the tab-close flush still goes out while restore admission is closed', async () => {
     const { installRestoreAdmission } = await import('../../utils/restoreAdmission');
-    installRestoreAdmission({ ready: () => false, wait: () => new Promise(() => {}) });
+    installRestoreAdmission({ ready: () => false, phase: () => 'awaiting-hello', wait: () => new Promise(() => {}) });
     try {
       updateCompose('t-1', { text: 'typed during a reconnect' });
       window.dispatchEvent(new Event('pagehide'));
@@ -1729,7 +1731,7 @@ describe('compose writes for a thread are serialized', () => {
         .map(([, init]) => JSON.parse(String((init as RequestInit).body)).text as string);
       expect(flushed).toEqual(['typed during a reconnect']);
     } finally {
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     }
   });
 
@@ -1816,6 +1818,57 @@ describe('a stale-epoch refusal resyncs instead of failing', () => {
     expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
     expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
     expect(knownComposeEpoch('t-1')).toBe(7);
+  });
+
+  it('retries a stale PUT with exact restoration additions after missed SSE', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: ['old'], mode: null, selection: null });
+    let calls = 0;
+    mockFetch = vi.fn(() => Promise.resolve(++calls === 1
+      ? new Response(JSON.stringify({ summary_version: 3, compose_epoch: 2,
+        text: 'committed before Stop\n\nqueued', image_hashes: ['server', 'queued'],
+        restorations: [{ epoch: 2, text: 'queued', image_hashes: ['queued'] }] }), { status: 412 })
+      : new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'local replacement', image_hashes: ['local'] });
+    await vi.runAllTimersAsync();
+    expect(composeBodies()[1]).toMatchObject({ text: 'local replacement\n\nqueued', image_hashes: ['local', 'queued'], compose_epoch: 2 });
+    expect(isComposeIntentPending('t-1')).toBe(false);
+  });
+
+  it('a reconnect summary rebases additions into a pending local draft', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: [], mode: null, selection: null });
+    mockFetch = vi.fn(() => Promise.resolve(new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'local replacement' });
+    const map = new Map(threadMap.value);
+    upsertThread(map, { ...staleComposingSummary('t-1', 'saved\n\nqueued'), state: 'active',
+      summary_version: 3, compose_epoch: 2,
+      compose_restorations: [{ epoch: 2, text: 'queued', image_hashes: [] }] }, false);
+    threadMap.value = map;
+    expect(getDraft('t-1').text).toBe('local replacement\n\nqueued');
+    await vi.runAllTimersAsync();
+    expect(composeBodies().slice(-1)[0].text).toBe('local replacement\n\nqueued');
+  });
+
+  it('sends rebased content after an older successful PUT acknowledgement', async () => {
+    _resetComposeSyncForTesting();
+    acceptComposeReport('t-1', { revision: 1, epoch: 1, text: 'saved', imageHashes: [], mode: null, selection: null });
+    let answer!: (response: Response) => void;
+    mockFetch = vi.fn().mockImplementationOnce(() => new Promise<Response>(resolve => { answer = resolve; }))
+      .mockImplementation(() => Promise.resolve(new Response(null, { status: 204 })));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+    updateCompose('t-1', { text: 'committed edit' });
+    await vi.advanceTimersByTimeAsync(300);
+    acceptComposeReport('t-1', { revision: 3, epoch: 2, text: 'committed edit\n\nqueued', imageHashes: [], mode: null, selection: null,
+      restorations: [{ epoch: 2, text: 'queued', image_hashes: [] }] });
+    answer(new Response(JSON.stringify({ summary_version: 2, compose_epoch: 1, text: 'committed edit', image_hashes: [] })));
+    await vi.runAllTimersAsync();
+    expect(composeBodies()).toHaveLength(2);
+    expect(composeBodies()[1]).toMatchObject({ text: 'committed edit\n\nqueued', compose_epoch: 2 });
+    expect(getDraft('t-1').text).toBe('committed edit\n\nqueued');
+    expect(isComposeIntentPending('t-1')).toBe(false);
   });
 
   it('parks the draft rather than spinning when the slot keeps being consumed', async () => {
@@ -2243,6 +2296,17 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     expect(thread.pendingUserMessages, 'no optimistic row while the thread starts').toHaveLength(1);
     expect(effectiveThreadStatus(thread)).toBe('running');
 
+    handleThreadEvent({
+      thread_id: thread.meta.id, seq: 1, created: '2026-01-01T00:00:00Z',
+      event: { type: 'ThreadStarted' },
+      aggregate: {
+        ...thread.meta, threadId: thread.meta.id, state: 'composing',
+        summaryVersion: 1, lastActivity: '', isSaved: false,
+      },
+    });
+    expect(thread.meta.state).toBe('active');
+    expect(composeViewActive.value).toBe(false);
+
     releaseThreadStart!(new Response(null, { status: 200 }));
     await expect(started).resolves.toBe(true);
   });
@@ -2255,6 +2319,19 @@ describe('sendCompose waits for the thread row before the chat POST', () => {
     await expect(started).resolves.toBe(false);
     expect(chatCalls(), 'chat POST fired despite the thread row failing').toHaveLength(0);
     expect(toasts.value.filter((t) => t.type === 'error').length).toBeGreaterThan(0);
+  });
+
+  it('restores compose view when the first message is refused after thread creation', async () => {
+    const started = startSetupInterview();
+    const id = focusedThreadId.value!;
+    expect(composeViewActive.value).toBe(false);
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ error: 'Send refused' }), { status: 403 }));
+    releaseThreadStart!(new Response(null, { status: 200 }));
+
+    await expect(started).resolves.toBe(false);
+    expect(threadMap.value.get(id)!.meta.state).toBe('composing');
+    expect(composeViewActive.value).toBe(true);
+    expect(getDraft(id).text.length).toBeGreaterThan(0);
   });
 
   // A seeded send starts a conversation, so it lands on a thread and must
@@ -2679,5 +2756,94 @@ describe('a thread start that gets no answer keeps the draft', () => {
     expect(threadMap.value.has(id)).toBe(false);
     expect(isThreadStartPending(id)).toBe(false);
     expect(mockFetch.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'DELETE')).toBe(false);
+  });
+});
+
+
+describe('remembered composer coding agent', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetComposeSelectionsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    focusedThreadId.value = null;
+    selectedCodingAgent.value = 'claude-code';
+    preferences.value = { status: 'loaded', data: {} };
+    threadMap.value = new Map([
+      ['legacy', makeThread({ id: 'legacy', state: 'composing' })],
+      ['explicit', makeThread({ id: 'explicit', state: 'composing' })],
+      ['started', makeThread({ id: 'started', codingAgent: 'claude-code' })],
+    ]);
+    patchComposeSelection('explicit', { codingAgent: 'codex' });
+    globalThis.fetch = vi.fn(async () => new Response('{}', { status: 200 }));
+  });
+
+  afterEach(() => {
+    _resetUndeliveredComposeDraftsForTesting();
+    _resetComposeSelectionsForTesting();
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    selectedCodingAgent.value = 'claude-code';
+  });
+
+  it('remembers the picked agent while preserving implicit and explicit existing drafts', async () => {
+    await selectComposeCodingAgent(null, 'codex');
+    expect(selectedCodingAgent.value).toBe('codex');
+    expect(preferences.value).toMatchObject({ data: { coding_agent_default: 'codex' } });
+    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/preferences'), expect.objectContaining({
+      method: 'PUT', body: JSON.stringify({ value: 'codex' }),
+    }));
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+    expect(resolveCodingAgent('explicit')).toBe('codex');
+    expect(threadMap.value.get('started')?.meta.codingAgent).toBe('claude-code');
+    const id = ensureFocusedComposeThread();
+    expect(getComposeSelectionOverride(id).codingAgent).toBe('codex');
+    _resetComposeSelectionsForTesting();
+    expect(resolveCodingAgent(null)).toBe('codex');
+  });
+
+  it('preserves the inherited agent when a peer preference refresh arrives during an edit', () => {
+    updateCompose('legacy', { text: 'new peer text' });
+    applyCodingAgentDefault('codex');
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+    expect(resolveCodingAgent('explicit')).toBe('codex');
+    expect(resolveCodingAgent(null)).toBe('codex');
+    expect(isComposeIntentPending('legacy')).toBe(true);
+  });
+
+  it('does not send content writes for unrelated drafts when remembering a pick', async () => {
+    await selectComposeCodingAgent(null, 'codex');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url).includes('/compose'))).toBe(false);
+  });
+
+  it('accepts a server agent pin during startup without replacing pending text', () => {
+    preferences.value = { status: 'loading' };
+    updateCompose('legacy', { text: 'new peer text' });
+    acceptComposeReport('legacy', {
+      revision: 2, epoch: 0, text: 'older server text', imageHashes: [], mode: 'claude_code',
+      selection: { codingAgent: 'codex' },
+    });
+    expect(resolveCodingAgent('legacy')).toBe('codex');
+    expect(getDraft('legacy')?.text).toBe('new peer text');
+    patchComposeSelection('legacy', { codingAgent: 'claude-code' });
+    acceptComposeReport('legacy', {
+      revision: 3, epoch: 0, text: 'older server text', imageHashes: [], mode: 'claude_code',
+      selection: { codingAgent: 'codex' },
+    });
+    expect(resolveCodingAgent('legacy')).toBe('claude-code');
+  });
+
+  it('does not persist the boot fallback before the saved preference is known', () => {
+    preferences.value = { status: 'loading' };
+    const id = ensureFocusedComposeThread();
+    expect(getComposeSelectionOverride(id).codingAgent).toBeUndefined();
+    selectedCodingAgent.value = 'codex';
+    expect(resolveCodingAgent(id)).toBe('codex');
+  });
+
+  it('updates the focused draft as well as the next composer', async () => {
+    await selectComposeCodingAgent('legacy', 'codex');
+    expect(resolveCodingAgent('legacy')).toBe('codex');
+    expect(selectedCodingAgent.value).toBe('codex');
   });
 });

@@ -189,7 +189,7 @@ impl LucidosEngine {
         let mut redacted_args = tool_call.arguments.clone();
         crate::core::redact_postgres_secrets_in_json(&mut redacted_args);
         let description = self.describe_tool(&tool_call.name, &redacted_args);
-        log!("[AgentLoop] Step {}/{}: {}", step, max, description);
+        log_legacy!("[AgentLoop] Step {}/{}: {}", step, max, description);
         self.event_bus
             .emit_for_id(crate::engine::event_bus::BusEvent::Thread {
                 thread_id,
@@ -369,15 +369,19 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
 /// follow-up must not buy one.
 ///
 /// A set of spoken asides alone carries no follow-up, per
-/// [`InjectedPromptKind::can_carry_a_turn`]. `drain_turn_orphans` drops one a
-/// moment later for the same reason, so the two windows agree rather than a
-/// race deciding.
+/// [`InjectedPromptKind::reopens_a_finished_answer`]. `drain_turn_orphans`
+/// drops one a moment later for the same reason, so the two windows agree
+/// rather than a race deciding.
+///
+/// The rest of a spoken sentence is where the two windows differ. Here it
+/// reopens the answer, which nobody has heard yet. In the teardown window that
+/// answer is out, and a re-submitted turn would be a second one.
 ///
 /// Mixed with a real follow-up the set still reopens, and the aside rides
 /// along in the appended message. That is the case
 /// `TurnStarter::overheard` exists for.
 pub(crate) fn injections_reopen_a_finished_answer(prompts: &[InjectedPrompt]) -> bool {
-    prompts.iter().any(|p| p.kind.can_carry_a_turn())
+    prompts.iter().any(|p| p.kind.reopens_a_finished_answer())
 }
 
 /// Where a framed injection is being delivered — the half of the framing the
@@ -556,7 +560,7 @@ pub(crate) async fn filter_removed_queued_prompts(
     {
         Ok(rows) => rows.into_iter().collect::<HashSet<_>>(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Inject] queued-message removal lookup failed for thread {}: {}",
                 thread_id,
                 e
@@ -583,7 +587,7 @@ pub(crate) async fn filter_removed_queued_prompts(
         .collect();
     let skipped = before.saturating_sub(filtered.len());
     if skipped > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[Inject] Skipped {} removed queued prompt(s) for thread {}",
             skipped,
             thread_id
@@ -624,14 +628,14 @@ pub(crate) async fn append_injected_prompts_to_messages(
                 // this is the backstop that turns a future slip into a dropped
                 // no-op rather than a failed turn.
                 if prompt.text.trim().is_empty() {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Inject] Dropped an empty engine re-entry {:?} on thread {}",
                         prompt.kind,
                         thread_id
                     );
                     continue;
                 }
-                crate::log!(
+                crate::log_legacy!(
                     "[Inject] Engine re-entry {:?} (spawning_event {:?}) into active thread {}",
                     prompt.kind,
                     prompt.spawning_event_id,
@@ -644,15 +648,21 @@ pub(crate) async fn append_injected_prompts_to_messages(
                 });
                 result.appended = true;
             }
-            InjectedPromptGroup::UserText(batch) => {
-                for prompt in &batch {
-                    crate::log!(
+            InjectedPromptGroup::UserText(queued) => {
+                let mut batch = Vec::with_capacity(queued.len());
+                for prompt in queued {
+                    crate::log_legacy!(
                         "[Inject] Mid-flight {:?} prompt injected into thread {}: {}",
                         prompt.mode,
                         thread_id,
                         &prompt.text[..prompt.text.floor_char_boundary(80)]
                     );
-                    emit_prompt_injected_event(bus, thread_id, meta, prompt).await;
+                    if emit_prompt_injected_event(bus, thread_id, meta, &prompt).await {
+                        batch.push(prompt);
+                    }
+                }
+                if batch.is_empty() {
+                    continue;
                 }
                 let has_images = prompts_have_images(&batch);
                 messages.push(coalesced_user_text_message(workspace, &batch));
@@ -1347,7 +1357,7 @@ pub(crate) fn load_attached_images(
         .filter_map(|hash| {
             let loaded = crate::core::blobs::read_blob_as_base64(workspace, hash);
             if loaded.is_none() {
-                log!("[AgentLoop] Attached image {hash} is no longer in the blob store");
+                log_legacy!("[AgentLoop] Attached image {hash} is no longer in the blob store");
             }
             loaded
         })
@@ -1975,16 +1985,19 @@ pub(crate) async fn emit_iteration_cap_response_generated(
 /// frontend correlates pending messages via `MessageReceived.id`;
 /// `PromptInjected` is a separate engine-side acknowledgment whose
 /// link back to the request is carried by `meta.request_event_id`.
+///
+/// Returns false when the user took the message back, and the caller must not
+/// deliver it. Any other emit failure only logs, and the prompt still runs.
 pub(crate) async fn emit_prompt_injected_event(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
     base_meta: &crate::engine::thread_events::EventMeta,
     prompt: &super::super::InjectedPrompt,
-) {
+) -> bool {
     let mut inject_meta = base_meta.clone();
     inject_meta.event_id = None;
-    bus.emit_or_log(
-        crate::engine::event_bus::BusEvent::Thread {
+    let emitted = bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::PromptInjected {
                 text: prompt.text.clone(),
@@ -1994,10 +2007,44 @@ pub(crate) async fn emit_prompt_injected_event(
                 delivered_event_id: None,
             },
             meta: inject_meta,
-        },
-        "[AgenticLoop] PromptInjected",
+        })
+        .await;
+    match emitted {
+        Ok(_) => {
+            if let Some(message) = prompt.event_id {
+                log_record_to_inject(bus.pool(), thread_id, message).await;
+            }
+            true
+        }
+        Err(e) if crate::engine::consumption_claim::is_removed_refusal(&*e) => {
+            crate::log_legacy!(
+                "[Inject] Skipped a queued prompt the user took back on thread {thread_id}"
+            );
+            false
+        }
+        Err(e) => {
+            crate::log_legacy!("[AgenticLoop] PromptInjected emit failed: {e}");
+            true
+        }
+    }
+}
+
+/// Log how long a follow-up waited between its record and its delivery, so a
+/// stalled message names the window it stalled in.
+async fn log_record_to_inject(pool: &sqlx::PgPool, thread_id: Uuid, message: Uuid) {
+    let waited: Result<Option<i64>, sqlx::Error> = sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM now() - created) * 1000)::bigint FROM events \
+         WHERE id = $1 AND thread_id = $2 AND event_type = 'MessageReceived'",
     )
+    .bind(message)
+    .bind(thread_id)
+    .fetch_optional(pool)
     .await;
+    match waited {
+        Ok(Some(ms)) => crate::log_legacy!("[Inject] Thread {thread_id}: message {message} reached the agent {ms} ms after it was recorded"),
+        Ok(None) => {}
+        Err(e) => crate::log_legacy!("[Inject] Thread {thread_id}: could not read when message {message} was recorded: {e}"),
+    }
 }
 
 /// How many tool-result images the model explicitly asked to see stay pinned in
@@ -2109,14 +2156,14 @@ pub(crate) async fn emit_image_descriptions(
             })
             .unwrap_or_default(),
         Ok(None) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[AgentLoop] ImageDescribed: origin event {} not found, skipping emit",
                 origin_id
             );
             Vec::new()
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[AgentLoop] ImageDescribed: failed to load origin event {}: {}",
                 origin_id,
                 e
@@ -2173,7 +2220,7 @@ pub(crate) async fn ensure_terminator_emitted(
         return;
     }
 
-    crate::log!(
+    crate::log_legacy!(
         "[AgenticLoop] WARNING: loop exited without emitting a terminator for request {} on thread {} — emitting defensive ResponseAborted",
         request_event_id,
         thread_id
@@ -2227,6 +2274,32 @@ pub(crate) async fn ensure_failure_terminator_emitted(
     .await;
 }
 
+/// [`ensure_agent_failure_terminator_emitted`] for the error a coding-agent run
+/// returned. A run parked on the owner's card is waiting, not failed, so it
+/// gets no terminator: the card holds the turn.
+pub(crate) async fn ensure_run_failure_terminator_emitted(
+    bus: &crate::engine::event_bus::EventBus,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+    channel: Option<crate::engine::thread_events::EventChannel>,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    if crate::engine::agent_session::spawn_gate::awaits_owner(error) {
+        return;
+    }
+    ensure_agent_failure_terminator_emitted(
+        bus,
+        pool,
+        thread_id,
+        request_event_id,
+        channel,
+        &error.to_string(),
+        crate::engine::agent_session::start_failure::agent_exit_of(error),
+    )
+    .await;
+}
+
 /// [`ensure_failure_terminator_emitted`] for a failure that is a coding agent's
 /// own exit, which the card reads from `agent_exit`.
 pub(crate) async fn ensure_agent_failure_terminator_emitted(
@@ -2247,7 +2320,11 @@ pub(crate) async fn ensure_agent_failure_terminator_emitted(
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                 error: error.to_string(),
+                spend_cap: crate::llm::spend_cap::SpendCapNotice::from_agent_text(
+                    "Provider", error,
+                ),
                 agent_exit,
+                provider_error: None,
             },
             meta: crate::engine::thread_events::EventMeta {
                 request_event_id: Some(request_event_id),

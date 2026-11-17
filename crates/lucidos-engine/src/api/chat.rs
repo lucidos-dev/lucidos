@@ -1,15 +1,13 @@
 use super::actor::build_message_origin;
 use super::*;
-use crate::engine::agent_pause::MessageAudience;
-use crate::engine::thread_events::{
-    ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent, WakeMode,
-};
+use crate::engine::thread_events::{ActorMode, EventMeta, MessageOrigin, WakeMode};
 use crate::engine::thread_lifecycle::ThreadType;
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
 use crate::engine::PreEmittedOrigin;
+use crate::engine::ThreadAgent;
 use crate::engine::{
-    overtaken_message, InputAdmission, InputOrder, InputPosition, InputTurn, OVERTAKEN_REASON,
+    overtaken_message, InputAdmission, InputOrder, InputPosition, OVERTAKEN_REASON,
 };
 use crate::runtime::InputWithdrawal;
 use std::collections::VecDeque;
@@ -140,7 +138,7 @@ async fn require_human_mode_is_attributed(
         Some(id) => match crate::core::DeviceStore::is_registered(pool, id).await {
             Ok(exists) => exists,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Chat] device lookup for '{}' failed ({}); treating the request as \
                      device-attributed so a database blip cannot refuse a real send",
                     id,
@@ -158,7 +156,7 @@ async fn require_human_mode_is_attributed(
     ) {
         return Ok(());
     }
-    log!(
+    log_legacy!(
         "[Chat] Refusing unattributed mode=human POST: device_id={:?}, user_agent={:?}, thread={:?}",
         device_id,
         headers.get("user-agent").and_then(|v| v.to_str().ok()),
@@ -315,21 +313,54 @@ pub(crate) fn require_offered_coding_agent_model(
 /// as done while it is the turn being worked on.
 ///
 /// See `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`.
+///
+/// Returns the orphans it announced: one the user took back meanwhile is left
+/// out, so the re-run never answers it.
 async fn announce_orphan_batch(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
-    batch: &[InjectedPrompt],
-) {
-    let Some(first) = batch.first() else {
-        return;
-    };
-    let base_meta = EventMeta {
-        request_event_id: first.event_id,
-        ..EventMeta::NONE
-    };
+    batch: Vec<InjectedPrompt>,
+) -> Vec<InjectedPrompt> {
+    let mut announced: Vec<InjectedPrompt> = Vec::with_capacity(batch.len());
     for orphan in batch {
-        crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, orphan).await;
+        // The re-run is anchored on the first orphan still owed.
+        let base_meta = EventMeta {
+            request_event_id: announced
+                .first()
+                .map_or(orphan.event_id, |first| first.event_id),
+            ..EventMeta::NONE
+        };
+        if crate::engine::emit_prompt_injected_event(bus, thread_id, &base_meta, &orphan).await {
+            announced.push(orphan);
+        }
     }
+    announced
+}
+
+/// Reserve a re-run or hand every orphan to the live turn as itself. For a
+/// Lucidos Agent thread only.
+async fn admit_orphan_batch(
+    engine: &SharedEngine,
+    thread_id: Uuid,
+    orphans: Vec<InjectedPrompt>,
+) -> (Vec<InjectedPrompt>, Option<crate::engine::PreAdmission>) {
+    use crate::engine::OrphanAdmission;
+    let is_user_text = orphans
+        .first()
+        .is_some_and(|first| matches!(first.kind, crate::engine::InjectedPromptKind::UserText));
+    if !is_user_text {
+        return (orphans, None);
+    }
+    let (registration, batch) = match engine.hand_over_or_admit(thread_id, orphans) {
+        OrphanAdmission::HandedOver => return (Vec::new(), None),
+        OrphanAdmission::Admitted(registration, batch) => (registration, batch),
+        OrphanAdmission::Closing(batch) => (engine.register_thread_queued(thread_id).await, batch),
+    };
+    let recover_engine = engine.clone();
+    let pending = crate::engine::PreAdmission::new(registration, move |prompts| {
+        recover_engine.resubmit_orphans_of_failed_turn(thread_id, prompts);
+    });
+    (batch, Some(pending))
 }
 
 /// Re-process orphaned injections sequentially until the chain settles.
@@ -355,81 +386,164 @@ pub(crate) async fn process_orphan_chain(
             let orphans =
                 crate::engine::filter_removed_queued_prompts(engine.pool(), thread_id, orphans)
                     .await;
-            let Some(first) = orphans.first() else {
+            if orphans.is_empty() {
                 return Vec::new();
-            };
-
-            let (text, images, mode, spawning_event_id, origin_event_id) =
-                if matches!(&first.kind, crate::engine::InjectedPromptKind::UserText) {
-                    announce_orphan_batch(&engine.event_bus, thread_id, &orphans).await;
-                    (
-                        crate::engine::coalesced_user_text_for_reprocess(&orphans),
-                        crate::engine::coalesced_images_for_reprocess(&orphans),
-                        first.mode,
-                        first.spawning_event_id,
-                        first.event_id,
-                    )
-                } else {
-                    (
-                        first.text.clone(),
-                        first.images.clone(),
-                        first.mode,
-                        first.spawning_event_id,
-                        first.event_id,
-                    )
-                };
-
-            match engine
-                .process_message_with_steps(
-                    &text,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None, // provider_override
-                    images.as_deref(),
-                    None,
-                    None,
-                    None,
-                    Some(thread_id),
-                    None,
-                    None,
-                    None,
-                    None,
-                    spawning_event_id,
-                    None,
-                    mode,
-                    None,
-                    None,
-                    // The first orphan was already emitted as MessageReceived
-                    // before it entered the injection channel. Flagged as an
-                    // engine re-entry, not a message: this is the engine
-                    // replaying work the user already saw acknowledged, so a
-                    // second acknowledgment would double up.
-                    origin_event_id.map(PreEmittedOrigin::EngineReentry),
-                    None,
-                    None,
-                    None,
-                    crate::engine::FollowUpUrgency::Normal,
-                    None,
-                )
-                .await
-            {
-                Ok(res) => res.orphaned_injections,
-                // A failed turn has already re-submitted its own orphans.
-                Err(e) => {
-                    log!(
-                        "[Chat] Failed to re-process {} orphaned injection(s) for thread {}: {}",
-                        orphans.len(),
-                        thread_id,
-                        e
-                    );
-                    Vec::new()
+            }
+            match crate::engine::thread_agent(engine.pool(), thread_id).await {
+                Ok(Some(ThreadAgent::LucidosAgent)) => {
+                    process_lucidos_agent_orphans(&engine, thread_id, orphans).await
                 }
+                Ok(Some(ThreadAgent::CodingAgent)) => {
+                    process_coding_agent_orphans(&engine, thread_id, orphans).await
+                }
+                Ok(None) => {
+                    refuse_orphans(&engine, thread_id, orphans.len(), "it has no row").await
+                }
+                Err(e) => refuse_orphans(&engine, thread_id, orphans.len(), &e.to_string()).await,
             }
         }
     })
     .await;
+}
+
+/// An unknown lane never runs the Lucidos Agent, which would spend a chat
+/// credential on a coding-agent thread. The messages stay unanswered.
+async fn refuse_orphans(
+    engine: &SharedEngine,
+    thread_id: Uuid,
+    count: usize,
+    why: &str,
+) -> Vec<InjectedPrompt> {
+    log_legacy!("[Chat] Could not read which agent runs thread {thread_id} ({why}), so {count} orphaned input(s) did not re-run");
+    let error = "Lucidos could not tell which agent runs this thread, so a message \
+                 the agent never read did not run. Send it again.";
+    if let Err(e) = crate::engine::emit_routing_failure(&engine.event_bus, thread_id, error).await {
+        log_legacy!("[Chat] Could not record the refused orphans on thread {thread_id}: {e}");
+    }
+    Vec::new()
+}
+
+/// Re-run the first orphan and queue its batch before newer follow-ups.
+/// Each message stays its own input and gets its own `CodingAgentPromptSent`.
+async fn process_coding_agent_orphans(
+    engine: &SharedEngine,
+    thread_id: Uuid,
+    orphans: Vec<InjectedPrompt>,
+) -> Vec<InjectedPrompt> {
+    let mut runnable = orphans
+        .into_iter()
+        .filter(|orphan| coding_agent_orphan_starter(&orphan.kind).is_some());
+    let Some(first) = runnable.next() else {
+        return Vec::new();
+    };
+    let starter = coding_agent_orphan_starter(&first.kind).expect("a runnable orphan");
+    let followups = runnable
+        .map(|orphan| crate::engine::AgentUserInput {
+            text: orphan.text,
+            images: orphan.images,
+            origin_event_id: orphan.event_id,
+            kind: if matches!(orphan.kind, crate::engine::InjectedPromptKind::UserText) {
+                crate::engine::AgentInputKind::User
+            } else {
+                crate::engine::AgentInputKind::ReentryFromEngine
+            },
+            completion: None,
+        })
+        .collect();
+    match engine
+        .process_orphan(
+            &first.text,
+            first.images.as_deref(),
+            thread_id,
+            first.spawning_event_id,
+            first.mode,
+            first.event_id.map(starter),
+            crate::engine::OrphanLane::CodingAgent(followups),
+        )
+        .await
+    {
+        Ok(res) => res.orphaned_injections,
+        Err(e) => {
+            log_legacy!("[Chat] Failed to re-process orphaned inputs for coding-agent thread {thread_id}: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// How a coding-agent orphan's recorded event becomes its starter. A message
+/// stays a message, so the run names it. `None` for the spoken kinds, which
+/// wake nothing.
+fn coding_agent_orphan_starter(
+    kind: &crate::engine::InjectedPromptKind,
+) -> Option<fn(Uuid) -> PreEmittedOrigin> {
+    use crate::engine::InjectedPromptKind;
+    match kind {
+        InjectedPromptKind::UserText => Some(PreEmittedOrigin::Message),
+        InjectedPromptKind::ReentryFromEngine => Some(PreEmittedOrigin::EngineReentry),
+        InjectedPromptKind::ReentryFromWait => Some(PreEmittedOrigin::WaitReentry),
+        InjectedPromptKind::SpokenAside | InjectedPromptKind::SpokenContinuation => None,
+    }
+}
+
+async fn process_lucidos_agent_orphans(
+    engine: &SharedEngine,
+    thread_id: Uuid,
+    orphans: Vec<InjectedPrompt>,
+) -> Vec<InjectedPrompt> {
+    let (mut orphans, admission) = admit_orphan_batch(engine, thread_id, orphans).await;
+    if orphans
+        .first()
+        .is_some_and(|first| matches!(first.kind, crate::engine::InjectedPromptKind::UserText))
+    {
+        orphans = announce_orphan_batch(&engine.event_bus, thread_id, orphans).await;
+    }
+    let Some(first) = orphans.first() else {
+        return Vec::new();
+    };
+
+    let (text, images, mode, spawning_event_id, origin_event_id) =
+        if matches!(&first.kind, crate::engine::InjectedPromptKind::UserText) {
+            (
+                crate::engine::coalesced_user_text_for_reprocess(&orphans),
+                crate::engine::coalesced_images_for_reprocess(&orphans),
+                first.mode,
+                first.spawning_event_id,
+                first.event_id,
+            )
+        } else {
+            (
+                first.text.clone(),
+                first.images.clone(),
+                first.mode,
+                first.spawning_event_id,
+                first.event_id,
+            )
+        };
+
+    match engine
+        .process_orphan(
+            &text,
+            images.as_deref(),
+            thread_id,
+            spawning_event_id,
+            mode,
+            origin_event_id.map(PreEmittedOrigin::EngineReentry),
+            crate::engine::OrphanLane::LucidosAgent(admission),
+        )
+        .await
+    {
+        Ok(res) => res.orphaned_injections,
+        // A failed turn has already re-submitted its own orphans.
+        Err(e) => {
+            log_legacy!(
+                "[Chat] Failed to re-process {} orphaned injection(s) for thread {}: {}",
+                orphans.len(),
+                thread_id,
+                e
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Iterate over `initial`, calling `process_one` per item; items the processor
@@ -561,7 +675,7 @@ fn validate_mode_and_spawn(request: &ChatRequest) -> Result<ValidatedSpawn, ApiE
     }
 
     if parent_thread_id.is_some() && parent_thread_id == thread_id {
-        log!(
+        log_legacy!(
             "[Chat] Refusing self-parented thread {:?}: mode={:?}",
             thread_id,
             request.mode
@@ -607,7 +721,7 @@ async fn refuse_unfit_integrated_spawn(
 ) -> Result<(), ApiError> {
     use crate::engine::integrated::{integrated_spawn_refusal, IntegratedSpawn};
     let read_failed = |e: sqlx::Error| {
-        log!("[Chat] integrated spawn check failed: {}", e);
+        log_legacy!("[Chat] integrated spawn check failed: {}", e);
         ApiError::from(StatusCode::INTERNAL_SERVER_ERROR)
     };
     let lucidos_repo = crate::core::repositories::RepositoryStore::get_by_name(
@@ -616,7 +730,7 @@ async fn refuse_unfit_integrated_spawn(
     )
     .await
     .map_err(|e| {
-        log!("[Chat] integrated spawn: Lucidos repo lookup failed: {}", e);
+        log_legacy!("[Chat] integrated spawn: Lucidos repo lookup failed: {}", e);
         ApiError::from(StatusCode::INTERNAL_SERVER_ERROR)
     })?;
     let lucidos_source = !app_folder
@@ -726,7 +840,7 @@ pub(super) struct ChatSubmitResponse {
     event_id: String,
     /// The *compose report* the send left when it consumed the thread's
     /// compose slot (ADR 0450). Absent when nothing was consumed: a new
-    /// thread, a caller other than a person, or a re-post already accepted.
+    /// thread, a caller other than a user, or a re-post already accepted.
     #[serde(skip_serializing_if = "Option::is_none")]
     compose: Option<crate::core::store::ComposeReport>,
 }
@@ -737,66 +851,11 @@ struct RemoveQueuedMessageRequest {
     message_id: String,
 }
 
-async fn queued_message_already_removed(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-    message_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1
-              FROM events
-             WHERE aggregate = 'thread'
-               AND aggregate_id = $1
-               AND event_type = 'QueuedMessageRemoved'
-               AND payload->>'removed_message_id' = $2
-        )",
-    )
-    .bind(thread_id.to_string())
-    .bind(message_id.to_string())
-    .fetch_one(pool)
-    .await
-}
-
-async fn queued_message_already_injected(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-    message_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1
-              FROM events
-             WHERE aggregate = 'thread'
-               AND aggregate_id = $1
-               AND event_type = 'PromptInjected'
-               AND payload->>'injected_message_id' = $2
-        )",
-    )
-    .bind(thread_id.to_string())
-    .bind(message_id.to_string())
-    .fetch_one(pool)
-    .await
-}
-
-/// Whether `thread_id` is a coding-agent thread, whose queued messages live in
-/// the agent's own queue rather than the Lucidos Agent's.
-async fn is_coding_agent_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1 FROM thread_summaries WHERE thread_id = $1 AND source = 'claude_code'
-        )",
-    )
-    .bind(thread_id)
-    .fetch_one(pool)
-    .await
-}
-
 /// The refusal for a queued message its agent already read.
-fn already_read(agent: &str) -> ApiError {
+fn already_read(recipient: &str) -> ApiError {
     ApiError::new(
         StatusCode::CONFLICT,
-        format!("{agent} has already read this message, so it can no longer be taken back."),
+        format!("This message has already been delivered to {recipient}, so it can no longer be taken back."),
     )
     .with_reason("already_read")
 }
@@ -805,7 +864,7 @@ async fn remove_queued_message(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(request): Json<RemoveQueuedMessageRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     let thread_id = Uuid::parse_str(&request.thread_id)
         .map_err(|_| ApiError::bad_request(format!("Invalid thread_id {:?}", request.thread_id)))?;
     let message_id = Uuid::parse_str(&request.message_id).map_err(|_| {
@@ -815,21 +874,24 @@ async fn remove_queued_message(
         &state.engine.event_bus,
         &headers,
         Some(thread_id),
-        crate::api::thread_reach::ThreadReachVerb::Control,
+        crate::engine::permission::Action::Control,
     )
     .await?;
 
-    let already_removed = queued_message_already_removed(&state.pool, thread_id, message_id)
-        .await
-        .map_err(ApiError::db)?;
+    let already_removed =
+        crate::engine::consumption_claim::was_removed(&state.pool, thread_id, message_id)
+            .await
+            .map_err(ApiError::db)?;
     if already_removed {
-        return Ok(StatusCode::OK);
+        return queued_removal_response(&state.pool, thread_id, message_id).await;
     }
 
     let actor = super::actor::user_actor(&headers, None);
-    if is_coding_agent_thread(&state.pool, thread_id)
+    // A coding agent's queued messages live in its own queue, not the Lucidos Agent's.
+    if crate::engine::thread_agent(&state.pool, thread_id)
         .await
         .map_err(ApiError::db)?
+        == Some(ThreadAgent::CodingAgent)
     {
         // The engine records the tombstone itself, once the agent drops the
         // message or no live process can hold it.
@@ -838,47 +900,58 @@ async fn remove_queued_message(
             .withdraw_coding_agent_input(thread_id, message_id, actor)
             .await
         {
-            InputWithdrawal::Withdrawn => Ok(StatusCode::OK),
+            InputWithdrawal::Withdrawn => {
+                queued_removal_response(&state.pool, thread_id, message_id).await
+            }
             // A concurrent request may have withdrawn it first: stay idempotent.
             InputWithdrawal::AlreadyRead
-                if queued_message_already_removed(&state.pool, thread_id, message_id)
-                    .await
-                    .map_err(ApiError::db)? =>
+                if crate::engine::consumption_claim::was_removed(
+                    &state.pool,
+                    thread_id,
+                    message_id,
+                )
+                .await
+                .map_err(ApiError::db)? =>
             {
-                Ok(StatusCode::OK)
+                queued_removal_response(&state.pool, thread_id, message_id).await
             }
-            InputWithdrawal::AlreadyRead => Err(already_read("The coding agent")),
+            InputWithdrawal::AlreadyRead => Err(already_read("the coding agent")),
             InputWithdrawal::Refused(why) => {
                 Err(ApiError::new(StatusCode::CONFLICT, why).with_reason("withdraw_refused"))
             }
         };
     }
 
-    let already_injected = queued_message_already_injected(&state.pool, thread_id, message_id)
-        .await
-        .map_err(ApiError::db)?;
-    if already_injected {
-        return Err(already_read("The Lucidos Agent"));
+    use crate::engine::consumption_claim::{take_back_message, TakeBackOutcome};
+    match take_back_message(&state.engine.event_bus, thread_id, message_id, actor).await {
+        Ok(TakeBackOutcome::Removed | TakeBackOutcome::AlreadyRemoved) => {
+            queued_removal_response(&state.pool, thread_id, message_id).await
+        }
+        Ok(TakeBackOutcome::Consumed) => Err(already_read("its recipient")),
+        Err(error) => Err(ApiError::internal(format!(
+            "Could not record the removal: {error}"
+        ))),
     }
+}
 
-    state
-        .engine
-        .event_bus
-        .emit(crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event: ThreadEvent::QueuedMessageRemoved {
-                removed_message_id: message_id,
-            },
-            meta: EventMeta {
-                channel: Some(EventChannel::Chat),
-                actor,
-                ..EventMeta::NONE
-            },
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("Could not record the removal: {e}")))?;
-
-    Ok(StatusCode::OK)
+/// An idempotent removal may have been won by Stop, which already restored
+/// compose. Edit must reconcile that report instead of appending again.
+async fn queued_removal_response(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    message_id: Uuid,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let compose: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'compose' FROM events WHERE thread_id=$1 \
+         AND event_type='QueuedMessageRemoved' AND payload->>'removed_message_id'=$2",
+    )
+    .bind(thread_id)
+    .bind(message_id.to_string())
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::db)?
+    .flatten();
+    Ok(Json(serde_json::json!({ "compose": compose })))
 }
 
 /// Did this engine already accept a message with this client event id? Asks
@@ -902,8 +975,9 @@ async fn message_was_already_accepted(
 /// Returns immediately with an `event_id` (the response's only field; the
 /// legacy `message_id` name survives solely as a request-body serde alias on
 /// `ChatRequest::event_id`). All progress events are sent via the global SSE
-/// stream as ThreadEvent events. A re-post of an accepted `event_id` returns
-/// the same ack and starts nothing (`message_was_already_accepted`).
+/// stream as ThreadEvent events. Human inputs acknowledge durable acceptance;
+/// their receipt replays before mutable settings or draft fences. Recording
+/// remains execution-time work, including question and coding-agent routing.
 pub(super) async fn chat_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -925,6 +999,8 @@ pub(super) async fn chat_submit(
     // writes nothing at all. See `human_mode_is_attributed` for why it sits in
     // front of the (stricter, but opt-in) subprocess gate further down.
     require_human_mode_is_attributed(&state.pool, &headers, &request).await?;
+    let wire_intent =
+        serde_json::to_value(&request).map_err(|error| ApiError::internal(error.to_string()))?;
 
     // The validator parses the target id too, so the subprocess gate below and
     // the self-parent refusal read the same value.
@@ -965,7 +1041,7 @@ pub(super) async fn chat_submit(
             .fetch_optional(state.engine.pool())
             .await
             .map_err(|e| {
-                log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
+                log_legacy!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?,
             None => None,
@@ -1012,7 +1088,7 @@ pub(super) async fn chat_submit(
             parent_thread_id,
             request.caller_workspace.is_some(),
         ) {
-            log!(
+            log_legacy!(
                 "[Chat] Refusing to address unknown thread {} (no create signal): mode={:?}, user_agent={:?}",
                 tid,
                 mode,
@@ -1041,7 +1117,7 @@ pub(super) async fn chat_submit(
                 parent_thread_id,
                 thread_exists,
             ) {
-                log!(
+                log_legacy!(
                     "[Chat] Rejecting subprocess chat POST: mode={:?}, source_thread={:?}, target_thread={:?}, parent_thread={:?}, target_exists={}",
                     mode,
                     source_thread_id,
@@ -1054,40 +1130,12 @@ pub(super) async fn chat_submit(
         }
     }
 
-    refuse_unroutable_provider(
-        &state,
-        request.model.as_deref(),
-        request.provider.as_deref(),
-    )?;
-
-    // A message for a running Lucidos Agent turn is answered by that turn, so
-    // it cannot name another pair (the rung lock, `chat::rung`).
-    let chat_thread = existing_thread_row
-        .as_ref()
-        .filter(|(_, source, ..)| source != crate::engine::thread_lifecycle::CODING_AGENT_SOURCE)
-        .and(target_thread_id);
-    if let (Some(tid), false) = (chat_thread, request.use_coding_agent == Some(true)) {
-        let overrides = crate::core::ResolvedModelSelection {
-            model: request.model.clone(),
-            reasoning_effort: request.reasoning_effort.clone(),
-            provider: request.provider.clone(),
-        };
-        if state
-            .engine
-            .mid_turn_override_differs(tid, overrides)
-            .await
-            .map_err(|e| ApiError::internal(format!("Could not read thread {tid}: {e}")))?
-        {
-            return Err(turn_running_refusal());
-        }
-    }
-
     let engine_clone = state.engine.clone();
     let message = request.message.clone();
     let model = request.model.clone();
     let reasoning_effort = request.reasoning_effort.clone();
     let provider = request.provider.clone();
-    let device_id = match crate::gateway_operators::current().person_count() >= 2 {
+    let device_id = match crate::gateway_users::current().user_count() >= 2 {
         true => super::actor::authenticated_device_id(request.device_id.as_deref(), &headers),
         false => super::actor::claimed_device_id(request.device_id.as_deref(), &headers),
     }
@@ -1102,7 +1150,7 @@ pub(super) async fn chat_submit(
             .get_thread_title(ptid)
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[Chat] Failed to load parent thread title for {}: {}",
                     ptid,
                     e
@@ -1136,6 +1184,97 @@ pub(super) async fn chat_submit(
     );
     origin_agrees_with_mode(origin.as_ref(), mode)?;
 
+    // An accepted retry is independent of today's provider registry, running
+    // rung, image blobs and compose slot. Authenticate first, then compare the
+    // original wire intent before resolving any of those mutable inputs.
+    if mode == ActorMode::Human {
+        if let (Some(tid), Some(id), Some(actor)) = (
+            target_thread_id,
+            request
+                .event_id
+                .as_deref()
+                .and_then(|id| Uuid::parse_str(id).ok()),
+            origin.as_ref(),
+        ) {
+            let intent =
+                crate::engine::event_bus::OrdinarySubmissionIntent::new(tid, id, &wire_intent)
+                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            if let Some(receipt) = state
+                .engine
+                .event_bus
+                .ordinary_submission_receipt(&intent, actor)
+                .await
+                .map_err(|error| {
+                    let message = error.to_string();
+                    if message == "ordinary_retry_identity_conflict" {
+                        ApiError::new(StatusCode::CONFLICT, message)
+                    } else {
+                        ApiError::internal(format!("Could not read the accepted input: {error}"))
+                    }
+                })?
+            {
+                return Ok(Json(ChatSubmitResponse {
+                    event_id: receipt.event_id.to_string(),
+                    compose: receipt.compose,
+                }));
+            }
+            // Inputs recorded before durable receipts existed keep their
+            // original idempotency contract. This read claims no new id and
+            // cannot consume a newer draft. A different target is a conflict.
+            if crate::engine::chat_event_id_is_recorded(state.engine.pool(), id)
+                .await
+                .map_err(ApiError::db)?
+            {
+                let same_thread: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM events WHERE id=$1 AND thread_id=$2)",
+                )
+                .bind(id)
+                .bind(tid)
+                .fetch_one(state.engine.pool())
+                .await
+                .map_err(ApiError::db)?;
+                if !same_thread {
+                    return Err(ApiError::new(
+                        StatusCode::CONFLICT,
+                        "ordinary_retry_identity_conflict",
+                    ));
+                }
+                return Ok(Json(ChatSubmitResponse {
+                    event_id: id.to_string(),
+                    compose: None,
+                }));
+            }
+        }
+    }
+
+    refuse_unroutable_provider(
+        &state,
+        request.model.as_deref(),
+        request.provider.as_deref(),
+    )?;
+
+    // A message for a running Lucidos Agent turn is answered by that turn, so
+    // it cannot name another pair (the rung lock, `chat::rung`).
+    let chat_thread = existing_thread_row
+        .as_ref()
+        .filter(|(_, source, ..)| source != crate::engine::thread_lifecycle::CODING_AGENT_SOURCE)
+        .and(target_thread_id);
+    if let (Some(tid), false) = (chat_thread, request.use_coding_agent == Some(true)) {
+        let overrides = crate::core::ResolvedModelSelection {
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            provider: request.provider.clone(),
+        };
+        if state
+            .engine
+            .mid_turn_override_differs(tid, overrides)
+            .await
+            .map_err(|e| ApiError::internal(format!("Could not read thread {tid}: {e}")))?
+        {
+            return Err(turn_running_refusal());
+        }
+    }
+
     let app_ctx = request.app_context;
     let file_ctx = resolve_file_ctx(
         request.file_context.as_ref(),
@@ -1158,22 +1297,12 @@ pub(super) async fn chat_submit(
         }
         (None, None) => None,
     };
-    let chat_images = supplied_image_hashes.as_ref().map(|hashes| {
-        let mut resolved = Vec::with_capacity(hashes.len());
-        for hash in hashes {
-            match crate::core::blobs::read_blob_as_base64(state.engine.workspace_path(), hash) {
-                Some((data, mime_type)) => resolved.push(ChatImage {
-                    base64: data,
-                    mime_type,
-                }),
-                None => log!(
-                    "[Chat] image_hashes: blob {} missing on disk, dropping from message",
-                    hash
-                ),
-            }
-        }
-        resolved
-    });
+    let chat_images = supplied_image_hashes
+        .as_ref()
+        .map(|hashes| state.engine.resolve_message_image_hashes(hashes))
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?
+        .flatten();
     require_input_to_create(
         has_started,
         &message,
@@ -1185,7 +1314,7 @@ pub(super) async fn chat_submit(
     // `coding_agent` is a coding-agent-spawn payload — without CC requested it
     // would silently vanish (the chat-agent path never reads it). Reject early.
     if coding_agent.is_some() && use_coding_agent != Some(true) {
-        log!("[Chat] chat_submit received `coding_agent` without `use_coding_agent=true` — rejecting");
+        log_legacy!("[Chat] chat_submit received `coding_agent` without `use_coding_agent=true` — rejecting");
         return Err(StatusCode::BAD_REQUEST.into());
     }
     require_offered_coding_agent_model(
@@ -1195,7 +1324,7 @@ pub(super) async fn chat_submit(
         cc_model.as_deref(),
     )?;
     // An agent starting a thread picks a rung on its surface's ladder, a
-    // coding agent's or chat's. A person picks anything the picker offers
+    // coding agent's or chat's. A user picks anything the picker offers
     // (ADR 0500, ADR 0525).
     if !has_started && super::intelligence_ladder::is_agent_caller(&headers, origin.as_ref()) {
         let (surface, picked_model) = match use_coding_agent {
@@ -1218,7 +1347,11 @@ pub(super) async fn chat_submit(
         )
         .await?;
     }
-    let event_id = request.event_id;
+    let event_id = request
+        .event_id
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let event_uuid =
+        Uuid::parse_str(&event_id).map_err(|_| ApiError::bad_request("event_id must be a UUID"))?;
     // Re-bind the value parsed above for the subprocess-origin gate.
     // Re-parsing it here would double the 400 branch.
     let thread_id = target_thread_id;
@@ -1236,11 +1369,11 @@ pub(super) async fn chat_submit(
             {
                 Ok(Some(repo)) => Some(repo.id.to_string()),
                 Ok(None) => {
-                    log!("[Chat] Unknown repo name '{}' in chat_submit", s);
+                    log_legacy!("[Chat] Unknown repo name '{}' in chat_submit", s);
                     return Err(StatusCode::BAD_REQUEST.into());
                 }
                 Err(e) => {
-                    log!("[Chat] Failed to look up repo '{}': {}", s, e);
+                    log_legacy!("[Chat] Failed to look up repo '{}': {}", s, e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
             }
@@ -1264,14 +1397,14 @@ pub(super) async fn chat_submit(
         .filter(|s| !s.is_empty());
     let (repo_id, thread_id, app_id_to_stash) = if let Some(folder_str) = folder_in {
         if repo_id.as_deref().is_some_and(|s| !s.is_empty()) {
-            log!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
+            log_legacy!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
             return Err(StatusCode::BAD_REQUEST.into());
         }
         // `folder` is a coding-agent spawn payload. Without CC requested, the
         // resolved `app_id_to_stash` would sit forever in `pending_app_spawn`,
         // because the chat agent path never pops it.
         if use_coding_agent != Some(true) {
-            log!(
+            log_legacy!(
                 "[Chat] chat_submit received `folder` without `use_coding_agent=true` — rejecting"
             );
             return Err(StatusCode::BAD_REQUEST.into());
@@ -1287,7 +1420,7 @@ pub(super) async fn chat_submit(
             match std::fs::canonicalize(&raw) {
                 Ok(p) => p,
                 Err(e) => {
-                    log!("[Chat] canonicalize workspace_root {:?} failed ({}); falling back to raw path — symlinked workspaces may misclassify", raw, e);
+                    log_legacy!("[Chat] canonicalize workspace_root {:?} failed ({}); falling back to raw path — symlinked workspaces may misclassify", raw, e);
                     raw
                 }
             }
@@ -1300,7 +1433,7 @@ pub(super) async fn chat_submit(
             match crate::core::repositories::RepositoryStore::list(state.engine.pool()).await {
                 Ok(v) => v,
                 Err(e) => {
-                    log!("[Chat] failed to list repos for folder resolution: {}", e);
+                    log_legacy!("[Chat] failed to list repos for folder resolution: {}", e);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
             };
@@ -1316,7 +1449,7 @@ pub(super) async fn chat_submit(
                 let canon = match std::fs::canonicalize(&raw) {
                     Ok(p) => p,
                     Err(e) => {
-                        log!("[Chat] canonicalize repo {} path {:?} failed ({}); using raw — match may miss for symlinked / deleted paths", r.id, raw, e);
+                        log_legacy!("[Chat] canonicalize repo {} path {:?} failed ({}); using raw — match may miss for symlinked / deleted paths", r.id, raw, e);
                         raw
                     }
                 };
@@ -1335,7 +1468,7 @@ pub(super) async fn chat_submit(
                 match std::fs::canonicalize(&raw) {
                     Ok(p) => p,
                     Err(e) => {
-                        log!("[Chat] canonicalize Lucidos repo path {:?} failed ({}); using raw — Lucidos classification may misfire", raw, e);
+                        log_legacy!("[Chat] canonicalize Lucidos repo path {:?} failed ({}); using raw — Lucidos classification may misfire", raw, e);
                         raw
                     }
                 }
@@ -1358,7 +1491,7 @@ pub(super) async fn chat_submit(
         ) {
             Ok(p) => p,
             Err(e) => {
-                log!("[Chat] folder `{}` failed to resolve: {}", folder_str, e);
+                log_legacy!("[Chat] folder `{}` failed to resolve: {}", folder_str, e);
                 return Err(StatusCode::BAD_REQUEST.into());
             }
         };
@@ -1382,7 +1515,7 @@ pub(super) async fn chat_submit(
         ) {
             Ok(c) => c,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Chat] folder `{}` classification failed: {}",
                     folder_str,
                     e
@@ -1403,7 +1536,7 @@ pub(super) async fn chat_submit(
                 let repo_uuid = match repo {
                     Some((id, _)) => id.to_string(),
                     None => {
-                        log!(
+                        log_legacy!(
                             "[Chat] external repo {:?} not found in canonical snapshot — \
                              external_repo_match invariant violated",
                             repo_root
@@ -1441,7 +1574,7 @@ pub(super) async fn chat_submit(
         (thread_id, existing_thread_row)
     {
         let existing_state = ThreadState::from_db_str(&state_str).map_err(|e| {
-            log!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
+            log_legacy!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
         if !existing_state.can_change_mode() {
@@ -1458,7 +1591,7 @@ pub(super) async fn chat_submit(
                 // over HTTP/2, so the user's toast read "Failed to send
                 // message: 409" with no hint that the thread was locked to a
                 // different mode.
-                log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
+                log_legacy!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
                 return Err(ApiError::new(sc, msg));
             }
         }
@@ -1478,16 +1611,17 @@ pub(super) async fn chat_submit(
     }
 
     // Checked before the dispatch, so a refused mention records nothing.
-    let people_addressing = super::people_messages::addressing_of_send(
+    let user_addressing = super::user_only_messages::addressing_of_send(
         &state.pool,
         thread_id,
         request.mentions,
         request.agent_mentioned,
         mode,
+        origin.as_ref(),
     )
     .await?;
-    super::people_messages::refuse_people_only_start(
-        people_addressing.as_ref(),
+    super::user_only_messages::refuse_user_only_start(
+        user_addressing.as_ref(),
         use_coding_agent == Some(true) && !has_started,
     )?;
 
@@ -1501,14 +1635,89 @@ pub(super) async fn chat_submit(
         } => emitting_trigger_id,
         crate::api::actor::SubprocessOrigin::NotSubprocess => None,
     };
+    if mode == ActorMode::Human {
+        let tid = thread_id.unwrap_or_else(Uuid::new_v4);
+        let actor = origin
+            .clone()
+            .ok_or_else(|| ApiError::bad_request("The input has no authenticated author"))?;
+        let intent =
+            crate::engine::event_bus::OrdinarySubmissionIntent::new(tid, event_uuid, &wire_intent)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let queue_request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+            message,
+            user_addressing: user_addressing.map(Box::new),
+            thread_id: tid,
+            depth: 0,
+            event_id: Some(event_id),
+            image_hashes: supplied_image_hashes.unwrap_or_default(),
+            device_id,
+            app_context: app_ctx,
+            file_context: file_ctx,
+            url_context: url_ctx.map(Box::new),
+            conflict_change_id,
+            model,
+            reasoning_effort,
+            provider,
+            use_coding_agent,
+            repo_id,
+            cc_model,
+            coding_agent,
+            title: request_title,
+            mode,
+            origin,
+            parent_thread_id,
+            spawning_event_id,
+            wake_mode,
+            app_id: app_id_to_stash.map(|(_, app_id)| app_id),
+            integrated: request_integrated,
+            spawning_trigger_id,
+        };
+        // Detached, so a dropped request cannot abandon an acceptance that is
+        // waiting on the thread append lock (ADR 0449). The retry replays its receipt.
+        let acceptor = state.engine.clone();
+        let input_chain = request.input_chain;
+        let (input_seq, compose_epoch) = (request.input_seq, request.compose_epoch);
+        let accepted = tokio::spawn(async move {
+            acceptor
+                .accept_ordinary_submission(
+                    queue_request,
+                    actor,
+                    input_chain.as_deref(),
+                    input_seq,
+                    compose_epoch,
+                    intent,
+                )
+                .await
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("The input acceptance failed: {error}")))?
+        .map_err(|error| {
+            let reason = error.to_string();
+            match reason.as_str() {
+                "overtaken" => ApiError::new(StatusCode::CONFLICT, overtaken_message(tid)).with_reason(OVERTAKEN_REASON),
+                "compose_snapshot_stale" => ApiError::new(StatusCode::CONFLICT, "The saved draft changed before this send was accepted. Its content was not sent.").with_reason("compose_snapshot_stale"),
+                "compose_fence_required" => ApiError::new(StatusCode::CONFLICT, "This send has no draft epoch after a saved-draft submission. Its content was not sent.").with_reason("compose_fence_required"),
+                "ordinary_retry_identity_conflict" => ApiError::new(StatusCode::CONFLICT, reason),
+                _ => ApiError::internal(format!("Could not accept the input: {error}")),
+            }
+        })?;
+        // The transaction owns the work already. Neither a lost wake nor a
+        // disconnected HTTP request can cancel it: the periodic loader and
+        // boot recovery both read this same durable membership.
+        let engine = state.engine.clone();
+        tokio::spawn(async move {
+            engine.thread_queue.drain().await;
+        });
+        return Ok(Json(ChatSubmitResponse {
+            event_id: accepted.receipt.event_id.to_string(),
+            compose: accepted.receipt.compose,
+        }));
+    }
     // Everything from here to the ack runs as one detached task the handler
     // awaits. A dropped request then drops only that wait: it can never split
     // an admitted input from the work that records it (ADR 0449).
     let dispatch = tokio::spawn(async move {
         let engine = state.engine.clone();
-        let event_uuid = event_id
-            .as_deref()
-            .and_then(|raw| Uuid::parse_str(raw).ok());
         // Fix this input's place in the thread's order before the ack. An input
         // a later one from its page overtook is refused here, never recorded.
         // It runs before the dedupe below. A refused send then never claims an
@@ -1516,12 +1725,12 @@ pub(super) async fn chat_submit(
         let mut input_turn = match thread_id {
             Some(tid) => match engine
                 .input_order
-                .admit(engine.pool(), tid, input_position, event_uuid)
+                .admit(engine.pool(), tid, input_position, Some(event_uuid))
                 .await
             {
                 Ok(InputAdmission::Admitted(turn)) => Some(turn),
                 Ok(InputAdmission::Overtaken) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] Refusing an overtaken input on thread {}: {:?}",
                         tid,
                         input_position
@@ -1542,22 +1751,17 @@ pub(super) async fn chat_submit(
         // and starts nothing. Placed after every refusal, so a refused request
         // leaves its id free for the corrected retry. A failure further down that
         // starts nothing forgets `accepted_event_id` for the same reason.
-        let mut accepted_event_id = None;
-        if let Some(raw) = event_id.as_deref() {
-            if let Some(id) = event_uuid {
-                if message_was_already_accepted(&engine, id).await? {
-                    log!(
-                        "[Chat] Event {} was already accepted; acking the re-post",
-                        id
-                    );
-                    return Ok(Json(ChatSubmitResponse {
-                        event_id: raw.to_string(),
-                        compose: None,
-                    }));
-                }
-                accepted_event_id = Some(id);
-            }
+        if message_was_already_accepted(&engine, event_uuid).await? {
+            log_legacy!(
+                "[Chat] Event {} was already accepted; acking the re-post",
+                event_uuid
+            );
+            return Ok(Json(ChatSubmitResponse {
+                event_id,
+                compose: None,
+            }));
         }
+        let accepted_event_id = event_uuid;
 
         // ---- Thread Queue gate ----
         // Agent/Engine-mode POSTs that START a new thread are background spawns: a
@@ -1570,10 +1774,9 @@ pub(super) async fn chat_submit(
             // Queue requests never carry inline base64, because the request is
             // persisted in the event payload. Every image is a stored blob by now.
             let image_hashes = supplied_image_hashes.unwrap_or_default();
-            let response_event_id = event_id
-                .clone()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            let response_event_id = event_id;
             let queue_request = crate::engine::thread_queue::ThreadQueueRequest::AgentChat {
+                user_addressing: None,
                 // Stamped by `submit` from this task's chain depth.
                 depth: 0,
                 message: message.clone(),
@@ -1581,6 +1784,10 @@ pub(super) async fn chat_submit(
                 event_id: Some(response_event_id.clone()),
                 image_hashes,
                 device_id: device_id.clone(),
+                app_context: app_ctx,
+                file_context: file_ctx,
+                url_context: url_ctx.map(Box::new),
+                conflict_change_id,
                 model: model.clone(),
                 reasoning_effort: reasoning_effort.clone(),
                 provider: provider.clone(),
@@ -1600,7 +1807,7 @@ pub(super) async fn chat_submit(
             };
             let outcome = engine.thread_queue.submit(queue_request, origin).await;
             if !outcome.admitted {
-                log!(
+                log_legacy!(
                     "[Chat] Agent-mode spawn queued at position {} (thread {})",
                     outcome.position,
                     queue_thread_id
@@ -1612,95 +1819,8 @@ pub(super) async fn chat_submit(
             }));
         }
 
-        // A person's send consumes the thread's compose slot now, at accept. The
-        // ack then reports the state it left, and no later event of this send
-        // touches the draft (ADR 0450). Every refusal is behind this line, and an
-        // accepted re-post returned above, so a send consumes exactly once.
-        let compose = match thread_id {
-            Some(tid) if thread_exists && mode == ActorMode::Human => {
-                let consumed = super::threads_compose::consume_and_announce_compose_slot(
-                    &state,
-                    tid,
-                    &message,
-                    supplied_image_hashes.as_deref().unwrap_or(&[]),
-                    device_id.clone(),
-                )
-                .await;
-                match consumed {
-                    Ok(report) => report,
-                    Err(e) => {
-                        if let Some(id) = accepted_event_id {
-                            engine.accepted_messages.forget(id);
-                        }
-                        return Err(ApiError::internal(format!(
-                            "could not consume the compose slot: {e}"
-                        )));
-                    }
-                }
-            }
-            _ => None,
-        };
-
-        // On a team gateway a person's message may stay between people. It
-        // then records `PeopleMessagePosted`, which starts no turn (ADR 0649).
-        let thread_id = match (&people_addressing, thread_id) {
-            (Some(_), None) => Some(Uuid::new_v4()),
-            (_, tid) => tid,
-        };
-        if let (Some(addressing), Some(tid)) = (&people_addressing, thread_id) {
-            // The route reads the pause, which an input admitted before this
-            // one may still flip. Waiting keeps both in admission order.
-            if let Some(turn) = input_turn.as_mut() {
-                turn.wait_for_predecessor().await;
-            }
-            let routed = super::people_messages::route_people_message(
-                engine.pool(),
-                &engine.event_bus,
-                tid,
-                addressing,
-                origin.clone(),
-            )
-            .await;
-            let posted = match routed {
-                Ok(MessageAudience::Agent) => None,
-                Ok(MessageAudience::PeopleOnly) => Some(
-                    super::people_messages::post_people_message(
-                        &engine.event_bus,
-                        tid,
-                        super::people_messages::PeopleMessage {
-                            text: message.clone(),
-                            image_hashes: supplied_image_hashes.clone().unwrap_or_default(),
-                            device_id: device_id.clone(),
-                            mentions: addressing.mentions.clone(),
-                            event_id: event_uuid,
-                        },
-                        origin.clone(),
-                    )
-                    .await,
-                ),
-                Err(e) => Some(Err(e)),
-            };
-            match posted {
-                None => {}
-                Some(Ok(())) => {
-                    drop(input_turn.take());
-                    super::people_messages::spawn_people_notice(
-                        &engine, tid, event_uuid, &message, addressing, true, &origin,
-                    );
-                    return Ok(Json(ChatSubmitResponse {
-                        event_id: event_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-                        compose,
-                    }));
-                }
-                Some(Err(e)) => {
-                    if let Some(id) = accepted_event_id {
-                        engine.accepted_messages.forget(id);
-                    }
-                    return Err(e);
-                }
-            }
-        }
-
+        let compose = None;
+        let thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
         // Stash the app spawn AFTER every early-return gate above. An entry
         // stamped earlier would leak in the in-memory map when a gate rejects:
         // `run_direct_agent` is the only popper, and it is never reached on the
@@ -1713,63 +1833,19 @@ pub(super) async fn chat_submit(
                     guard.insert(tid, app_id);
                 }
                 Err(e) => {
-                    log!("[Chat] pending_app_spawn poisoned, cannot stash: {}", e);
-                    if let Some(id) = accepted_event_id {
-                        engine.accepted_messages.forget(id);
-                    }
+                    log_legacy!("[Chat] pending_app_spawn poisoned, cannot stash: {}", e);
+                    engine.accepted_messages.forget(accepted_event_id);
                     return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
             }
         }
 
         let title = request_title;
-        let response_event_id = event_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let response_event_id = event_id.clone();
 
-        // Persist the follow-up's MessageReceived BEFORE this handler acks, when no
-        // input admitted before it is still unrecorded. The 200 then also means
-        // "recorded". Self-gating and non-fatal: see
-        // `pre_emit_chat_message_received`. Runs after admission, so a request
-        // that was refused cannot leave an orphaned message behind.
-        let input_ahead = input_turn.as_mut().is_some_and(InputTurn::has_input_ahead);
-        let pre_emitted_origin = engine
-            .pre_emit_chat_message_received(
-                thread_id,
-                thread_exists,
-                input_ahead,
-                mode,
-                use_coding_agent,
-                &message,
-                chat_images.as_deref(),
-                device_id.as_deref(),
-                model.as_deref(),
-                reasoning_effort.as_deref(),
-                provider.as_deref(),
-                event_id.as_deref(),
-                origin.clone(),
-                // Typed. A spoken message arrives on the voice socket instead,
-                // never through this handler.
-                None,
-            )
-            .await;
-        // Recorded, so the next input admitted to this thread may record too.
-        if pre_emitted_origin.is_some() {
-            drop(input_turn.take());
-        }
+        let pre_emitted_origin: Option<PreEmittedOrigin> = None;
 
-        // A request with no thread id starts a new thread. Name it here, as a
-        // client's raw new send does, so the Thread Queue gate's reservation
-        // belongs to the thread it starts (ADR 0443).
-        let thread_id = thread_id.unwrap_or_else(Uuid::new_v4);
-        if let Some(addressing) = people_addressing
-            .as_ref()
-            .filter(|a| !a.mentions.is_empty())
-        {
-            super::people_messages::spawn_people_notice(
-                &engine, thread_id, event_uuid, &message, addressing, false, &origin,
-            );
-        }
+        // Reserve capacity for the thread identity assigned before recording.
         let engine_for_panic = engine.clone();
         let thread_id_for_panic = thread_id;
         let actor_for_apply = origin.clone();
@@ -1782,7 +1858,7 @@ pub(super) async fn chat_submit(
             // User-initiated work shares the one capacity pool (ADR 0008): take a
             // prioritized slot, held across the whole response. Admits at once
             // when the pool has room; at true pool-max this awaits a free slot
-            // (the person sees "requesting" until then). Released on task end —
+            // (the user sees "requesting" until then). Released on task end —
             // even on panic — by the guard's Drop.
             let _user_slot = {
                 let summary = crate::engine::thread_queue::truncate_summary(message.trim());
@@ -1802,7 +1878,7 @@ pub(super) async fn chat_submit(
                     chat_images.as_deref(),
                     device_id.as_deref(),
                     use_coding_agent,
-                    event_id.as_deref(),
+                    Some(event_id.as_str()),
                     Some(thread_id),
                     conflict_change_id,
                     repo_id.as_deref(),
@@ -1830,7 +1906,7 @@ pub(super) async fn chat_submit(
                             let pending = match engine_clone.changes().list_pending().await {
                                 Ok(v) => v,
                                 Err(e) => {
-                                    log!(
+                                    log_legacy!(
                                         "[Chat] auto-apply: list_pending: {} — skipping auto-apply",
                                         e
                                     );
@@ -1845,10 +1921,13 @@ pub(super) async fn chat_submit(
                                     .await
                                 {
                                     Ok(result) => {
-                                        log!("[Chat] Auto-applied change: {}", result.message);
+                                        log_legacy!(
+                                            "[Chat] Auto-applied change: {}",
+                                            result.message
+                                        );
                                     }
                                     Err(e) => {
-                                        log!("[Chat] Failed to auto-apply change: {}", e);
+                                        log_legacy!("[Chat] Failed to auto-apply change: {}", e);
                                         engine_clone
                                             .event_bus
                                             .emit_or_log(
@@ -1896,7 +1975,7 @@ pub(super) async fn chat_submit(
                 // `ResponseFailed`. The idempotency gate could not match that, so
                 // an in-loop failure wrote the event twice and fired every
                 // subscribed trigger twice.
-                Err(ref e) => log!("[Chat] Chat error: {}", e),
+                Err(ref e) => log_legacy!("[Chat] Chat error: {}", e),
             }
         });
 
@@ -1963,8 +2042,7 @@ pub(super) struct ChatSettingsRequest {
 }
 
 /// Record a rung pick on a Lucidos Agent thread. Its next turn runs on it,
-/// however that turn starts. While a turn runs, the rung is locked and this
-/// refuses with 409 and `reason: "turn-running"`.
+/// however that turn starts. During a turn this saves the next-turn pick.
 pub(super) async fn chat_settings(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -1976,7 +2054,7 @@ pub(super) async fn chat_settings(
         &state.engine.event_bus,
         &headers,
         Some(thread_id),
-        crate::api::thread_reach::ThreadReachVerb::Control,
+        crate::engine::permission::Action::Control,
     )
     .await?;
     let actor = super::actor::user_actor(&headers, None);
@@ -2029,7 +2107,6 @@ pub(super) async fn chat_settings(
         .map_err(|e| ApiError::internal(format!("Could not record the pick: {e}")))?
     {
         crate::engine::ChatSettingsOutcome::Recorded => Ok(Json(serde_json::json!({ "ok": true }))),
-        crate::engine::ChatSettingsOutcome::TurnRunning => Err(turn_running_refusal()),
     }
 }
 
@@ -2057,7 +2134,7 @@ pub(super) async fn cancel_chat(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Query(query): Query<CancelChatQuery>,
-) -> Result<Json<super::CancelResponse>, ApiError> {
+) -> Result<Json<super::ChatCancelResponse>, ApiError> {
     let thread_id = parse_optional_uuid(query.thread_id.as_deref())?;
     // Before the question card is cancel-stamped, so a refusal writes nothing.
     // A thread-bound caller with no `thread_id` is refused rather than reread
@@ -2067,7 +2144,7 @@ pub(super) async fn cancel_chat(
         &state.engine.event_bus,
         &headers,
         thread_id,
-        crate::api::thread_reach::ThreadReachVerb::Cancel,
+        crate::engine::permission::Action::Cancel,
     )
     .await?;
     // Resolve the actor once and reuse it for the question-card resolution, the
@@ -2075,6 +2152,14 @@ pub(super) async fn cancel_chat(
     // `ResponseCanceled.actor` / `ResponseAborted.actor`, so the timeline
     // records which device clicked Stop.
     let actor = super::actor::user_actor(&headers, None);
+    // Persist take-backs before any question resolution or cancel token can
+    // wake/finalize the live loop. Keep cancellation available on a read error.
+    let taken_back = crate::engine::consumption_claim::take_back_unconsumed(
+        &state.engine.event_bus,
+        thread_id,
+        actor.clone(),
+    )
+    .await;
     // Resolve any pending question card before firing the cancel token.
     // Otherwise the chat agent's `ask_user_question` tool stays blocked on
     // `walk_question_batch.recv()`, which has no cancel-aware select, and the
@@ -2091,10 +2176,8 @@ pub(super) async fn cancel_chat(
     } else {
         false
     };
-    // Stop ends the TURN, and nothing else. It deliberately leaves this
-    // thread's event subscriptions alone (ADR 0052): a subscription has not
-    // held a turn since ADR 0049, so it is not part of what a turn-scoped Stop
-    // owns.
+    // Stop ends the turn and holds automatic wakes (ADR 0696). Subscriptions
+    // remain live (ADR 0052): their deliveries wait for the human's resume.
     //
     // `canceled = false` means the server had nothing live to cancel, so the
     // client's optimistic "canceling" state is stale and it must re-sync.
@@ -2128,7 +2211,7 @@ pub(super) async fn cancel_chat(
                 {
                     Ok(settled) => settled,
                     Err(e) => {
-                        crate::log!("[API] cancel_chat settle failed for {}: {}", uuid, e);
+                        crate::log_legacy!("[API] cancel_chat settle failed for {}: {}", uuid, e);
                         false
                     }
                 }
@@ -2136,8 +2219,14 @@ pub(super) async fn cancel_chat(
         }
         None => state.engine.cancel_all_threads(actor),
     };
-    Ok(Json(super::CancelResponse {
+    let take_back = taken_back.map_err(|error| {
+        ApiError::internal(format!(
+            "Cancellation was requested, but unread inputs could not be taken back: {error}"
+        ))
+    })?;
+    Ok(Json(super::ChatCancelResponse {
         canceled: question_resolved || canceled,
+        take_back,
     }))
 }
 

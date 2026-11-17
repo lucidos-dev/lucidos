@@ -71,6 +71,7 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         crate::external_address::stored(&client, &base, &token)
     };
 
+    let waits = crate::devices::any_paired(&client, &base, &token) == Some(true);
     let mut request = client
         .post(format!("{base}{PAIRING_CODE_PATH}"))
         .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
@@ -136,8 +137,21 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
         println!("  Unless that device names itself, it will be listed as \"{label}\".");
     }
     println!("  It works once and expires in {minutes} minutes.");
+    if waits {
+        print!("{}", awaiting_owner_note("device"));
+    }
     println!();
     Ok(())
+}
+
+/// Pure: what a code minted here waits for, once a device is paired. The
+/// redeemer of `kind` waits until a paired device taps Allow.
+fn awaiting_owner_note(kind: &str) -> String {
+    format!(
+        "\n  A device is already paired here, so the new {kind} waits until you tap\n  \
+         Allow under Settings -> Access on a paired device. If no paired device\n  \
+         works any more, run `lucidos devices revoke --all` and pair again.\n"
+    )
 }
 
 /// `lucidos pair --gateway`: mint a secret that lets another gateway relay this
@@ -146,7 +160,11 @@ pub fn cmd_pair(args: PairArgs<'_>) -> Result<(), BoxError> {
 /// It prints the `https` address the other gateway should use, found the way a
 /// device QR finds one. Without one there is nothing to pair over, so it says
 /// what to set up instead.
-pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), BoxError> {
+pub fn cmd_pair_gateway(
+    port: Option<u16>,
+    label: Option<&str>,
+    manage: bool,
+) -> Result<(), BoxError> {
     let client = gateway::client()?;
     let base = gateway::the_gateway(
         &client,
@@ -162,16 +180,23 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
         || tailnet_origin(&probe, &base),
     );
 
+    let waits = crate::devices::any_paired(&client, &base, &token) == Some(true);
     let mut request = client
         .post(format!("{base}{GATEWAY_PAIRING_CODE_PATH}"))
         .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token);
     if let Some(label) = label {
         request = request.query(&[("label", label)]);
     }
+    if manage {
+        request = request.query(&[("manage", "true")]);
+    }
     let Minted { code, minutes, .. } = mint(request)?;
 
     println!();
     println!("  Gateway pairing secret: {code}");
+    if manage {
+        println!("  Devices on the other gateway may manage this gateway's users and devices.");
+    }
     println!();
     println!("  On the other gateway, open Settings -> Access -> Add a remote gateway,");
     match &address {
@@ -190,6 +215,9 @@ pub fn cmd_pair_gateway(port: Option<u16>, label: Option<&str>) -> Result<(), Bo
     }
     println!();
     println!("  It works once and expires in {minutes} minutes.");
+    if waits {
+        print!("{}", awaiting_owner_note("gateway"));
+    }
     println!();
     Ok(())
 }
@@ -695,5 +723,13 @@ mod tests {
             painted,
             "\u{1b}[30;47mab\u{1b}[0m\n\u{1b}[30;47mcd\u{1b}[0m\n"
         );
+    }
+
+    #[test]
+    fn the_waiting_note_names_the_redeemer_and_the_way_back_in() {
+        let note = awaiting_owner_note("gateway");
+        assert!(note.contains("the new gateway waits"), "{note}");
+        assert!(note.contains("lucidos devices revoke --all"), "{note}");
+        assert!(note.lines().all(|l| l.chars().count() <= 80), "{note}");
     }
 }

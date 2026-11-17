@@ -277,7 +277,10 @@ test.describe('Where a thread reopens', () => {
     // whatever the reload then happens to land on.
     const recorded = await page.evaluate(
       (key) => localStorage.getItem(key), scrollKey(threadId));
-    expect(recorded).toBe(`anchor:${parked.relTop}:${parked.id}`);
+    // The save writes the line form, whose turn half places the reader when
+    // the line itself is gone.
+    expect(recorded).toMatch(
+      new RegExp(`^line:-?\\d+:${parked.relTop}:${parked.id}:`));
 
     // The turn sits inside the page a cold open loads, so nothing is chased.
     let olderReads = 0;
@@ -310,8 +313,8 @@ test.describe('Where a thread reopens', () => {
    *  most `MAX_READING_CHASES` of them, until that turn is loaded. Then the
    *  walk lands the reader on it.
    *
-   *  The position is seeded rather than walked to. It is the same key and the
-   *  same stored form the test above reads back off the app's own write. */
+   *  The position is seeded rather than walked to. It is the same key the test
+   *  above reads back, in the turn form, which the open still reads. */
   test('a position behind the loaded page is chased and lands on its turn', async ({ page }) => {
     const { threadId, messageIds } = seedStepHeavyThread();
     seededThreads.push(threadId);

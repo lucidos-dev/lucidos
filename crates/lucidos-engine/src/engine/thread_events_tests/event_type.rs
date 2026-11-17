@@ -200,7 +200,9 @@ fn thread_event_type_name_extraction() {
         (
             ThreadEvent::ResponseFailed {
                 error: "e".into(),
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             },
             "ResponseFailed",
         ),
@@ -215,6 +217,7 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "s".into(),
                 branch: String::new(),
@@ -288,6 +291,7 @@ fn thread_event_type_name_extraction() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             "CodingAgentIdled",
         ),
@@ -330,6 +334,7 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::ChangeProposed {
+                content: Default::default(),
                 change_id: "c".into(),
                 description: None,
                 files: vec![],
@@ -348,6 +353,7 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::ChangeApplied {
+                content: Default::default(),
                 change_id: "c".into(),
                 requires_restart: false,
                 client_update: false,
@@ -379,6 +385,9 @@ fn thread_event_type_name_extraction() {
         ),
         (
             ThreadEvent::ChangeApplyFailed {
+                pre_merge_sha: None,
+                post_merge_sha: None,
+                landing_merge_sha: None,
                 change_id: "c".into(),
                 error: "conflict".into(),
                 actor: None,

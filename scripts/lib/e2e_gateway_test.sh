@@ -52,17 +52,6 @@ test_identity_needs_the_engine_port_listed() {
     assert_eq "" "$got" "not listed gives none"
 }
 
-test_auto_candidates_are_deduplicated() {
-    echo "test: auto mode asks the inherited gateway, then the dev one, once each"
-    local got
-    got="$(e2e_gateway_auto_candidates 5252 5251 | tr '\n' ' ')"
-    assert_eq "5252 5251 " "$got" "inherited first"
-    got="$(e2e_gateway_auto_candidates 5251 5251 | tr '\n' ' ')"
-    assert_eq "5251 " "$got" "no repeat"
-    got="$(e2e_gateway_auto_candidates "" 5251 | tr '\n' ' ')"
-    assert_eq "5251 " "$got" "nothing inherited"
-}
-
 # Run attach_e2e_gateway in a subshell with a coding-agent session's inherited
 # environment, and print what the engine would inherit.
 attach_from_session() {
@@ -70,31 +59,17 @@ attach_from_session() {
     (
         export WORKSPACE="$E2E_WORKSPACE" ENGINE_PORT="$1"
         export LUCIDOS_GATEWAY_PORT="$2" LUCIDOS_WORKSPACE_ID=dev
-        unset LUCIDOS_E2E_GATEWAY LUCIDOS_DEV_GATEWAY_PORT
+        unset LUCIDOS_E2E_GATEWAY
         attach_e2e_gateway >/dev/null 2>&1
         echo "port=${LUCIDOS_GATEWAY_PORT:-} id=${LUCIDOS_WORKSPACE_ID:-}"
     )
 }
 
-test_auto_replaces_the_inherited_dev_identity() {
-    echo "test: auto mode gives the engine its own id, never the inherited 'dev'"
+test_a_local_run_drops_the_inherited_dev_identity() {
+    echo "test: a local run never attaches, even to a gateway that lists the engine"
     local got
     got="$(attach_from_session 5341 "$DEFAULT_DEV_GATEWAY_PORT")"
-    assert_eq "port=$DEFAULT_DEV_GATEWAY_PORT id=e2e-test" "$got" "registered as e2e-test"
-}
-
-test_auto_clears_both_when_no_gateway_lists_the_engine() {
-    echo "test: auto mode clears both variables when the listing names another port"
-    local got
-    got="$(attach_from_session 6000 "$DEFAULT_DEV_GATEWAY_PORT")"
     assert_eq "port= id=" "$got" "no gateway identity at all"
-}
-
-test_auto_falls_through_to_the_dev_gateway() {
-    echo "test: auto mode asks the dev gateway when the inherited one does not list us"
-    local got
-    got="$(attach_from_session 5341 5252)"
-    assert_eq "port=$DEFAULT_DEV_GATEWAY_PORT id=e2e-test" "$got" "found on the dev gateway"
 }
 
 test_unknown_mode_is_refused() {
@@ -227,6 +202,10 @@ EOF
     esac
     check "data dir is inside the e2e workspace" grep -qx "LUCIDOS_GATEWAY_DATA=$dir" "$env_file"
     check "the gateway inherits no workspace id" not_grep '^LUCIDOS_WORKSPACE_ID=' "$env_file"
+    check "the gateway keeps its secrets under the e2e root" \
+        grep -qx "LUCIDOS_PRIVATE_DIR=$(e2e_private_dir)" "$env_file"
+    check "adoption reads the e2e root's local token" \
+        grep -qx "$(e2e_private_dir)/local-token" "$SANDBOX/adopt-request"
     check "the workspace was adopted at the engine's port" grep -qx 5341 "$SANDBOX/adopt-request"
     check "the owner helper receives the workspace identity" grep -qx e2e-test "$SANDBOX/adopt-request"
     check "nothing wrote the gateway's registry file" test ! -e "$dir/config/workspaces.json"
@@ -244,10 +223,7 @@ EOF
 check "E2E adoption ownership contract" env PYTHONDONTWRITEBYTECODE=1 python3 "$SCRIPT_DIR/e2e_adopt_test.py"
 
 test_identity_needs_the_engine_port_listed
-test_auto_candidates_are_deduplicated
-test_auto_replaces_the_inherited_dev_identity
-test_auto_clears_both_when_no_gateway_lists_the_engine
-test_auto_falls_through_to_the_dev_gateway
+test_a_local_run_drops_the_inherited_dev_identity
 test_unknown_mode_is_refused
 test_own_gateway_env_is_isolated
 test_log_summary_counts_adoptions_and_spawns

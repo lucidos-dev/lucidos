@@ -179,6 +179,19 @@ describe('app toast bridge: lifetime', () => {
     expect(toasts.value).toEqual([]);
   });
 
+  it.each(['success', 'info', 'warning', 'error'])('lets an app close a timed %s even with dismissable false', (type) => {
+    toastMsg({ message: 'Finished', type, key: 'timed-app', durationMs: 8000, dismissable: false });
+    const buttons = findByClass(ToastList(), 'toast-close');
+    expect(buttons).toHaveLength(1);
+    (buttons[0].props as unknown as { onClick: () => void }).onClick();
+    expect(toasts.value).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+    // A canceled keyed timer must not remove a later toast using the same key.
+    toastMsg({ message: 'Still working', type: 'info', key: 'timed-app', spinning: true });
+    vi.advanceTimersByTime(8000);
+    expect(toasts.value).toHaveLength(1);
+  });
+
   it('honours an explicit durationMs', () => {
     toastMsg({ message: 'Failed', type: 'error', key: 'a', durationMs: 1000 });
     vi.advanceTimersByTime(1000);

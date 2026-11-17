@@ -188,7 +188,7 @@ describe('PresenceCheck (active page) → in-app toast', () => {
     expect(t.secondaryAction).toBeUndefined();
   });
 
-  it('a tap on a navigate (thread + event) notification deep-links to the source event', () => {
+  it('a tap on a navigate (thread + event) notification deep-links to the source event', async () => {
     // The tap must route through the SAME navigate dispatch the inbox detail
     // and push taps use: focusThreadOrBootstrap(threadId, { targetEventId }).
     // The scroll-and-pulse itself is covered by e2e/notifications-all.spec.ts.
@@ -203,7 +203,7 @@ describe('PresenceCheck (active page) → in-app toast', () => {
 
     toasts.value[0].onClick!();
 
-    expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' });
+    await vi.waitFor(() => expect(focusThreadOrBootstrap).toHaveBeenCalledWith('t-9', { targetEventId: 'e-7' }));
     expect(markReadOptimistic).toHaveBeenCalledWith('notif-q', undefined);
   });
 

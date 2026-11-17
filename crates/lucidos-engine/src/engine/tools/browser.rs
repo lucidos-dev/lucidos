@@ -154,7 +154,7 @@ impl LucidosEngine {
                             .commit(&held, &actual_path, &format!("Screenshot: {}", actual_path))
                             .await
                         {
-                            log!(@screenshot, "Failed to commit: {}", e);
+                            log_legacy!(@screenshot, "Failed to commit: {}", e);
                         }
                         Ok(result)
                     }

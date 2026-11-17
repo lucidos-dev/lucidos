@@ -8,16 +8,17 @@
 use super::*;
 use crate::engine::claude_code::AllowScope;
 use crate::engine::command_permission::resolve_command_permission;
+use crate::engine::permission::tool_grants::AnsweredBy;
 
 #[derive(Deserialize)]
 pub(super) struct CommandConsentRequest {
     pub request_id: String,
     pub allowed: bool,
-    /// When `Some(_)` and `allowed`, the engine records the derived pattern so
-    /// future matching commands skip the prompt: `session` into the in-memory
-    /// per-thread allow set; `narrow` / `broad` into `~/.lucidos/
-    /// agent-allowed-commands`. Absent (Allow-once) records nothing. Unknown
-    /// wire values 4xx via serde — match the engine's typed enum exactly.
+    /// When `Some(_)` and `allowed`, the engine records the derived pattern as
+    /// a *tool grant* so future matching commands skip the prompt: `session`
+    /// held by the thread, `narrow` / `broad` standing. Absent (Allow once)
+    /// records nothing. Unknown wire values 4xx via serde, matching the
+    /// engine's typed enum exactly.
     #[serde(default)]
     pub persist_scope: Option<AllowScope>,
 }
@@ -57,7 +58,7 @@ pub(super) async fn submit_command_consent(
         body.request_id,
         body.allowed,
         body.persist_scope,
-        actor,
+        AnsweredBy::tap(actor),
         "[CommandPermission] CommandPermissionResolved",
     )
     .await;

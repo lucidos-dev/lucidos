@@ -174,6 +174,7 @@ pub enum WriteAnnouncement {
     /// `writer_thread_id` is the thread whose turn wrote it, when one did.
     Entity {
         source: Option<String>,
+        writer: crate::core::artifact_writer::ArtifactWriterOrigin,
         writer_thread_id: Option<uuid::Uuid>,
     },
     /// The caller emits a RICHER event that stands in for the entity event on
@@ -215,7 +216,7 @@ impl ArtifactManager {
     pub fn new(workspace_path: PathBuf) -> Result<Self, git2::Error> {
         let artifacts_path = workspace_path.join(ARTIFACTS_DIR);
         if let Err(e) = fs::create_dir_all(&artifacts_path) {
-            log!("[Artifacts] Failed to create artifacts directory: {}", e);
+            log_legacy!("[Artifacts] Failed to create artifacts directory: {}", e);
         }
 
         let repo = match Repository::open(&workspace_path) {
@@ -247,11 +248,11 @@ impl ArtifactManager {
                     super::commit_index(&repo, "chore: update .gitignore", base)
                 });
                 if let Err(e) = committed {
-                    log!("[Artifacts] Failed to commit .gitignore: {}", e);
+                    log_legacy!("[Artifacts] Failed to commit .gitignore: {}", e);
                 }
             }
             Ok(false) => {}
-            Err(e) => log!("[Artifacts] Failed to ensure .gitignore entries: {}", e),
+            Err(e) => log_legacy!("[Artifacts] Failed to ensure .gitignore entries: {}", e),
         }
 
         Ok(Self {
@@ -317,12 +318,19 @@ impl ArtifactManager {
         message: &str,
         announcement: WriteAnnouncement,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let writer = match &announcement {
+            WriteAnnouncement::Entity { writer, .. } => {
+                Some(writer.clone().resolve(event_bus.pool()).await?)
+            }
+            WriteAnnouncement::SupersededBy(_) => None,
+        };
         let existed = self.artifact_exists(relative_path);
         self.write_artifact(relative_path, content)?;
         let commit_sha = self.commit(held, relative_path, message).await?;
         if let WriteAnnouncement::Entity {
             source,
             writer_thread_id,
+            ..
         } = announcement
         {
             event_bus
@@ -333,6 +341,7 @@ impl ArtifactManager {
                         commit_sha.clone(),
                         source,
                         writer_thread_id,
+                        writer.expect("entity writer was resolved before writing"),
                     )),
                     "[Artifacts] artifact write",
                 )
@@ -809,8 +818,10 @@ impl ArtifactManager {
         // memory from this list, and an error here would drop every artifact.
         let oids: Vec<git2::Oid> = revwalk
             .filter_map(|r| {
-                r.map_err(|e| log!("[Artifacts] Skipping unreadable commit in history: {}", e))
-                    .ok()
+                r.map_err(|e| {
+                    log_legacy!("[Artifacts] Skipping unreadable commit in history: {}", e)
+                })
+                .ok()
             })
             .collect();
 
@@ -1065,6 +1076,9 @@ mod tests {
                 "one",
                 "Write notes",
                 WriteAnnouncement::Entity {
+                    writer: crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                        crate::engine::event_bus::ArtifactWriter::Person,
+                    ),
                     source: None,
                     writer_thread_id: None,
                 },
@@ -1079,6 +1093,9 @@ mod tests {
                 "two",
                 "Rewrite notes",
                 WriteAnnouncement::Entity {
+                    writer: crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                        crate::engine::event_bus::ArtifactWriter::Person,
+                    ),
                     source: Some("run_python".to_string()),
                     writer_thread_id: None,
                 },
@@ -1094,6 +1111,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(kinds, vec!["ArtifactCreated", "ArtifactUpdated"]);
+        let writers: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT COALESCE(payload->'data', payload)->'writer' FROM events WHERE event_type IN ('ArtifactCreated', 'ArtifactUpdated') ORDER BY sequence",
+        ).fetch_all(&pool).await.unwrap();
+        let expected =
+            serde_json::to_value(crate::engine::event_bus::ArtifactWriter::Person).unwrap();
+        assert_eq!(writers, vec![expected.clone(), expected]);
 
         // A caller with a richer event of its own suppresses the entity event
         // rather than adding to it, so an import is not double-announced.

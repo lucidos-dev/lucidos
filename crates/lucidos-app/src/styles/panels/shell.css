@@ -71,7 +71,8 @@
 .connection-banner,
 .slowness-banner,
 .ingress-banner,
-.refusal-banner {
+.refusal-banner,
+.sandbox-banner {
     flex: none;
     display: flex;
     align-items: center;
@@ -86,7 +87,7 @@
 
 /* A banner's buttons share one size, a step under a surface's, because a bar is
    a single line of chrome. The tone icon at the start is `.surface-icon`. */
-:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) .action-btn {
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner, .sandbox-banner) .action-btn {
     display: inline-flex;
     align-items: center;
     min-height: var(--banner-button-height);
@@ -102,7 +103,7 @@
    the sentence pads its first line into that row, and only above: padding
    below would add height to every line a wrapped bar carries. A one-line bar
    looks the same as a centred one. */
-:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) {
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner, .sandbox-banner) {
     --banner-first-row: var(--banner-button-height);
     align-items: flex-start;
     line-height: var(--banner-line-height);
@@ -116,17 +117,17 @@
     --banner-line-height: 1.2;
 }
 
-:is(.backup-reminder-text, .slowness-banner-text, .ingress-banner-text, .refusal-banner-text) {
+:is(.backup-reminder-text, .slowness-banner-text, .ingress-banner-text, .refusal-banner-text, .sandbox-banner-text) {
     box-sizing: border-box;
     min-height: var(--banner-first-row);
     padding-top: calc((var(--banner-first-row) - 1em * var(--banner-line-height)) / 2);
 }
 
-:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) > .surface-icon {
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner, .sandbox-banner) > .surface-icon {
     margin-top: calc((var(--banner-first-row) - var(--icon-size-md)) / 2);
 }
 
-:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner) > .action-btn {
+:is(.backup-reminder, .slowness-banner, .ingress-banner, .refusal-banner, .sandbox-banner) > .action-btn {
     margin-top: calc((var(--banner-first-row) - var(--banner-button-height)) / 2);
 }
 
@@ -258,12 +259,28 @@
     background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
 }
 
+/* The agent sandbox bar. Red while agents cannot start at all, a live fault.
+   Amber while the owner runs them unsandboxed, a standing risk they chose,
+   the backup reminder's colour for the same kind of news. */
+.sandbox-banner {
+    background: color-mix(in srgb, var(--accent-red) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+.sandbox-banner[data-state='owner-opted-out'] {
+    background: color-mix(in srgb, var(--accent-yellow) var(--banner-tint-strength), var(--bg-secondary));
+}
+
+.sandbox-banner b {
+    font-weight: 600;
+}
+
 /* Takes the slack so the button sits at the trailing edge, and wraps rather
    than truncating. The ingress sentence names the address family and the
    refusal sentence names the hook, and a half-read version drops exactly the
    thing the reader needs. */
 .ingress-banner-text,
-.refusal-banner-text {
+.refusal-banner-text,
+.sandbox-banner-text {
     flex: 1;
     min-width: 0;
 }
@@ -280,17 +297,18 @@
    white-space: nowrap and a 3.5rem min-width, so a shrinking flex item would
    clip its own label rather than wrap it. */
 .ingress-banner .action-btn,
-.refusal-banner .action-btn {
+.refusal-banner .action-btn,
+.sandbox-banner .action-btn {
     flex: none;
 }
 
 /* On a phone the buttons' own column is what the sentence loses. The button
    cannot shrink (the rule above), so the sentence wrapped inside roughly 60%
    of the bar. The refusal notice ran to ten lines beside a tall empty gap.
-   Wrapping gives the sentence the whole first line and drops the buttons to a
-   second one, at the trailing edge where they already sat.
+   Wrapping keeps the icon beside the sentence and drops the buttons to a
+   second row at the trailing edge.
 
-   Both bars, one rule, for the reason the grouped rules above are grouped.
+   All three bars, one rule, for the reason the grouped rules above are grouped.
    The backup reminder is NOT here: its trailing X is a dismiss. Sent down to
    a row of actions, a dismiss reads as a third action. The connection bar
    carries a control only while stopped, and keeps its sentence beside its
@@ -300,15 +318,17 @@
    its own button, so the row gap alone is tighter. */
 @media (--phone-layout) {
     .ingress-banner,
-    .refusal-banner {
+    .refusal-banner,
+    .sandbox-banner {
         flex-wrap: wrap;
         justify-content: flex-end;
         row-gap: var(--space-sm);
     }
 
     .ingress-banner-text,
-    .refusal-banner-text {
-        flex-basis: 100%;
+    .refusal-banner-text,
+    .sandbox-banner-text {
+        flex-basis: calc(100% - var(--icon-size-md) - var(--space-md));
     }
 }
 
@@ -1880,6 +1900,10 @@
     }
 
     .app-header .content-header-actions[data-compact] {
+        /* Anchor the leading overflow to the row itself. A cached offset of
+           this trailing group goes stale when it moves without resizing.
+           As a flex item, its z-index still keeps it above the title. */
+        position: static;
         margin-left: auto;
     }
 
@@ -1887,7 +1911,7 @@
        never shows it trailing the pointer or gliding across the row. */
     .app-header .content-header-actions[data-compact] > .content-header-more {
         position: absolute;
-        left: calc(var(--content-leading-inset) + var(--header-icon-box) + 0.15rem - var(--content-actions-offset));
+        left: calc(var(--content-leading-inset) + var(--header-icon-box) + 0.15rem);
     }
 
     .app-header .pane-header-content-title .pane-header-title-text,
@@ -2177,9 +2201,6 @@
    column on its right edge. */
 .brand-badge {
     --badge-height: var(--header-mark-count-size);
-    /* The spinner's and the hourglass's design size. styles/badges.css snaps
-       it so the icon's inset is a whole pixel on each side. */
-    --badge-icon-size: 0.5625rem;
 }
 
 .brand-badge-dot {
@@ -2201,11 +2222,10 @@
     animation: none;
 }
 
+/* styles/badges.css sizes the icon from the badge's box. */
 .brand-badge-spinner svg,
 .brand-badge-queued svg {
     display: block;
-    width: var(--badge-icon-size);
-    height: var(--badge-icon-size);
 }
 
 /* The still glyph a queued build shows in the spinner's place. */

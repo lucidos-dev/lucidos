@@ -32,9 +32,12 @@ pub(crate) struct Ladder {
     pub(crate) intelligence_rungs: Vec<IntelligenceRung>,
     /// The thread's rung, when it recorded one on the ladder.
     pub(crate) current: Option<usize>,
+    /// The actual current pair, including when it is not an enabled choice.
+    pub(crate) current_pair: Option<String>,
     /// The rung the bands compare against, as `model at effort`. Codex
     /// compares against Claude Code's default while it has none of its own.
     pub(crate) reference: Option<String>,
+    pub(crate) other_backend_ladders: Vec<Ladder>,
 }
 
 impl Ladder {
@@ -64,9 +67,19 @@ impl Ladder {
             });
         }
         Some(Self {
+            other_backend_ladders: body["other_backend_ladders"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Self::parse)
+                .collect(),
             surface: body["surface"].as_str()?.to_string(),
             intelligence_rungs,
             current,
+            current_pair: body["current"]["model"]
+                .as_str()
+                .zip(body["current"]["effort"].as_str())
+                .map(|(model, effort)| format!("{model} at {effort}")),
             reference: body["reference"]["model"]
                 .as_str()
                 .zip(body["reference"]["effort"].as_str())
@@ -94,24 +107,43 @@ impl Ladder {
     /// The ladder as numbered lines, with the default and the thread's rung
     /// marked.
     pub(crate) fn render(&self) -> String {
-        if self.intelligence_rungs.is_empty() {
-            return format!(
+        let mut out = self.render_own();
+        for other in &self.other_backend_ladders {
+            let comparison = if self.reference.is_some() && self.reference == other.reference {
+                "Their multiples compare: both ladders use the same reference."
+            } else {
+                "Their multiples do not compare: their references are missing or different."
+            };
+            out.push_str(&format!("\n\n{}\n{comparison}", other.render()));
+        }
+        out
+    }
+
+    fn render_own(&self) -> String {
+        let mut out = if self.intelligence_rungs.is_empty() {
+            format!(
                 "The {} intelligence ladder has no rung.",
                 self.surface_name()
-            );
-        }
-        let compared = match &self.reference {
-            Some(reference) => {
-                format!("Intelligence, cost and time per task are rough multiples of {reference}.")
-            }
-            None => {
-                "No reference rung has an estimate, so intelligence, cost and time are not compared.".to_string()
-            }
+            )
+        } else {
+            let compared = match &self.reference {
+                Some(reference) => {
+                    format!("Intelligence, cost and time per task are rough multiples of {reference}.")
+                }
+                None => {
+                    "No reference rung has an estimate, so intelligence, cost and time are not compared.".to_string()
+                }
+            };
+            format!(
+                "The {} intelligence ladder, least to most intelligent. {compared}",
+                self.surface_name()
+            )
         };
-        let mut out = format!(
-            "The {} intelligence ladder, least to most intelligent. {compared}",
-            self.surface_name()
-        );
+        if self.current.is_none() {
+            if let Some(pair) = &self.current_pair {
+                out.push_str(&format!("\nThis thread runs on {pair} (off-ladder)."));
+            }
+        }
         for (i, step) in self.intelligence_rungs.iter().enumerate() {
             let mut marks = Vec::new();
             if step.is_default {
@@ -136,6 +168,7 @@ impl Ladder {
                 band(step.time.as_deref()),
             ));
         }
+
         out
     }
 
@@ -146,8 +179,8 @@ impl Ladder {
             format!("{}={}", step.model, step.effort)
         } else {
             format!(
-                "--coding-agent-model {} --reasoning-effort {}",
-                step.model, step.effort
+                "--coding-agent {} --coding-agent-model {} --reasoning-effort {}",
+                self.surface, step.model, step.effort
             )
         }
     }
@@ -274,7 +307,7 @@ mod tests {
     fn the_render_marks_the_default_and_the_threads_intelligence_rung() {
         let ladder = Ladder::parse(&sample()).expect("parses");
         let text = ladder.render();
-        assert!(text.contains("1. Haiku 5.5, low (`--coding-agent-model claude-haiku-5-5 --reasoning-effort low`): intelligence 0.6×, cost 0.02×, time 0.4×"), "{text}");
+        assert!(text.contains("1. Haiku 5.5, low (`--coding-agent claude-code --coding-agent-model claude-haiku-5-5 --reasoning-effort low`): intelligence 0.6×, cost 0.02×, time 0.4×"), "{text}");
         assert!(
             !text.contains("Sonnet"),
             "a rung that is off stays out: {text}"
@@ -294,6 +327,71 @@ mod tests {
             !ladder.has_higher_intelligence_rung(),
             "the thread is on the top rung"
         );
+    }
+
+    #[test]
+    fn off_ladder_current_is_reported_without_becoming_a_choice() {
+        for surface in ["chat", "claude-code", "codex"] {
+            for (model, effort, position) in [
+                ("custom-model", "high", serde_json::Value::Null),
+                ("claude-sonnet-5-5", "low", serde_json::json!(1)),
+            ] {
+                let mut body = sample();
+                body["surface"] = surface.into();
+                body["current"] = serde_json::json!({
+                    "model": model, "effort": effort, "position": position,
+                });
+                let ladder = Ladder::parse(&body).unwrap();
+                let text = ladder.render();
+                assert!(
+                    text.contains(&format!(
+                        "This thread runs on {model} at {effort} (off-ladder)."
+                    )),
+                    "{text}"
+                );
+                assert_eq!(ladder.intelligence_rungs.len(), 2);
+                assert!(text.contains("1. Haiku"), "{text}");
+                assert!(text.contains("2. Opus"), "{text}");
+                assert!(!text.contains("3. "), "{text}");
+                assert!(!text.contains("[default, this thread]"), "{text}");
+                assert!(
+                    !text.contains(&format!("--coding-agent-model {model}")),
+                    "{text}"
+                );
+                assert!(!text.contains(&format!("`{model}={effort}`")), "{text}");
+                assert!(!ladder.has_higher_intelligence_rung());
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_enabled_ladder_still_reports_the_current_pair() {
+        let mut body = sample();
+        for intelligence_rung in body["rungs"].as_array_mut().unwrap() {
+            intelligence_rung["on"] = false.into();
+        }
+        let ladder = Ladder::parse(&body).unwrap();
+        let text = ladder.render();
+        assert!(text.contains("intelligence ladder has no rung."), "{text}");
+        assert!(
+            text.contains("This thread runs on claude-opus-5-5 at medium (off-ladder)."),
+            "{text}"
+        );
+        assert!(!ladder.has_higher_intelligence_rung());
+    }
+
+    #[test]
+    fn an_unavailable_current_pair_is_not_reported_as_off_ladder() {
+        let mut body = sample();
+        for current in [
+            serde_json::Value::Null,
+            serde_json::json!({"position": null}),
+        ] {
+            body["current"] = current;
+            let ladder = Ladder::parse(&body).unwrap();
+            assert!(!ladder.render().contains("off-ladder"));
+            assert!(!ladder.has_higher_intelligence_rung());
+        }
     }
 
     #[test]
@@ -331,5 +429,37 @@ mod tests {
             text.contains("1. Haiku 5.5, low (`claude-haiku-5-5=low`)"),
             "{text}"
         );
+    }
+    #[test]
+    fn other_ladders_use_full_flags_and_require_equal_present_references() {
+        let mut body = sample();
+        let mut other = sample();
+        other["surface"] = "codex".into();
+        body["other_backend_ladders"] = serde_json::json!([other]);
+        let text = Ladder::parse(&body).unwrap().render();
+        assert!(text.contains("The codex intelligence ladder"));
+        assert!(text.contains("--coding-agent codex --coding-agent-model"));
+        assert!(text.contains("Their multiples compare"));
+        let mut empty_own = body.clone();
+        empty_own["rungs"] = serde_json::json!([]);
+        assert!(Ladder::parse(&empty_own)
+            .unwrap()
+            .render()
+            .contains("The codex intelligence ladder"));
+        body["other_backend_ladders"][0]["reference"] = serde_json::Value::Null;
+        let text = Ladder::parse(&body).unwrap().render();
+        assert!(text.contains("Their multiples do not compare"));
+        body["other_backend_ladders"][0]["reference"] =
+            serde_json::json!({"model":"different", "effort":"low"});
+        assert!(Ladder::parse(&body)
+            .unwrap()
+            .render()
+            .contains("Their multiples do not compare"));
+        body["reference"] = serde_json::Value::Null;
+        body["other_backend_ladders"][0]["reference"] = serde_json::Value::Null;
+        assert!(Ladder::parse(&body)
+            .unwrap()
+            .render()
+            .contains("Their multiples do not compare"));
     }
 }

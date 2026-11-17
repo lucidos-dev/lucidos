@@ -163,14 +163,14 @@ async fn a_request_names_the_asking_thread() {
 }
 
 fn person(device_id: &str, devices: &[&str]) -> Reader {
-    Reader::Person {
+    Reader::User {
         device_id: device_id.into(),
         devices: devices.iter().map(|d| d.to_string()).collect(),
     }
 }
 
 async fn see_as(pool: &PgPool, bus: &EventBus, thread_id: Uuid, reader: &Reader) -> ReplySeen {
-    let Reader::Person { device_id, .. } = reader else {
+    let Reader::User { device_id, .. } = reader else {
         panic!("a person reads here");
     };
     let version = summary_version(pool, thread_id).await;

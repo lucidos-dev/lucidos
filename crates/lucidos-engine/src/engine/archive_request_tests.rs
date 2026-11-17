@@ -84,6 +84,7 @@ async fn cc_idled(bus: &EventBus, thread_id: Uuid) {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         EventChannel::ClaudeCode,
     )
@@ -99,6 +100,7 @@ async fn propose(bus: &EventBus, thread_id: Uuid) {
         bus,
         thread_id,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id(thread_id).to_string(),
             description: Some("work".into()),
             files: vec!["a.rs".into()],
@@ -123,6 +125,7 @@ async fn apply(bus: &EventBus, thread_id: Uuid) {
         bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
@@ -332,6 +335,8 @@ async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         EventChannel::Chat,
     )
@@ -342,6 +347,7 @@ async fn a_question_holds_the_request_until_the_turn_after_it_ends() {
         &bus,
         thread,
         ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "tu-1".into(),
             quiet: false,
             answer: AnswerKind::FreeText {

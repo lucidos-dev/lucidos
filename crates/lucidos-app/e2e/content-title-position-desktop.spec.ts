@@ -219,6 +219,39 @@ test.describe('the desktop content title holds its position across views', () =>
     await expect(title).toHaveText(APP_NAME);
   });
 
+  test('compact overflow holds its leading slot during position-only layout changes', async ({ page }) => {
+    await page.setViewportSize({ width: 1920, height: 1080 });
+    await page.addInitScript((id) => {
+      localStorage.setItem('app-window-open', id);
+      localStorage.setItem('lucidos-thread-drawer-open', 'true');
+      localStorage.setItem('lucidos-split-ratio', '0.6');
+    }, APP_ID);
+    const preferencesReady = watchPreferenceReads(page);
+    await gotoWithRetry(page, '/');
+    await preferencesReady();
+    await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '175%'));
+    await settled(page);
+    await expect(page.locator('.desktop-header .content-header-actions')).toHaveAttribute('data-compact');
+    const more = page.locator('.desktop-header .content-header-more');
+    await expect(more).toBeVisible();
+    const shifts = await more.evaluate((el) => {
+      const row = el.closest<HTMLElement>('.content-header-elements')!;
+      const hamburger = row.querySelector('.hamburger-panel')!;
+      const style = getComputedStyle(row);
+      const padding = parseFloat(style.paddingRight);
+      const gap = parseFloat(style.gap);
+      // Padding moves the trailing group without resizing it. Check in the
+      // same frame: the leading slot must not depend on ResizeObserver timing.
+      return [padding + 40, padding].map((right) => {
+        row.style.paddingRight = `${right}px`;
+        return el.getBoundingClientRect().left - hamburger.getBoundingClientRect().right - gap;
+      });
+    });
+    for (const shift of shifts) expect(Math.abs(shift), 'overflow stays beside the hamburger').toBeLessThan(1);
+    await more.click();
+    await expect(page.getByRole('menuitem', { name: 'Refresh', exact: true })).toBeVisible();
+  });
+
   test('reported 1920 by 1080 at 175% keeps real destinations whole', async ({ page }) => {
     await page.setViewportSize({ width: 1920, height: 1080 });
     await page.addInitScript((id) => {

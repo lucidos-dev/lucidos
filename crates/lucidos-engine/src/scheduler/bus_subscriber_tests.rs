@@ -263,12 +263,101 @@ fn build_observed(depth: u32) -> BusEvent {
     })
 }
 
+#[tokio::test]
+async fn trigger_group_delayed_frames_and_stale_reload_preserve_inline_writes() {
+    use crate::engine::trigger_group_writes::{
+        create_trigger_group_locked, emit_and_apply_group_event, rename_trigger_group_locked,
+    };
+
+    let (pool, db) = setup_test_db().await;
+    let mut h = Harness::new(&pool, vec![]).await;
+    let lock = tokio::sync::Mutex::new(());
+    let created =
+        create_trigger_group_locked(&h.groups, &h.bus, &lock, "Original", Some(100), None)
+            .await
+            .unwrap();
+    let snapshot = load_trigger_groups(&pool).await.unwrap();
+    rename_trigger_group_locked(&h.groups, &h.bus, &lock, &created.group_id, "Renamed", None)
+        .await
+        .unwrap();
+    emit_and_apply_group_event(
+        &h.groups,
+        &h.bus,
+        SystemEvent::TriggerGroupReordered {
+            group_id: created.group_id.clone(),
+            payload: json!({"group_id":created.group_id,"order":200}),
+            actor: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Deliver every buffered lifecycle frame only after the inline writes.
+    for _ in 0..3 {
+        let received = h.rx.recv().await;
+        assert!(h.subscriber.step(received).await.is_continue());
+        let groups = h.groups.read().unwrap();
+        assert_eq!(groups[&created.group_id].name, "Renamed");
+        assert_eq!(groups[&created.group_id].order, 200);
+    }
+    h.groups.write().unwrap().merge(snapshot.clone());
+    assert_eq!(h.groups.read().unwrap()[&created.group_id].order, 200);
+
+    emit_and_apply_group_event(
+        &h.groups,
+        &h.bus,
+        SystemEvent::TriggerGroupDeleted {
+            group_id: created.group_id.clone(),
+            payload: json!({"group_id":created.group_id}),
+            actor: None,
+        },
+    )
+    .await
+    .unwrap();
+    h.groups.write().unwrap().merge(snapshot);
+    assert!(!h.groups.read().unwrap().contains_key(&created.group_id));
+    h.lag().await;
+    assert!(!h.groups.read().unwrap().contains_key(&created.group_id));
+    let mut rebooted = load_trigger_groups(&pool).await.unwrap();
+    let stale_frame = crate::triggers::TriggerGroupEventRow {
+        seq: 1,
+        event_type: "TriggerGroupCreated".into(),
+        payload: json!({"group_id":created.group_id,"name":"Original","order":100}),
+        created: created.created,
+    };
+    rebooted.apply(&stale_frame);
+    assert!(!rebooted.contains_key(&created.group_id));
+    drop(h);
+    teardown_test_db(&db).await;
+}
+
 async fn emit_build_observed(bus: &EventBus) -> Uuid {
     bus.emit(build_observed(0))
         .await
         .unwrap()
         .expect("a domain event is persisted")
         .event_id
+}
+
+#[tokio::test]
+async fn trigger_group_failed_lag_reload_retains_current_projection() {
+    let (pool, db) = setup_test_db().await;
+    let mut h = Harness::new(&pool, vec![]).await;
+    let created = crate::engine::trigger_group_writes::create_trigger_group_locked(
+        &h.groups,
+        &h.bus,
+        &tokio::sync::Mutex::new(()),
+        "Retained",
+        Some(100),
+        None,
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+    h.lag().await;
+    assert_eq!(h.groups.read().unwrap()[&created.group_id].name, "Retained");
+    drop(h);
+    teardown_test_db(&db).await;
 }
 
 /// I1. The event the trigger listens for is dropped by the lag, and the step

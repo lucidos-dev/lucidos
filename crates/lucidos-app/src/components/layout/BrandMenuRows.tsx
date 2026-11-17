@@ -5,13 +5,14 @@
  * opens only once it is in memory, so no row pops in (ADR 0436).
  */
 
-import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, whatsNewSeenRelease } from '../../store/store';
+import { connectionStatus, visibleWorkspaceName, searchEverywhereOpen, searchEverywhereAnchor, llmConfigured, lucidosRelease, lucidosReleaseDirty, releaseCheck, whatsNewSeenRelease } from '../../store/store';
 import type { ConnectionStatus } from '../../store/types';
 import { hasUnreadWhatsNew } from '../../store/actions/whatsNew';
 import { unfocusThread } from '../../store/actions/threads';
 import { homeThreadId, openHomeThread } from '../../store/actions/homeThread';
 import { openWhatsNew } from '../../store/actions/menu';
 import { connectionNotice } from '../../utils/connectionNotice';
+import { withUpdateChannel } from '../../utils/updateChannel';
 import { lucidosVersionLabel, lucidosVersionTooltip } from '../../utils/lucidosVersion';
 import { composeHandlers } from '../chat/composeHandlers';
 import { focusSearchInput } from '../search/searchEverywhereActions';
@@ -83,14 +84,16 @@ export function BrandMenuRows({ onClose, actionsInRow, homeInRow }: {
   homeInRow: boolean;
 }) {
   // The version of LUCIDOS the user is running: the umbrella release, plus a
-  // `*` when the code has moved past it. One number, the same on every
+  // `*` when the code has moved past it, plus the selected update channel.
+  // One number, the same on every
   // platform. The engine's CalVer and the two build ids are parts, not the
   // product, so they live in Settings > System. Always a string, so the row
   // never changes shape. See `utils/lucidosVersion.ts`.
   const release = lucidosRelease.value;
   const releaseDirty = lucidosReleaseDirty.value;
-  const version = lucidosVersionLabel(release, releaseDirty);
-  const versionTooltip = lucidosVersionTooltip(release, releaseDirty);
+  const version = withUpdateChannel(lucidosVersionLabel(release, releaseDirty), release ? releaseCheck.value?.channel : undefined);
+  const tooltip = lucidosVersionTooltip(release, releaseDirty);
+  const versionTooltip = tooltip ? withUpdateChannel(tooltip, releaseCheck.value?.channel) : undefined;
   // Is there a release whose notes this client has not read? The dot shows it.
   // The sentence below says it to a screen reader and a desktop hover, since
   // a bare dot says nothing there. `hasUnreadWhatsNew` is false while the

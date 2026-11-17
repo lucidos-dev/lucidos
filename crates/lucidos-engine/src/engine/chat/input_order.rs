@@ -92,6 +92,8 @@ pub(crate) enum InputAdmission {
 #[derive(Clone, Default)]
 pub(crate) struct InputOrder {
     threads: Arc<Mutex<Threads>>,
+    /// Coalesced hint for the queue to reconsider inputs behind a released turn.
+    pub(crate) successor_released: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Default)]
@@ -103,6 +105,7 @@ struct Threads {
 
 struct ThreadTail {
     turn: u64,
+    input: u64,
     done: oneshot::Receiver<()>,
 }
 
@@ -121,18 +124,40 @@ impl InputOrder {
         position: Option<InputPosition>,
         event_id: Option<Uuid>,
     ) -> Result<InputAdmission, sqlx::Error> {
+        if position.is_none() || event_id.is_none() {
+            return Ok(InputAdmission::Admitted(self.join(thread_id)));
+        }
+        let mut tx = pool.begin().await?;
+        let admission = self
+            .admit_in_transaction(&mut tx, thread_id, position, event_id)
+            .await?;
+        // Dropped on a failed commit, which releases the place it took.
+        tx.commit().await?;
+        Ok(admission)
+    }
+
+    /// Join admission to the caller's durable acceptance transaction. The
+    /// caller retains the returned turn through commit, or drops it on error.
+    /// Acquire any append-horizon lock before calling this method: it takes
+    /// the thread append lock even for an input without a page position.
+    pub(crate) async fn admit_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        thread_id: Uuid,
+        position: Option<InputPosition>,
+        event_id: Option<Uuid>,
+    ) -> Result<InputAdmission, sqlx::Error> {
+        crate::engine::event_bus::EventBus::lock_thread_append(tx, thread_id).await?;
         let (Some(position), Some(event_id)) = (position, event_id) else {
             return Ok(InputAdmission::Admitted(self.join(thread_id)));
         };
-        let mut tx = pool.begin().await?;
-        crate::engine::event_bus::EventBus::lock_thread_append(&mut tx, thread_id).await?;
         let tail: Option<(i64, Uuid)> = sqlx::query_as(
             "SELECT last_seq, last_event_id FROM thread_input_chains \
              WHERE thread_id = $1 AND input_chain = $2",
         )
         .bind(thread_id)
         .bind(position.chain)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let tail = tail.map(|(seq, event_id)| ChainTail { seq, event_id });
         if !admits(tail, position.seq, event_id) {
@@ -148,12 +173,9 @@ impl InputOrder {
         .bind(position.chain)
         .bind(position.seq)
         .bind(event_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        // Dropped on a failed commit, which releases the place it took.
-        let turn = self.join(thread_id);
-        tx.commit().await?;
-        Ok(InputAdmission::Admitted(turn))
+        Ok(InputAdmission::Admitted(self.join(thread_id)))
     }
 
     /// Has any page admitted an input to `thread_id`? A thread whose first
@@ -169,25 +191,38 @@ impl InputOrder {
     }
 
     /// Take the next place in `thread_id`'s order. Never waits.
-    fn join(&self, thread_id: Uuid) -> InputTurn {
+    pub(crate) fn join(&self, thread_id: Uuid) -> InputTurn {
+        self.join_input(thread_id, None)
+    }
+
+    /// Add a recording barrier belonging to an existing input's routing turn.
+    pub(crate) fn join_recording_barrier(&self, routing: &InputTurn) -> InputTurn {
+        self.join_input(routing.thread_id, Some(routing.input))
+    }
+
+    fn join_input(&self, thread_id: Uuid, input: Option<u64>) -> InputTurn {
         let (done_tx, done_rx) = oneshot::channel();
         let mut threads = lock(&self.threads);
         let turn = threads.next_turn;
         threads.next_turn += 1;
+        let input = input.unwrap_or(turn);
         let predecessor = threads
             .tails
             .insert(
                 thread_id,
                 ThreadTail {
                     turn,
+                    input,
                     done: done_rx,
                 },
             )
             .map(|tail| tail.done);
         InputTurn {
             threads: self.threads.clone(),
+            successor_released: self.successor_released.clone(),
             thread_id,
             turn,
+            input,
             predecessor,
             done: Some(done_tx),
         }
@@ -198,8 +233,10 @@ impl InputOrder {
 /// input, but never before this one's own predecessor is done.
 pub(crate) struct InputTurn {
     threads: Arc<Mutex<Threads>>,
+    successor_released: Arc<tokio::sync::Notify>,
     thread_id: Uuid,
     turn: u64,
+    input: u64,
     predecessor: Option<oneshot::Receiver<()>>,
     /// Dropped to release the successor. Nothing is ever sent on it.
     done: Option<oneshot::Sender<()>>,
@@ -235,10 +272,16 @@ impl InputTurn {
 
 impl Drop for InputTurn {
     fn drop(&mut self) {
+        // A paired recording barrier often outlives an already-released turn.
+        // Observe that closure now so rollback/terminal cleanup releases it
+        // synchronously instead of leaving a needless task between successors.
+        self.has_input_ahead();
         let release = Release {
             threads: self.threads.clone(),
+            successor_released: self.successor_released.clone(),
             thread_id: self.thread_id,
             turn: self.turn,
+            input: self.input,
             done: self.done.take(),
         };
         // A turn dropped before its predecessor finished must not let its
@@ -260,23 +303,28 @@ impl Drop for InputTurn {
 
 struct Release {
     threads: Arc<Mutex<Threads>>,
+    successor_released: Arc<tokio::sync::Notify>,
     thread_id: Uuid,
     turn: u64,
+    input: u64,
     done: Option<oneshot::Sender<()>>,
 }
 
 impl Release {
     fn run(self) {
         let mut threads = lock(&self.threads);
-        if threads
-            .tails
-            .get(&self.thread_id)
-            .is_some_and(|tail| tail.turn == self.turn)
-        {
+        let tail = threads.tails.get(&self.thread_id);
+        let has_successor_input = tail.is_some_and(|tail| tail.input != self.input);
+        if tail.is_some_and(|tail| tail.turn == self.turn) {
             threads.tails.remove(&self.thread_id);
         }
         drop(threads);
         drop(self.done);
+        // Close the predecessor channel before the queue checks it. With no
+        // successor there is no newly admissible input to drain.
+        if has_successor_input {
+            self.successor_released.notify_one();
+        }
     }
 }
 

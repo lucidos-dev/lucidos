@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::oauth::AuthorizationGrant;
 
 /// A state no other test opens, so parallel tests never share a slot.
 fn unique_state(prefix: &str) -> String {
@@ -113,22 +114,130 @@ fn a_device_is_remembered_by_its_latest_prefix_and_last_origin() {
     );
 }
 
+/// Deliver `query` while a stand-in flow takes the grant and settles the page
+/// with `connected`. Returns the grant the flow saw, and the delivery.
+async fn deliver_to_flow(
+    pending: PendingCallback,
+    query: &str,
+    connected: bool,
+) -> (AuthorizationGrant, CallbackDelivery) {
+    let flow = tokio::spawn(async move {
+        let received = pending.received().await.unwrap();
+        received.reply.settle(connected);
+        received.grant
+    });
+    let delivery = deliver_callback(query).await;
+    (flow.await.unwrap(), delivery)
+}
+
 #[tokio::test]
 async fn a_delivered_callback_reaches_its_flow_and_closes_the_slot() {
     let state = unique_state("/dev/");
     let pending = PendingCallback::open(&state, "testprov");
     let query = format!("code=the-code&state={}", urlencoding::encode(&state));
 
-    let CallbackDelivery::Accepted { ok, page } = deliver_callback(&query) else {
+    let (grant, delivery) = deliver_to_flow(pending, &query, true).await;
+    let CallbackDelivery::Accepted {
+        state: page_state,
+        page,
+    } = delivery
+    else {
         panic!("the open flow owns its state");
     };
-    assert!(ok);
-    assert!(page.contains("Authorization complete"), "{page}");
-    assert_eq!(pending.received().await.unwrap().code, "the-code");
+    assert_eq!(page_state, CallbackPageState::Connected);
+    assert!(page.contains("Connected"), "{page}");
+    assert_eq!(grant.code, "the-code");
 
     assert!(
-        matches!(deliver_callback(&query), CallbackDelivery::Unclaimed { .. }),
+        matches!(
+            deliver_callback(&query).await,
+            CallbackDelivery::Unclaimed { .. }
+        ),
         "a replay finds no slot"
+    );
+}
+
+#[tokio::test]
+async fn a_flow_that_fails_after_the_callback_gets_the_failure_page() {
+    let state = unique_state("/dev/");
+    let pending = PendingCallback::open(&state, "testprov");
+    let query = format!("code=the-code&state={}", urlencoding::encode(&state));
+
+    let (_, delivery) = deliver_to_flow(pending, &query, false).await;
+    let CallbackDelivery::Accepted { state, page } = delivery else {
+        panic!("the open flow owns its state");
+    };
+    assert_eq!(state, CallbackPageState::Failed);
+    assert!(page.contains("Connection failed"), "{page}");
+    assert!(!page.contains("Connected"), "{page}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_flow_that_has_not_settled_in_time_leaves_the_page_pending() {
+    let state = unique_state("/dev/");
+    let pending = PendingCallback::open(&state, "testprov");
+    let query = format!("code=the-code&state={}", urlencoding::encode(&state));
+    // The flow holds the reply and never settles it.
+    let flow = tokio::spawn(async move {
+        let received = pending.received().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        drop(received);
+    });
+
+    let CallbackDelivery::Accepted { state, page } = deliver_callback(&query).await else {
+        panic!("the open flow owns its state");
+    };
+    assert_eq!(state, CallbackPageState::Pending);
+    assert!(page.contains("Authorization received"), "{page}");
+    flow.abort();
+}
+
+#[tokio::test]
+async fn a_flow_that_ends_without_settling_leaves_the_page_pending() {
+    let state = unique_state("/dev/");
+    let pending = PendingCallback::open(&state, "testprov");
+    let query = format!("code=the-code&state={}", urlencoding::encode(&state));
+    let flow = tokio::spawn(async move { drop(pending.received().await) });
+
+    let CallbackDelivery::Accepted { state, .. } = deliver_callback(&query).await else {
+        panic!("the open flow owns its state");
+    };
+    assert_eq!(state, CallbackPageState::Pending);
+    flow.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_callback_for_a_flow_that_already_ended_fails_at_once() {
+    let state = unique_state("/dev/");
+    // The flow's receiver is gone while its slot is still open: the race
+    // between the delivery taking the slot and the flow giving up.
+    let (deliver, received) = tokio::sync::oneshot::channel();
+    drop(received);
+    pending().insert(
+        state.clone(),
+        PendingEntry {
+            provider: "testprov".to_string(),
+            deliver,
+        },
+    );
+    let query = format!("code=the-code&state={}", urlencoding::encode(&state));
+
+    let started = tokio::time::Instant::now();
+    let CallbackDelivery::Accepted { state, .. } = deliver_callback(&query).await else {
+        panic!("the open slot owns its state");
+    };
+    assert_eq!(state, CallbackPageState::Failed);
+    assert_eq!(
+        started.elapsed(),
+        std::time::Duration::ZERO,
+        "no flow can settle the page"
+    );
+}
+
+#[test]
+fn the_page_wait_stays_under_the_gateways_engine_timeout() {
+    assert!(
+        crate::core::oauth::PAGE_SETTLE_WAIT < lucidos_engine_socket::OAUTH_CALLBACK_HOP_TIMEOUT
     );
 }
 
@@ -140,12 +249,10 @@ async fn a_delivered_callback_hands_its_flow_the_issued_client_id() {
         "code=the-code&state={}&client_id=app_issued",
         urlencoding::encode(&state)
     );
-    assert!(matches!(
-        deliver_callback(&query),
-        CallbackDelivery::Accepted { ok: true, .. }
-    ));
+    let (grant, delivery) = deliver_to_flow(pending, &query, true).await;
+    assert!(matches!(delivery, CallbackDelivery::Accepted { .. }));
     assert_eq!(
-        pending.received().await.unwrap(),
+        grant,
         AuthorizationGrant {
             code: "the-code".into(),
             client_id: Some("app_issued".into()),
@@ -159,15 +266,18 @@ async fn a_provider_denial_is_delivered_as_the_flows_error() {
     let pending = PendingCallback::open(&state, "testprov");
     let query = format!("error=access_denied&state={}", urlencoding::encode(&state));
     assert!(matches!(
-        deliver_callback(&query),
-        CallbackDelivery::Accepted { ok: false, .. }
+        deliver_callback(&query).await,
+        CallbackDelivery::Accepted {
+            state: CallbackPageState::Refused,
+            ..
+        }
     ));
     let error = pending.received().await.unwrap_err().to_string();
     assert!(error.contains("access_denied"), "{error}");
 }
 
-#[test]
-fn an_unknown_or_tampered_state_is_refused() {
+#[tokio::test]
+async fn an_unknown_or_tampered_state_is_refused() {
     let state = unique_state("/dev/");
     let _pending = PendingCallback::open(&state, "testprov");
     let nonce = state.rsplit_once(STATE_PREFIX_SEPARATOR).unwrap().1;
@@ -180,7 +290,7 @@ fn an_unknown_or_tampered_state_is_refused() {
     ] {
         assert!(
             matches!(
-                deliver_callback(&forged),
+                deliver_callback(&forged).await,
                 CallbackDelivery::Unclaimed { .. }
             ),
             "{forged} must not reach the flow"
@@ -192,13 +302,13 @@ fn an_unknown_or_tampered_state_is_refused() {
     );
 }
 
-#[test]
-fn a_finished_flow_cannot_be_delivered_to() {
+#[tokio::test]
+async fn a_finished_flow_cannot_be_delivered_to() {
     let state = unique_state("/dev/");
     drop(PendingCallback::open(&state, "testprov"));
     let query = format!("code=x&state={}", urlencoding::encode(&state));
     assert!(matches!(
-        deliver_callback(&query),
+        deliver_callback(&query).await,
         CallbackDelivery::Unclaimed { .. }
     ));
 }

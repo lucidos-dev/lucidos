@@ -2034,6 +2034,174 @@ pub fn run_service() -> i32 {
     0
 }
 
+/// Run the supported disposable package role before Tauri starts.
+pub fn run_disposable_service(args: Vec<std::ffi::OsString>) -> i32 {
+    match disposable_service(args) {
+        Ok(code) => code,
+        Err(e) => service_boot_failed(e),
+    }
+}
+
+fn disposable_service(args: Vec<std::ffi::OsString>) -> io::Result<i32> {
+    if args.len() != 3
+        || (args[0] != "--disposable-service" && args[0] != "--disposable-supervisor")
+    {
+        return Err(io::Error::other(
+            "expected --disposable-service <new-root> <port>",
+        ));
+    }
+    let port = args[2]
+        .to_str()
+        .and_then(|s| s.parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .ok_or_else(|| io::Error::other("invalid disposable port"))?;
+    let parent = unsafe { libc::getppid() };
+    if parent <= 1 {
+        return Err(io::Error::other("disposable controller is absent"));
+    }
+    install_stop_handlers();
+    if args[0] == "--disposable-service" {
+        let scope = lucidos_home::disposable::Scope::create(Path::new(&args[1]))?;
+        let mut supervisor = scope
+            .command(&std::env::current_exe()?)
+            .arg("--disposable-supervisor")
+            .arg(scope.root())
+            .arg(port.to_string())
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        let started = Instant::now();
+        loop {
+            if let Some(status) = supervisor.try_wait()? {
+                return Ok(status.code().unwrap_or(1));
+            }
+            if SERVICE_STOP.load(Ordering::SeqCst)
+                || unsafe { libc::getppid() } != parent
+                || started.elapsed() >= lucidos_home::disposable::LIFETIME
+            {
+                drop(supervisor.stdin.take());
+                return Ok(supervisor.wait()?.code().unwrap_or(1));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    let scope = lucidos_home::disposable::Scope::open(Path::new(&args[1]))?;
+    scope.claim_supervisor()?;
+    let resources = resource_dir_from_exe()?;
+    // A controller's process-group cancellation must leave the service time to clean up.
+    if unsafe { libc::setsid() } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let controller_closed = watch_disposable_controller();
+    let mut svc = spawn_gateway_in_scope(&resources, &scope.app_data(), port, Some(&scope))?;
+    let recorded = match std::fs::write(
+        scope.root().join("gateway.pid"),
+        svc.gateway.id().to_string(),
+    ) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("[service] cannot record disposable gateway: {e}");
+            false
+        }
+    };
+    let result = supervise_disposable_group(
+        &mut svc.gateway,
+        parent,
+        lucidos_home::disposable::LIFETIME,
+        || {
+            !recorded
+                || SERVICE_STOP.load(Ordering::SeqCst)
+                || controller_closed.load(Ordering::SeqCst)
+        },
+    );
+    let bundle = bundled_resources(&resources);
+    let data = scope.app_data().join("pgdata");
+    if data.join("postmaster.pid").exists() {
+        let status = embedded_pg_stop_command(&bundle.pg_bin, &bundle.pg_lib, &data)
+            .args(["-t", "10"])
+            .status()?;
+        if !status.success() {
+            let status = embedded_pg_stop_command(&bundle.pg_bin, &bundle.pg_lib, &data)
+                .args(["-m", "immediate", "-t", "10"])
+                .status()?;
+            if !status.success() {
+                return Err(io::Error::other("disposable Postgres did not stop"));
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn watch_disposable_controller() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+    let controller_closed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let closed = controller_closed.clone();
+    std::thread::spawn(move || {
+        let mut byte = [0u8; 1];
+        // EOF, input or a read error all end this single-use lifetime channel.
+        let _ = std::io::stdin().read(&mut byte);
+        closed.store(true, Ordering::SeqCst);
+    });
+    controller_closed
+}
+
+fn supervise_disposable_group(
+    gateway: &mut Child,
+    parent: i32,
+    lifetime: Duration,
+    canceled: impl Fn() -> bool,
+) -> i32 {
+    let started = Instant::now();
+    let mut stop_code = 0;
+    let exited = loop {
+        if canceled() || unsafe { libc::getppid() } != parent {
+            break false;
+        }
+        if started.elapsed() > lifetime {
+            stop_code = 1;
+            break false;
+        }
+        // Keep the group leader unreaped until the last group signal, preventing PID reuse.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let waited = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                gateway.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if waited != 0 {
+            eprintln!(
+                "[service] disposable gateway wait failed: {}",
+                io::Error::last_os_error()
+            );
+            return 1;
+        }
+        if info.si_signo != 0 {
+            break true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let group = -(gateway.id() as i32);
+    unsafe {
+        // The gateway's persistent signal contract ignores SIGTERM. Ask its
+        // leader to stop, then terminate every owned engine before escalation.
+        libc::kill(gateway.id() as i32, libc::SIGUSR1);
+        libc::kill(group, libc::SIGTERM);
+    }
+    std::thread::sleep(lucidos_home::disposable::STOP_GRACE);
+    unsafe {
+        libc::kill(group, libc::SIGKILL);
+    }
+    match gateway.wait() {
+        Ok(status) if exited => status.code().unwrap_or(1),
+        Ok(_) => stop_code,
+        Err(e) => {
+            eprintln!("[service] disposable gateway reap failed: {e}");
+            1
+        }
+    }
+}
+
 /// Install SIGTERM/SIGINT handlers that flip [`SERVICE_STOP`] so the supervise
 /// loop can tear the stack down gracefully before launchd's SIGKILL deadline.
 #[cfg(unix)]
@@ -2576,7 +2744,12 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     )?;
     Command::new("/bin/sh")
         .arg("-c")
-        .arg(&script)
+        .arg(format!("exec 2>&1; {script}"))
+        .stdout(
+            crate::client_log::relaunch_output(&exe)
+                .map_err(|e| format!("spawn relaunch diagnostic capture: {e}"))?,
+        )
+        .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("spawn the relaunch watcher: {e}"))?;
     Ok(())
@@ -2623,9 +2796,9 @@ fn relaunched_exe_forms(exe: &Path) -> Vec<PathBuf> {
 /// without launching anything. So the ask repeats until `pgrep` finds the
 /// client, up to [`RELAUNCH_OPEN_ATTEMPTS`].
 ///
-/// **Every give-up says so** on stderr, which for a packaged client is the log
-/// `client_log` opened. A relaunch that silently failed is exactly the report
-/// nobody could answer.
+/// **Every give-up says so** on stderr, drained by a separate sanitized
+/// diagnostic helper that survives the client exit. A relaunch that silently
+/// failed is exactly the report nobody could answer.
 ///
 /// Errors on a path or argument that is not valid UTF-8: it cannot be quoted
 /// into a shell word without corrupting it, and the caller's fallback passes
@@ -3220,6 +3393,15 @@ fn applescript_escape(s: &str) -> String {
 /// this environment, so the paths set below reach all of them. First run
 /// creates no workspace, and the smart root serves the picker instead.
 fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<GatewayService> {
+    spawn_gateway_in_scope(resources, app_data, port, None)
+}
+
+fn spawn_gateway_in_scope(
+    resources: &Path,
+    app_data: &Path,
+    port: u16,
+    scope: Option<&lucidos_home::disposable::Scope>,
+) -> io::Result<GatewayService> {
     let bundle = bundled_resources(resources);
     lucidos_home::ensure_storage_root(app_data)?;
 
@@ -3230,10 +3412,26 @@ fn spawn_gateway(resources: &Path, app_data: &Path, port: u16) -> io::Result<Gat
     // gateway spawns INHERITS this, so one ~465 MB copy serves the whole install
     // and uninstalling the app takes it with it.
     let fastembed_cache = app_data.join("fastembed");
-    std::fs::create_dir_all(&fastembed_cache)?;
-    std::fs::create_dir_all(app_data.join("config"))?;
-
-    let gateway = Command::new(&bundle.gateway_bin)
+    if scope.is_none() {
+        std::fs::create_dir_all(&fastembed_cache)?;
+        std::fs::create_dir_all(app_data.join("config"))?;
+    }
+    let mut command = match scope {
+        Some(scope) => {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = scope.command(&bundle.gateway_bin);
+            cmd.arg("--disposable")
+                .arg(scope.root())
+                .process_group(0)
+                .env("LUCIDOS_GATEWAY_BIND_ADDR", "127.0.0.1")
+                .env("LUCIDOS_GATEWAY_ENGINE_LOOPBACK", "1")
+                .env("LUCIDOS_HOOK_PORT", "0")
+                .env("LUCIDOS_PUBLIC_PORT", "0");
+            cmd
+        }
+        None => Command::new(&bundle.gateway_bin),
+    };
+    let gateway = command
         .current_dir(app_data)
         .env("LUCIDOS_API_PORT", port.to_string())
         .env("LUCIDOS_GATEWAY_DATA", app_data)
@@ -3295,7 +3493,10 @@ pub(crate) fn gateway_body(
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let credential = match lucidos_local_token::read() {
-        Some(token) => format!("{}: {token}\r\n", lucidos_local_token::HEADER_LOCAL_TOKEN),
+        Some(token) => {
+            let token = crate::client_log::secret(token);
+            format!("{}: {token}\r\n", lucidos_local_token::HEADER_LOCAL_TOKEN)
+        }
         None => String::new(),
     };
     // A bodyless POST still needs a length, or the server waits for one.
@@ -3347,6 +3548,131 @@ fn parse_unread_total(body: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    const DISPOSABLE_FIXTURE: &str = "desktop::tests::disposable_lifecycle_fixture";
+
+    #[test]
+    #[ignore = "subprocess fixture for disposable lifetime tests"]
+    fn disposable_lifecycle_fixture() {
+        use std::os::unix::process::CommandExt;
+        let root = std::path::PathBuf::from(std::env::var_os("DISPOSABLE_FIXTURE_ROOT").unwrap());
+        let role = std::env::var("DISPOSABLE_FIXTURE_ROLE").unwrap();
+        if role == "gateway" {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            std::fs::write(
+                root.join("ready"),
+                listener.local_addr().unwrap().to_string(),
+            )
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            return;
+        }
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--ignored", "--exact", DISPOSABLE_FIXTURE])
+            .env(
+                "DISPOSABLE_FIXTURE_ROLE",
+                if role == "controller" {
+                    "supervisor"
+                } else {
+                    "gateway"
+                },
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        if role == "controller" {
+            if std::env::var_os("DISPOSABLE_FIXTURE_CLOSE").is_some() {
+                while !root.join("ready").exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                drop(child.stdin.take());
+            }
+            let _ = child.wait();
+        } else {
+            let closed = super::watch_disposable_controller();
+            super::supervise_disposable_group(
+                &mut child,
+                unsafe { libc::getppid() },
+                std::time::Duration::from_secs(10),
+                || closed.load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+    }
+
+    #[test]
+    fn disposable_supervisor_cleans_up_after_controller_death_and_pipe_close() {
+        for kill_controller in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--ignored", "--exact", DISPOSABLE_FIXTURE])
+                .env("DISPOSABLE_FIXTURE_ROOT", root.path())
+                .env("DISPOSABLE_FIXTURE_ROLE", "controller")
+                .stdout(std::process::Stdio::null());
+            if !kill_controller {
+                command.env("DISPOSABLE_FIXTURE_CLOSE", "1");
+            }
+            let mut controller = command.spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            while !root.path().join("ready").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if !root.path().join("ready").exists() {
+                let _ = controller.kill();
+                let _ = controller.wait();
+                panic!("disposable fixture did not start");
+            }
+            let address: std::net::SocketAddr = std::fs::read_to_string(root.path().join("ready"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if kill_controller {
+                controller.kill().unwrap();
+            }
+            while std::net::TcpStream::connect(address).is_ok()
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            let closed = std::net::TcpStream::connect(address).is_err();
+            let _ = controller.kill();
+            let _ = controller.wait();
+            assert!(closed, "disposable gateway outlived its controller");
+        }
+    }
+
+    #[test]
+    fn disposable_supervisor_stops_owned_group_on_cancel_timeout_and_exit() {
+        use std::os::unix::process::CommandExt;
+        for mode in ["cancel", "timeout", "exit"] {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .args(["-c", if mode == "exit" { "true" } else { "sleep 30" }])
+                .process_group(0);
+            let mut child = command.spawn().unwrap();
+            let result = super::supervise_disposable_group(
+                &mut child,
+                unsafe { libc::getppid() },
+                std::time::Duration::from_millis(if mode == "exit" { 5000 } else { 100 }),
+                || mode == "cancel",
+            );
+            assert_eq!(result, if mode == "timeout" { 1 } else { 0 });
+            assert!(child.try_wait().unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn disposable_service_refuses_partial_and_mixed_launch_arguments() {
+        for args in [
+            vec!["--disposable-service"],
+            vec!["--disposable-service", "/tmp/run", "0"],
+            vec!["--disposable-service", "--service", "/tmp/run", "5300"],
+        ] {
+            assert!(super::disposable_service(args.into_iter().map(Into::into).collect()).is_err());
+        }
+    }
+
     use super::*;
 
     // ── What a launch reopens ────────────────────────────────────────────────

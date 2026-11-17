@@ -66,8 +66,8 @@
       }
 
       function actions(item) {
-        if (!list.person) return '';
-        const me = list.person.id;
+        if (!list.user) return '';
+        const me = list.user.id;
         const drives = item.driver && item.driver.id === me;
         const watches = item.watchers.some((w) => w.id === me);
         const out = [];
@@ -86,8 +86,8 @@
           tab.setAttribute('aria-selected', String(tab.dataset.view === view));
         }
         const notice = document.getElementById('notice');
-        notice.hidden = Boolean(list.person);
-        notice.textContent = 'This device belongs to no person yet, so Mine is empty and Take and Watch are off. Add it to a person in Settings, Devices, People.';
+        notice.hidden = Boolean(list.user);
+        notice.textContent = 'This device belongs to no user yet, so Mine is empty and Take and Watch are off. Add it to a user in Settings, Users.';
         const items = shown();
         document.getElementById('items').innerHTML = items.length
           ? items.map((item) => `
@@ -104,7 +104,7 @@
 
       async function load() {
         try {
-          list = await lucidos.threads.people.list();
+          list = await lucidos.threads.users.list();
           render();
         } catch (e) {
           document.getElementById('items').innerHTML =
@@ -131,7 +131,7 @@
           return;
         }
         try {
-          await lucidos.threads.people[act](id);
+          await lucidos.threads.users[act](id);
           await load();
         } catch (err) {
           lucidos.ui.toast(err.message || String(err), 'error');
@@ -143,7 +143,7 @@
         'WorkItemDriverTaken', 'WorkItemDriverReleased', 'WorkItemWatched',
         'WorkItemUnwatched', 'WorkItemGateEscalated', 'UserQuestionAsked',
         'UserQuestionAnswered', 'ThreadArchived', 'ThreadUnarchived', 'TriggerStarted',
-        'MessageReceived', 'PeopleMessagePosted', 'OperatorsChanged',
+        'MessageReceived', 'UserOnlyMessagePosted', 'UsersChanged',
       ]) {
         lucidos.sse.on(type, load);
       }

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  WIDGET_RESOURCES_MESSAGE_TYPE,
   MAX_FIT_FINDINGS,
   WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
   WIDGET_FIT_MESSAGE_TYPE,
@@ -8,6 +9,8 @@ import {
 import { overlayStack, pushOverlay } from '../overlayStack';
 import { primaryPointerIsDown } from '../../utils/pointerPress';
 
+const noteFrameResources = vi.fn();
+vi.mock('../../utils/frameResources', () => ({ noteFrameResources }));
 const appFrameFor = vi.fn();
 vi.mock('../../utils/appFrame', () => ({ appFrameFor }));
 
@@ -35,6 +38,15 @@ describe('handleWidgetFrameMessage', () => {
     // A blur forgets any press an earlier case marked.
     window.dispatchEvent(new Event('blur'));
     appFrameFor.mockReset().mockImplementation((s) => (s === SOURCE ? frame : null));
+  });
+
+  it('accepts resource reports only from mounted app frames', () => {
+    const counts = { type: WIDGET_RESOURCES_MESSAGE_TYPE, videoLoaded: 1, videoPixels: 100, images: 0, imagePixels: 0 };
+    noteFrameResources.mockClear();
+    handleWidgetFrameMessage(message(counts, {}));
+    expect(noteFrameResources).not.toHaveBeenCalled();
+    handleWidgetFrameMessage(message(counts));
+    expect(noteFrameResources).toHaveBeenCalledWith(frame, counts);
   });
 
   it('dispatches the height on the frame that sent it', () => {

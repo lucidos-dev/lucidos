@@ -81,12 +81,7 @@ fn confirmation_with_branches<'a>(
 }
 fn batch_confirmation_phrase(members: &[FrozenMember]) -> Result<String, ApiError> {
     let protected = members.iter().find_map(|member| match &member.resource {
-        FrozenResource::Registered { workspace }
-            if matches!(
-                workspace.cleanup.origin,
-                crate::registry::WorkspaceOrigin::User | crate::registry::WorkspaceOrigin::Unknown
-            ) =>
-        {
+        FrozenResource::Registered { workspace } if !workspace.cleanup.origin.is_machine_made() => {
             Some(workspace.name.clone())
         }
         FrozenResource::Folder { directory } => Some(directory.display().to_string()),
@@ -285,7 +280,7 @@ impl GatewayState {
     }
 
     pub(super) fn cleanup_peer_paths(&self) -> Vec<PathBuf> {
-        crate::installs::inventory(std::env::current_exe().ok(), self.app_data())
+        self.install_inventory()
             .installs
             .into_iter()
             .filter_map(|install| install.data_dir)
@@ -1108,8 +1103,10 @@ mod tests {
             let result = state
                 .delete_workspace_authorized_with_observation(
                     "scratch",
-                    Some("Scratch"),
-                    Some(token),
+                    crate::server::DeleteAuthority::OwnerToken {
+                        confirm: Some("Scratch"),
+                        owner_token: Some(token),
+                    },
                     |database| {
                         assert_eq!(database, "lucidos_scratch");
                         std::future::ready(observation.ok_or_else(|| "catalog unavailable".into()))
@@ -2034,7 +2031,7 @@ mod tests {
                         label: "Test device".into(),
                     });
                     request.headers_mut().insert(
-                        "x-lucidos-agent-origin-token",
+                        crate::auth::HEADER_AGENT_ORIGIN_TOKEN,
                         HeaderValue::from_static("subprocess"),
                     );
                 }

@@ -103,7 +103,7 @@ impl VoiceProvider for RealtimeProvider {
                     // mid-sentence. Unlogged, an operator chasing a recurring
                     // drop has nothing to grep. `live.rs` logs the same case.
                     Some(Err(e)) => {
-                        log!("[Voice] The Realtime socket failed: {}", e);
+                        log_legacy!("[Voice] The Realtime socket failed: {}", e);
                         return;
                     }
                     None => return,
@@ -112,7 +112,7 @@ impl VoiceProvider for RealtimeProvider {
                     continue;
                 };
                 let Ok(value) = serde_json::from_str::<Value>(&text) else {
-                    log!("[Voice] The talker sent something that is not JSON");
+                    log_legacy!("[Voice] The talker sent something that is not JSON");
                     continue;
                 };
                 for event in map_event(&value) {
@@ -421,7 +421,7 @@ fn error_events(value: &Value) -> Vec<VoiceEvent> {
         .and_then(Value::as_str)
         .unwrap_or("the talker reported an error with no message");
     if value.pointer("/error/code").and_then(Value::as_str) == Some(CANCEL_FOUND_NO_REPLY) {
-        log!(
+        log_legacy!(
             "[Voice] A cancel arrived after the reply ended: {}",
             message
         );
@@ -449,7 +449,7 @@ fn error_events(value: &Value) -> Vec<VoiceEvent> {
 /// fourth tool appearing, and the design says there is none.
 fn tool_call(value: &Value) -> Vec<VoiceEvent> {
     let Some(tool_call_id) = value.get("call_id").and_then(Value::as_str) else {
-        log!("[Voice] A tool call arrived with no id, so it cannot be resolved");
+        log_legacy!("[Voice] A tool call arrived with no id, so it cannot be resolved");
         return vec![];
     };
     let tool_call_id = tool_call_id.to_string();
@@ -471,13 +471,13 @@ fn tool_call(value: &Value) -> Vec<VoiceEvent> {
                 choice_id,
             }],
             None => {
-                log!("[Voice] An answer arrived naming no choice, so it settles nothing");
+                log_legacy!("[Voice] An answer arrived naming no choice, so it settles nothing");
                 vec![]
             }
         },
         HANGUP_TOOL => vec![VoiceEvent::HangupRequested { tool_call_id }],
         _ => {
-            log!(
+            log_legacy!(
                 "[Voice] The talker called {:?}, which it does not hold",
                 name
             );
@@ -505,7 +505,7 @@ fn unnamed_tool_call(value: &Value, tool_call_id: String) -> Vec<VoiceEvent> {
             choice_id,
         }];
     }
-    log!("[Voice] A tool call arrived unnamed and unreadable, so it cannot be routed");
+    log_legacy!("[Voice] A tool call arrived unnamed and unreadable, so it cannot be routed");
     vec![]
 }
 
@@ -658,7 +658,7 @@ fn warn_on_modality_drift(usage: &ApiUsage) {
         || cached != usage.cache_read_tokens
         || output != usage.output_tokens
     {
-        log!(
+        log_legacy!(
             "[Voice] usage modality split disagrees with the totals: input {} vs {}, cached {} vs {}, output {} vs {}. Storing both as reported.",
             input,
             usage.input_tokens,

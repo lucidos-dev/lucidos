@@ -123,7 +123,9 @@ async fn a_thread_scoped_replay_reads_only_its_thread_and_its_types() {
         mine,
         ThreadEvent::ResponseFailed {
             error: "not a replayed type".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
     )
     .await;
@@ -303,6 +305,7 @@ async fn commit_unsent_row(bus: &EventBus) -> super::super::CommittedSystemEvent
         commit: "abc123".into(),
         source: None,
         writer_thread_id: None,
+        writer: None, // Legacy event fixture.
     };
     let append = bus.begin_append().await.unwrap();
     bus.commit_system_event(append, Uuid::new_v4(), event, 0, None)

@@ -47,7 +47,7 @@ pub fn location_handle(initial: String) -> LocationHandle {
 /// every LLM and image call if it does.
 pub fn read_location(handle: &LocationHandle) -> String {
     handle.read().map(|g| g.clone()).unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Vertex] location lock poisoned, falling back to global: {}",
             e
         );
@@ -114,7 +114,7 @@ fn well_formed_location(location: &str) -> &str {
     if ok {
         return location;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[Vertex] refusing malformed region {:?}; using global instead",
         location
     );
@@ -286,7 +286,7 @@ async fn fetch_access_token() -> Result<String, Box<dyn std::error::Error + Send
             Ok(token) => return Ok(token),
             // Don't fail outright — a stale/revoked ADC refresh should still try
             // the gcloud path (which may re-prompt / use a different config).
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[Vertex] ADC token refresh failed, falling back to gcloud: {}",
                 e
             ),
@@ -454,11 +454,11 @@ impl VertexProvider {
         }
         match get_cached_access_token(&self.token_cache).await {
             Ok(new_token) => {
-                log!("[{}] HTTP 401, refreshed access token and retrying", model);
+                log_legacy!("[{}] HTTP 401, refreshed access token and retrying", model);
                 Some(new_token)
             }
             Err(e) => {
-                log!("[{}] HTTP 401 and failed to refresh token: {}", model, e);
+                log_legacy!("[{}] HTTP 401 and failed to refresh token: {}", model, e);
                 None
             }
         }
@@ -474,6 +474,7 @@ impl VertexProvider {
         body: &impl Serialize,
         attempt_timeout: Option<std::time::Duration>,
     ) -> Result<(reqwest::StatusCode, String), Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::Vertex).await?;
         let mut attempt = 0u32;
         let mut token = access_token.to_string();
         let mut retried_auth = false;
@@ -512,7 +513,20 @@ impl VertexProvider {
             };
 
             let status = response.status();
+            let error_headers = response.headers().clone();
             let response_body = response.text().await?;
+            if !status.is_success() {
+                if let Some(cap) = super::metered::http_spend_cap(
+                    super::ProviderKind::Vertex,
+                    status.as_u16(),
+                    &error_headers,
+                    &response_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
+            }
 
             if status.as_u16() == 401 && !retried_auth {
                 if let Some(new_token) = self.handle_auth_refresh(model, &mut retried_auth).await {
@@ -536,6 +550,13 @@ impl VertexProvider {
 
 #[async_trait]
 impl LlmProvider for VertexProvider {
+    fn resolved_provider_kind(
+        &self,
+        _selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Some(crate::llm::ProviderKind::Vertex))
+    }
+
     fn default_model(&self) -> &str {
         &self.model
     }

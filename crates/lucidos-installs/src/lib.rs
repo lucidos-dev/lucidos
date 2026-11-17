@@ -429,7 +429,7 @@ fn instances_under(
 /// them: the port it holds is what a conflict turns on, and dropping the row
 /// would hide the very install the user forgot about.
 fn source_checkout(roots: &ScanRoots, running: &RunningProcess) -> Vec<Install> {
-    let data_dir = lucidos_home::path_in(&roots.home).join(lucidos_home::GATEWAY_DIR_NAME);
+    let data_dir = lucidos_home::default_gateway_data_dir_in(&lucidos_home::path_in(&roots.home));
     if !data_dir.is_dir() {
         return Vec::new();
     }
@@ -446,11 +446,12 @@ fn source_checkout(roots: &ScanRoots, running: &RunningProcess) -> Vec<Install> 
         port: Some(roots.dev_gateway_port),
         agents: Vec::new(),
         running_here: running.belongs_to(repo.as_deref(), Some(&data_dir)),
+        removal: format!(
+            "Stop it with ./scripts/stop.sh, then delete the checkout and {}.",
+            data_dir.display()
+        ),
         data_dir: Some(data_dir),
         root: repo,
-        removal: "Stop it with ./scripts/stop.sh, then delete the checkout and \
-                  ~/.lucidos/gateway."
-            .to_string(),
     }]
 }
 

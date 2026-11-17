@@ -59,10 +59,30 @@ impl CodingAgent {
     }
 }
 
+/// A Codex usage notification that is not proven to describe this turn's work.
+/// Counts use the same uncached-input convention as `AgentEvent::Usage`.
+#[derive(Debug, Clone)]
+pub struct CodexUsageSnapshot {
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_creation_tokens: u32,
+}
+
 /// Canonical event emitted by a coding agent. Implementors translate their
 /// CLI's output format into this enum before sending it over `events_rx`.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Still recorded as usage, but never billed from this process's account.
+    UsageRestored { snapshot: CodexUsageSnapshot },
+    /// Neither restored identity nor a current turn is proven. Keep the counts.
+    UsageUnscoped { snapshot: CodexUsageSnapshot },
+    /// Allowlisted evidence from this process, never the engine's own router.
+    BillingObserved {
+        attribution: super::billing_provider::BillingAttribution,
+    },
     /// Initial handshake — session id, model, available commands.
     Init {
         session_id: String,
@@ -71,6 +91,8 @@ pub enum AgentEvent {
         skills: Vec<String>,
         /// The agent CLI's own version, when its handshake names one.
         agent_version: Option<String>,
+        /// This process can accept ordinary follow-ups during an active turn.
+        can_steer: bool,
     },
     /// Streamed assistant text fragment. `opens_block` is true when this text
     /// starts a new content block rather than continuing the open one. The
@@ -145,20 +167,31 @@ pub enum AgentEvent {
     /// (`--replay-user-messages`): mid-turn when it folds the input in at a tool
     /// result, and at the next turn's start otherwise. A local command such as
     /// `/cost` replays too. Codex reports it when the driver starts the turn
-    /// that carries the input.
+    /// that carries the input or accepts its mid-turn steer.
     InputRead { input: uuid::Uuid },
     /// The agent will never take the forwarded input `input`: Codex rejected or
     /// failed the turn that carried it. The turn's `Result` carries the error.
     InputRejected { input: uuid::Uuid },
+    /// A steer failed. The input remains queued; the driver interrupts the
+    /// current turn only when it cannot safely leave the input for its end.
+    SteerFallback { can_steer: bool, interrupting: bool },
     /// Turn-complete marker. The agent is now idle.
     /// `error` is `Some` when the agent reported the turn ended in failure
     /// (CC's `subtype: "error_during_execution"` etc., `is_error: true`) —
     /// the consumer emits `ResponseFailed` instead of `ResponseGenerated` so
     /// the partial response renders as a failed exchange, not a complete one.
+    ///
+    /// `provider_error` is the structured code the provider attached to the
+    /// failure, when it sent one (Codex's `codexErrorInfo`).
+    ///
+    /// `turn_end` is how the turn ended, stored on the idle that follows.
+    /// Claude Code sends `None`.
     Result {
         text: String,
         duration_ms: u64,
         error: Option<String>,
+        provider_error: Option<crate::engine::thread_events::ProviderError>,
+        turn_end: Option<crate::engine::thread_events::TurnEndFacts>,
     },
     /// Token usage of one API call the agent made, exactly once per call. The
     /// consumer records it as a `ContextCaptured`, the same event the main-LLM
@@ -231,6 +264,8 @@ pub struct AgentExitFacts {
 /// User input sent to a running agent.
 #[derive(Debug, Clone)]
 pub struct AgentInput {
+    /// Keep this input queued until idle if steering fails; never interrupt for it.
+    pub defer_on_steer_failure: bool,
     pub text: String,
     pub images: Vec<crate::api::ChatImage>,
     /// The name the agent knows this write by, which a withdraw uses. Fresh
@@ -274,7 +309,8 @@ pub enum ControlRequest {
 /// one set to its default path. The two read different keychain entries and
 /// different `.claude.json` files, so only one of them holds the user's login.
 /// A pinned spawn therefore replays exactly what turn 1 ran with.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum AccountPin {
     /// `CLAUDE_CONFIG_DIR` was unset. `dir` is Claude Code's default,
     /// `$HOME/.claude`, where the transcripts live.
@@ -384,6 +420,8 @@ pub struct SpawnArgs<'a> {
     /// orchestration (which has the pool); empty for callers that don't inject
     /// (tests, engine-internal spawns with no user env).
     pub user_env_vars: &'a [(String, String)],
+    /// Engine-owned scheduling class, resolved from the repair's durable lineage.
+    pub build_slot_class: lucidos_build_slot::SlotClass,
     /// The thread's *account pin*, replayed on every spawn after turn 1.
     /// `build_command` applies it AFTER `apply_lucidos_env`. So neither a live
     /// user toggle nor the engine's own env can move the thread to another
@@ -425,6 +463,9 @@ pub struct SpawnArgs<'a> {
     /// The agent run marker the spawn stamps, and what the driver's end does
     /// with the processes carrying it (ADR 0391, 0478).
     pub(crate) agent_run: super::agent_run_marker::AgentRun,
+    /// The OS sandbox the agent process runs in, resolved by the spawn
+    /// orchestration, which holds the pool (ADR 0645).
+    pub sandbox: super::agent_sandbox::Sandbox,
 }
 
 impl SpawnArgs<'_> {
@@ -658,6 +699,7 @@ mod tests {
 
     fn input(text: &str) -> AgentInput {
         AgentInput {
+            defer_on_steer_failure: false,
             text: text.into(),
             images: Vec::new(),
             uuid: uuid::Uuid::new_v4(),

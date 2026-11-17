@@ -297,7 +297,7 @@ async fn emit_failure_notification(
     )
     .await
     {
-        log!(
+        log_legacy!(
             "[Scheduler] Failed to emit failure notification for '{}': {}",
             config.name,
             error
@@ -408,7 +408,7 @@ async fn execute_script_task(
     invocation: &TriggerInvocation,
     event_payload: Option<&serde_json::Value>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    log!(
+    log_legacy!(
         "[Scheduler] Running script trigger '{}': {}",
         config.name,
         script_path
@@ -463,7 +463,7 @@ async fn execute_script_task(
             engine
                 .record_trigger_completed(&config.id, &config.name, &summary, None)
                 .await?;
-            log!("[Scheduler] Script trigger '{}' completed", config.name);
+            log_legacy!("[Scheduler] Script trigger '{}' completed", config.name);
             Ok(())
         }
         Err(e) => {
@@ -536,7 +536,7 @@ async fn execute_llm_task(
         }
     }
 
-    log!(
+    log_legacy!(
         "[Scheduler] Executing LLM trigger '{}': {}",
         config.name,
         user_message.chars().take(50).collect::<String>()
@@ -592,11 +592,16 @@ async fn execute_llm_task(
         Ok(r) => r,
         Err(e) => {
             if is_shutdown_interruption(engine.is_shutting_down(), e.as_ref()) {
-                log!(
+                log_legacy!(
                     "[Scheduler] Trigger '{}' interrupted during shutdown: {}",
                     config.name,
                     e
                 );
+                return Err(e);
+            }
+            if e.is::<crate::llm::spend_cap::SpendCapReached>() {
+                // The single ModelSpendCapReached announcement owns its notice,
+                // so another trigger fire cannot repeat it during this hold.
                 return Err(e);
             }
             let err_str = e.to_string();
@@ -611,7 +616,7 @@ async fn execute_llm_task(
             let notification_task_id = uuid::Uuid::parse_str(&config.id)
                 .unwrap_or_else(|_| trigger_id_to_uuid(&config.id));
             if is_transient && has_recent_error_notification(pool, notification_task_id).await {
-                log!(
+                log_legacy!(
                     "[Scheduler] Suppressing duplicate transient error notification for '{}': {}",
                     config.name,
                     err_str
@@ -642,7 +647,7 @@ async fn execute_llm_task(
         )
         .await?;
 
-    log!("[Scheduler] Trigger '{}' completed", config.name);
+    log_legacy!("[Scheduler] Trigger '{}' completed", config.name);
 
     Ok(())
 }
@@ -701,7 +706,7 @@ async fn answer_open_question(
         }
         // Answered or overtaken in the meantime: the fire runs as a message.
         AnswerResult::Conflict(reason) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Trigger '{}' could not answer the question on thread {}: {}",
                 config.name,
                 thread_id,
@@ -887,7 +892,7 @@ async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bo
             // A dedup lookup that could not run is UNKNOWN, not "already
             // notified": fall through to notifying, so a DB hiccup costs a
             // duplicate banner rather than the failure report itself.
-            log!(
+            log_legacy!(
                 "[Scheduler] Error-notification dedup lookup failed for task {}: {}",
                 task_id,
                 e
@@ -1229,57 +1234,6 @@ mod tests {
             &format!("{pattern} {constructor}"),
             "ResponseAborted"
         ));
-    }
-
-    /// Source-scan tripwire, in the repo's existing idiom (see
-    /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).
-    ///
-    /// A "the run finished, tell the frontend" broadcast is the most natural
-    /// thing in the world to reach for from the scheduler, and it reads as
-    /// harmless at the call site: the turn really has finished, and the event is
-    /// empty. It is not harmless. It is a second terminator for a turn that
-    /// already has one, anchored on no `request_event_id`, and the case it gets
-    /// wrong is the one nobody writes the code for: the turn that ended because
-    /// the user pressed Stop. `execute_llm_task` carried exactly that from 2026-03
-    /// until 2026-08-07 and put "Done ✓ / the model returned an empty response"
-    /// under every canceled trigger fire.
-    ///
-    /// Nothing here may construct one. The terminator belongs to the agentic
-    /// loop, which owns the turn's `request_event_id`; the scheduler observes.
-    #[test]
-    fn the_scheduler_never_constructs_a_chat_terminator() {
-        use crate::test_support::source_scan::{is_test_path, production_sources};
-
-        // The chat-mode terminator set (`TERMINATOR_EVENT_TYPES`), spelled out
-        // rather than imported so a new variant joining that constant does not
-        // silently widen what this test forbids without a look at this comment.
-        const TERMINATORS: [&str; 4] = [
-            "ResponseGenerated",
-            "ResponseCanceled",
-            "ResponseAborted",
-            "ResponseFailed",
-        ];
-
-        let mut offenders: Vec<String> = Vec::new();
-        for (rel, text) in production_sources() {
-            if !rel.starts_with("scheduler/") || is_test_path(&rel) {
-                continue;
-            }
-            for event in TERMINATORS {
-                if constructs_terminator(&text, event) {
-                    offenders.push(format!("{rel}: {event}"));
-                }
-            }
-        }
-        offenders.sort();
-        assert!(
-            offenders.is_empty(),
-            "the scheduler must not emit a terminator: a trigger turn's terminator \
-             is the agentic loop's, and a second one anchored on no request_event_id \
-             renders as a phantom 'empty response' turn under a cancel and reports a \
-             canceled child to its parent as Success. Constructed in:\n  {}",
-            offenders.join("\n  ")
-        );
     }
 
     #[test]
@@ -1822,5 +1776,59 @@ mod tests {
         assert!(retried.contains("## Retry"));
         assert!(retried.contains(&format!("[interrupted run](thread:{})", retry.thread_id)));
         assert!(retried.contains("before repeating a side effect"));
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// Source-scan tripwire, in the repo's existing idiom (see
+        /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).
+        ///
+        /// A "the run finished, tell the frontend" broadcast is natural to reach for
+        /// from the scheduler, and it reads as harmless: the turn has finished. It
+        /// is not harmless. It is a second terminator for a turn that already has
+        /// one, anchored on no `request_event_id`.
+        ///
+        /// It gets wrong the turn that ended because the user pressed Stop.
+        /// `execute_llm_task` once carried exactly that, and put "Done ✓ / the
+        /// model returned an empty response" under every canceled trigger fire.
+        ///
+        /// Nothing here may construct one. The terminator belongs to the agentic
+        /// loop, which owns the turn's `request_event_id`; the scheduler observes.
+        #[test]
+        fn the_scheduler_never_constructs_a_chat_terminator() {
+            use crate::test_support::source_scan::{is_test_path, production_sources};
+
+            // The chat-mode terminator set (`TERMINATOR_EVENT_TYPES`), spelled out
+            // rather than imported. A new variant joining that constant must not
+            // widen what this test forbids without a look at this comment.
+            const TERMINATORS: [&str; 4] = [
+                "ResponseGenerated",
+                "ResponseCanceled",
+                "ResponseAborted",
+                "ResponseFailed",
+            ];
+
+            let mut offenders: Vec<String> = Vec::new();
+            for (rel, text) in production_sources() {
+                if !rel.starts_with("scheduler/") || is_test_path(&rel) {
+                    continue;
+                }
+                for event in TERMINATORS {
+                    if constructs_terminator(&text, event) {
+                        offenders.push(format!("{rel}: {event}"));
+                    }
+                }
+            }
+            offenders.sort();
+            assert!(
+                offenders.is_empty(),
+                "the scheduler must not emit a terminator: a trigger turn's terminator \
+             is the agentic loop's, and a second one anchored on no request_event_id \
+             renders as a phantom 'empty response' turn under a cancel and reports a \
+             canceled child to its parent as Success. Constructed in:\n  {}",
+                offenders.join("\n  ")
+            );
+        }
     }
 }

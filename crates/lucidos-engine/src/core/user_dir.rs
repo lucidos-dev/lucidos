@@ -17,17 +17,17 @@ pub fn ensure_git_init(user_dir: &Path) {
         restrict_git_dir(user_dir);
         return;
     }
-    log!("[UserDir] Initializing git repo at {}", user_dir.display());
+    log_legacy!("[UserDir] Initializing git repo at {}", user_dir.display());
     let output = Command::new("git")
         .args(["init"])
         .current_dir(user_dir)
         .output();
     match output {
         Ok(o) if o.status.success() => {
-            log!("[UserDir] Git repo initialized");
+            log_legacy!("[UserDir] Git repo initialized");
             restrict_git_dir(user_dir);
             if let Err(e) = std::fs::write(user_dir.join(".gitignore"), USER_DIR_GITIGNORE) {
-                log!("[UserDir] Could not write .gitignore, so nothing is staged: {e}");
+                log_legacy!("[UserDir] Could not write .gitignore, so nothing is staged: {e}");
                 return;
             }
             let mut stage = vec!["add", "--", ".gitignore"];
@@ -40,11 +40,11 @@ pub fn ensure_git_init(user_dir: &Path) {
                 .current_dir(user_dir)
                 .output()
             {
-                Ok(o) if !o.status.success() => log!(
+                Ok(o) if !o.status.success() => log_legacy!(
                     "[UserDir] git add failed: {}",
                     String::from_utf8_lossy(&o.stderr)
                 ),
-                Err(e) => log!("[UserDir] git add failed: {}", e),
+                Err(e) => log_legacy!("[UserDir] git add failed: {}", e),
                 _ => {}
             }
             match Command::new("git")
@@ -52,19 +52,19 @@ pub fn ensure_git_init(user_dir: &Path) {
                 .current_dir(user_dir)
                 .output()
             {
-                Ok(o) if !o.status.success() => log!(
+                Ok(o) if !o.status.success() => log_legacy!(
                     "[UserDir] initial commit failed: {}",
                     String::from_utf8_lossy(&o.stderr)
                 ),
-                Err(e) => log!("[UserDir] initial commit failed: {}", e),
+                Err(e) => log_legacy!("[UserDir] initial commit failed: {}", e),
                 _ => {}
             }
         }
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[UserDir] git init failed: {}",
             String::from_utf8_lossy(&o.stderr)
         ),
-        Err(e) => log!("[UserDir] Failed to run git: {}", e),
+        Err(e) => log_legacy!("[UserDir] Failed to run git: {}", e),
     }
 }
 
@@ -75,7 +75,7 @@ fn restrict_git_dir(user_dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let git_dir = user_dir.join(".git");
     if let Err(e) = std::fs::set_permissions(&git_dir, std::fs::Permissions::from_mode(0o700)) {
-        log!(
+        log_legacy!(
             "[UserDir] Could not make {} owner-only: {e}",
             git_dir.display()
         );
@@ -97,14 +97,14 @@ pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
         .output();
     match add {
         Ok(o) if !o.status.success() => {
-            log!(
+            log_legacy!(
                 "[UserDir] git add failed: {}",
                 String::from_utf8_lossy(&o.stderr)
             );
             return;
         }
         Err(e) => {
-            log!("[UserDir] git add failed: {}", e);
+            log_legacy!("[UserDir] git add failed: {}", e);
             return;
         }
         _ => {}
@@ -115,15 +115,15 @@ pub fn auto_commit(user_dir: &Path, relative_path: &str, message: &str) {
         .output();
     match commit {
         Ok(o) if o.status.success() => {
-            log!("[UserDir] Committed: {}", message);
+            log_legacy!("[UserDir] Committed: {}", message);
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             if !stderr.contains("nothing to commit") {
-                log!("[UserDir] git commit warning: {}", stderr);
+                log_legacy!("[UserDir] git commit warning: {}", stderr);
             }
         }
-        Err(e) => log!("[UserDir] git commit failed: {}", e),
+        Err(e) => log_legacy!("[UserDir] git commit failed: {}", e),
     }
 }
 

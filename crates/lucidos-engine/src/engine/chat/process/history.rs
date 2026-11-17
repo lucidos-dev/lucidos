@@ -33,17 +33,17 @@ use super::context_build::summarize_user_topics;
 /// so two models echo each other into agreement. Print it as `User` and the
 /// doer obeys an instruction nobody gave.
 ///
-/// On a team gateway a person's typed message reads under its operator's
-/// name from `operators`, so the agent can tell Sam from Alex (ADR 0649).
+/// On a team gateway a typed message reads under its user's
+/// name from `users`, so the agent can tell Sam from Alex (ADR 0649).
 ///
 /// A free function rather than a line inside the formatter, so the rule has one
 /// definition that a test can reach.
 pub(super) fn speaker_label<'a>(
     m: &'a crate::core::store::SessionMessage,
-    operators: &crate::gateway_operators::OperatorSnapshot,
+    users: &crate::gateway_users::UserSnapshot,
 ) -> std::borrow::Cow<'a, str> {
     match (m.role.as_str(), m.agent.as_ref()) {
-        ("user", _) => operators
+        ("user", _) => users
             .speaker_of_device(m.sender_device_id.as_deref())
             .into(),
         (_, Some(agent)) => agent.speaker_label().into(),
@@ -144,7 +144,7 @@ impl LucidosEngine {
                 loaded_knowhow_docs: match self.thread_loaded_knowhow(thread_id).await {
                     Ok(docs) => docs,
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[Chat] Could not read the loaded knowhow of {}: {}",
                             thread_id,
                             e
@@ -204,7 +204,7 @@ impl LucidosEngine {
                     ))
                 }
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] resume context load failed (DB error): {}; \
                          orchestrator will resume without verbatim tool history",
                         e
@@ -216,7 +216,7 @@ impl LucidosEngine {
             match messages_result {
                 Ok((messages, image_walk)) => {
                     // All messages except the one that woke this turn. It is
-                    // the newest message the agent reads, though people-only
+                    // the newest message the agent reads, though user-only
                     // messages posted since may follow it.
                     let mut all_prior = messages;
                     let woke_at = all_prior
@@ -267,7 +267,7 @@ impl LucidosEngine {
                         .iter()
                         .map(|d| d.body.as_str())
                         .collect();
-                    let operators = crate::gateway_operators::current();
+                    let users = crate::gateway_users::current();
 
                     // Format a message for history context with tiered truncation.
                     // - Last HISTORY_VERBATIM_TAIL messages: fully verbatim (only 15K safety net)
@@ -278,7 +278,7 @@ impl LucidosEngine {
                                               is_verbatim: bool,
                                               msg_idx: usize|
                      -> String {
-                        let role = speaker_label(m, &operators);
+                        let role = speaker_label(m, &users);
                         let content = format_history_content(
                             &m.content,
                             &m.role,

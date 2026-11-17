@@ -73,6 +73,29 @@ This practice is not grill-specific. It applies to brainstorming (`superpowers:b
 
 Every grill session either reinforces the canonical vocabulary or improves it. Drift never accumulates. The next grill, by you, by another agent session, or by the user reading back through `docs/glossary.md`, starts from sharper ground. That's the multiplier.
 
+## Record a settled design
+
+When the dialogue is producing a design plan, run `lucidos planned start --kind design`
+before writing it. This records Designing without opening the source edit gate.
+Write the settled decisions to `docs/plans/YYYY-MM-DD-<slug>-design.md`; a design
+plan has no implementation phases and includes `- **Status**: Proposed`. Commit the file, then run
+`lucidos planned mark --plan <path> --kind design`.
+
+Ask with your question tool (`AskUserQuestion` on Claude Code,
+`ask_user_question` on the Lucidos MCP server on Codex). Put the design summary
+and any changed decisions on the card itself. Offer `Approve design` first,
+then a real design fork if one exists; otherwise offer `Approve design and plan here`.
+Typed questions and suggestions mean revise the design, commit it, mark it again,
+and ask again. A fork approves that variant after its file is revised and committed.
+
+After approval, run `lucidos planned approve`. Design approval always records
+plan-only scope: it permits landing design plan files alone and never source edits.
+For `Approve design`, end the turn with the committed design alone so Lucidos can
+propose it. For `Approve design and plan here`, keep the design on the branch and
+run the `implementation-plan` skill here. That skill starts implementation
+planning, records a new proposed marker, and asks for its own approval before any
+source edit. Design approval does not approve implementation.
+
 ## See also
 
 - `.claude/rules/glossary.md`: the canonical-term rule itself, carrying the synonym list, the cross-layer name-root rule, and the name-accuracy rule.

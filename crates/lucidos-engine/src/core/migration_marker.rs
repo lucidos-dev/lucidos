@@ -119,7 +119,7 @@ pub async fn record_migrated(workspace: &Path, database_url: &str, pool: &PgPool
         return;
     };
     if let Err(e) = write(workspace, &identity) {
-        crate::log!(
+        crate::log_legacy!(
             "[Startup] Could not write the migration marker {}: {}",
             path(workspace).display(),
             e
@@ -153,25 +153,6 @@ mod tests {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         write(workspace.path(), "").expect("write");
         assert_eq!(read(workspace.path()), None);
-    }
-
-    /// The e2e reset recreates its database under a `.lucidos/` it keeps, so it
-    /// must delete the marker by name. Shell cannot import the constant, so
-    /// this pins the copy.
-    #[test]
-    fn the_e2e_database_reset_forgets_the_marker() {
-        let script =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/e2e.sh");
-        let text = std::fs::read_to_string(&script).expect("read e2e.sh");
-        let reset = text
-            .split("reset_e2e_database() {")
-            .nth(1)
-            .and_then(|rest| rest.split("\n}\n").next())
-            .expect("reset_e2e_database exists");
-        assert!(
-            reset.contains(&format!("rm -f \"$E2E_WORKSPACE/.lucidos/{FILE_NAME}\"")),
-            "reset_e2e_database must delete the migration marker"
-        );
     }
 
     /// The incident: a script's `DROP SCHEMA public CASCADE` reached the live
@@ -234,5 +215,28 @@ mod tests {
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The e2e reset recreates its database under a `.lucidos/` it keeps, so it
+        /// must delete the marker by name. Shell cannot import the constant, so
+        /// this pins the copy.
+        #[test]
+        fn the_e2e_database_reset_forgets_the_marker() {
+            let script =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/e2e.sh");
+            let text = std::fs::read_to_string(&script).expect("read e2e.sh");
+            let reset = text
+                .split("reset_e2e_database() {")
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .expect("reset_e2e_database exists");
+            assert!(
+                reset.contains(&format!("rm -f \"$E2E_WORKSPACE/.lucidos/{FILE_NAME}\"")),
+                "reset_e2e_database must delete the migration marker"
+            );
+        }
     }
 }

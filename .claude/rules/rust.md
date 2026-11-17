@@ -7,13 +7,19 @@ paths:
 
 # Rust Conventions
 
-- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Seven are blessed, each because a caller branches on it:
+- **Error handling:** `Box<dyn std::error::Error + Send + Sync>`, with no custom error types. Thirteen are blessed, each because a caller branches on it:
+  - `llm::spend_cap::SpendCapReached`: retry loops stop on a billing refusal, and background callers hold until its reset.
   - `LifecycleViolation` (`engine/thread_lifecycle.rs`): the EventBus rejection path fails fast on its typed payload.
   - `llm::ModelNotServed`: an unset default moves to its next model (ADR 0403).
   - `lucidos_engine_socket::ConnectError` and the gateway's `engine_hop::HopError`: a probe tells `Unreachable` from `Foreign` (ADR 0445).
   - `agent_session::start_failure::AgentStartFailure`: a coding-agent turn that could not begin. `agent_exit_of` attaches `agent_exit` to the `ResponseFailed` (ADR 0487).
   - `llm::prefill::PrefillRefused`: the keep-alive's first-beat guard marks a provider that refused a prefill unable to prefill (ADR 0556).
+  - `llm::ProviderError`: the retry loops downcast to it and branch on `kind.is_retryable()`. Every model provider failure is built through its parser (ADR 0673).
   - `llm::chatgpt_plan::ChatGptPlanError`: the Responses retry loop refreshes or stops on its failure kind, and the limit pause reads `LimitReached` (ADR 0636).
+  - `agent_session::spawn_gate::StartAwaitsOwner`: a run parked on the owner's Allow once card. `ensure_run_failure_terminator_emitted` writes no failure for it, so the thread reads as waiting, and the Thread Queue completes its entry.
+  - `agent_drafts::DraftRefusal`: the draft route answers `Invalid` with 400 and `Internal` with 500.
+  - `permission::batch::BatchError`: the batch route answers `Refused` with 400 and `Unreadable` with 500.
+  - `automation_pause::PauseError`: the automation-pause routes answer `NotFound` with 404, `Refused` with 400 and `Internal` with 500.
   - `core::snapshot::store::DiskFloorRefused`: the snapshot capture job reads its `needed_bytes` to fail with the space to free. Every other caller sees the `snapshot_disk_floor` slug.
   - `api::error::ApiError` is not an error type in this sense. It is the `/api/v1` response shape (`status` plus `{"error": msg}`), and handlers return `Result<_, ApiError>`. Internal code keeps the boxed trait object. `ApiError::with_reason` adds a `reason` slug for a refusal a client must tell apart.
   - A new custom type needs the same structural reason. "I want a typed error for this layer" is not one. If the caller only formats the error into a string, use the boxed trait object.
@@ -68,10 +74,10 @@ Only conversational data goes through the HTTP API. DB access, vector search, em
 
 ## Intra-host scheme: never hardcode `http`/`https`
 
-An HTTP call between co-located Lucidos processes resolves its scheme through **`net_config::tls_scheme` / `tls_scheme_from` / `peer_scheme_order`** (`SCHEME_HTTP` / `SCHEME_HTTPS`). That covers engine to gateway control API and any `127.0.0.1` hop. The decision lives in `net_config` only. Never re-derive it from `LUCIDOS_TLS_*` inline.
+An HTTP call between co-located Lucidos processes resolves its scheme through **`net_config::tls_scheme` / `tls_scheme_from` / `gateway_scheme_order`** (`SCHEME_HTTP` / `SCHEME_HTTPS`). That covers engine to gateway control API and any `127.0.0.1` hop. The decision lives in `net_config` only. Never re-derive it from `LUCIDOS_TLS_*` inline.
 
 - A process serves TLS iff both `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY` point at non-empty paths. Dev keeps the certs (`https`). The packaged gateway strips them (`http`), per ADR 0014.
-- For a peer whose scheme might differ, use `peer_scheme_order()`: the resolved scheme first, the other second.
+- **An engine calling its gateway uses `gateway_scheme_order()`**: the gateway's scheme first, the other second. A gateway-spawned engine serves plain HTTP behind a TLS gateway, so its own `LUCIDOS_TLS_*` never decides that call. The gateway hands its TLS to the engine as `LUCIDOS_GATEWAY_TLS_*`.
 - A self-signed dev cert on a loopback hop is accepted with `danger_accept_invalid_certs(true)` + `no_proxy()`.
 - **The gateway's hop to an engine has no scheme.** It uses the *engine socket* through `engine_hop` (ADR 0445).
 

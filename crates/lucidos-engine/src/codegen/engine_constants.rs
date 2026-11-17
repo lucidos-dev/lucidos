@@ -15,8 +15,9 @@ use crate::core::apps::WidgetSize;
 use crate::core::preference_catalog::MEMORY_MODULE_WHILE_UNSET;
 use crate::engine::agent_recovery::{
     AUTO_RECOVERY_AFTER_HANG_REASON, AUTO_RESUME_AFTER_API_ERROR_REASON,
-    AUTO_RESUME_AFTER_SWITCH_REASON, EFFORT_RESTART_REASON, ENGINE_RESTART_INTERRUPT_REASON,
-    HARDEN_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
+    AUTO_RESUME_AFTER_SWITCH_REASON, BUILD_REQUESTED_REASON, EFFORT_RESTART_REASON,
+    ENGINE_RESTART_INTERRUPT_REASON, HANDOFF_REQUESTED_REASON, HARDEN_REQUESTED_REASON,
+    PLAN_REQUESTED_REASON, REPORTS_REQUESTED_REASON, USER_CLICKED_CONTINUE_REASON,
 };
 use crate::engine::agent_session::side_question::SIDE_QUESTION_TIMEOUT;
 use crate::engine::command_guard::{
@@ -24,6 +25,7 @@ use crate::engine::command_guard::{
 };
 use crate::engine::summary_tree::log::EntryKind;
 use crate::engine::thread_events::{KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON};
+use crate::engine::thread_liveness::LivenessState;
 use crate::engine::thread_triage::archive_all::{PINNED_SUB_THREAD, SAME_FAMILY};
 use crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES;
 use crate::engine::TURN_RUNNING_REASON;
@@ -75,6 +77,13 @@ pub(super) fn render() -> String {
     out.push_str("// crates/lucidos-engine/src.\n\n");
     let mut ts = Writer { out, file: "" };
 
+    ts.from("../../lucidos-gateway-stamp/src/workspace_client.rs");
+    ts.renamed(
+        "VERSION",
+        "WORKSPACE_CLIENT_VERSION",
+        lucidos_gateway_stamp::workspace_client::VERSION,
+    );
+
     ts.from("api/internal.rs");
     ts.export("CLIENT_LOG_MAX_BATCH", CLIENT_LOG_MAX_BATCH);
     ts.from("api/history.rs");
@@ -90,6 +99,9 @@ pub(super) fn render() -> String {
     ts.from("core/apps.rs");
     let sizes = list(&WidgetSize::ALL.map(WidgetSize::as_str));
     ts.renamed("WidgetSize::ALL", "WIDGET_SIZES", sizes);
+    ts.from("engine/thread_liveness.rs");
+    let states = list(&LivenessState::ALL.map(LivenessState::as_str));
+    ts.renamed("LivenessState::ALL", "LIVENESS_STATES", states);
     ts.from("api/threads/archive_all.rs");
     ts.renamed("MAX_IDS", "ARCHIVE_ALL_MAX_IDS", MAX_IDS);
     ts.from("engine/thread_triage/archive_all.rs");
@@ -149,6 +161,10 @@ pub(super) fn render() -> String {
             ENGINE_RESTART_INTERRUPT_REASON,
         ),
         ("HARDEN_REQUESTED_REASON", HARDEN_REQUESTED_REASON),
+        ("PLAN_REQUESTED_REASON", PLAN_REQUESTED_REASON),
+        ("BUILD_REQUESTED_REASON", BUILD_REQUESTED_REASON),
+        ("HANDOFF_REQUESTED_REASON", HANDOFF_REQUESTED_REASON),
+        ("REPORTS_REQUESTED_REASON", REPORTS_REQUESTED_REASON),
         ("EFFORT_RESTART_REASON", EFFORT_RESTART_REASON),
     ];
     for (name, value) in reasons {

@@ -100,6 +100,7 @@ The host carries them in the frame URL, so they are visible there. Never put a c
    - Never cut data text in a widget with an ellipsis. Show less instead, and let the rest wrap.
    - `not checked` is never a pass. It means no window could render the widget, as in a trigger run with no window open.
    - A widget with a required param is checked without its params, so its note says `not checked with params`. Fix what it names. To see its real content, embed it with params in a reply.
+   - A local-token automation browser cannot answer as your paired device. A launcher with a verified origin for its source thread can register a fit-only renderer at `POST /api/v1/widgets/fit-session`, then explicitly select it on `POST /api/v1/widgets/fit`. Its one-check credential grants no owner authority; keep it in launcher memory and attach it only to the top-frame fit report. Never put it in widget frames, URLs or saved evidence. Ordinary paired windows need no session.
 
 Sizes are names, never pixels. A cell is one size in rem, and a narrow phone column draws the cells smaller, as a narrow dashboard does.
 

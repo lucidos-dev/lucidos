@@ -140,7 +140,7 @@ pub(crate) async fn repo_cache_ttl(pool: &sqlx::PgPool, repo_id: Option<&str>) -
     {
         Ok(row) => row,
         Err(e) => {
-            crate::log!("[CacheTtl] Could not read the repo's latest cache write: {e}");
+            crate::log_legacy!("[CacheTtl] Could not read the repo's latest cache write: {e}");
             return CacheTtl::Unknown;
         }
     };

@@ -640,7 +640,9 @@ async fn an_in_loop_failure_is_not_terminated_twice() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "OpenAI streaming error [502]: Provider returned error".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta,
     })
@@ -682,7 +684,9 @@ async fn an_earlier_failure_does_not_settle_the_current_exchange() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "first failure".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: earlier_meta,
     })
@@ -837,6 +841,8 @@ async fn filter_removed_queued_prompts_binds_thread_aggregate_id_as_text() {
         thread_id,
         event: ThreadEvent::QueuedMessageRemoved {
             removed_message_id: removed_id,
+            restore_to_compose: false,
+            compose: None,
         },
         meta: EventMeta::NONE,
     })

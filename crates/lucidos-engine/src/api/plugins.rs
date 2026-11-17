@@ -78,7 +78,7 @@ async fn prune_uploads_older_than(root: &std::path::Path, ttl: std::time::Durati
         // A workspace that never uploaded has no directory here.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
         Err(e) => {
-            log!(@Plugins, "prune uploads: read {:?} failed: {}", root, e);
+            log_legacy!(@Plugins, "prune uploads: read {:?} failed: {}", root, e);
             return;
         }
     };
@@ -89,8 +89,8 @@ async fn prune_uploads_older_than(root: &std::path::Path, ttl: std::time::Durati
             continue;
         }
         match tokio::fs::remove_dir_all(&path).await {
-            Ok(()) => log!(@Plugins, "pruned stale upload {}", path.display()),
-            Err(e) => log!(@Plugins, "prune uploads: remove {:?} failed: {}", path, e),
+            Ok(()) => log_legacy!(@Plugins, "pruned stale upload {}", path.display()),
+            Err(e) => log_legacy!(@Plugins, "prune uploads: remove {:?} failed: {}", path, e),
         }
     }
 }
@@ -423,7 +423,7 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
     {
         Ok(rows) => rows.into_iter().collect(),
         Err(e) => {
-            log!(@Plugins, "setup-complete summary lookup failed (leaving cards on Setup): {}", e);
+            log_legacy!(@Plugins, "setup-complete summary lookup failed (leaving cards on Setup): {}", e);
             return;
         }
     };
@@ -441,7 +441,7 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
         {
             Ok(rows) => (rows.into_iter().collect(), false),
             Err(e) => {
-                log!(@Plugins, "setup-complete queue lookup failed (treating unknown threads as pending): {}", e);
+                log_legacy!(@Plugins, "setup-complete queue lookup failed (treating unknown threads as pending): {}", e);
                 (std::collections::HashSet::new(), true)
             }
         };
@@ -542,7 +542,7 @@ pub(super) async fn upload_archive(
 
     let upload_dir = uploads.join(Uuid::new_v4().simple().to_string());
     tokio::fs::create_dir_all(&upload_dir).await.map_err(|e| {
-        log!(@Plugins, "upload {} ({} bytes): create_dir_all {:?} failed: {}", safe_name, byte_size, upload_dir, e);
+        log_legacy!(@Plugins, "upload {} ({} bytes): create_dir_all {:?} failed: {}", safe_name, byte_size, upload_dir, e);
         err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("create upload dir: {e}"),
@@ -551,7 +551,7 @@ pub(super) async fn upload_archive(
 
     let dest = upload_dir.join(&safe_name);
     if let Err(e) = tokio::fs::write(&dest, &bytes).await {
-        log!(@Plugins, "upload {} ({} bytes): write {:?} failed: {}", safe_name, byte_size, dest, e);
+        log_legacy!(@Plugins, "upload {} ({} bytes): write {:?} failed: {}", safe_name, byte_size, dest, e);
         // Only what this attempt created, and only because it failed.
         let _ = tokio::fs::remove_dir_all(&upload_dir).await;
         return Err(err(
@@ -560,7 +560,7 @@ pub(super) async fn upload_archive(
         ));
     }
 
-    log!(@Plugins, "staged archive {} ({} bytes) at {}", safe_name, byte_size, dest.display());
+    log_legacy!(@Plugins, "staged archive {} ({} bytes) at {}", safe_name, byte_size, dest.display());
 
     Ok(Json(UploadArchiveResponse {
         path: dest.to_string_lossy().into_owned(),

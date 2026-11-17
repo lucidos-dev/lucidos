@@ -28,7 +28,7 @@ fn step_failed<E: std::fmt::Display>(
     slug: &'static str,
 ) -> impl FnOnce(E) -> BoxError {
     move |error| {
-        crate::log!(
+        crate::log_legacy!(
             "[Snapshots] {step} failed: {}",
             crate::core::redact_postgres_secrets(&error.to_string())
         );
@@ -265,7 +265,7 @@ impl Session {
                 },
                 Err(error) => {
                     let reason = capture_failure(&error);
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Snapshots] Capture job {id} for {} failed: {reason:?} ({})",
                         request_handle.as_str(),
                         crate::core::redact_postgres_secrets(&error.to_string())
@@ -309,7 +309,7 @@ impl Session {
                     reason: super::jobs::Failure::CheckFailed,
                 },
                 Err(error) => {
-                    crate::log!("[Snapshots] Check job {id} worker failed: {error}");
+                    crate::log_legacy!("[Snapshots] Check job {id} worker failed: {error}");
                     super::jobs::State::Failed {
                         reason: super::jobs::Failure::CheckFailed,
                     }
@@ -362,10 +362,10 @@ impl Session {
         .map_err(|_| "snapshot_job_recovery_failed")?;
         // Leftover trees cost disk, never correctness, so they never stop boot.
         if let Err(error) = self.store.clean_partial(Utc::now(), &self._lock) {
-            crate::log!("[Snapshots] Partial capture cleanup failed: {error}");
+            crate::log_legacy!("[Snapshots] Partial capture cleanup failed: {error}");
         }
         if let Err(error) = self.store.discard_settled_staging(&self._lock) {
-            crate::log!("[Snapshots] Restore staging cleanup failed: {error}");
+            crate::log_legacy!("[Snapshots] Restore staging cleanup failed: {error}");
         }
         Ok(settled)
     }
@@ -688,7 +688,7 @@ impl Session {
             // clears only partials an hour old, so remove them now.
             match std::fs::remove_dir_all(&partial) {
                 Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
-                    crate::log!("[Snapshots] Failed capture cleanup: {error}");
+                    crate::log_legacy!("[Snapshots] Failed capture cleanup: {error}");
                 }
                 _ => {}
             }

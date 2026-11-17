@@ -3,6 +3,15 @@
 Facts about building, signing and installing Lucidos that no ADR, script header
 or workflow comment holds. The rule is `.claude/rules/build-release.md`.
 
+## DMG layout without Finder
+
+The v0.59.0 sandbox build failed when Tauri asked Finder to arrange the volume.
+`build-dmg.sh` now asks Tauri for the app bundle only (ADR 0714).
+`dmg_volume.sh` builds the image around the final app; `dmg_layout.py` writes
+its five layout records, matching the shipped v0.58.0 window.
+Never restore the Tauri DMG bundle or a CI-only layout bypass.
+Run `bash scripts/lib/dmg_volume_test.sh` to check real image assembly and flags.
+
 ## Ask once per release: does it need a release notice?
 
 The changelog says what changed. A release notice says what the user has to do
@@ -101,3 +110,76 @@ carry a `port` marker. That file is the whole meaning of "installed".
 
 Both launch shapes (service and foreground) write the marker.
 The orderings stay deliberately different. `register_service` writes after its unit, so a failed registration leaves no marker. `launch_runtime` writes before an `exec` that never returns.
+
+## Release blockers
+
+`release-blockers.tsv` is private release metadata, stripped from the public tree.
+Its tab-separated header is `id state ref work_item title reason`.
+Use tabs between fields, end every row with a newline, and retain rows after they close.
+
+- `open`: `ref` and `reason` are `-`; refuses every cut.
+- `fixed`: `ref` is the fixing commit; passes only when that commit is in the cut.
+- `withdrawn`: `ref` is `-`; a reason records why this was never a blocker.
+- `waived`: `ref` is one `N.N.N` version; the owner must authorize the reason.
+
+`work_item` is a tracker id or `-`. Neither the tracker nor event availability
+decides the verdict. Commit ledger updates to main through the usual review.
+An unattended release never writes a waiver. There is no waiver flag.
+
+Phase A records its gate trailer in verify-build state for deterministic retries.
+Phase B checks current main knowledge again without rebuilding the candidate.
+Waivers appear in the gate report, STILL OWED and the local annotated tag.
+
+`ReleaseGateChecked` emission is best effort; the ledger commit is the audit authority.
+Nightly preflight returns SKIP on refusal, with a `release_blockers` JSON field.
+For `auto`, a version-specific waiver refuses until the version is selected.
+The mirror workflow checks the public trailer before either tarball push arm runs.
+
+## Named update feeds
+
+Beta and Local carry the packaged Apple Silicon macOS app. Headless gateways
+support Stable and Custom addresses. Nightly has no publisher.
+
+`release.sh --publish-beta <version>` verifies the recorded Phase A identity,
+current release blockers, and every install-smoke run for that rc commit. Both
+source-install and DMG-verification jobs must have succeeded. It reserves the
+bundle hash before public mutation, moves only the scanned `channel/beta` tag,
+and uploads immutable assets to the Beta prerelease. Retries compare existing
+bytes. They never replace an asset under the same name.
+
+`release-channel-versions.tsv` stays private and survives abandonment. A new
+Beta supersedes the previous active candidate. Abandonment retires the active
+version without reviving older candidates.
+
+Cached candidate feeds live under
+`.lucidos/release-channels/`; both lock files live there. The producer commits
+only the private ledger before continuing, keeping the source checkout clean.
+A missing cache rebuilds from the reserved version and immutable GitHub signature.
+A corrupt cache fails closed. Never point Beta at unrelated bytes under an exposed version.
+
+Stable remains the hosted feed's floor. Stable publication requests a refresh
+after announcing the release. A failed refresh prints `STILL OWED` without
+failing Stable. Retry with `release.sh --refresh-update-feeds <version>`.
+
+The release scripts write `artifacts/update-feeds/beta/latest.json` through the
+workspace CLI, then emit `UpdateFeedPublishRequested` with these fields:
+
+```json
+{
+  "channel": "beta",
+  "version": "1.2.3",
+  "feed": "artifacts/update-feeds/beta/latest.json"
+}
+```
+
+The workspace publisher deploys that file to
+`https://updates.lucidos.dev/beta/latest.json` on the public Pages project.
+It must preserve the JSON bytes and serve without Access or redirects. Deploy
+from the maintainer's machine; no Cloudflare deployment credential goes to CI.
+The producer HEAD-checks the bundle URL first, then verifies identical feed
+bytes through both an edge read and a cache-defeating origin read.
+
+Serialize publisher runs. Always read the current workspace artifact when a run
+starts, rather than caching an older request's contents. A delayed request must
+not overwrite a newer feed. Emit `UpdateFeedPublished` only after the current
+artifact is served, with the channel, version and public URL actually verified.

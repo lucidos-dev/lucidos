@@ -199,6 +199,13 @@ A plugin may ship *reusable widgets* (ADR 0414). Such a widget's plugin owns it,
 - **Narrow its sizes** with `"sizes"`, default first, only if it cannot draw all three (none declared means all three, starting medium). Set `"transparent": true` for one that draws its own shape (`system-knowhow/building-an-app.md` § Widgets). A bad `sizes` fails validation like a bad origin. The user adds it from a *dashboard*'s own Add, and it runs no code until the plugin is installed: Add lists only installed widgets.
 - **A plugin widget brings work in.** It reads the user's own data through `lucidos.*`, and a tap leads into a thread or an app with `lucidos.ui.navigate`. It never frames another product's interface so the user works there instead: that would be a room, not a ramp (`docs/philosophy.md`).
 
+## Artifact provenance
+
+Plugin update backups that the user confirms are person-authored artifact writes.
+An upstream patch prepared before its proposal thread exists is engine-authored.
+Neither is an unattended trigger write, so both remain eligible for workspace memory.
+Artifact provenance changes no plugin manifest fields or installation confirmation requirements.
+
 ## Install confirmation panel
 
 `plugins(action="install")` (and `plugins(action="update")`) never write directly to `data/`. The engine fetches and validates into a staged temp dir, and checks the manifest's `engine` requirement. A plugin this release cannot take is refused there, and no panel opens. Otherwise the engine opens a confirmation panel in the same content pane as a credential request. The panel shows:
@@ -1013,3 +1020,10 @@ Both events are useful trigger sources. Examples worth considering:
 - **Expecting an update to keep every user edit.** An update merges edits, but a conflict, a binary, a `trigger.toml` or a file over 1 MB takes the new shipped version. The user's copy is saved aside (see "An update keeps your changes"). If the user is meant to edit `knowhow/sites/linkedin.com/selectors.md`, ship it as a template they copy elsewhere.
 - **Cross-plugin path collisions.** See "Sharing a path between plugins" under "Uninstall semantics".
 - **Keeping user data in a shipped file.** Confirming an uninstall deletes every recorded file still on disk, edits included. Keep runtime state under `data/artifacts/<plugin-id>/`, which uninstall never touches.
+
+## Diagnostic evidence
+
+Plugin lifecycle logs use the sanitized engine diagnostic log.
+Legacy lines remain private when rendered for a maintainer.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

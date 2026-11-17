@@ -15,28 +15,34 @@ use sqlx::PgPool;
 
 /// Every clause-4 verb, so a test that must hold "per verb" says so by
 /// iterating rather than by picking one and hoping.
-const EVERY_VERB: &[ThreadReachVerb] = &[
-    ThreadReachVerb::Archive,
-    ThreadReachVerb::Cancel,
-    ThreadReachVerb::Control,
-    ThreadReachVerb::AskSideQuestion,
-    ThreadReachVerb::DismissSideQuestion,
-    ThreadReachVerb::Apply,
-    ThreadReachVerb::Discard,
-    ThreadReachVerb::SetAside,
-    ThreadReachVerb::BringBack,
-    ThreadReachVerb::Revert,
-    ThreadReachVerb::AnswerQuestion,
-    ThreadReachVerb::ResolvePermission,
-    ThreadReachVerb::Continue,
+const EVERY_VERB: &[Action] = &[
+    Action::Archive,
+    Action::Cancel,
+    Action::Control,
+    Action::AskSideQuestion,
+    Action::DismissSideQuestion,
+    Action::Apply,
+    Action::Discard,
+    Action::SetAside,
+    Action::BringBack,
+    Action::Revert,
+    Action::AnswerQuestion,
+    Action::ResolvePermission,
+    Action::Continue,
 ];
+
+/// The owner buttons other than a card answer. Clause 3 and clause 5 still
+/// cover these, and no longer cover a card answer (ADR 0664).
+fn owner_buttons() -> impl Iterator<Item = &'static Action> {
+    EVERY_VERB.iter().filter(|verb| !verb.answers_a_card())
+}
 
 /// The verbs that left clause 4: thread creation (ADR 0475) and the handoff to
 /// a legacy successor thread. Kept for stored approval cards.
-const RETIRED_VERBS: &[ThreadReachVerb] = &[
-    ThreadReachVerb::CreateTopThread,
-    ThreadReachVerb::DetachChild,
-    ThreadReachVerb::SpawnSuccessor,
+const RETIRED_VERBS: &[Action] = &[
+    Action::CreateTopThread,
+    Action::DetachChild,
+    Action::SpawnSuccessor,
 ];
 
 /// Every surface carrying a clause-4 verb, and the file its handler lives in.
@@ -309,14 +315,27 @@ fn agent_headers_for_fire(thread_id: Option<Uuid>, emitting_trigger_id: Option<&
     h
 }
 
-/// The user's browser or phone: a device id and no origin token.
+/// The user's browser or phone: a device id the gateway stamped, and no
+/// origin token.
 fn device_headers() -> HeaderMap {
-    let mut h = HeaderMap::new();
-    h.insert(
+    crate::api::gateway_stamp::test_support::stamped_device_headers("device-abc")
+}
+
+/// Callers that identify themselves without proving the owner: a typed device
+/// id, the machine-local token, and nothing at all.
+fn unattested_headers() -> Vec<HeaderMap> {
+    let local = crate::api::local_auth::publish_test_local_token();
+    let mut typed = HeaderMap::new();
+    typed.insert(
         crate::api::actor::HEADER_DEVICE_ID,
         "device-abc".parse().unwrap(),
     );
-    h
+    let mut token = HeaderMap::new();
+    token.insert(
+        lucidos_local_token::HEADER_LOCAL_TOKEN,
+        local.parse().unwrap(),
+    );
+    vec![typed, token, HeaderMap::new()]
 }
 
 async fn seed_thread(bus: &EventBus, thread_id: Uuid, parent: Option<Uuid>) {
@@ -358,10 +377,50 @@ async fn seed_thread_opened_by(
     .unwrap();
 }
 
-/// A bus over `pool`, for a gate call that emits only when it spends an
-/// owner approval.
+/// A bus over `pool`, for a gate call that emits only when it spends a
+/// permission.
 fn bus_for(pool: &PgPool) -> EventBus {
     EventBus::new(pool.clone()).0
+}
+
+#[tokio::test]
+async fn saved_draft_submission_needs_owner_authority_even_in_own_subtree() {
+    let (pool, db_name) = setup_test_db().await;
+    let f = family(&pool).await;
+    for target in [f.root, f.child, f.grandchild, f.sibling] {
+        assert_eq!(
+            authority_held(&pool, Some(f.root), None, Some(target), Action::SubmitDraft)
+                .await
+                .unwrap(),
+            None,
+            "a relationship must not authorize sending saved owner content"
+        );
+    }
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn saved_draft_submission_accepts_a_standing_owner_instruction() {
+    let (pool, db_name) = setup_test_db().await;
+    let bus = bus_for(&pool);
+    let caller = Uuid::new_v4();
+    seed_thread_opened_by(&bus, caller, None, Some(owner_device())).await;
+    for target in [caller, Uuid::new_v4()] {
+        assert_eq!(
+            authority_held(&pool, Some(caller), None, Some(target), Action::SubmitDraft)
+                .await
+                .unwrap(),
+            Some(HeldAuthority::StandingInstruction)
+        );
+    }
+    assert!(Action::SubmitDraft.proposable());
+    assert_eq!(
+        serde_json::to_value(Action::SubmitDraft).unwrap(),
+        "submit-draft"
+    );
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 fn owner_device() -> MessageOrigin {
@@ -453,7 +512,7 @@ async fn a_thread_cannot_reach_its_sibling() {
         &bus_for(&pool),
         &agent_headers(Some(f.child)),
         Some(f.sibling),
-        ThreadReachVerb::Archive,
+        Action::Archive,
     )
     .await
     .expect_err("a sibling is out of reach");
@@ -461,7 +520,7 @@ async fn a_thread_cannot_reach_its_sibling() {
         err,
         ThreadReachError::OutOfReach {
             target: f.sibling,
-            verb: ThreadReachVerb::Archive
+            verb: Action::Archive
         }
     );
     assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
@@ -488,7 +547,7 @@ async fn a_thread_cannot_reach_its_own_parent_or_grandparent() {
             &bus_for(&pool),
             &agent_headers(Some(caller)),
             Some(target),
-            ThreadReachVerb::Cancel,
+            Action::Cancel,
         )
         .await
         .expect_err("an ancestor is out of reach");
@@ -496,7 +555,7 @@ async fn a_thread_cannot_reach_its_own_parent_or_grandparent() {
             err,
             ThreadReachError::OutOfReach {
                 target,
-                verb: ThreadReachVerb::Cancel
+                verb: Action::Cancel
             }
         );
     }
@@ -522,7 +581,7 @@ async fn a_thread_reaches_neither_an_unrelated_thread_nor_a_missing_one() {
             &bus_for(&pool),
             &agent_headers(Some(f.root)),
             Some(target),
-            ThreadReachVerb::Archive,
+            Action::Archive,
         )
         .await
         .expect_err("out of reach");
@@ -533,24 +592,35 @@ async fn a_thread_reaches_neither_an_unrelated_thread_nor_a_missing_one() {
     teardown_test_db(&db_name).await;
 }
 
-/// Invariant: the user is unaffected. A request with no origin token is the
-/// browser, the phone or any other local API client. The gate returns before
-/// it looks at the target at all, for every verb.
+/// Invariant: the user is unaffected. The owner's stamped device reaches every
+/// thread for every verb. An unattested caller keeps that reach except at the
+/// owner's own verbs: a change waits for the owner, and a card answer is
+/// refused (`api::owner_door`).
 #[tokio::test]
 async fn a_user_device_reaches_every_thread_exactly_as_before() {
     let (pool, db_name) = setup_test_db().await;
     let f = family(&pool).await;
 
-    for headers in [device_headers(), HeaderMap::new()] {
-        for verb in EVERY_VERB {
-            for target in [Some(f.root), Some(f.sibling), Some(f.grandchild), None] {
-                assert!(
-                    refuse_without_authority(&bus_for(&pool), &headers, target, *verb)
-                        .await
-                        .is_ok(),
-                    "an untokened caller keeps the reach it has always had"
-                );
-            }
+    for verb in EVERY_VERB {
+        for target in [Some(f.root), Some(f.sibling), Some(f.grandchild), None] {
+            assert!(
+                refuse_without_authority(&bus_for(&pool), &device_headers(), target, *verb)
+                    .await
+                    .is_ok(),
+                "the owner's device keeps the reach it has always had"
+            );
+            let unattested =
+                refuse_without_authority(&bus_for(&pool), &HeaderMap::new(), target, *verb).await;
+            let expected = match verb {
+                Action::Apply | Action::Discard | Action::Revert => {
+                    Err(ThreadReachError::Unattested(UnattestedOutcome::Refused))
+                }
+                Action::AnswerQuestion | Action::ResolvePermission => {
+                    Err(ThreadReachError::Unattested(UnattestedOutcome::CardAnswer))
+                }
+                _ => Ok(()),
+            };
+            assert_eq!(unattested, expected, "{verb:?}");
         }
     }
 
@@ -567,24 +637,17 @@ async fn a_tokened_agent_is_bound_to_its_own_subtree() {
     let headers = agent_headers(Some(f.child));
 
     for target in [f.child, f.grandchild] {
-        assert!(refuse_without_authority(
-            &bus_for(&pool),
-            &headers,
-            Some(target),
-            ThreadReachVerb::Archive
-        )
-        .await
-        .is_ok());
+        assert!(
+            refuse_without_authority(&bus_for(&pool), &headers, Some(target), Action::Archive)
+                .await
+                .is_ok()
+        );
     }
     for target in [f.root, f.sibling] {
-        let err = refuse_without_authority(
-            &bus_for(&pool),
-            &headers,
-            Some(target),
-            ThreadReachVerb::Archive,
-        )
-        .await
-        .expect_err("outside its own subtree");
+        let err =
+            refuse_without_authority(&bus_for(&pool), &headers, Some(target), Action::Archive)
+                .await
+                .expect_err("outside its own subtree");
         assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
     }
 
@@ -624,7 +687,7 @@ async fn every_verb_reaches_the_caller_s_own_subtree_with_no_owner_turn() {
     let f = family(&pool).await;
     let headers = agent_headers(Some(f.root));
 
-    for verb in EVERY_VERB {
+    for verb in owner_buttons() {
         for target in [f.root, f.child, f.grandchild] {
             assert!(
                 refuse_without_authority(&bus_for(&pool), &headers, Some(target), *verb)
@@ -688,7 +751,7 @@ async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
     seed_thread_opened_by(&bus, orchestrator, None, Some(owner_device())).await;
     let headers = agent_headers(Some(orchestrator));
 
-    for verb in EVERY_VERB {
+    for verb in owner_buttons() {
         assert!(
             refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb)
                 .await
@@ -697,7 +760,7 @@ async fn a_turn_the_owner_opened_reaches_past_the_subtree() {
         );
     }
     assert!(
-        refuse_without_authority(&bus_for(&pool), &headers, None, ThreadReachVerb::Apply)
+        refuse_without_authority(&bus_for(&pool), &headers, None, Action::Apply)
             .await
             .is_ok(),
         "so does an act aimed at the workspace, which is nobody's subtree"
@@ -753,25 +816,15 @@ async fn a_trigger_fire_reaches_its_own_subtree_and_wider() {
     let headers = agent_headers(Some(trigger_thread));
 
     assert!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &headers,
-            Some(its_child),
-            ThreadReachVerb::Apply
-        )
-        .await
-        .is_ok(),
+        refuse_without_authority(&bus_for(&pool), &headers, Some(its_child), Action::Apply)
+            .await
+            .is_ok(),
         "its own subtree, which clause 3 already covered"
     );
     assert!(
-        refuse_without_authority(
-            &bus_for(&pool),
-            &headers,
-            Some(f.sibling),
-            ThreadReachVerb::Apply
-        )
-        .await
-        .is_ok(),
+        refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), Action::Apply)
+            .await
+            .is_ok(),
         "and wider, on the firing the owner authorized"
     );
 
@@ -802,7 +855,7 @@ async fn a_script_trigger_fire_carries_the_instruction_with_no_thread() {
         &bus_for(&pool),
         &agent_headers_for_fire(None, Some("nightly")),
         Some(f.sibling),
-        ThreadReachVerb::Apply,
+        Action::Apply,
     )
     .await
     .is_ok());
@@ -820,18 +873,10 @@ async fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
     let f = family(&pool).await;
     let headers = agent_headers(None);
 
-    let err = refuse_without_authority(
-        &bus_for(&pool),
-        &headers,
-        Some(f.child),
-        ThreadReachVerb::Archive,
-    )
-    .await
-    .expect_err("no thread of its own");
-    assert_eq!(
-        err,
-        ThreadReachError::NoCallerThread(ThreadReachVerb::Archive)
-    );
+    let err = refuse_without_authority(&bus_for(&pool), &headers, Some(f.child), Action::Archive)
+        .await
+        .expect_err("no thread of its own");
+    assert_eq!(err, ThreadReachError::NoCallerThread(Action::Archive));
     assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
 
     pool.close().await;
@@ -850,7 +895,7 @@ async fn a_tokened_agent_cannot_cancel_the_whole_workspace() {
         &bus_for(&pool),
         &agent_headers(Some(f.child)),
         None,
-        ThreadReachVerb::Cancel,
+        Action::Cancel,
     )
     .await
     .expect_err("an unscoped cancel is not an agent's to make");
@@ -985,7 +1030,7 @@ async fn the_home_thread_gains_reach_but_not_authority() {
     }
 
     seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
-    for verb in EVERY_VERB {
+    for verb in owner_buttons() {
         assert!(
             refuse_without_authority(&bus_for(&pool), &headers, Some(f.sibling), *verb)
                 .await
@@ -1006,13 +1051,21 @@ fn an_agent_never_presses_an_always_allow_grant() {
     use crate::engine::claude_code::AllowScope;
     let agent = agent_headers(Some(Uuid::new_v4()));
     for scope in [AllowScope::Narrow, AllowScope::Broad] {
-        let err = refuse_agent_always_allow(&agent, Some(scope)).unwrap_err();
+        let err = require_owner_for_always_allow(&agent, Some(scope)).unwrap_err();
         assert_eq!(err.status, StatusCode::FORBIDDEN, "{scope:?}");
-        assert!(refuse_agent_always_allow(&device_headers(), Some(scope)).is_ok());
+        assert!(require_owner_for_always_allow(&device_headers(), Some(scope)).is_ok());
+        for h in unattested_headers() {
+            let err = require_owner_for_always_allow(&h, Some(scope)).unwrap_err();
+            assert_eq!(
+                err.message,
+                crate::api::actor::NOT_ATTESTED_AS_OWNER,
+                "{h:?}"
+            );
+        }
     }
     for scope in [None, Some(AllowScope::Session)] {
         assert!(
-            refuse_agent_always_allow(&agent, scope).is_ok(),
+            require_owner_for_always_allow(&agent, scope).is_ok(),
             "{scope:?}"
         );
     }
@@ -1023,16 +1076,20 @@ fn an_agent_never_presses_an_always_allow_grant() {
 /// agent token passed, so `PUT /cc-allowed-tools` with `Bash(*)` answered 204.
 #[test]
 fn an_agent_never_writes_a_permission_grant_through_settings() {
-    let err = refuse_agent_permission_grant(&agent_headers(Some(Uuid::new_v4()))).unwrap_err();
+    let err = require_owner_for_permission_grant(&agent_headers(Some(Uuid::new_v4()))).unwrap_err();
     assert_eq!(err.status, StatusCode::FORBIDDEN);
-    assert!(refuse_agent_permission_grant(&device_headers()).is_ok());
+    assert!(require_owner_for_permission_grant(&device_headers()).is_ok());
+    for h in unattested_headers() {
+        let err = require_owner_for_permission_grant(&h).unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN, "{h:?}");
+    }
 
     for (path, source, handler, write) in [
         (
             "settings.rs",
             include_str!("settings.rs"),
             "write_grant_file",
-            "grants::write_raw(",
+            "tool_grants::change_standing(",
         ),
         (
             "mcp.rs",
@@ -1044,7 +1101,7 @@ fn an_agent_never_writes_a_permission_grant_through_settings() {
         let body = handler_body(source, handler)
             .unwrap_or_else(|| panic!("{path}: no handler named {handler}"));
         let gate = body
-            .find("refuse_agent_permission_grant")
+            .find("require_owner_for_permission_grant")
             .unwrap_or_else(|| panic!("{path}: {handler} never refuses an agent"));
         let mutation = body.find(write).expect("the handler writes the grant");
         assert!(
@@ -1062,8 +1119,11 @@ fn an_agent_never_writes_a_permission_grant_through_settings() {
 /// caller. A key the agent may write, and an app's own key, still pass.
 #[test]
 fn an_agent_never_writes_a_human_only_preference() {
-    use crate::api::settings::refuse_agent_human_only_preference as refuse;
+    use crate::api::settings::{require_owner_for_human_only_preference, setting_act};
     use crate::core::prefs;
+    let refuse = |h: &HeaderMap, key: &str| {
+        require_owner_for_human_only_preference(h, key, setting_act(key))
+    };
     let agent = agent_headers(Some(Uuid::new_v4()));
     let internal: Vec<&str> = prefs::internal_specs().map(|s| s.key).collect();
     let named = [
@@ -1082,6 +1142,9 @@ fn an_agent_never_writes_a_human_only_preference() {
         assert_eq!(err.status, StatusCode::FORBIDDEN, "{key}");
         assert!(err.message.contains(key), "{key}: {}", err.message);
         assert!(refuse(&device_headers(), key).is_ok(), "{key}");
+        for h in unattested_headers() {
+            assert!(refuse(&h, key).is_err(), "{key}: {h:?}");
+        }
     }
     for key in [prefs::TIMEZONE.key(), "habit_tracker_goal"] {
         assert!(refuse(&agent, key).is_ok(), "{key}");
@@ -1112,8 +1175,8 @@ fn every_human_only_route_refuses_an_agent_before_it_acts() {
     let reveal = include_str!("credential_reveal.rs");
     let backup = include_str!("backup.rs");
     let gateway = include_str!("claude_gateway.rs");
-    let pref_gate = "refuse_agent_human_only_preference(";
-    let agent_gate = "refuse_agent_caller(";
+    let pref_gate = "require_owner_for_human_only_preference(";
+    let agent_gate = "require_attested_owner(";
     for (path, source, handler, gate, act) in [
         (
             "settings.rs",
@@ -1241,11 +1304,11 @@ fn removing_a_queued_message_asks_the_control_gate_first() {
         .find("refuse_without_authority")
         .expect("remove_queued_message never asks the gate");
     assert!(
-        body[gate..].contains("ThreadReachVerb::Control"),
+        body[gate..].contains("Action::Control"),
         "taking back a queued message is a Control act"
     );
     let first_read = body
-        .find("queued_message_already_removed")
+        .find("was_removed")
         .expect("the handler checks for an earlier removal");
     assert!(gate < first_read, "the gate must run before any lookup");
 }
@@ -1280,7 +1343,7 @@ fn draft_and_undo_routes_ask_the_gate_before_they_write() {
             COMMAND_CHECKPOINT_RS,
             "authorize_checkpoint_undo",
             "refuse_without_authority",
-            "ThreadReachVerb::Revert",
+            "Action::Revert",
             &[][..],
         ),
         (
@@ -1317,13 +1380,7 @@ async fn a_queued_message_is_taken_back_only_inside_the_callers_subtree() {
     let remove = |headers: HeaderMap, target: Uuid| {
         let pool = pool.clone();
         async move {
-            refuse_without_authority(
-                &bus_for(&pool),
-                &headers,
-                Some(target),
-                ThreadReachVerb::Control,
-            )
-            .await
+            refuse_without_authority(&bus_for(&pool), &headers, Some(target), Action::Control).await
         }
     };
 
@@ -1352,7 +1409,7 @@ fn cancelling_apply_all_asks_the_apply_gate_first() {
         .find("refuse_without_authority")
         .expect("cancel_apply_all_changes never asks the gate");
     assert!(
-        body[gate..].contains("ThreadReachVerb::Apply"),
+        body[gate..].contains("Action::Apply"),
         "cancelling Apply All takes back an Apply"
     );
     for touch in ["cancel_apply_all_batches", "drop_standing_applies"] {
@@ -1370,17 +1427,12 @@ async fn only_the_owner_cancels_apply_all() {
     let f = family(&pool).await;
     let cancel = |headers: HeaderMap| {
         let pool = pool.clone();
-        async move {
-            refuse_without_authority(&bus_for(&pool), &headers, None, ThreadReachVerb::Apply).await
-        }
+        async move { refuse_without_authority(&bus_for(&pool), &headers, None, Action::Apply).await }
     };
 
     for caller in [f.root, f.child, f.sibling] {
         let err = cancel(agent_headers(Some(caller))).await.unwrap_err();
-        assert_eq!(
-            err,
-            ThreadReachError::NoStandingInstruction(ThreadReachVerb::Apply)
-        );
+        assert_eq!(err, ThreadReachError::NoStandingInstruction(Action::Apply));
         assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
     }
     assert!(cancel(device_headers()).await.is_ok());
@@ -1389,12 +1441,11 @@ async fn only_the_owner_cancels_apply_all() {
     teardown_test_db(&db_name).await;
 }
 
-/// Answering a permission card is a clause-4 verb on the card's thread. Inside
-/// its own subtree an agent answers on its own authority. Outside it, even the
-/// home thread needs the owner's words in this turn. The user's device always
-/// answers, and no agent ever presses Always allow.
+/// No thread answers a permission card (I18): not inside its own subtree, and
+/// not on the owner's words in its turn. A denial is an answer too. The user's
+/// device always answers, and no agent ever presses Always allow.
 #[tokio::test]
-async fn a_permission_answer_outside_the_subtree_needs_the_owners_words() {
+async fn no_thread_answers_a_permission_card() {
     use crate::engine::claude_code::AllowScope;
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
@@ -1402,47 +1453,238 @@ async fn a_permission_answer_outside_the_subtree_needs_the_owners_words() {
     let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
         .await
         .unwrap();
-    let answer = |headers: HeaderMap, card: Uuid, scope: Option<AllowScope>| {
+    let answer = |headers: HeaderMap, card: Uuid, allowed: bool, scope: Option<AllowScope>| {
         let pool = pool.clone();
-        async move { refuse_permission_answer(&bus_for(&pool), &headers, Some(card), true, scope).await }
+        async move {
+            refuse_permission_answer(&bus_for(&pool), &headers, Some(card), allowed, scope).await
+        }
     };
 
     let child = agent_headers(Some(f.child));
-    assert!(answer(child.clone(), f.grandchild, None).await.is_ok());
-    let err = answer(child, f.sibling, None).await.unwrap_err();
-    assert_eq!(err.status, StatusCode::FORBIDDEN);
-    assert!(answer(device_headers(), f.sibling, Some(AllowScope::Broad))
-        .await
-        .is_ok());
-
-    seed_thread_opened_by(&bus, home, None, None).await;
-    let from_home = agent_headers(Some(home));
-    assert!(
-        answer(from_home.clone(), f.sibling, Some(AllowScope::Session))
+    for allowed in [true, false] {
+        let err = answer(child.clone(), f.grandchild, allowed, None)
             .await
-            .is_err()
-    );
-
-    seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
+            .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::FORBIDDEN,
+            "its own sub-thread's card"
+        );
+    }
     assert!(
-        answer(from_home.clone(), f.sibling, Some(AllowScope::Session))
+        answer(device_headers(), f.sibling, true, Some(AllowScope::Broad))
             .await
             .is_ok()
     );
-    let err = answer(from_home.clone(), f.sibling, Some(AllowScope::Narrow))
+
+    seed_thread_opened_by(&bus, home, None, Some(owner_device())).await;
+    let from_home = agent_headers(Some(home));
+    for (allowed, scope) in [
+        (true, Some(AllowScope::Session)),
+        (false, Some(AllowScope::Narrow)),
+    ] {
+        let err = answer(from_home.clone(), f.sibling, allowed, scope)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.status,
+            StatusCode::FORBIDDEN,
+            "the owner's words relay nothing"
+        );
+    }
+    let err = answer(from_home, f.sibling, true, Some(AllowScope::Narrow))
         .await
         .unwrap_err();
     assert_eq!(err.status, StatusCode::FORBIDDEN);
-    // A denial carrying a scope grants nothing, so it is not an Always allow.
-    assert!(refuse_permission_answer(
-        &bus_for(&pool),
-        &from_home,
-        Some(f.sibling),
-        false,
-        Some(AllowScope::Narrow)
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Clause 5 no longer covers a card answer, and neither does clause 3 (I18).
+/// A thread answers no card on its own subtree, a turn the owner opened or a
+/// trigger firing. The owner's confirmed batch is the only relay.
+#[tokio::test]
+async fn a_card_answer_from_a_thread_needs_a_batch() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let orchestrator = Uuid::new_v4();
+    seed_thread_opened_by(&bus, orchestrator, None, Some(owner_device())).await;
+    let callers = [
+        (agent_headers(Some(f.root)), Some(f.root), "its own thread"),
+        (agent_headers(Some(f.root)), Some(f.child), "its own child"),
+        (
+            agent_headers(Some(orchestrator)),
+            Some(f.sibling),
+            "a turn the owner opened",
+        ),
+        (
+            agent_headers_for_fire(None, Some("nightly")),
+            Some(f.child),
+            "a trigger firing",
+        ),
+    ];
+
+    for verb in [Action::AnswerQuestion, Action::ResolvePermission] {
+        assert!(verb.answers_a_card());
+        for (headers, target, how) in &callers {
+            let refused = refuse_without_authority(&bus_for(&pool), headers, *target, verb).await;
+            let Err(err) = refused else {
+                panic!("{verb:?} on {how} must refuse");
+            };
+            assert_eq!(
+                err,
+                ThreadReachError::CardAnswerNeedsBatch,
+                "{verb:?} on {how}"
+            );
+            assert_eq!(err.status_code(), StatusCode::FORBIDDEN);
+            let msg = err.to_string();
+            assert!(msg.contains("lucidos permissions batch"), "{msg}");
+            assert!(msg.contains("workspace owner"), "{msg}");
+        }
+        assert!(
+            refuse_without_authority(&bus_for(&pool), &device_headers(), Some(f.child), verb)
+                .await
+                .is_ok(),
+            "the owner's device still answers"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Grant `label` on `caller`'s request to `verb` `target`, as the owner would.
+async fn allow(bus: &EventBus, caller: Uuid, verb: Action, target: Uuid, label: &str) {
+    use crate::api::permission_requests::{tests::grant, thread_ask};
+    let ask = thread_ask(bus.pool(), caller, verb, Some(target), "I need it.")
+        .await
+        .unwrap();
+    grant(bus, caller, ask, label).await;
+}
+
+/// Invariant 1 and 2 at the thread gate: with no permission the act out of
+/// reach is refused. Allow once lets exactly one act through, on its verb and
+/// target only.
+#[tokio::test]
+async fn allow_once_lets_one_act_out_of_reach_through_once() {
+    use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    let press = |verb| refuse_thread_without_authority(&bus, f.child, Some(f.sibling), verb);
+
+    assert!(matches!(
+        press(Action::Archive).await,
+        Err(ThreadReachError::OutOfReach { .. })
+    ));
+    allow(&bus, f.child, Action::Archive, f.sibling, ALLOW_ONCE_LABEL).await;
+    assert!(press(Action::Cancel).await.is_err(), "one verb only");
+    assert!(
+        refuse_thread_without_authority(&bus, f.child, Some(f.root), Action::Archive)
+            .await
+            .is_err(),
+        "one target only"
+    );
+    assert!(
+        refuse_thread_without_authority(&bus, f.grandchild, Some(f.sibling), Action::Archive)
+            .await
+            .is_err(),
+        "the asking thread only"
+    );
+    assert!(press(Action::Archive).await.is_ok());
+    assert!(press(Action::Archive).await.is_err(), "spent");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Invariant 2: two racing acts on one Allow once, and exactly one runs.
+#[tokio::test]
+async fn two_racing_acts_spend_one_allow_once_once() {
+    use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    allow(&bus, f.child, Action::Continue, f.sibling, ALLOW_ONCE_LABEL).await;
+
+    let press =
+        || refuse_thread_without_authority(&bus, f.child, Some(f.sibling), Action::Continue);
+    let (a, b) = tokio::join!(press(), press());
+    assert!(a.is_ok() ^ b.is_ok(), "{a:?} {b:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Always allow holds on the workspace: any thread may press that verb on
+/// that target, again and again. Apply offers no Always allow.
+#[tokio::test]
+async fn always_allow_lets_any_thread_press_the_verb_on_its_target() {
+    use crate::engine::permission::menu::{ALWAYS_ALLOW_LABEL, DONT_ALLOW_LABEL};
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    allow(&bus, f.child, Action::Archive, f.root, ALWAYS_ALLOW_LABEL).await;
+
+    for caller in [f.child, f.sibling, f.child] {
+        refuse_thread_without_authority(&bus, caller, Some(f.root), Action::Archive)
+            .await
+            .unwrap();
+    }
+    // The card promises the act to a thread, so a threadless caller holds none.
+    assert_eq!(
+        refuse_without_authority(&bus, &agent_headers(None), Some(f.root), Action::Archive).await,
+        Err(ThreadReachError::NoCallerThread(Action::Archive))
+    );
+
+    use crate::api::permission_requests::{prepare, tests::ask_prepared, thread_ask};
+    let ask = thread_ask(&pool, f.child, Action::Apply, Some(f.root), "Ship it.")
+        .await
+        .unwrap();
+    let request_id = prepare(&bus, f.child, ask).await.unwrap();
+    let card = ask_prepared(&bus, f.child, &request_id).await;
+    assert!(!card.labels().contains(&ALWAYS_ALLOW_LABEL));
+    assert!(card.labels().contains(&DONT_ALLOW_LABEL));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The gate never spends a draft send's grant: draft acceptance spends it in
+/// its own transaction (ADR 0651).
+#[tokio::test]
+async fn the_gate_leaves_a_draft_sends_grant_to_its_acceptance() {
+    use crate::api::permission_requests::thread_user;
+    use crate::engine::permission::{live_permission, menu::ALLOW_ONCE_LABEL};
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let f = family(&pool).await;
+    allow(
+        &bus,
+        f.child,
+        Action::SubmitDraft,
+        f.sibling,
+        ALLOW_ONCE_LABEL,
+    )
+    .await;
+
+    assert!(
+        refuse_thread_without_authority(&bus, f.child, Some(f.sibling), Action::SubmitDraft)
+            .await
+            .is_err()
+    );
+    let target = f.sibling.to_string();
+    assert!(live_permission(
+        &pool,
+        &thread_user(f.child),
+        Action::SubmitDraft,
+        Some(&target)
     )
     .await
-    .is_ok());
+    .unwrap()
+    .is_some());
 
     pool.close().await;
     teardown_test_db(&db_name).await;

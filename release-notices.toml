@@ -393,3 +393,31 @@ The button lists each trigger and server that needs you. It changes nothing.
 """
 action_label = "Check what the guard affects"
 action_prompt = "Run only the command guard audit checks on my triggers and MCP servers."
+
+[[notice]]
+id = "agents-run-in-the-sandbox"
+since = "0.58.1"
+title = "Agents now run in a sandbox"
+body = """
+Every command an agent starts now runs in an OS sandbox. The sandbox hides \
+your secrets and keeps Lucidos state read-only. Scripts keep their \
+`LUCIDOS_DATABASE_URL` database handle.
+
+The bundled database now always requires a password. If an older running \
+workspace loses database access, use **Switch to new version** for that \
+workspace. Lucidos does not restart it automatically.
+
+Sandboxed commands using a Unix database require the gateway-managed bundled \
+database. External Unix databases require an explicit sandbox opt-out. Older \
+engines missing the gateway handoff also need **Switch to new version**.
+
+Two things may change for you:
+
+- **Codex asks before every command.** Codex now asks before each command and \
+file change, as Claude Code does. To let Lucidos answer these cards for you, \
+turn on [Auto-answer coding-agent cards](settings:permissions#coding-agent-auto-answer).
+- **No sandbox, no agents.** If this machine cannot apply the sandbox, agents \
+do not run, and a banner says why. You can let agents run without the \
+sandbox in [Agent sandbox](settings:permissions#agent-sandbox:unsandboxed). \
+That removes the protection.
+"""

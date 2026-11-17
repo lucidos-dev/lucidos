@@ -14,8 +14,8 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use lucidos_build_slot::{
-    host_ncpu, inherited_slot, resolve_class, BuildLimits, BuildSlotPool, SlotClass, SlotState,
-    ENV_CARGO_JOBS, ENV_HELD, ENV_NICE, ENV_PRIORITY,
+    host_ncpu, inherited_slot, resolve_class_with_legacy, BuildLimits, BuildSlotPool, SlotClass,
+    SlotState, ENV_CARGO_JOBS, ENV_CLASS, ENV_HELD, ENV_LEGACY_PRIORITY, ENV_NICE,
 };
 
 use crate::workspace::{resolve_from_env, BoxError, Workspace};
@@ -145,7 +145,10 @@ fn cmd_wrap(args: BuildSlotArgs) -> Result<u8, BoxError> {
         }
     };
 
-    let class = resolve_class(std::env::var(ENV_PRIORITY).ok().as_deref());
+    let class = resolve_class_with_legacy(
+        std::env::var(ENV_CLASS).ok().as_deref(),
+        std::env::var(ENV_LEGACY_PRIORITY).ok().as_deref(),
+    );
     let guard = match pool.try_acquire_as(&label, class) {
         Some(guard) => guard,
         None => match wait_for_slot(&pool, &label, class, args.max_wait_secs) {
@@ -222,6 +225,7 @@ fn wait_for_slot(
     let turn = match class {
         SlotClass::Priority => "as a priority build, so the next free one is ours",
         SlotClass::Ordinary => "for one",
+        SlotClass::Background => "behind chosen work",
     };
     eprintln!(
         "lucidos build-slot: all {capacity} build slots are busy, waiting {turn}. \
@@ -342,8 +346,9 @@ fn spawn_child(
     if let Some(index) = slot {
         cmd.env(ENV_HELD, index);
     }
-    // Priority belongs to this acquisition, not to the tree it admits.
-    cmd.env_remove(ENV_PRIORITY);
+    // The class belongs to this acquisition, not to the tree it admits.
+    cmd.env_remove(ENV_CLASS);
+    cmd.env_remove(ENV_LEGACY_PRIORITY);
     if let Some(jobs) = limits.jobs {
         cmd.env(ENV_CARGO_JOBS, jobs.to_string());
     }

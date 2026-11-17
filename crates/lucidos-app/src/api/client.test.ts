@@ -22,29 +22,11 @@ describe('mutating fetch retry on TypeError', () => {
     vi.restoreAllMocks();
   });
 
-  it('cancelChat retries once on TypeError("Load failed") and succeeds', async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockResolvedValueOnce(new Response(null, { status: 200 }));
-
-    await cancelChat('thread-123');
-
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-    const [url1, init1] = mockFetch.mock.calls[0];
-    const [url2, init2] = mockFetch.mock.calls[1];
-    expect(url1).toContain('/api/v1/chat/cancel');
-    expect(url1).toBe(url2);
-    expect(init1.method).toBe('POST');
-    expect(init2.method).toBe('POST');
-  });
-
-  it('cancelChat propagates error if both attempts fail', async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockRejectedValueOnce(new TypeError('Load failed'));
-
+  it('cancelChat does not retry a lost take-back response', async () => {
+    // A second Stop must not hide the first response's taken-back content.
+    mockFetch.mockRejectedValueOnce(new TypeError('Load failed'));
     await expect(cancelChat('thread-123')).rejects.toThrow('Load failed');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
   it('cancelChat does NOT retry on a non-network error (HTTP 500)', async () => {

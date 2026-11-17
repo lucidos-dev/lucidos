@@ -47,7 +47,10 @@ fn cc_running_shows_no_close_actions() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::ApplyWhenSettled, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![ThreadAction::ApplyWhenSettled, ThreadAction::Save]
+    );
 }
 
 // ── UserQuestionAsked / UserQuestionAnswered tests ──
@@ -240,7 +243,7 @@ fn waiting_for_user_answer_returns_no_actions() {
             );
             assert_eq!(
                 actions,
-                vec![Action::Save],
+                vec![ThreadAction::Save],
                 "WaitingForUserAnswer must yield no close actions (section={:?}, has_changes={}); Cancel is rendered separately, Save toggle still appends",
                 section,
                 has_changes,
@@ -303,6 +306,18 @@ fn cc_settings_changed_is_persisted_event() {
         all_persisted_event_types().contains(&"CodingAgentSettingsChanged"),
         "CodingAgentSettingsChanged must be in all_persisted_event_types()"
     );
+}
+
+#[test]
+fn billing_observation_is_passive_coding_agent_metadata() {
+    let event = "CodingAgentBillingObserved";
+    assert_eq!(classify_event(event), Some(EventClass::Metadata));
+    assert!(all_persisted_event_types().contains(&event));
+    for section in [ArchiveState::Inbox, ArchiveState::Archived] {
+        let result = resolve_transition(event, ThreadType::CodingAgent, section, false).unwrap();
+        assert_eq!(result.new_section, None);
+        assert!(resolve_transition(event, ThreadType::Chat, section, false).is_err());
+    }
 }
 
 // 22b. last_activity_events_are_valid_persisted_events

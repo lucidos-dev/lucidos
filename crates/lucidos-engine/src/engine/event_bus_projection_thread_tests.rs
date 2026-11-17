@@ -11,6 +11,30 @@ use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEve
 use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
 use uuid::Uuid;
 
+#[tokio::test]
+async fn plan_only_code_refusal_persists_through_the_event_projection() {
+    use crate::engine::thread_events::UnproposedReason;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = crate::test_support::seed_coding_thread(&bus, None).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: thread,
+        event: ThreadEvent::ProposalWithheld {
+            branch_name: "feature/plan".into(),
+            files: vec!["src/main.rs".into()],
+            reason: UnproposedReason::PlanOnlyCode,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap()
+    .expect("refusal persisted");
+    let state: (String, Option<String>) = sqlx::query_as("SELECT coding_agent_change_state, coding_agent_unproposed_reason FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread).fetch_one(&pool).await.unwrap();
+    assert_eq!(state, ("unproposed".into(), Some("plan_only_code".into())));
+    teardown_test_db(&db).await;
+}
+
 /// A lane batch's integration branch is never a change, whoever proposes it
 /// (ADR 0463). The projection is the one place every `ChangeProposed` passes,
 /// so it refuses the event and the emit writes nothing.
@@ -26,6 +50,7 @@ async fn a_proposal_naming_a_lane_branch_is_refused_and_writes_nothing() {
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ChangeProposed {
+                content: Default::default(),
                 change_id: Uuid::new_v4().to_string(),
                 description: Some("the batch".into()),
                 files: vec!["a.rs".into()],
@@ -217,6 +242,7 @@ async fn start_session_on(
         bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent,
             session_id: String::new(),
             branch: String::new(),

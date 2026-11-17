@@ -94,7 +94,7 @@ fn socket_for(dir: &Path) -> io::Result<PathBuf> {
 }
 
 /// The same derivation, rooted in a per-user temp directory, so the
-/// gateway's tests never write into the machine's own `~/.lucidos/run`.
+/// gateway's tests never write into the machine's own run directory.
 #[cfg(test)]
 fn socket_for(dir: &Path) -> io::Result<PathBuf> {
     lucidos_engine_socket::test_support::path_in(&test_engine::run_dir(), dir)
@@ -169,12 +169,12 @@ pub async fn send(
     req: Request<Body>,
     credential: Credential<'_>,
 ) -> Result<Response<Incoming>, HopError> {
-    let (mut sender, conn) = open(addr).await?;
+    let (mut sender, conn, socket_credential) = open(addr).await?;
     tokio::spawn(async move {
         let _ = conn.await;
     });
     sender
-        .send_request(prepare(addr, req, credential))
+        .send_request(prepare(addr, req, &socket_credential, credential))
         .await
         .map_err(HopError::Http)
 }
@@ -186,40 +186,49 @@ pub async fn send_upgrade(
     req: Request<Body>,
     credential: Credential<'_>,
 ) -> Result<Response<Incoming>, HopError> {
-    let (mut sender, conn) = open(addr).await?;
+    let (mut sender, conn, socket_credential) = open(addr).await?;
     tokio::spawn(async move {
         let _ = conn.with_upgrades().await;
     });
     sender
-        .send_request(prepare(addr, req, credential))
+        .send_request(prepare(addr, req, &socket_credential, credential))
         .await
         .map_err(HopError::Http)
 }
 
+/// A handshaken connection, and the socket credential its requests carry.
 type Opened = (
     hyper::client::conn::http1::SendRequest<Body>,
     hyper::client::conn::http1::Connection<TokioIo<lucidos_engine_socket::OwnedEngineStream>, Body>,
+    String,
 );
 
 async fn open(addr: &EngineAddress) -> Result<Opened, HopError> {
     let stream = addr.connect().await?;
-    hyper::client::conn::http1::handshake(TokioIo::new(stream))
+    let socket_credential = stream.credential().to_string();
+    let (sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
-        .map_err(HopError::Http)
+        .map_err(HopError::Http)?;
+    Ok((sender, conn, socket_credential))
 }
 
 /// Stamp the gateway's own headers, replacing any value already present.
 ///
-/// `Host` is the engine's TCP authority. The credential is the one the caller
-/// named, and none at all for [`Credential::None`]. Callers strip a client's
-/// copy of both token headers before this point (`proxy::gateway_owns_header`).
+/// `Host` is the engine's TCP authority. Every request carries the socket
+/// credential, which the engine checks before routing. The token is the one
+/// the caller named, and none at all for [`Credential::None`]. Callers strip a
+/// client's copy of all three before this point (`proxy::gateway_owns_header`).
 fn prepare(
     addr: &EngineAddress,
     mut req: Request<Body>,
+    socket_credential: &str,
     credential: Credential<'_>,
 ) -> Request<Body> {
     let headers = req.headers_mut();
     headers.insert(header::HOST, addr.host());
+    if let Some(value) = crate::auth::sensitive_credential(socket_credential) {
+        headers.insert(lucidos_engine_socket::CREDENTIAL_HEADER, value);
+    }
     let (name, token) = match credential {
         Credential::None => return req,
         Credential::Local(token) => (crate::auth::HEADER_LOCAL_TOKEN, token),
@@ -383,7 +392,8 @@ mod tests {
                 Some("x-lucidos-hook-socket-token: own-hook"),
                 "x-lucidos-local-token",
             ),
-            (Credential::None, None, "x-lucidos-"),
+            (Credential::None, None, "x-lucidos-local-token"),
+            (Credential::None, None, "x-lucidos-hook-socket-token"),
         ] {
             let dir = scratch();
             let (listener, addr) = bind(&dir);
@@ -394,6 +404,30 @@ mod tests {
                 assert!(head.contains(present), "{head}");
             }
             assert!(!head.contains(absent), "{head}");
+        }
+    }
+
+    /// The engine routes nothing without the socket credential, so every hop
+    /// carries it, a credential-less probe included. A client's copy is
+    /// replaced, never forwarded.
+    #[tokio::test]
+    async fn every_hop_carries_the_socket_credential() {
+        for credential in [Credential::None, Credential::Local("own-local")] {
+            let dir = scratch();
+            let (listener, addr) = bind(&dir);
+            let socket = dir.path().join("run").join("engine");
+            let expected = lucidos_engine_socket::credential_for(&socket).expect("credential");
+            let captured = tokio::spawn(capture_one(listener));
+            let req = Request::builder()
+                .uri("/")
+                .header(lucidos_engine_socket::CREDENTIAL_HEADER, "forged")
+                .body(Body::empty())
+                .expect("request");
+            send(&addr, req, credential).await.expect("send");
+            let head = captured.await.expect("captured");
+            let line = format!("{}: {expected}", lucidos_engine_socket::CREDENTIAL_HEADER);
+            assert!(head.contains(&line), "{head}");
+            assert!(!head.contains("forged"), "{head}");
         }
     }
 
@@ -460,7 +494,8 @@ mod tests {
                         continue;
                     }
                     let names_a_token = code.contains("HEADER_LOCAL_TOKEN")
-                        || code.contains("HEADER_HOOK_SOCKET_TOKEN");
+                        || code.contains("HEADER_HOOK_SOCKET_TOKEN")
+                        || code.contains("CREDENTIAL_HEADER");
                     let token_ok = name == "engine_hop.rs"
                         || name == "auth.rs"
                         || code.contains("eq_ignore_ascii_case");

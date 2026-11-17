@@ -6,7 +6,7 @@ import { createInterface } from 'node:readline';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   FAKE_VERSION, NO_EFFORT, NO_RULE_REPLY, NO_SESSION_CONTEXT_REPLY,
-  failToStartText, replyTo, resolveModel, turnDurationMs,
+  failToStartText, modelBase, replyTo, resolveModel, restrictedModels, restrictionWarning, turnDurationMs,
 } from './claude.mjs';
 import {
   SCENARIO_FLAGS, SESSION_FLAGS, UNREPLAYED_FLAGS, diffShapes, shapeOf, unknownKinds,
@@ -20,9 +20,9 @@ type Line = Record<string, any>;
 const { CLAUDE_CODE_EFFORT_LEVEL: _, ...ENV } = process.env;
 const NO_DELAY = { ...ENV, FAKE_CLAUDE_CODE_TURN_MS: '0' };
 
-function runFake(args: string[], inputs: Line[] = []): Line[] {
+function runFake(args: string[], inputs: Line[] = [], env: Record<string, string> = {}): Line[] {
   const input = inputs.map((l) => `${JSON.stringify(l)}\n`).join('');
-  const out = execFileSync(process.execPath, [FAKE, ...args], { input, encoding: 'utf8', env: NO_DELAY });
+  const out = execFileSync(process.execPath, [FAKE, ...args], { input, encoding: 'utf8', env: { ...NO_DELAY, ...env } });
   return out.trim().split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
 
@@ -58,8 +58,9 @@ describe('the fake Claude Code', () => {
       env: { ...NO_DELAY, LUCIDOS_AGENT_ORIGIN_TOKEN: '' },
     });
     const lines = out.trim().split('\n').map(l => JSON.parse(l));
-    expect(lines.at(-1)?.result).toBe('{"verified":false}');
-    expect(lines.find(l => l.type === 'assistant')?.message.content).toEqual([{ type: 'text', text: '{"verified":false}' }]);
+    const refusal = '{"verified":false,"stage":"env"}';
+    expect(lines.at(-1)?.result).toBe(refusal);
+    expect(lines.find(l => l.type === 'assistant')?.message.content).toEqual([{ type: 'text', text: refusal }]);
   });
 
   it('runs a Say exactly turn: init, replay, the text, then result', () => {
@@ -75,6 +76,37 @@ describe('the fake Claude Code', () => {
     const lines = runFake(['--resume', 'sid-1'], [user('Say exactly: "a"'), user('Say exactly: "b"')]);
     expect(lines.filter((l) => l.subtype === 'init')).toHaveLength(1);
     expect(lines.filter((l) => l.type === 'result').map((l) => [l.session_id, l.result])).toEqual([['sid-1', 'a'], ['sid-1', 'b']]);
+  });
+
+  describe('with restricted models', () => {
+    const RESTRICTED = { FAKE_CLAUDE_CODE_RESTRICTED_MODELS: 'claude-fable-5-2, claude-x-1' };
+    const turns = [user('Say exactly: "a"'), user('Say exactly: "b"')];
+
+    it('runs the default model in place of a restricted pick, and warns once after init', () => {
+      const lines = runFake(['--model', 'claude-fable-5-2[1m]'], turns, RESTRICTED);
+      expect(lines[0]).toMatchObject({ subtype: 'init', model: resolveModel('default') });
+      expect(lines[1]).toEqual(restrictionWarning('claude-fable-5-2[1m]', resolveModel('default')));
+      expect(lines.filter((l) => l.subtype === 'informational')).toHaveLength(1);
+      expect(lines.filter((l) => l.type === 'assistant').map((l) => l.message.model)).toEqual([resolveModel('default'), resolveModel('default')]);
+    });
+
+    it('runs a model it does not restrict, with no warning', () => {
+      const lines = runFake(['--model', 'haiku'], turns, RESTRICTED);
+      expect(lines[0]).toMatchObject({ subtype: 'init', model: resolveModel('haiku') });
+      expect(lines.some((l) => l.subtype === 'informational')).toBe(false);
+    });
+
+    it('warns on the turn after a set_model to a restricted model', () => {
+      const lines = runFake([], [user('Say exactly: "a"'), control('set_model', { model: 'claude-x-1@pin' }), user('Say exactly: "b"')], RESTRICTED);
+      const warningAt = lines.findIndex((l) => l.subtype === 'informational');
+      expect(warningAt).toBeGreaterThan(lines.findIndex((l) => l.type === 'result'));
+      expect(lines[warningAt].content).toContain('"claude-x-1@pin"');
+    });
+
+    it('reads the list by base id', () => {
+      expect([...restrictedModels(' a[1m], b@x ,,')]).toEqual(['a', 'b']);
+      expect(modelBase('claude-opus-5-5[1m]')).toBe('claude-opus-5-5');
+    });
   });
 
   it('replays at once but lasts a turn before its result, so a mid-turn poll sees it live', async () => {

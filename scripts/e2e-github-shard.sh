@@ -42,6 +42,10 @@ source "$SCRIPT_DIR/lib/e2e_flaky.sh"
 source "$SCRIPT_DIR/lib/e2e_warm.sh"
 REQUEST="${E2E_GITHUB_REQUEST:-$PROJECT_DIR/.github/e2e-request.json}"
 OUT_ROOT="${E2E_GITHUB_OUT:-$PROJECT_DIR/e2e-out}"
+# Nothing moves a runner's HEAD, and the restored target/ state and dependency
+# cache live in target/. So every build here compiles live, never in a launch
+# tree, which would compile all of them from scratch (scripts/lib/launch_tree.sh).
+export LUCIDOS_LAUNCH_TREE=off
 
 # Shards per browser project for a full run. 7 + 5 + 5 browser jobs plus the
 # three other suites fill the public repo's 20 concurrent jobs, and macOS is
@@ -152,14 +156,21 @@ cmd_plan() {
     # shellcheck source=scripts/lib/e2e.sh
     source "$SCRIPT_DIR/lib/e2e.sh"
     mkdir -p "$OUT_ROOT/plan"
-    local entries="$OUT_ROOT/plan/entries" linux="" macos="" engine=false suite project count shards i id entry
+    local entries="$OUT_ROOT/plan/entries" linux="" macos="" own="" confinement=false suite project count shards i id entry
     : >"$entries"
     while IFS= read -r suite; do
         case "$suite" in
-            engine)
-                # Its own job: it builds nothing the e2e shards share.
-                echo "engine engine - 1 1" >>"$entries"
-                engine=true
+            engine | crates | scripts)
+                # Their own jobs, on both platforms: they build nothing the e2e
+                # shards share, and the crates hold macOS-only code and tests.
+                echo "$suite $suite - 1 1" >>"$entries"
+                echo "$suite-macos $suite - 1 1" >>"$entries"
+                own="$own{\"id\":\"$suite\",\"suite\":\"$suite\",\"os\":\"ubuntu-latest\"},"
+                own="$own{\"id\":\"$suite-macos\",\"suite\":\"$suite\",\"os\":\"macos-15\"},"
+                ;;
+            confinement)
+                echo "confinement confinement - 1 1" >>"$entries"
+                confinement=true
                 ;;
             api | wasm | embedder)
                 echo "$suite $suite - 1 1" >>"$entries"
@@ -192,7 +203,9 @@ EOF
         echo "macos={\"include\":[${macos%,}]}"
         echo "has_linux=$([ -n "$linux" ] && echo true || echo false)"
         echo "has_macos=$([ -n "$macos" ] && echo true || echo false)"
-        echo "has_engine=$engine"
+        echo "suites={\"include\":[${own%,}]}"
+        echo "has_suites=$([ -n "$own" ] && echo true || echo false)"
+        echo "has_confinement=$confinement"
     } >>"${GITHUB_OUTPUT:-/dev/stdout}"
     cat "$entries"
 }
@@ -228,8 +241,10 @@ E2E_GITHUB_CARGO_PROFILE=e2e
 E2E_ENGINE_CANDIDATES=8
 # How many pages of the artifact list a lookup reads, 100 artifacts each.
 E2E_ARTIFACT_PAGES=5
-# Where the state's own manifest travels inside target/.
-TARGET_STATE_MANIFEST=lucidos-input-manifest
+# Where the state's own manifest travels inside target/. The name carries the
+# state format: a state packed before ADR 0693 held a launch tree build's
+# leftovers under a newer tree's manifest, so it must never be restored.
+TARGET_STATE_MANIFEST=lucidos-target-state-v2
 
 # The platform key each job's runner builds for (engine_manifest_platform).
 github_platform() {
@@ -325,16 +340,18 @@ EOF
 # only what changed. Never fails the build: without state it compiles from
 # scratch.
 restore_target_state() {
-    local state="$1/e2e-target.tar.zst" manifest="$PROJECT_DIR/target/$E2E_GITHUB_CARGO_PROFILE/$TARGET_STATE_MANIFEST"
+    local state="$1/e2e-target.tar.zst" profile_dir="$PROJECT_DIR/target/$E2E_GITHUB_CARGO_PROFILE"
     if [ ! -f "$state" ]; then
         echo "Target state: none arrived, compiling from scratch"
         return 0
     fi
-    if zstd -dc "$state" | tar -C "$PROJECT_DIR" -xf - && [ -f "$manifest" ]; then
+    if zstd -dc "$state" | tar -C "$PROJECT_DIR" -xf - && [ -f "$profile_dir/$TARGET_STATE_MANIFEST" ]; then
         echo "Target state: restored"
-        engine_manifest_stamp_mtimes "$PROJECT_DIR" "$manifest"
+        engine_manifest_stamp_mtimes "$PROJECT_DIR" "$profile_dir/$TARGET_STATE_MANIFEST"
     else
-        echo "Target state: could not restore it, compiling from scratch"
+        # Unaged outputs without their manifest prove nothing about this tree.
+        rm -rf "$profile_dir"
+        echo "Target state: could not restore it, or it is from an older format, compiling from scratch"
     fi
 }
 
@@ -614,6 +631,10 @@ cmd_native_postgres() {
     source "$SCRIPT_DIR/lib/workspace_constants.sh"
     # shellcheck source=scripts/lib/pg_secret.sh
     source "$SCRIPT_DIR/lib/pg_secret.sh"
+    # Mint into the e2e root's private/, where every e2e run reads it.
+    # shellcheck source=scripts/lib/e2e_root.sh
+    source "$SCRIPT_DIR/lib/e2e_root.sh"
+    e2e_root_env
     # A restored cache holds the compiled prefix, so this only starts it.
     prefix="$(stage_runtime_fetch_postgres "$PG_VERSION" "$PGVECTOR_VERSION" "$MACOS_PG_TRIPLE" "$work")" || return 1
     data="$work/data"
@@ -623,6 +644,57 @@ cmd_native_postgres() {
         -o "-p $port -c listen_addresses=127.0.0.1 -c max_connections=$PG_MAX_CONNECTIONS" start >/dev/null || return 1
     echo "$prefix/bin" >>"${GITHUB_PATH:-/dev/null}"
     echo "LUCIDOS_EXTERNAL_PG_PORT=$port" >>"${GITHUB_ENV:-/dev/stdout}"
+}
+
+# A macOS runner has no Docker: the engine tests reach the Postgres that
+# native-postgres started, on LUCIDOS_EXTERNAL_PG_PORT.
+use_native_test_postgres() {
+    [ -n "${LUCIDOS_EXTERNAL_PG_PORT:-}" ] || return 0
+    # shellcheck source=scripts/lib/workspace_constants.sh
+    source "$SCRIPT_DIR/lib/workspace_constants.sh"
+    # shellcheck source=scripts/lib/pg_secret.sh
+    source "$SCRIPT_DIR/lib/pg_secret.sh"
+    # shellcheck source=scripts/lib/e2e_root.sh
+    source "$SCRIPT_DIR/lib/e2e_root.sh"
+    e2e_root_env
+    local password
+    password="$(shared_pg_password)" || return 1
+    export LUCIDOS_TEST_DATABASE_URL="postgres://$PG_USER:$password@127.0.0.1:$LUCIDOS_EXTERNAL_PG_PORT/postgres"
+}
+
+# The Rust suites /harden runs per change, each with its own command
+# (hs_suite_command), all run to the end so one failure never hides another.
+run_crate_suites() {
+    local suite rc=0
+    # shellcheck source=scripts/lib/harden_suites.sh
+    source "$SCRIPT_DIR/lib/harden_suites.sh"
+    # The desktop app's tests embed the built frontend.
+    warm_npm && ensure_frontend_built || return 1
+    for suite in $HS_MAIN_CHECK_CRATE_SUITES; do
+        echo "── $suite ──"
+        # The desktop app ships for macOS only, and needs GTK to build on Linux.
+        if [ "$suite" = app-lib ] && [ "$(uname -s)" != Darwin ]; then
+            echo "skipped: the desktop app builds only on macOS"
+            continue
+        fi
+        (cd "$PROJECT_DIR" && eval "$(hs_suite_command "$suite" normal /nonexistent)") || rc=1
+    done
+    return "$rc"
+}
+
+# The script suites test the libraries as a developer's host runs them, so
+# none may see what this shard set for its own builds, nor GitHub's own
+# variables: each suite sets the ones it tests.
+run_script_suites() {
+    local -a unset_args=()
+    local name
+    for name in $(compgen -e); do
+        case "$name" in
+            GITHUB_* | RUNNER_* | CI | LUCIDOS_* | HOST_LOAD_* | ENGINE_CARGO_PROFILE | CARGO_BUILD_JOBS)
+                unset_args+=(-u "$name") ;;
+        esac
+    done
+    env ${unset_args[@]+"${unset_args[@]}"} "$SCRIPT_DIR/test-scripts.sh"
 }
 
 cmd_run() {
@@ -652,7 +724,17 @@ cmd_run() {
         engine)
             # A cold runner compiles the whole test binary inside the run limit.
             export LUCIDOS_TEST_RUN_LIMIT_SECS="${LUCIDOS_TEST_RUN_LIMIT_SECS:-$ENGINE_RUN_LIMIT_SECS}"
+            use_native_test_postgres
             cmd=("$SCRIPT_DIR/test-engine.sh")
+            ;;
+        crates)
+            # shellcheck source=scripts/lib/e2e.sh
+            source "$SCRIPT_DIR/lib/e2e.sh"
+            cmd=(run_crate_suites)
+            ;;
+        scripts) cmd=(run_script_suites) ;;
+        confinement)
+            cmd=("$SCRIPT_DIR/confinement-tests.sh" --here)
             ;;
         api)
             # The gateway chain test's child proves its workspace id, which an

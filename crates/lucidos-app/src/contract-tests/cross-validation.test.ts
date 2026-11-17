@@ -9,7 +9,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { actionBlocker, availableThreadActions, changeWork, displaySection, ownBlocker, OWN_BLOCKER_PRIORITY, THREAD_STATUSES } from '../generated/thread-lifecycle';
-import type { ThreadType, ThreadStatus, ArchiveState, Action, ChangeStateKind, ChangeWork, DisplaySection, OwnBlocker } from '../generated/thread-lifecycle';
+import type { ThreadType, ThreadStatus, ArchiveState, ThreadAction, ChangeStateKind, ChangeWork, DisplaySection, OwnBlocker } from '../generated/thread-lifecycle';
 import fixture from '../generated/cross-validation-fixture.json';
 
 interface AvailableThreadActionsCase {
@@ -84,7 +84,7 @@ describe('Cross-validation: generated TS matches Rust', () => {
           hasUnsentDraft,
           isSaved,
         );
-        expect(result).toEqual(tc.expected as Action[]);
+        expect(result).toEqual(tc.expected as ThreadAction[]);
       });
     }
   });

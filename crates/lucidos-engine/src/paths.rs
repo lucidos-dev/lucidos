@@ -61,10 +61,44 @@ pub fn user_cache_root() -> Option<PathBuf> {
     match lucidos_home::ensure_storage_root(&root) {
         Ok(()) => Some(root),
         Err(e) => {
-            crate::log!("[Paths] No shared user cache: {e}");
+            crate::log_legacy!("[Paths] No shared user cache: {e}");
             None
         }
     }
+}
+
+/// Every gateway data dir on this machine: each install the installs scan
+/// finds, plus the one this process's environment names.
+pub fn gateway_data_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<_> = lucidos_installs::scan_this_machine(None)
+        .installs
+        .into_iter()
+        .filter_map(|install| install.data_dir)
+        .collect();
+    if let Some(dir) = lucidos_home::gateway_data_dir().filter(|dir| !dirs.contains(dir)) {
+        dirs.push(dir);
+    }
+    dirs
+}
+
+/// Every workspace root the gateway registries in `data_dirs` list. A registry
+/// that is missing or unreadable lists none.
+pub fn registered_workspace_dirs(data_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for data in data_dirs {
+        let Ok(bytes) = std::fs::read(data.join("config/workspaces.json")) else {
+            continue;
+        };
+        let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        for entry in registry["workspaces"].as_array().into_iter().flatten() {
+            if let Some(dir) = entry["dir"].as_str() {
+                roots.push(data.join(dir));
+            }
+        }
+    }
+    roots
 }
 
 /// Resolve the Lucidos repo root from the running binary's path.
@@ -100,14 +134,16 @@ fn compute_repo_root() -> Result<PathBuf, String> {
 /// and every dev-mode resource lookup (`scripts/`, `system-knowhow/`, the SDK
 /// bundle) resolves through here. The walk is also exactly what makes that
 /// relocation safe: only "somewhere inside the checkout" is required, never a
-/// particular parent. Split out from [`compute_repo_root`] so the
+/// particular parent. An app bundle is a boundary even inside a checkout.
+/// Split out from [`compute_repo_root`] so the
 /// depth-independence is testable without touching `current_exe()`.
 ///
 /// The gateway has a hand-synced copy (`crates/lucidos-gateway/src/build_id.rs`
-/// `repo_root_from`) — ADR 0014 §1 keeps it free of any dependency on the
+/// `repo_root_above`) — ADR 0014 §1 keeps it free of any dependency on the
 /// engine. Keep the two in step.
 pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
+        .take_while(|a| a.extension().is_none_or(|ext| ext != "app"))
         .find(|a| a.join(REPO_MARKER).exists())
         .map(Path::to_path_buf)
 }
@@ -138,14 +174,16 @@ pub fn has_lucidos_source() -> bool {
     repo_root().is_ok()
 }
 
-/// Best-effort repo root: falls back to compile-time `CARGO_MANIFEST_DIR`
-/// when the binary lives outside a Lucidos tree (engine startup, recovery).
-pub fn repo_root_or_compile_time_fallback() -> PathBuf {
+/// Root for startup and recovery: the runtime checkout when present, otherwise
+/// this workspace. A build machine's compile-time source path is never authority.
+pub fn repo_or_workspace_root() -> PathBuf {
     repo_root().unwrap_or_else(|_| {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
+        workspace_root_fallback(std::env::var_os("LUCIDOS_WORKSPACE").map(PathBuf::from))
     })
+}
+
+fn workspace_root_fallback(workspace: Option<PathBuf>) -> PathBuf {
+    workspace.unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Path to a script under `<repo_root>/scripts/<name>`. Errors with the
@@ -164,13 +202,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn repo_root_finds_scripts_marker_from_test_binary() {
-        let root = repo_root().expect("repo_root must resolve from a cargo-run test binary");
-        assert!(
-            root.join(REPO_MARKER).exists(),
-            "resolved repo root {} does not contain {REPO_MARKER}",
-            root.display()
-        );
+    fn app_bundle_inside_a_checkout_does_not_expose_platform_source() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+        std::fs::write(root.path().join(REPO_MARKER), "").unwrap();
+        let engine = root
+            .path()
+            .join("target/release/bundle/macos/Demo.app/Contents/Resources/lucidos-engine");
+        assert_eq!(repo_root_above(&engine), None);
+    }
+
+    #[test]
+    fn packaged_recovery_falls_back_to_its_workspace_without_build_machine_paths() {
+        let workspace = PathBuf::from("/owned/workspace");
+        assert_eq!(workspace_root_fallback(Some(workspace.clone())), workspace);
+        assert_eq!(workspace_root_fallback(None), PathBuf::from("."));
     }
 
     /// The checkout is found by WALKING ancestors, at any depth and under any
@@ -262,5 +308,19 @@ mod tests {
         assert!(path_is_in_cc_worktree(Path::new(
             "/gone/.lucidos/worktrees/thread-x/crates"
         )));
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn repo_root_finds_scripts_marker_from_test_binary() {
+            let root = repo_root().expect("repo_root must resolve from a cargo-run test binary");
+            assert!(
+                root.join(REPO_MARKER).exists(),
+                "resolved repo root {} does not contain {REPO_MARKER}",
+                root.display()
+            );
+        }
     }
 }

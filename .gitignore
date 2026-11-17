@@ -13,6 +13,8 @@
 signers/*/target/
 signers/*/*.wasm
 signers/*/Cargo.lock
+# Python bytecode caches, written when a repo script is imported.
+__pycache__/
 
 # IDE
 .idea/

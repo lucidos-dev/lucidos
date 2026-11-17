@@ -250,7 +250,7 @@ impl ClaudeGatewayAccountStore {
         if changed != Some(true) {
             return Ok(());
         }
-        crate::log!(
+        crate::log_legacy!(
             "[ClaudeGateway] {} changed its managed settings: {:?}",
             account.issuer,
             policy
@@ -436,7 +436,7 @@ impl ClaudeGatewayAccountStore {
                 refresh_token,
             }),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[ClaudeGateway] Forgot the sign-in to {issuer} without revoking it: {e}"
                 );
                 None

@@ -1,0 +1,18 @@
+[package]
+name = "lucidos-agent-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The OS sandbox around an agent subprocess (ADR 0645): the policy, the macOS
+# seatbelt profile, the Linux Landlock ruleset and the probe. The engine owns
+# the gate, the owner preference and the notification.
+#
+# A crate of its own so it builds for Linux on a Mac, and its tests run in a
+# Linux container. It depends on `libc` alone.
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

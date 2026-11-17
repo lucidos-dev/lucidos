@@ -267,7 +267,17 @@ async fn floor_rungs(state: &AppState, thread_id: Uuid) -> Result<FloorRungs, Ap
         (Some(model), Some(effort)) => Some(IntelligenceRung::new(&model, &effort)),
         _ => None,
     };
-    Ok(FloorRungs::on_ladder(&ladder, thread.as_ref()))
+    let mut rungs = FloorRungs::on_ladder(&ladder, thread.as_ref());
+    rungs.other_backends = intelligence_ladder::other_backend_ladders(
+        &state.pool,
+        &state.engine.model_routes(),
+        &ladder,
+    )
+    .await
+    .iter()
+    .filter_map(crate::engine::handoff_estimate::OtherBackendRungs::on_ladder)
+    .collect();
+    Ok(rungs)
 }
 
 /// Record a checkpoint run on a coding-agent thread and answer with the
@@ -392,16 +402,18 @@ pub(in crate::api) enum HandoffPath {
     /// The cache was warm: the agent is writing the narrative, and the
     /// successor session follows its turn.
     Narrative,
-    /// The cache was cold, or its lifetime unknown: the successor session
-    /// starts at once from a brief.
+    /// The cache was cold, or its lifetime unknown, or the provider blocked
+    /// the session: the successor session starts at once from a brief.
     Brief,
 }
 
 impl HandoffPath {
-    fn of_warmth(warmth: CacheWarmth) -> Self {
-        match warmth {
-            CacheWarmth::Warm => Self::Narrative,
-            CacheWarmth::Cold | CacheWarmth::Unknown => Self::Brief,
+    /// A blocked session is never asked for a narrative, whatever the cache's
+    /// warmth: waking it would replay the history that tripped the block.
+    fn of(warmth: CacheWarmth, blocking_policy: Option<&'static str>) -> Self {
+        match (warmth, blocking_policy) {
+            (CacheWarmth::Warm, None) => Self::Narrative,
+            _ => Self::Brief,
         }
     }
 }
@@ -435,8 +447,12 @@ enum Opening {
         narrative: String,
         request: Option<HandoffRequest>,
     },
-    /// No narrative: the *handoff brief*, and the user's request if any.
-    Brief(Option<HandoffRequest>),
+    /// No narrative: the *handoff brief* for `cause`, and the user's request if
+    /// any.
+    Brief {
+        cause: BriefCause,
+        request: Option<HandoffRequest>,
+    },
 }
 
 /// One handoff, as `hand_off` runs it.
@@ -451,8 +467,9 @@ struct HandoffStart {
 
 /// The thread, once it may hand off: the refusals every handoff shares.
 /// `require_idle` is the composer's: a stale tap must not hand off a thread
-/// whose turn has started since. The agent's own handoff runs inside its turn
-/// by design.
+/// whose turn has started since. A failed turn has ended too, and a provider
+/// block leaves its thread `failed`. The agent's own handoff runs inside its
+/// turn by design.
 async fn hand_off_candidate(
     state: &AppState,
     thread_id: Uuid,
@@ -480,7 +497,7 @@ async fn hand_off_candidate(
             format!("\"{title}\" is not a coding-agent thread, so it has no successor session."),
         ));
     }
-    if require_idle && thread.status != "idle" {
+    if require_idle && !matches!(thread.status.as_str(), "idle" | "failed") {
         return Err(refusal(
             StatusCode::CONFLICT,
             "thread-busy",
@@ -520,6 +537,10 @@ fn block_refusal(state: &AppState, block: HandoffBlock, title: &str) -> ApiError
         HandoffBlock::Archived => (
             "archived",
             format!("\"{title}\" is archived. Unarchive it first."),
+        ),
+        HandoffBlock::LaneEnded => (
+            "lane-ended",
+            format!("\"{title}\" resolved a landing batch that has ended. Apply any pending source changes again to start a new landing batch."),
         ),
         HandoffBlock::Applying => (
             "applying",
@@ -585,8 +606,7 @@ pub(in crate::api) async fn spawn_successor(
         .await
         .map_err(ApiError::db)?
         .unwrap_or_default();
-    let picked_by_agent = request.implementer.coding_agent_model.is_some()
-        || request.implementer.reasoning_effort.is_some();
+    let picked_by_agent = request.implementer.is_explicit();
     let implementer = if picked_by_agent {
         request.implementer
     } else {
@@ -646,10 +666,13 @@ pub(in crate::api) async fn continue_in_successor(
         &request.implementer,
     )
     .map_err(|e| refusal(StatusCode::BAD_REQUEST, "implementer-not-offered", e))?;
-    let path = HandoffPath::of_warmth(
+    let blocking_policy =
+        crate::engine::agent_session::blocking_policy(&state.pool, thread_id).await;
+    let path = HandoffPath::of(
         cache_warmth(&state.pool, thread_id)
             .await
             .map_err(ApiError::db)?,
+        blocking_policy,
     );
     let successor = match path {
         HandoffPath::Brief => Some(
@@ -658,7 +681,12 @@ pub(in crate::api) async fn continue_in_successor(
                 &headers,
                 HandoffStart {
                     thread_id,
-                    opening: Opening::Brief(typed),
+                    opening: Opening::Brief {
+                        cause: blocking_policy.map_or(BriefCause::CacheCold, |policy| {
+                            BriefCause::ProviderBlocked { policy }
+                        }),
+                        request: typed,
+                    },
                     implementer: request.implementer,
                     picked_by_agent: false,
                     checkpoint: None,
@@ -744,7 +772,7 @@ async fn hand_off(
 
     let from_agent = caller_is_the_agent(headers, thread_id)?;
     let (thread, title) =
-        hand_off_candidate(state, thread_id, matches!(opening, Opening::Brief(_))).await?;
+        hand_off_candidate(state, thread_id, matches!(opening, Opening::Brief { .. })).await?;
     let implementer = resolve_implementer(
         &thread_implementer(state, thread_id, thread.coding_agent.as_deref()).await?,
         &requested,
@@ -768,11 +796,11 @@ async fn hand_off(
             narrative_opening(checkpoint.as_ref().map(|c| c.name.as_str()), &narrative),
             request,
         ),
-        Opening::Brief(request) => (
+        Opening::Brief { cause, request } => (
             HandoffOpening::Brief,
             handoff_brief(
                 thread_id,
-                BriefCause::CacheCold,
+                cause,
                 request.is_some(),
                 last_applied_summary(pool, thread_id).await.as_deref(),
             ),
@@ -782,11 +810,27 @@ async fn hand_off(
     let crossing = crate::engine::context_ceiling::past_ceiling(pool, thread_id)
         .await
         .map_err(ApiError::db)?;
+    let cut_short = if crossing.is_some() && from_agent && kind == HandoffOpening::Narrative {
+        match crate::engine::context_ceiling::reentry_cut_turn_short(pool, thread_id).await {
+            Ok(cut) => cut,
+            Err(e) => {
+                log_legacy!(
+                    "[Successor] Could not read ceiling delivery for {}: {}",
+                    thread_id,
+                    e
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
     let (cause, starts) = crate::engine::successor::cause_and_start(
         crossing.is_some(),
         checkpoint.is_some(),
         request.is_some(),
         from_agent,
+        cut_short,
     );
     let handoff = NewHandoff {
         opening: kind,

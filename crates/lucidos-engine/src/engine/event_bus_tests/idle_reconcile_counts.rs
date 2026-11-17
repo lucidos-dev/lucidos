@@ -29,6 +29,7 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: test_change_id(child_id).to_string(),
             requires_restart: false,
             client_update: false,
@@ -327,7 +328,7 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
 /// that semantic — counting WaitingForUserAnswer children as active —
 /// otherwise a sibling's terminal event silently zeroes the parent's
 /// counter while a paused child still owes work. (Same definition the
-/// sibling helper `reconcile_blocking_descendant_count_for_ancestors`
+/// sibling helper `reconcile_descendant_counts_from`
 /// uses at the `status IN ('running', 'waiting_for_user_answer')` filter.)
 #[tokio::test]
 async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
@@ -531,6 +532,7 @@ async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -564,6 +566,7 @@ async fn test_cc_child_stale_resume_does_not_decrement_parent() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "stale-sid".into(),
             branch: "claude-code/stale".into(),

@@ -398,7 +398,13 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       expect(put.status()).toBe(204);
       const reread = await apiContext.get('/api/v1/cc-allowed-tools');
       expect(reread.status()).toBe(200);
-      expect((await reread.json()).contents).toBe(sentinel);
+      // The file mirrors the live grants under the engine's own header, so a
+      // comment the PUT carried does not come back. Only the grant does.
+      const grantLines = ((await reread.json()).contents as string)
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith('#'));
+      expect(grantLines).toEqual(['ReadOnly']);
     } finally {
       await apiContext.put('/api/v1/cc-allowed-tools', { data: { contents: snapshot } }).catch(() => undefined);
       await apiContext.dispose();

@@ -5,7 +5,7 @@ import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, isAgentReplyText, modeToInitiator, parentToolUseIdOf } from './exchange';
 import { isOneUtterance, joinSpoken } from './spokenMerge';
 import { CONTINUATION_EFFORT_RESTART_REASON, SIDE_QUESTION_TYPES, LEGACY_WIDGET_PIN_TYPES, isFormRequest, isRedirectCancel, isSideQuestionEvent, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
-import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
+import { applyAggregateToThread, updatesLastActivity } from './thread-meta';
 import type { Exchange, TypedAnswer } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
 import { KEEP_ALIVE_ENDING_EVENT_TYPES, KEEP_ALIVE_IDLE_REASON } from '@lucidos/engine-constants';
@@ -522,9 +522,7 @@ function filterRemovedQueuedExchanges(
   });
 }
 
-/** Event types that begin a new exchange in the timeline. Each agent pause is
- *  its own auditable boundary with an actor, never a step inside the prior
- *  agent response.
+/** Event types that begin a new exchange in the timeline.
  *
  *  One boundary is decided by the EVENT rather than by its type and so is not
  *  in this set: see `isExchangeStartEvent`. */
@@ -557,11 +555,9 @@ export const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   // transcript by who is talking. Which turn was running underneath comes
   // second, so the caller opens a boundary either way.
   'SpokenMessageReceived',
-  // A *people-only message*, and the agent pause flipping (ADR 0649). Notes
-  // that hold no turn: see `isTurnlessBoundary`.
-  'PeopleMessagePosted',
-  'AgentPaused',
-  'AgentResumed',
+  // A *user-only message* (ADR 0649). A note that holds no turn: see
+  // `isTurnlessBoundary`.
+  'UserOnlyMessagePosted',
 ]);
 
 /** Whether this event opens a new exchange. Takes the EVENT, not its type,
@@ -642,9 +638,7 @@ export const BOUNDARY_CONTINUATION_HANDOFF: ReadonlyMap<string, ContinuationHand
   ['ChildThreadStopped', 'own-arm'],
   ['ChildThreadDetached', 'own-arm'],
   ['ChildReportFiled', 'own-arm'],
-  ['PeopleMessagePosted', 'own-arm'],
-  ['AgentPaused', 'own-arm'],
-  ['AgentResumed', 'own-arm'],
+  ['UserOnlyMessagePosted', 'own-arm'],
 ]);
 
 /** Does this boundary take the running turn? `previous` held it.
@@ -741,6 +735,10 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   ...LEGACY_WIDGET_PIN_TYPES,
   // A card's size. `widgetCardSize` reads it from the thread's events.
   'InlineWidgetSized',
+  // The agent pause flipping (ADR 0649, amended by ADR 0657). The composer
+  // placeholder says it, so the transcript draws nothing and no turn splits.
+  'AgentPaused',
+  'AgentResumed',
   // A legacy arrangement of Home's old board, read only, draws nothing (ADR 0496).
   'HomeBoardArranged',
   // An Apply Now's bracket only marks the row as applying (ADR 0437). What the
@@ -750,9 +748,10 @@ const NON_EXCHANGE_METADATA_EVENTS: ReadonlySet<string> = new Set([
   // A failed model call is telemetry for the gateway export. No step draws it
   // (docs/adr/0510-claude-gateway-managed-settings-and-telemetry.md).
   'ModelCallFailed',
-  // A rung pick between turns names the NEXT turn's pair. `threadModelSelections`
-  // reads it from the thread's events, never from a turn's steps.
+  // Next-turn picks and applied settings belong to the rung control.
+  // `threadModelSelections` reads them from events, never from a turn's steps.
   'ChatSettingsChanged',
+  'ChatTurnSettingsResolved',
   // The per-thread keep-alive switch (ADR 0554). The cache-warm line and the
   // waiting panel say it, never a turn.
   'CacheKeepAliveTurnedOff',
@@ -2622,7 +2621,7 @@ function foldEvent(
       //
       // A `ChildThreadStopped`, `ChildThreadDetached` or `ChildReportFiled` is
       // handled the same way: it wakes nothing, so a turn the parent is running
-      // keeps writing where it was. So are a people-only message and a pause.
+      // keeps writing where it was. So is a user-only message.
       // An unsent message never reached the engine, so no agent reads it and it
       // takes no turn either.
       if (isTurnlessBoundary(event) || event._unsent) {
@@ -2971,7 +2970,7 @@ export function handleEvent(
   // applyEventRows), so per-row calls here legitimately have no aggregate.
   if (aggregate) {
     const prevStatus = thread.meta.status;
-    if (applyAggregateToMeta(thread.meta, aggregate)) metaChanged = true;
+    if (applyAggregateToThread(thread, aggregate)) metaChanged = true;
     if (thread.meta.status === 'running' && prevStatus !== 'running' && created) {
       thread.meta.lastRevivedAt = created;
       metaChanged = true;
@@ -3047,8 +3046,8 @@ export function handleEvent(
     }
     // A real MessageReceived from the backend removes the matching optimistic
     // pending message by event_id. A send the engine kept between people
-    // lands as a `PeopleMessagePosted` under the same id.
-    if ((event.type === 'MessageReceived' || event.type === 'PromptInjected' || event.type === 'PeopleMessagePosted') && thread.pendingUserMessages.length > 0) {
+    // lands as a `UserOnlyMessagePosted` under the same id.
+    if ((event.type === 'MessageReceived' || event.type === 'PromptInjected' || event.type === 'UserOnlyMessagePosted') && thread.pendingUserMessages.length > 0) {
       if (eventId) {
         const idx = thread.pendingUserMessages.findIndex(p => p.eventId === eventId);
         if (idx !== -1) {

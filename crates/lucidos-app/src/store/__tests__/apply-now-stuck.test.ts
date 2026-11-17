@@ -10,7 +10,7 @@ vi.mock('../../api/client', async (importOriginal) => {
 });
 
 
-import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
+import { endClaudeCodeAndApply } from '../actions/codingAgentChanges';
 import { applyNow, ApiError } from '../../api/client';
 import { _holdArchiveForTesting, _resetRowIntentsForTesting } from '../rowIntents';
 

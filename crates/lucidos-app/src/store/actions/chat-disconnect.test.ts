@@ -280,7 +280,7 @@ describe('a send that gets no answer', () => {
 });
 
 describe('Retry on an unsent message', () => {
-  it('re-posts the first request, event id included, at a fresh input sequence', async () => {
+  it('re-posts the exact first request after an uncertain outcome', async () => {
     const { eventId } = await sendUnanswered('try me again');
     mockedSubmitChat.mockResolvedValueOnce({ event_id: eventId });
 
@@ -289,9 +289,8 @@ describe('Retry on an unsent message', () => {
     expect(mockedSubmitChat).toHaveBeenCalledTimes(ATTEMPTS + 1);
     const first = mockedSubmitChat.mock.calls[0][0];
     const retried = mockedSubmitChat.mock.calls[ATTEMPTS][0];
-    // A Retry lands at the tail of this page's inputs (ADR 0449); nothing else moves.
-    expect(retried).toEqual({ ...first, input_seq: retried.input_seq });
-    expect(retried.input_seq).toBeGreaterThan(first.input_seq!);
+    // The original input may already have a receipt; its position is immutable.
+    expect(retried).toEqual(first);
     expect(retried.event_id).toBe(eventId);
   });
 

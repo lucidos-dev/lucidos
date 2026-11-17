@@ -11,10 +11,16 @@ vi.mock('./platform', () => ({ isWebKit: () => webKit, isIOSPwa: () => false }))
 // can assert what the probe would emit without a real fetch.
 const postClientLog = vi.fn();
 vi.mock('./liveness', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
+let admissionPhase = 'admitted';
+vi.mock('./restoreAdmission', () => ({ restoreAdmissionPhase: () => admissionPhase }));
+vi.mock('../api/client/requestsInFlight', () => ({
+  requestsInFlight: () => ({ count: 2, oldestMs: 9000, oldestPaths: ['/api/v1/threads/t1'] }),
+}));
 
 import {
   classifyThreadRender,
   shouldReportThreadRender,
+  reportAbsentThreadRender,
   reportThreadRenderProbe,
   type ThreadRenderProbe,
 } from './threadRenderProbe';
@@ -130,5 +136,30 @@ describe('reportThreadRenderProbe', () => {
     reportThreadRenderProbe(probe());
     expect(postClientLog).toHaveBeenCalledTimes(1);
     expect(postClientLog.mock.calls[0][2]).toMatchObject({ class: 'content-present' });
+  });
+});
+
+describe('reportAbsentThreadRender', () => {
+  beforeEach(() => { postClientLog.mockClear(); webKit = true; admissionPhase = 'generation'; });
+
+  // A cold open whose thread never reached the store still leaves a trace.
+  // It names what held Loading: admission or a request.
+  it('names the admission phase and the in-flight request count and age', () => {
+    reportAbsentThreadRender('t1');
+    expect(postClientLog).toHaveBeenCalledExactlyOnceWith('render', 'thread_render_probe', {
+      class: 'target-absent', thread_id: 't1', admission_phase: 'generation',
+      requests_in_flight: 2, oldest_request_ms: 9000,
+    });
+  });
+
+  it('never carries request paths', () => {
+    reportAbsentThreadRender('t1');
+    expect(JSON.stringify(postClientLog.mock.calls[0])).not.toContain('/api/');
+  });
+
+  it('does not emit off WebKit', () => {
+    webKit = false;
+    reportAbsentThreadRender('t1');
+    expect(postClientLog).not.toHaveBeenCalled();
   });
 });

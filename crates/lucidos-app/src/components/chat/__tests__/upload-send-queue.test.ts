@@ -109,17 +109,17 @@ describe('settleQueuedUploadSends', () => {
 
   it('retains a ready queued send until generation admission and reacts when admission opens', () => {
     const dispatch = vi.fn();
-    installRestoreAdmission({ ready: () => false, wait: () => new Promise(() => {}) });
+    installRestoreAdmission({ ready: () => false, phase: () => 'awaiting-hello', wait: () => new Promise(() => {}) });
     queueUploadSend(T, { useCodingAgent: false, context: null });
     const dispose = effect(() => settleQueuedUploadSends(dispatch));
     try {
       expect(dispatch).not.toHaveBeenCalled();
       expect(queuedUploadSends.value.has(T)).toBe(true);
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
       expect(dispatch).toHaveBeenCalledTimes(1);
     } finally {
       dispose();
-      installRestoreAdmission({ ready: () => true, wait: async () => {} });
+      installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     }
   });
 

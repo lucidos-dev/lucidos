@@ -51,6 +51,7 @@ async fn test_session_started_updates_source_in_projection() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: String::new(),
@@ -319,6 +320,7 @@ async fn test_session_started_does_not_update_last_activity() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: String::new(),
@@ -476,6 +478,7 @@ async fn test_session_ended_stale_resume_keeps_status_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "stale-sid".into(),
             branch: "claude-code/stale".into(),
@@ -578,6 +581,7 @@ async fn test_permission_request_transitions_status_to_waiting_for_user_answer()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sess-1".into(),
             branch: "claude-code/branch".into(),
@@ -704,6 +708,7 @@ async fn test_session_started_stores_repo_id() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
@@ -741,6 +746,7 @@ async fn test_session_started_stores_repo_id() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s2".into(),
             branch: "claude-code/followup".into(),
@@ -873,6 +879,7 @@ async fn the_newest_session_started_names_the_coding_agent_backend() {
 
     let thread_id = Uuid::new_v4();
     let session_started = |agent: crate::runtime::CodingAgent| ThreadEvent::SessionStarted {
+        sandbox: None,
         coding_agent: agent,
         session_id: "s".into(),
         branch: String::new(),
@@ -1079,6 +1086,7 @@ async fn coding_agent_continuation_started_keeps_is_coding_agent_true() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s".into(),
             branch: "claude-code/test".into(),
@@ -1134,6 +1142,7 @@ async fn chat_channel_continuation_started_never_clears_is_coding_agent() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s".into(),
             branch: "claude-code/test".into(),

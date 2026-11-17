@@ -109,6 +109,10 @@ export interface LandingLane {
    *  The lane holds what it could not push and retries (ADR 0589). Absent
    *  while GitHub takes landings. */
   waiting_for_origin?: string;
+  /** The batch that holds clean arrivals off `main` while it hardens again
+   *  after a catch-up, and the change ids it holds, in arrival order. Each
+   *  also appears in `waiting`. Absent with no hold (ADR 0694). */
+  arrival_hold?: { batch_id: string; arrivals: string[] };
 }
 
 /** Where the *main check* stands. Mirrors the engine's `MainCheckState`. */
@@ -117,8 +121,21 @@ export type MainCheckState = 'idle' | 'running' | 'passed' | 'red' | 'unavailabl
 /** The *main check*: the GitHub run on a stripped copy of `main` after
  *  changes landed. Mirrors the engine's `MainCheckSnapshot`; a field a state
  *  has nothing for is absent. */
+/** The *main-check setting*. Mirrors the engine's `MainCheckSetting`. */
+export type MainCheckSetting = 'here' | 'another-host' | 'off';
+
 export interface MainCheck {
   state: MainCheckState;
+  /** The setting the engine runs under, absent before it restored the check. */
+  setting?: MainCheckSetting;
+  repair?: {
+    state: 'waiting' | 'running' | 'none';
+    fix_thread_id?: string;
+    started_by?: 'auto' | 'fix-now';
+    waiting_on: string[];
+  };
+  failures?: Array<{ suite: string; name: string; detail: string }>;
+  flaky?: Array<{ suite: string; name: string; detail: string }>;
   check_id?: string;
   from_sha?: string;
   to_sha?: string;
@@ -359,7 +376,7 @@ export interface EngineVersionStatus {
   /** Dev only: the engine SOURCE is behind HEAD by a restart-requiring change —
    *  a NEW engine version exists in source even if no fresh binary is on disk yet
    *  (rebuild failed / not run). Distinct from `update_available` (a fresh binary
-   *  IS on disk). Lets the UI surface a pending version + offer "Rebuild & Switch"
+   *  IS on disk). Lets the UI surface a pending version and offer "Build new version"
    *  so the Switch is never a dead-end. Absent/false when packaged or git is
    *  unavailable. */
   source_behind_head?: boolean;
@@ -501,13 +518,11 @@ export async function engineChangelog(): Promise<ChangelogRelease[]> {
   return body.releases;
 }
 
-/** Manually kick off the dev background engine rebuild (escape hatch for a wedged
- *  workspace whose source is behind HEAD with a stale binary — e.g. after a failed
- *  background rebuild). No-op packaged. The resulting version-status `build_state`
- *  transitions drive the UI (building → ready → Switch). See engine
- *  `POST /api/v1/engine/rebuild`. */
-export async function rebuildEngine(): Promise<void> {
-  const res = await mutatingFetch(`${API}/engine/rebuild`, { method: 'POST' });
+/** Build source without switching. Join preserves a build already running;
+ *  restart retains the escape hatch for a hung build. No-op packaged. */
+export async function rebuildEngine(mode: 'join' | 'restart' = 'restart'): Promise<void> {
+  const query = mode === 'join' ? '?mode=join' : '';
+  const res = await mutatingFetch(`${API}/engine/rebuild${query}`, { method: 'POST' });
   await throwIfNotOk(res);
 }
 

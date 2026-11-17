@@ -5,6 +5,7 @@ pub(super) use crate::test_support::{setup_test_db, teardown_test_db};
 
 pub(super) fn aggregate_proposed(change_id: Uuid, branch: &str, repo_root: &str) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: change_id.to_string(),
         description: Some("aggregate description".to_string()),
         files: vec!["a.rs".to_string(), "b.rs".to_string()],
@@ -28,6 +29,7 @@ pub(super) fn per_commit_proposed(
     requires_restart: bool,
 ) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: String::new(),
         description: Some(subject.to_string()),
         files: vec!["c.rs".to_string()],
@@ -50,6 +52,7 @@ pub(super) fn applied_event(
     requires_restart: bool,
 ) -> ThreadEvent {
     ThreadEvent::ChangeApplied {
+        content: Default::default(),
         change_id: change_id.to_string(),
         requires_restart,
         client_update: false,
@@ -75,6 +78,7 @@ pub(super) async fn start_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("cc-{thread_id}"),
             branch: String::new(),
@@ -129,6 +133,7 @@ pub(super) fn proposed_with_files(
     files: Vec<&str>,
 ) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: change_id.to_string(),
         description: Some("d".into()),
         files: files.iter().map(|s| s.to_string()).collect(),

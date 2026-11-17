@@ -26,18 +26,20 @@ async fn isolated_snapshot_cli_roundtrip() -> Result<(), BoxError> {
 async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
     let home = tempfile::tempdir()?;
     let root = home.path().join(".lucidos");
-    let app_data = root.join(if relocated {
-        "relocated-gateway"
+    let app_data = if relocated {
+        root.join("relocated-gateway")
     } else {
-        lucidos_home::GATEWAY_DIR_NAME
-    });
-    lucidos_home::ensure_storage_root(&root)?;
+        lucidos_home::default_gateway_data_dir_in(&root)
+    };
+    // A fresh home, so every private entry resolves into the subtree.
+    let private = lucidos_home::private::path_in(&root);
+    lucidos_home::ensure_storage_root(&private)?;
     let stem = format!("snapshot-e2e-{}", lucidos_local_token::mint_hex(12)?);
     std::fs::write(root.join("snapshot-fixture"), &stem)?;
     let backend = postgres::PgBackend::from_env()?;
     let mut container = if matches!(backend, postgres::PgBackend::Docker) {
         let password = lucidos_local_token::mint_hex(24)?;
-        let destination = root.join(lucidos_local_token::SHARED_PG_PASSWORD_FILE);
+        let destination = private.join(lucidos_local_token::SHARED_PG_PASSWORD_FILE);
         std::fs::write(&destination, &password)?;
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))?;
         Some(FixturePostgres::start(&stem, &password).await?)
@@ -61,6 +63,7 @@ async fn run_fixture(relocated: bool) -> Result<(), BoxError> {
     }
     for name in [
         "LUCIDOS_GATEWAY_DATA",
+        lucidos_home::private::DIR_ENV,
         "LUCIDOS_WORKSPACE",
         "LUCIDOS_THREAD_ID",
         "LUCIDOS_AGENT_ORIGIN_TOKEN",
@@ -199,7 +202,7 @@ impl FixturePostgres {
 impl Drop for FixturePostgres {
     fn drop(&mut self) {
         if self.finish().is_err() {
-            crate::log!("[SnapshotE2E] private Postgres cleanup failed");
+            crate::log_legacy!("[SnapshotE2E] private Postgres cleanup failed");
         }
     }
 }
@@ -215,7 +218,9 @@ async fn child() -> Result<(), BoxError> {
         return Err("not a disposable snapshot fixture".into());
     }
     let token = lucidos_local_token::ensure()?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    // The production acceptor, so each request carries the peer address the
+    // agent restore-caller admission reads.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
     let mut state =
         GatewayState::for_tests_with(Some(home), &token, false).with_live_engine_sockets();
@@ -233,11 +238,16 @@ async fn child() -> Result<(), BoxError> {
     let mut reservations = Vec::new();
     for suffix in ["source", "target"] {
         let reservation = std::net::TcpListener::bind("127.0.0.1:0")?;
-        let ws = Workspace::gateway_provisioned(
+        let mut ws = Workspace::gateway_provisioned(
             format!("{stem}-{suffix}"),
             format!("Snapshot {suffix}"),
             reservation.local_addr()?.port(),
         );
+        ws.cleanup.origin = if suffix == "source" {
+            crate::registry::WorkspaceOrigin::E2e
+        } else {
+            crate::registry::WorkspaceOrigin::Unknown
+        };
         state.inner.registry.lock().unwrap().add(ws.clone())?;
         workspaces.push(ws);
         reservations.push(reservation);
@@ -250,7 +260,12 @@ async fn child() -> Result<(), BoxError> {
         .save(&state.inner.registry_path)?;
     drop(reservations);
     let serving = state.clone();
-    let server = tokio::spawn(async move { axum::serve(listener, gateway_router(serving)).await });
+    let server = tokio::spawn(serve_listener(
+        listener,
+        gateway_router(serving),
+        axum_server::Handle::new(),
+        crate::tls::ListenerTls::Plain,
+    ));
     let result = exercise_roundtrip(&state, port, &token, &workspaces).await;
     for ws in &workspaces {
         state
@@ -294,12 +309,34 @@ async fn exercise_roundtrip(
     }
     let target = &workspaces[1];
     let source = &workspaces[0];
-    let source_api = format!("http://127.0.0.1:{}/api/v1", source.port);
-    let target_api = format!("http://127.0.0.1:{}/api/v1", target.port);
+    // The engines trust a device only under the gateway's stamp, so the owner
+    // reaches them through the gateway as a paired device.
+    let source_api = format!("http://127.0.0.1:{port}/{}/api/v1", source.id);
+    let target_api = format!("http://127.0.0.1:{port}/{}/api/v1", target.id);
     let device = "snapshot-roundtrip-owner";
+    let credential = "snapshot-roundtrip-credential";
+    state.seed_device_for_test(crate::auth::PairedDevice {
+        id: device.into(),
+        label: "Snapshot owner".into(),
+        credential_digest: crate::auth::digest(credential),
+        paired_at: "2020-01-01T00:00:00Z".into(),
+        last_seen_at: None,
+    })?;
+    let owner = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .default_headers({
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(
+                axum::http::header::COOKIE,
+                format!("{}={credential}", state.device_cookie_name()).parse()?,
+            );
+            headers
+        })
+        .build()?;
     for api in [&source_api, &target_api] {
         require_success(
-            client
+            owner
                 .post(format!("{api}/devices/register"))
                 .header("content-type", "application/json")
                 .body(json!({"device_id":device,"user_agent":"snapshot-e2e/1"}).to_string())
@@ -308,15 +345,6 @@ async fn exercise_roundtrip(
             "register device",
         )?;
     }
-    let owner = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(5))
-        .default_headers({
-            let mut headers = axum::http::HeaderMap::new();
-            headers.insert("x-lucidos-device-id", device.parse()?);
-            headers
-        })
-        .build()?;
     let fake = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../lucidos-app/e2e/fake-claude-code/claude.mjs")
         .canonicalize()?;
@@ -376,10 +404,13 @@ async fn exercise_roundtrip(
         .resolve_dir(state.app_data())
         .join("data/artifacts/after-snapshot.txt");
     let refused = agent_restore(&owner, &source_api, repo_id, &target.id, handle, port, 2).await?;
-    assert_eq!(refused["code"], 2, "an unapproved agent cannot restore");
+    assert_eq!(
+        refused["code"], 2,
+        "an agent cannot restore an unclassified workspace"
+    );
     assert_eq!(
         refused["status"]["error"],
-        "snapshot_restore_approval_required"
+        "snapshot_restore_target_protected"
     );
     assert!(file.exists());
     assert_eq!(
@@ -390,6 +421,10 @@ async fn exercise_roundtrip(
             .status(),
         reqwest::StatusCode::OK
     );
+    state
+        .classify_workspace(&target.id, crate::registry::WorkspaceOrigin::E2e)
+        .await
+        .map_err(|_| "fixture classification failed")?;
     require_success(
         owner
             .put(format!(
@@ -397,10 +432,10 @@ async fn exercise_roundtrip(
                 crate::preference_test_keys::key("SNAPSHOT_RESTORE_BY_AGENTS")
             ))
             .header("content-type", "application/json")
-            .body(json!({"value":"allow"}).to_string())
+            .body(json!({"value":"ask"}).to_string())
             .send()
             .await?,
-        "allow fixture agent restore",
+        "set current restore policy after capture",
     )?;
     let restored = agent_restore(&owner, &source_api, repo_id, &target.id, handle, port, 3).await?;
     assert_eq!(restored["code"], 0, "restore CLI completion");
@@ -445,7 +480,7 @@ async fn exercise_roundtrip(
         .map(Value::as_str);
     assert_eq!(
         policy,
-        Some(Some("allow")),
+        Some(Some("ask")),
         "restore carries the current agent policy forward (ADR 0612)"
     );
     let undone = agent_restore(
@@ -516,8 +551,8 @@ async fn exercise_roundtrip(
         .await?;
         assert_eq!(captured["state"]["phase"], "completed");
         let config = json!({
-            "port":port, "engine_port":target.port, "workspace":target.id, "name":target.name,
-            "device":device, "token":token, "label":label,
+            "port":port, "workspace":target.id, "label":label,
+            "cookie":state.device_cookie_name(), "credential":credential,
             "handle":captured["handle"], "generation":undone["status"]["restore_id"],
         });
         let mut browser = tokio::process::Command::new("node");
@@ -606,7 +641,12 @@ async fn cli(args: &[&str]) -> Result<Value, BoxError> {
     .output()
     .await?;
     if !output.status.success() {
-        return Err("snapshot fixture CLI failed".into());
+        return Err(format!(
+            "snapshot fixture CLI failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
     }
     Ok(serde_json::from_slice(&output.stdout)?)
 }

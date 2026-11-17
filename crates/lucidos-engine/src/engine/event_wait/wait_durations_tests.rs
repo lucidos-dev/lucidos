@@ -325,11 +325,14 @@ fn asked(tool_use_id: &str) -> ThreadEvent {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     }
 }
 
 fn answered(tool_use_id: &str) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: tool_use_id.to_string(),
         quiet: false,
         answer: AnswerKind::Selected {
@@ -365,6 +368,7 @@ fn request(purpose: ContextPurpose) -> ThreadEvent {
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
@@ -526,6 +530,7 @@ async fn a_card_keeps_the_local_hour_of_its_ask() {
 
 fn canceled(tool_use_id: &str) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: tool_use_id.to_string(),
         quiet: false,
         answer: AnswerKind::Canceled,

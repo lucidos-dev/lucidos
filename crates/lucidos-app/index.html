@@ -163,7 +163,11 @@
           // WITH its params, instead of a bare /<slug>/.
           // `@` stays literal, as `workspaceRouteUrlSegment` keeps it: the
           // gateway reads a remote route `<slug>@<name>` off the raw path.
-          if (slug) location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
+          if (slug) {
+            Promise.resolve(window.lucidosRemoteClientReady).then(function () {
+              location.replace('/' + encodeURIComponent(slug).replace('%40', '@') + '/' + location.search + location.hash);
+            }).catch(function () { /* boot reports retirement failure */ });
+          }
         } catch (e) { /* fall through to the normal picker render */ }
       })();
     </script>
@@ -412,7 +416,7 @@
            fallback and then reflow when the web font swaps, which is visible
            jank on the boot splash. An all-system monospace stack paints
            instantly with no swap. Size in px for the no-rem reason above. */
-        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+        font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
         font-size: 15px;
         line-height: 1.4;
         letter-spacing: 0.01em;

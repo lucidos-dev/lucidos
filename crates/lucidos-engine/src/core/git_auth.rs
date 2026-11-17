@@ -184,7 +184,7 @@ impl GitCredentials {
             let found = match CredentialStore::find_by_url(pool, url).await {
                 Ok(found) => found,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[GitAuth] credential lookup failed for {}: {}",
                         redacted(url),
                         e
@@ -198,7 +198,7 @@ impl GitCredentials {
             // holds a perfectly good secret. Saying it holds none sends the
             // user to re-enter a key that was never the problem.
             if credential.base_urls.is_empty() {
-                log!(
+                log_legacy!(
                     "[GitAuth] credential {} declares no base URL, so it is offered nowhere",
                     service_name
                 );
@@ -211,7 +211,7 @@ impl GitCredentials {
             };
             let found_entries = StoredGitCredential::entries_from_credential(credential, &value);
             if found_entries.is_empty() {
-                log!(
+                log_legacy!(
                     "[GitAuth] credential {} holds nothing a git clone can present",
                     service_name
                 );
@@ -433,9 +433,9 @@ fn authenticated_callbacks(credentials: GitCredentials) -> RemoteCallbacks<'stat
     callbacks.credentials(move |url, username_from_url, allowed| {
         let (plan, stored) = plan_for(url, allowed, &credentials);
         first_working(&plan, &mut tried, |source| {
-            log!("[GitAuth] trying {:?} for {}", source, redacted(url));
+            log_legacy!("[GitAuth] trying {:?} for {}", source, redacted(url));
             build_credential(source, url, username_from_url, stored)
-                .inspect_err(|e| log!("[GitAuth] {:?} is unavailable: {}", source, e))
+                .inspect_err(|e| log_legacy!("[GitAuth] {:?} is unavailable: {}", source, e))
         })
     });
     callbacks
@@ -571,7 +571,7 @@ fn bound_idle_sockets() {
         // until the write is done, so no read races it.
         let set = unsafe { git2::opts::set_server_timeout_in_milliseconds(SERVER_IDLE_TIMEOUT_MS) };
         if let Err(e) = set {
-            log!("[GitAuth] could not bound idle clone sockets: {}", e);
+            log_legacy!("[GitAuth] could not bound idle clone sockets: {}", e);
         }
     });
 }

@@ -36,7 +36,8 @@ fn failure(error: snapshot::BoxError) -> ApiError {
         }
         "snapshot_restore_caller_unverified"
         | "snapshot_restore_own_workspace_refused"
-        | "snapshot_restore_approval_required" => ApiError::new(StatusCode::FORBIDDEN, slug),
+        | "snapshot_restore_target_protected"
+        | "snapshot_restore_permission_required" => ApiError::new(StatusCode::FORBIDDEN, slug),
         "snapshot_restore_binding_mismatch"
         | "snapshot_restore_preflight_failed"
         | "snapshot_restore_admission_failed" => ApiError::new(StatusCode::CONFLICT, slug),
@@ -136,7 +137,7 @@ async fn create(
                 .await
                 .is_err()
             {
-                crate::log!("[Snapshot] snapshot_job_failed");
+                crate::log_legacy!("[Snapshot] snapshot_job_failed");
             }
         });
         Ok::<_, ApiError>(job)
@@ -189,7 +190,7 @@ async fn check(
                 .await
                 .is_err()
             {
-                crate::log!("[Snapshot] snapshot_job_failed");
+                crate::log_legacy!("[Snapshot] snapshot_job_failed");
             }
         });
         Ok::<_, ApiError>(job)
@@ -286,16 +287,20 @@ fn verified_restore_thread(headers: &HeaderMap) -> Result<uuid::Uuid, ApiError> 
     }
 }
 
-/// Only the issuing engine can verify its process-local origin MAC, which is
-/// the real gate here: the local token also rides on proxied device requests.
+/// Only the issuing engine can verify its process-local origin MAC, so the
+/// origin token alone is the gate. A sandboxed agent cannot read the local
+/// token, and the gateway adds it to every proxied request anyway.
+fn restore_caller_proof(
+    headers: &HeaderMap,
+    workspace: impl FnOnce() -> Result<String, ApiError>,
+) -> Result<(uuid::Uuid, String), ApiError> {
+    let thread = verified_restore_thread(headers)?;
+    Ok((thread, workspace()?))
+}
+
 /// The target engine must use the gateway's answer, never a body origin hint.
 async fn restore_caller(headers: HeaderMap) -> Result<Json<serde_json::Value>, ApiError> {
-    let refuse = || ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_caller_unverified");
-    if !super::local_auth::is_local_process(&headers) {
-        return Err(refuse());
-    }
-    let thread = verified_restore_thread(&headers)?;
-    let workspace = restore_workspace_identity()?;
+    let (thread, workspace) = restore_caller_proof(&headers, restore_workspace_identity)?;
     Ok(Json(
         serde_json::json!({"workspace_id":workspace,"source_thread_id":thread}),
     ))
@@ -318,40 +323,91 @@ pub(super) fn restore_workspace_identity() -> Result<String, ApiError> {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RestoreApprovalTarget {
+struct RestoreTarget {
     target_workspace_id: String,
     snapshot_handle: Handle,
 }
 
+/// The event's reason for a restore: the CLI's `--reason` goes to the target.
+const RESTORE_REASON: &str = "The agent asked to restore a snapshot of its machine-made workspace.";
+
 /// This POST is source-side authorization, not a restore of this engine.
-/// The thread-bound origin token is the gate: the local token rides on every
-/// proxied request, so it proves nothing about the caller. The card is spent
-/// only for the exact workspace and handle.
-async fn spend_restore_approval(
+async fn spend_restore_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(target): Json<RestoreApprovalTarget>,
+    Json(target): Json<RestoreTarget>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let refuse = || ApiError::new(StatusCode::FORBIDDEN, "snapshot_restore_approval_required");
-    if !super::local_auth::is_local_process(&headers) {
-        return Err(refuse());
-    }
-    let thread = verified_restore_thread(&headers)?;
-    let workspace = restore_workspace_identity()?;
-    if !super::owner_approval::spend_restore_approval(
-        &state.engine.event_bus,
-        thread,
-        &workspace,
-        &target.target_workspace_id,
-        &target.snapshot_handle,
-    )
-    .await
-    {
-        return Err(refuse());
-    }
+    let (thread, workspace) = restore_caller_proof(&headers, restore_workspace_identity)?;
+    let port = super::base_path::gateway_port().ok_or_else(permission_required)?;
+    authorize_restore(&state.engine.event_bus, &port, thread, &workspace, &target).await?;
     Ok(Json(
         serde_json::json!({"workspace_id":workspace,"source_thread_id":thread}),
     ))
+}
+
+fn permission_required() -> ApiError {
+    ApiError::new(
+        StatusCode::FORBIDDEN,
+        "snapshot_restore_permission_required",
+    )
+}
+
+/// The agent's workspace restores with no card, recorded on the caller's
+/// thread. Any other target spends the caller's once-only permission for this
+/// exact handle. An unreadable listing refuses: it never falls through to no
+/// card.
+async fn authorize_restore(
+    bus: &crate::engine::event_bus::EventBus,
+    gateway_port: &str,
+    caller: uuid::Uuid,
+    source: &str,
+    target: &RestoreTarget,
+) -> Result<(), ApiError> {
+    use super::workspace_broker::{record_agents_act, whose, Whose};
+    use crate::engine::permission::Action;
+    let id = target.target_workspace_id.as_str();
+    if source == id || !lucidos_gateway_constants::is_valid_workspace_id(id) {
+        return Err(permission_required());
+    }
+    let listing = super::workspace_list::list_from_gateway(
+        gateway_port,
+        super::workspace_list::GATEWAY_DEADLINE,
+    )
+    .await
+    .map_err(|e| {
+        crate::log_legacy!(
+            "[Snapshots] Restore of `{id}` refused: no gateway listing: {}",
+            e.message
+        );
+        permission_required()
+    })?;
+    let listed = listing
+        .into_iter()
+        .find(|w| w.id == id)
+        .ok_or_else(permission_required)?;
+    let handle = &target.snapshot_handle;
+    match whose(Action::RestoreSnapshot, listed.machine_made) {
+        Whose::Agents => {
+            record_agents_act(
+                bus,
+                caller,
+                Action::RestoreSnapshot,
+                id,
+                RESTORE_REASON,
+                Some(handle.as_str()),
+            )
+            .await
+        }
+        Whose::Users => {
+            use super::permission_requests::{snapshot_breadth, spend_live, thread_user};
+            let breadth = snapshot_breadth(id, handle.as_str());
+            if spend_live(bus, &thread_user(caller), Action::RestoreSnapshot, &breadth).await {
+                Ok(())
+            } else {
+                Err(permission_required())
+            }
+        }
+    }
 }
 
 pub fn router() -> Router<AppState> {
@@ -361,7 +417,7 @@ pub fn router() -> Router<AppState> {
         .route("/snapshots/restores/:id", get(restore::status))
         .route(
             "/snapshots/restore-caller",
-            get(restore_caller).post(spend_restore_approval),
+            get(restore_caller).post(spend_restore_permission),
         )
         .route(
             "/snapshots/:handle",
@@ -419,6 +475,37 @@ mod tests {
     }
 
     #[test]
+    fn restore_caller_proof_needs_only_an_origin_token_from_this_engine() {
+        use crate::api::actor::{init_agent_origin_secret, mint_agent_origin_token};
+        init_agent_origin_secret("snapshot-caller-test-secret".into());
+        let workspace = || Ok("ws-source".to_owned());
+        let refused = |headers: &HeaderMap| {
+            let err = restore_caller_proof(headers, workspace).unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert_eq!(err.message, "snapshot_restore_caller_unverified");
+        };
+        let mut headers = HeaderMap::new();
+        refused(&headers);
+        headers.insert(
+            super::super::actor::HEADER_AGENT_ORIGIN_TOKEN,
+            "forged".parse().unwrap(),
+        );
+        refused(&headers);
+        let thread = uuid::Uuid::new_v4();
+        headers.insert(
+            super::super::actor::HEADER_AGENT_ORIGIN_TOKEN,
+            mint_agent_origin_token(Some(thread), 0, None)
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            restore_caller_proof(&headers, workspace).unwrap(),
+            (thread, "ws-source".to_owned())
+        );
+    }
+
+    #[test]
     fn public_errors_discard_primitive_details_and_distinguish_busy() {
         let err = failure("postgres://private:credential@host/database /private/keys".into());
         assert_eq!(err.message, "snapshot_operation_failed");
@@ -443,5 +530,121 @@ mod tests {
         let request: Create = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(!request.keep);
         assert!(request.label.is_none());
+    }
+
+    mod restore_authority {
+        use super::*;
+        use crate::api::gateway_control::test_support::stand_in_gateway;
+        use crate::engine::event_bus::EventBus;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        const LISTING: &str = r#"{"workspaces":[
+            {"id":"demo","name":"Demo","path":"/home/user/workspaces/demo","port":5200,
+             "health":"healthy","autostart":false,"origin":"demo","machine_made":true},
+            {"id":"home","name":"Home","path":"/home/user/workspaces/home","port":5201,
+             "health":"healthy","autostart":true,"origin":"user","machine_made":false}]}"#;
+
+        fn to(workspace: &str) -> RestoreTarget {
+            RestoreTarget {
+                target_workspace_id: workspace.into(),
+                snapshot_handle: Handle::generate(),
+            }
+        }
+
+        async fn agents_acts(pool: &sqlx::PgPool) -> Vec<serde_json::Value> {
+            sqlx::query_scalar(
+                "SELECT payload FROM events \
+                 WHERE event_type = 'MachineMadeWorkspaceChanged' ORDER BY sequence",
+            )
+            .fetch_all(pool)
+            .await
+            .unwrap()
+        }
+
+        /// Invariants 1 and 2: the agent's workspace records one act and needs
+        /// no card. A user's workspace, a missing row and the source itself
+        /// spend a card, and with none they refuse.
+        #[tokio::test]
+        async fn only_the_agents_workspace_restores_with_no_card() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let port = stand_in_gateway(LISTING, StatusCode::OK).await.to_string();
+            let caller = uuid::Uuid::new_v4();
+
+            for refused in ["home", "absent", "rig", "../demo"] {
+                let err = authorize_restore(&bus, &port, caller, "rig", &to(refused))
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.status, StatusCode::FORBIDDEN, "{refused}");
+                assert_eq!(err.message, "snapshot_restore_permission_required");
+            }
+            assert!(agents_acts(&pool).await.is_empty());
+
+            let demo = to("demo");
+            authorize_restore(&bus, &port, caller, "rig", &demo)
+                .await
+                .unwrap();
+            let recorded = agents_acts(&pool).await;
+            assert_eq!(recorded.len(), 1);
+            assert_eq!(recorded[0]["verb"], "restore-snapshot");
+            assert_eq!(recorded[0]["workspace_id"], "demo");
+            assert_eq!(
+                recorded[0]["snapshot_handle"],
+                demo.snapshot_handle.as_str()
+            );
+            pool.close().await;
+            teardown_test_db(&db).await;
+        }
+
+        /// A user's workspace restores on Allow once for that exact snapshot,
+        /// once. Another snapshot, or another thread, holds nothing.
+        #[tokio::test]
+        async fn allow_once_restores_one_snapshot_of_a_users_workspace_once() {
+            use crate::api::permission_requests::snapshot_ask;
+            use crate::api::permission_requests::tests::{agent_thread, grant};
+            use crate::engine::permission::menu::ALLOW_ONCE_LABEL;
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let port = stand_in_gateway(LISTING, StatusCode::OK).await.to_string();
+            let caller = agent_thread(&bus).await;
+            let home = to("home");
+            let ask =
+                snapshot_ask("rig", "home", home.snapshot_handle.as_str(), "recover").unwrap();
+            grant(&bus, caller, ask, ALLOW_ONCE_LABEL).await;
+
+            let other = agent_thread(&bus).await;
+            for (thread, target) in [(caller, &to("home")), (other, &home)] {
+                let err = authorize_restore(&bus, &port, thread, "rig", target)
+                    .await
+                    .unwrap_err();
+                assert_eq!(err.message, "snapshot_restore_permission_required");
+            }
+            authorize_restore(&bus, &port, caller, "rig", &home)
+                .await
+                .unwrap();
+            assert!(authorize_restore(&bus, &port, caller, "rig", &home)
+                .await
+                .is_err());
+            assert!(agents_acts(&pool).await.is_empty());
+            pool.close().await;
+            teardown_test_db(&db).await;
+        }
+
+        /// Invariant 3: with no listing, even the agent's workspace refuses.
+        #[tokio::test]
+        async fn an_unreadable_listing_refuses_and_records_nothing() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let port = stand_in_gateway("nope", StatusCode::FORBIDDEN)
+                .await
+                .to_string();
+            let err = authorize_restore(&bus, &port, uuid::Uuid::new_v4(), "rig", &to("demo"))
+                .await
+                .unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+            assert!(agents_acts(&pool).await.is_empty());
+            pool.close().await;
+            teardown_test_db(&db).await;
+        }
     }
 }

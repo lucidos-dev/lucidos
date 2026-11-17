@@ -51,6 +51,7 @@ fn agent_idled(session_id: &str, reason: Option<&str>) -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 

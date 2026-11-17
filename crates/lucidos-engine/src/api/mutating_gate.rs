@@ -30,7 +30,7 @@ use super::AppState;
 ///
 /// GET and HEAD are reads, and OPTIONS is the CORS preflight, which carries no
 /// credential by design. Everything else changes something and owes a name.
-fn method_mutates(method: &Method) -> bool {
+pub(super) fn method_mutates(method: &Method) -> bool {
     !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
 }
 
@@ -78,6 +78,8 @@ pub(super) const EXEMPT_ROUTES: &[&str] = &[
     // The device bootstrap.
     "/devices/register",
     "/devices/hand-over",
+    // Diagnostic ingress authenticates a purpose/body-bound starter stamp itself.
+    "/diagnostic-bundles",
     // Third-party ingress.
     "/webhooks/:id/deliver",
     "/proxy/:name",
@@ -142,7 +144,7 @@ async fn refuse_unidentified(
     if let Err(refusal) =
         super::actor::require_user_actor(headers, pool, socket_claim.as_deref()).await
     {
-        crate::log!(
+        crate::log_legacy!(
             "[API] Refusing an unidentified {} {}: no credential to record who is acting",
             method,
             matched

@@ -7,8 +7,9 @@
 //!   loopback TCP with a minted password.
 //! * **Embedded** (packaged): one bundled cluster under `<app-data>/pgdata`.
 //!   It has no TCP listener. Its one socket sits in the owner-only cluster
-//!   socket directory `~/.lucidos/run/pg-<digest>`, and peer auth admits only
-//!   this OS user (ADR 0452).
+//!   socket directory `<run directory>/pg-<digest>` (ADR 0452). The
+//!   superuser signs in with a password kept beside the socket, which an
+//!   agent's sandbox cannot read (ADR 0645).
 //! * Each workspace gets its own database, `lucidos_<workspace-id>`, and the
 //!   engine still receives a normal single-tenant `DATABASE_URL`.
 //! * A legacy registry `database_url` is treated only as a migration source. If
@@ -250,6 +251,47 @@ pub struct Provisioned {
     pub handle: PgHandle,
 }
 
+impl Provisioned {
+    /// Only the bundled backend controls authentication throughout the engine's lifetime.
+    pub fn is_managed(&self) -> bool {
+        matches!(self.handle, PgHandle::Embedded { .. })
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+
+    #[test]
+    fn only_embedded_provisioning_grants_managed_provenance() {
+        for (handle, expected) in [
+            (PgHandle::External, false),
+            (
+                PgHandle::Docker {
+                    container: "fixture".into(),
+                    database: "fixture".into(),
+                },
+                false,
+            ),
+            (
+                PgHandle::Embedded {
+                    bin: "/bin".into(),
+                    lib: "/lib".into(),
+                    socket_dir: "/tmp/fixture".into(),
+                    database: "fixture".into(),
+                },
+                true,
+            ),
+        ] {
+            let provisioned = Provisioned {
+                database_url: "postgres:///fixture?host=/tmp/fixture".into(),
+                handle,
+            };
+            assert_eq!(provisioned.is_managed(), expected);
+        }
+    }
+}
+
 /// Ensure the shared cluster is running and this workspace's database exists.
 ///
 /// `legacy_url`, when present, is a migration source from the old
@@ -275,6 +317,20 @@ pub async fn ensure(
             ensure_embedded(bin, lib, app_data, &database, legacy_url).await
         }
     }
+}
+
+/// Secure a bundled cluster before adopting engines left by another gateway.
+/// This never starts, stops or replaces a cluster or an engine.
+pub fn secure_running_cluster(backend: &PgBackend, app_data: &Path) -> Result<(), ProvisionError> {
+    let PgBackend::Embedded { bin, lib } = backend else {
+        return Ok(());
+    };
+    let data = embedded_data_dir(app_data);
+    if !data.join("PG_VERSION").exists() || !pg_ctl_status(bin, lib, &data) {
+        return Ok(());
+    }
+    let socket_dir = embedded_socket_dir(&data)?;
+    converge_running_auth(bin, lib, &data, &socket_dir)
 }
 
 /// Drop a workspace database by id, without requiring a running stack handle.
@@ -360,13 +416,9 @@ pub fn cleanup_dump_named(
             command
         }
         PgBackend::Embedded { bin, lib } => {
-            let mut command = Command::new(bin.join("pg_dump"));
-            with_pg_libpath(&mut command, lib);
+            let socket_dir = embedded_socket_dir(&embedded_data_dir(app_data))?;
+            let mut command = embedded_client(bin, lib, "pg_dump", &socket_dir)?;
             command.env("PGOPTIONS", PG_BULK_OPTIONS);
-            command
-                .arg("-h")
-                .arg(embedded_socket_dir(&embedded_data_dir(app_data))?);
-            command.args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER]);
             command
         }
     };
@@ -589,13 +641,9 @@ pub fn cleanup_restore_named(
                     command
                 }
                 PgBackend::Embedded { bin, lib } => {
-                    let mut command = Command::new(bin.join("pg_restore"));
-                    with_pg_libpath(&mut command, lib);
+                    let socket_dir = embedded_socket_dir(&embedded_data_dir(app_data))?;
+                    let mut command = embedded_client(bin, lib, "pg_restore", &socket_dir)?;
                     command.env("PGOPTIONS", PG_BULK_OPTIONS);
-                    command
-                        .arg("-h")
-                        .arg(embedded_socket_dir(&embedded_data_dir(app_data))?);
-                    command.args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER]);
                     command
                 }
             };
@@ -933,7 +981,7 @@ async fn ensure_docker_cluster(container: &str, password: &str) -> Result<u16, P
     match docker_daemon_state() {
         DaemonState::Ready => {}
         DaemonState::Unreachable(detail) => {
-            crate::log!("[Gateway] Docker daemon not reachable yet: {}", detail);
+            crate::log_legacy!("[Gateway] Docker daemon not reachable yet: {}", detail);
             return Err(ProvisionError::transient(DOCKER_NOT_RUNNING));
         }
         DaemonState::CliMissing => return Err(ProvisionError::terminal(DOCKER_CLI_MISSING)),
@@ -967,7 +1015,9 @@ async fn ensure_docker_cluster(container: &str, password: &str) -> Result<u16, P
 /// The dev cluster's password: `~/.lucidos/` [`SHARED_PG_PASSWORD_FILE`],
 /// minted on first use. See that constant for why dev needs one.
 fn shared_pg_password() -> Result<String, BoxError> {
-    Ok(lucidos_local_token::ensure_named(SHARED_PG_PASSWORD_FILE)?)
+    Ok(crate::diagnostic_log::secret(
+        lucidos_local_token::ensure_named(SHARED_PG_PASSWORD_FILE)?,
+    ))
 }
 
 /// `docker run` for the shared cluster. It names `POSTGRES_PASSWORD` without a
@@ -1231,7 +1281,7 @@ async fn ensure_embedded(
         .map_err(|e| ProvisionError::transient(format!("cannot create {}: {e}", data.display())))?;
     let socket_dir = embedded_socket_dir(&data)?;
     ensure_embedded_cluster(bin, lib, &data, &socket_dir)?;
-    let url = embedded_database_url(&socket_dir, database);
+    let url = embedded_database_url(&socket_dir, database, &embedded_passfile(&socket_dir)?);
 
     if database_exists_embedded(bin, lib, &socket_dir, database)? {
         verify_database_embedded(bin, lib, &socket_dir, database)?;
@@ -1292,9 +1342,12 @@ fn teardown_embedded_workspace_with(
 /// alone.
 ///
 /// The cluster has no TCP listener. Its one socket sits in `socket_dir`, which
-/// only this user can enter, and peer auth admits only this OS user as role
-/// [`PG_USER`]. Both auth files are rewritten before every start, so a cluster
-/// an older build created with trust auth converges here, data intact.
+/// only this user can enter. Role [`PG_USER`] signs in with the password kept
+/// beside it ([`embedded_password`]), so this user's sandboxed agents cannot.
+///
+/// Both auth files and the password are set before every start. So a cluster
+/// an older build made with trust or peer auth converges here, data intact.
+/// An adopted cluster converges in place, with a reload.
 ///
 /// The lifecycle is **self-healing** where healing loses nothing, so a stale or
 /// orphaned same-major cluster never blocks a fresh start:
@@ -1336,21 +1389,21 @@ fn ensure_embedded_cluster(
     // This check runs before any stop or start on `data`.
     if let Some(data_major) = read_data_dir_major(data).filter(|&m| m != bundled) {
         let refusal = foreign_major_refusal(data, data_major, bundled);
-        crate::log!("[Gateway] {}", refusal.message);
+        crate::log_legacy!("[Gateway] {}", refusal.message);
         return Err(refusal);
     }
 
     // Adopt an already-running cluster ONLY if it is reachable AND version-matched.
     if pg_ctl_status(bin, lib, data) {
         if should_adopt(probe_running_major(bin, lib, socket_dir), bundled) {
-            crate::log!(
+            crate::log_legacy!(
                 "[Gateway] adopting healthy embedded Postgres v{} on {}",
                 bundled,
                 socket_dir.display()
             );
-            return Ok(());
+            return converge_running_auth(bin, lib, data, socket_dir);
         }
-        crate::log!(
+        crate::log_legacy!(
             "[Gateway] embedded Postgres reports running but does not answer on {} with v{} — tearing down",
             socket_dir.display(),
             bundled
@@ -1364,6 +1417,7 @@ fn ensure_embedded_cluster(
     // The cluster socket directory outlives a reboot, unlike `/tmp`, so the
     // lock Postgres keeps beside its socket can be stale the same way.
     remove_lock_naming_another_program(&embedded_socket_lock(socket_dir));
+    set_password_single_user(bin, lib, data, &embedded_password(socket_dir)?)?;
     write_auth_files(data)?;
     let log = data.join("server.log");
     let log_s = log.to_string_lossy().to_string();
@@ -1372,18 +1426,126 @@ fn ensure_embedded_cluster(
     pg_ctl(bin, lib, data, &["-l", &log_s, "-o", &opts, "-w", "start"]).map_err(|e| {
         ProvisionError::transient(format!("{e}. The server log is {}", log.display()))
     })?;
+    // Single-user mode reports a failed statement on stderr, not in its exit
+    // status. A sign-in with the password is the proof it took.
+    psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, "SELECT 1")
+        .map(|_| ())
+        .map_err(|e| {
+            ProvisionError::transient(format!(
+                "embedded Postgres started but refused its superuser password: {e}"
+            ))
+        })
+}
+
+/// Set [`PG_USER`]'s password while the cluster at `data` is stopped, through
+/// single-user mode. It needs no sign-in, so it works whatever the auth files
+/// said before. The statement goes on stdin, never argv.
+fn set_password_single_user(
+    bin: &Path,
+    lib: &Path,
+    data: &Path,
+    password: &str,
+) -> Result<(), ProvisionError> {
+    use std::io::Write as _;
+    let failed = |e: &dyn std::fmt::Display| {
+        ProvisionError::transient(format!(
+            "setting the embedded Postgres password failed: {e}"
+        ))
+    };
+    let mut cmd = Command::new(bin.join("postgres"));
+    with_pg_libpath(&mut cmd, lib);
+    cmd.arg("--single")
+        .arg("-D")
+        .arg(data)
+        .arg(PG_ADMIN_DATABASE);
+    cmd.stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| failed(&e))?;
+    let mut stdin = child.stdin.take().ok_or_else(|| failed(&"no stdin"))?;
+    let statement = format!("{}\n", alter_role_password_sql(password));
+    stdin
+        .write_all(statement.as_bytes())
+        .map_err(|e| failed(&e))?;
+    std::mem::drop(stdin);
+    let out = child.wait_with_output().map_err(|e| failed(&e))?;
+    if !out.status.success() {
+        return Err(failed(&String::from_utf8_lossy(&out.stderr).trim()));
+    }
     Ok(())
+}
+
+/// Converge an adopted cluster: set the password over a connection the
+/// rules in force admit, then write password-only auth and reload on every retry.
+fn converge_running_auth(
+    bin: &Path,
+    lib: &Path,
+    data: &Path,
+    socket_dir: &Path,
+) -> Result<(), ProvisionError> {
+    let sql = alter_role_password_sql(&embedded_password(socket_dir)?);
+    psql_query_embedded(bin, lib, socket_dir, PG_ADMIN_DATABASE, &sql).map_err(|e| {
+        ProvisionError::transient(format!(
+            "setting the embedded Postgres password failed: {e}"
+        ))
+    })?;
+    // Matching files do not prove a previous reload succeeded. Always reload.
+    write_auth_files(data)?;
+    pg_ctl(bin, lib, data, &["reload"])
+        .map_err(|e| ProvisionError::transient(format!("reloading embedded Postgres: {e}")))
 }
 
 /// The embedded cluster's port. Each cluster has its own socket directory, so
 /// the port need not be unique. libpq's default lets a bare `psql -h <dir>` in.
 const EMBEDDED_PORT: u16 = lucidos_pg_url::DEFAULT_PORT;
 
-/// The name of the cluster socket directory under `~/.lucidos/run`.
+/// The name of the cluster socket directory under the run directory.
 const EMBEDDED_SOCKET_PREFIX: &str = "pg";
 
-/// The `pg_ident.conf` map that names who may connect as [`PG_USER`].
-const PEER_MAP: &str = "owner";
+/// The superuser password's file, in the cluster socket directory.
+const EMBEDDED_PASSWORD_FILE: &str = "superuser-password";
+
+/// The libpq password file for the superuser, beside the password.
+const EMBEDDED_PASSFILE: &str = "superuser.pgpass";
+
+/// The superuser password of the cluster whose socket sits in `socket_dir`,
+/// minted on first use.
+///
+/// Kept beside the socket it opens, so every cluster has its own, and a
+/// test's cluster never touches the machine's. The socket directory is in the
+/// private subtree, which an agent's sandbox denies (ADR 0645).
+fn embedded_password(socket_dir: &Path) -> Result<String, ProvisionError> {
+    lucidos_local_token::ensure_at(&socket_dir.join(EMBEDDED_PASSWORD_FILE))
+        .map(crate::diagnostic_log::secret)
+        .map_err(|e| {
+            ProvisionError::transient(format!(
+                "the embedded Postgres password in {} cannot be read: {e}",
+                socket_dir.display()
+            ))
+        })
+}
+
+/// The libpq password file signing [`PG_USER`] in to the cluster on
+/// `socket_dir`, rewritten from the password whenever it differs.
+///
+/// Clients get its path, never the password. On macOS any same-user process
+/// reads another's environment, sandboxed or not (ADR 0645).
+fn embedded_passfile(socket_dir: &Path) -> Result<PathBuf, ProvisionError> {
+    let path = socket_dir.join(EMBEDDED_PASSFILE);
+    let line = lucidos_pg_url::passfile_line(PG_USER, &embedded_password(socket_dir)?);
+    if std::fs::read_to_string(&path).ok().as_deref() == Some(line.as_str()) {
+        return Ok(path);
+    }
+    let write = || -> std::io::Result<()> {
+        let mut staged = tempfile::NamedTempFile::new_in(socket_dir)?;
+        std::io::Write::write_all(&mut staged, line.as_bytes())?;
+        staged.persist(&path).map_err(|e| e.error)?;
+        Ok(())
+    };
+    write()
+        .map_err(|e| ProvisionError::transient(format!("cannot write {}: {e}", path.display())))?;
+    Ok(path)
+}
 
 /// The socket file Postgres binds in the cluster socket directory.
 fn embedded_socket_name() -> String {
@@ -1396,7 +1558,7 @@ fn embedded_socket_lock(socket_dir: &Path) -> PathBuf {
 }
 
 /// The cluster socket directory for the data dir `data`, which must exist:
-/// `~/.lucidos/run/pg-<digest>`, owner-only.
+/// `<run directory>/pg-<digest>`, owner-only.
 fn embedded_socket_dir(data: &Path) -> Result<PathBuf, ProvisionError> {
     lucidos_engine_socket::owner_only_subdir(EMBEDDED_SOCKET_PREFIX, data, &embedded_socket_name())
         .map_err(|e| {
@@ -1454,12 +1616,12 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-/// Rewrite `pg_hba.conf` and `pg_ident.conf` so only this OS user connects,
-/// over the socket: as [`PG_USER`], or as an agent role with its password.
-/// Runs before every start.
+/// Write password-only local authentication before startup or reload.
 fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
-    let ident = pg_ident_conf(&os_user_name()?)?;
-    for (name, body) in [("pg_hba.conf", pg_hba_conf()), ("pg_ident.conf", ident)] {
+    for (name, body) in [
+        ("pg_hba.conf", pg_hba_conf()),
+        ("pg_ident.conf", AUTH_FILE_HEADER.to_string()),
+    ] {
         let path = data.join(name);
         std::fs::write(&path, body).map_err(|e| {
             ProvisionError::transient(format!("cannot write {}: {e}", path.display()))
@@ -1471,53 +1633,17 @@ fn write_auth_files(data: &Path) -> Result<(), ProvisionError> {
 const AUTH_FILE_HEADER: &str =
     "# Written by the Lucidos gateway before every start. Edits here are lost.\n";
 
-/// An agent role (ADR 0509) signs in with the password its engine minted at
-/// boot. The socket directory is owner-only, so it is still this OS user.
+/// Agent roles and the superuser always need their own passwords.
 fn pg_hba_conf() -> String {
     let agents = lucidos_pg_url::AGENT_ROLE_GROUP;
     format!(
         "{AUTH_FILE_HEADER}local all +{agents} scram-sha-256\n\
-         local all {PG_USER} peer map={PEER_MAP}\n"
+         local all {PG_USER} scram-sha-256\n"
     )
 }
 
-/// The ident map: `os_user` connects as [`PG_USER`], and nobody else does.
-/// Quoted, so a name with a space stays one token.
-fn pg_ident_conf(os_user: &str) -> Result<String, ProvisionError> {
-    if os_user.is_empty() || os_user.contains(['"', '\n', '\r']) {
-        return Err(ProvisionError::terminal(format!(
-            "the OS user name {os_user:?} cannot be written to pg_ident.conf"
-        )));
-    }
-    Ok(format!(
-        "{AUTH_FILE_HEADER}{PEER_MAP} \"{os_user}\" {PG_USER}\n"
-    ))
-}
-
-/// The name of this process's effective user, as Postgres's peer auth reads
-/// it: `getpwuid` on the uid the kernel reports for the client.
-fn os_user_name() -> Result<String, ProvisionError> {
-    // SAFETY: `geteuid` takes no arguments, cannot fail and touches no memory.
-    let uid = unsafe { libc::geteuid() };
-    let mut buf = vec![0 as libc::c_char; 16 * 1024];
-    // SAFETY: an all-zero `passwd` is a valid value for getpwuid_r to fill.
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut found: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: every pointer is valid for the call, and `buf.len()` bounds `buf`.
-    let rc = unsafe { libc::getpwuid_r(uid, &mut entry, buf.as_mut_ptr(), buf.len(), &mut found) };
-    if rc != 0 || found.is_null() {
-        return Err(ProvisionError::terminal(format!(
-            "uid {uid} has no user name in the user database (getpwuid_r returned {rc}), so \
-             Postgres peer auth cannot admit it"
-        )));
-    }
-    // SAFETY: on success `pw_name` points at a NUL-terminated string in `buf`.
-    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) };
-    Ok(name.to_string_lossy().into_owned())
-}
-
-/// `initdb` a fresh cluster at `data` (peer auth on the socket, UTF-8), on
-/// first run only. [`write_auth_files`] narrows its auth files before the first start.
+/// `initdb` a fresh cluster at `data` (UTF-8, every sign-in rejected), on
+/// first run only. [`write_auth_files`] opens it before the first start.
 fn initdb_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<(), BoxError> {
     std::fs::create_dir_all(data)?;
     let mut cmd = Command::new(bin.join("initdb"));
@@ -1526,7 +1652,7 @@ fn initdb_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<(), BoxError> {
     cmd.args([
         "-U",
         PG_USER,
-        "--auth-local=peer",
+        "--auth-local=reject",
         "--auth-host=reject",
         "--encoding=UTF8",
     ]);
@@ -1644,7 +1770,7 @@ pub(crate) fn stop_cluster_robustly(bin: &Path, lib: &Path, data: &Path) {
     // pg_ctl could not stop it (foreign binaries, or a wedged/half-dead
     // postmaster). Fall back to signalling the single PID from postmaster.pid.
     if let Some(pid) = read_postmaster_pid(data) {
-        crate::log!(
+        crate::log_legacy!(
             "[Gateway] pg_ctl stop failed for {} — killing recorded postmaster pid {}",
             data.display(),
             pid
@@ -1664,7 +1790,7 @@ fn remove_lock_naming_another_program(lock: &Path) -> bool {
     let Some(exe) = lock_names_another_program(lock) else {
         return false;
     };
-    crate::log!(
+    crate::log_legacy!(
         "[Gateway] {} names a pid now running {}, so it is stale; removing it",
         lock.display(),
         exe.display()
@@ -1677,7 +1803,7 @@ fn remove_lock_naming_another_program(lock: &Path) -> bool {
 fn remove_stale_lock(lock: &Path) {
     if lock.exists() {
         if let Err(e) = std::fs::remove_file(lock) {
-            crate::log!("[Gateway] could not remove stale {}: {}", lock.display(), e);
+            crate::log_legacy!("[Gateway] could not remove stale {}: {}", lock.display(), e);
         }
     }
 }
@@ -1744,12 +1870,36 @@ fn kill_pid_graceful_then_force(pid: i32) {
 #[cfg(not(unix))]
 fn kill_pid_graceful_then_force(_pid: i32) {}
 
-/// The engine's URL for `database` on the socket in `socket_dir`. Peer auth
-/// needs no password. The port is spelled out, since sqlx and libpq would
-/// otherwise take an inherited `PGPORT`.
-fn embedded_database_url(socket_dir: &Path, database: &str) -> String {
-    let host = urlencoding::encode(&socket_dir.to_string_lossy()).into_owned();
-    format!("postgres:///{database}?host={host}&port={EMBEDDED_PORT}&user={PG_USER}")
+/// The engine's URL for `database` on the socket in `socket_dir`. The port is
+/// spelled out, since sqlx and libpq would otherwise take an inherited
+/// `PGPORT`. Everything sits in the query, since sqlx refuses an empty host.
+///
+/// It names the `passfile`, never the password, because the URL reaches the
+/// engine through its environment. The engine reads the file at boot.
+fn embedded_database_url(socket_dir: &Path, database: &str, passfile: &Path) -> String {
+    let enc = |path: &Path| urlencoding::encode(&path.to_string_lossy()).into_owned();
+    format!(
+        "postgres:///{database}?host={}&port={EMBEDDED_PORT}&user={PG_USER}&passfile={}",
+        enc(socket_dir),
+        enc(passfile)
+    )
+}
+
+/// The bundled client `tool`, signed in to the cluster on `socket_dir` as
+/// [`PG_USER`] through its password file, never `PGPASSWORD`.
+fn embedded_client(
+    bin: &Path,
+    lib: &Path,
+    tool: &str,
+    socket_dir: &Path,
+) -> Result<Command, ProvisionError> {
+    let mut cmd = Command::new(bin.join(tool));
+    with_pg_libpath(&mut cmd, lib);
+    cmd.env_remove("PGPASSWORD");
+    cmd.env("PGPASSFILE", embedded_passfile(socket_dir)?);
+    cmd.arg("-h").arg(socket_dir);
+    cmd.args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER]);
+    Ok(cmd)
 }
 
 fn pg_ctl(bin: &Path, lib: &Path, data: &Path, extra: &[&str]) -> Result<(), BoxError> {
@@ -1778,24 +1928,9 @@ fn psql_query_embedded(
     db: &str,
     sql: &str,
 ) -> Result<String, BoxError> {
-    let mut cmd = Command::new(bin.join("psql"));
-    with_pg_libpath(&mut cmd, lib);
+    let mut cmd = embedded_client(bin, lib, "psql", socket_dir)?;
     cmd.env("PGOPTIONS", PG_QUERY_OPTIONS);
-    cmd.arg("-h").arg(socket_dir);
-    cmd.args([
-        "-X",
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-p",
-        &EMBEDDED_PORT.to_string(),
-        "-U",
-        PG_USER,
-        "-d",
-        db,
-        "-tAX",
-        "-c",
-        sql,
-    ]);
+    cmd.args(["-X", "-v", "ON_ERROR_STOP=1", "-d", db, "-tAX", "-c", sql]);
     let out = cmd.cleanup_output()?;
     if !out.status.success() {
         return Err(format!(
@@ -2554,7 +2689,9 @@ mod tests {
             .args(["version", "--format", "{{.Server.Version}}"])
             .output();
         if matches!(&probe, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
-            eprintln!("SKIP gated_real_docker_cli_with_no_daemon_is_unreachable: no docker CLI");
+            crate::diagnostic_log::test_notice(format_args!(
+                "SKIP gated_real_docker_cli_with_no_daemon_is_unreachable: no docker CLI"
+            ));
             return;
         }
         assert!(
@@ -2741,15 +2878,34 @@ mod tests {
     /// A directory with a space (`Application Support`) and an `@` (a home
     /// named after an email address) survives the URL both ways.
     #[test]
-    fn the_embedded_url_names_the_socket_directory_and_no_password() {
+    fn the_embedded_url_names_the_socket_directory_and_its_passfile() {
         let dir = Path::new("/Users/me.x@example.com/.lucidos/run/pg x");
-        let url = embedded_database_url(dir, "lucidos_myws");
+        let passfile = dir.join("pass&file=x");
+        let url = embedded_database_url(dir, "lucidos_myws", &passfile);
         let parsed = PgUrl::parse(&url).unwrap();
         assert_eq!(parsed.host, Host::Socket(dir.to_path_buf()));
         assert_eq!(parsed.port, EMBEDDED_PORT);
         assert_eq!(parsed.user.as_deref(), Some(PG_USER));
         assert_eq!(parsed.password, None);
+        assert_eq!(parsed.passfile(), Some(passfile));
         assert_eq!(parsed.database, "lucidos_myws");
+    }
+
+    /// The URL an engine boots with resolves to the cluster's password, and
+    /// the file is owner-only.
+    #[test]
+    fn the_passfile_signs_in_with_the_cluster_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let passfile = embedded_passfile(dir.path()).unwrap();
+        let url = embedded_database_url(dir.path(), "lucidos_myws", &passfile);
+        let (inlined, _) = lucidos_pg_url::inline_passfile(&url).unwrap();
+        assert_eq!(
+            PgUrl::parse(&inlined).unwrap().password,
+            Some(embedded_password(dir.path()).unwrap())
+        );
+        let mode = std::fs::metadata(&passfile).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(embedded_passfile(dir.path()).unwrap(), passfile);
     }
 
     /// `pg_ctl` runs `-o` through `/bin/sh`, so the real shell reads the
@@ -2784,24 +2940,34 @@ mod tests {
         );
     }
 
+    fn rules(text: &str) -> Vec<&str> {
+        text.lines().filter(|l| !l.starts_with('#')).collect()
+    }
+
     /// The literals pin the file format Postgres reads, so they are spelled out.
+    /// No peer rule: it would admit an agent's subprocess (ADR 0645).
     #[test]
-    fn the_auth_files_admit_one_os_user_over_the_socket_alone() {
-        let rules: Vec<String> = pg_hba_conf()
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(str::to_string)
-            .collect();
+    fn the_auth_files_admit_password_holders_over_the_socket_alone() {
         assert_eq!(
-            rules,
+            rules(&pg_hba_conf()),
             [
                 "local all +lucidos_agents scram-sha-256",
-                "local all lucidos peer map=owner"
+                "local all lucidos scram-sha-256"
             ]
         );
-        let ident = pg_ident_conf("me x").unwrap();
-        let maps: Vec<&str> = ident.lines().filter(|l| !l.starts_with('#')).collect();
-        assert_eq!(maps, ["owner \"me x\" lucidos"]);
+    }
+
+    /// Each cluster mints its own password, beside its socket, at 0600.
+    #[test]
+    fn the_password_is_minted_once_beside_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = embedded_password(dir.path()).unwrap();
+        assert_eq!(embedded_password(dir.path()).unwrap(), first);
+        let file = dir.path().join(EMBEDDED_PASSWORD_FILE);
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(embedded_password(other.path()).unwrap(), first);
     }
 
     #[test]
@@ -2838,25 +3004,6 @@ mod tests {
         assert!(lock.exists());
     }
 
-    #[test]
-    fn a_user_name_that_would_break_the_ident_file_is_refused() {
-        for bad in ["", "a\"b", "a\nowner root lucidos"] {
-            let err = pg_ident_conf(bad).expect_err(bad);
-            assert_eq!(err.kind, ProvisionErrorKind::Terminal, "{bad:?}");
-        }
-    }
-
-    /// Postgres names the peer by `getpwuid`, as `id -un` does.
-    #[test]
-    fn the_os_user_name_is_the_one_id_reports() {
-        let out = Command::new("id").arg("-un").output().unwrap();
-        assert!(out.status.success());
-        assert_eq!(
-            os_user_name().unwrap(),
-            String::from_utf8(out.stdout).unwrap().trim()
-        );
-    }
-
     // ── Gated embedded-cluster integration tests ─────────────────────────────
     //
     // These drive `ensure_embedded_cluster` against REAL bundled PostgreSQL
@@ -2877,7 +3024,7 @@ mod tests {
     /// A throwaway cluster: a parent dir holding `pgdata`, so any sibling a
     /// repair might create lands inside it, and a cluster socket directory.
     ///
-    /// The run directory stands in for `~/.lucidos/run`. It sits in `/tmp` to
+    /// The run directory stands in for the real one. It sits in `/tmp` to
     /// fit `sun_path`. Its name holds a space and a quote, which the shell and
     /// Postgres's directory list must both carry through.
     struct GatedCluster {
@@ -2885,6 +3032,15 @@ mod tests {
         _run: tempfile::TempDir,
         data: PathBuf,
         socket_dir: PathBuf,
+    }
+
+    impl Drop for GatedCluster {
+        fn drop(&mut self) {
+            if self.data.join("postmaster.pid").exists() {
+                let (bin, lib) = gated_pg_dirs().expect("cluster test toolchain");
+                stop_cluster_robustly(&bin, &lib, &self.data);
+            }
+        }
     }
 
     fn gated_cluster() -> GatedCluster {
@@ -2929,11 +3085,11 @@ mod tests {
     }
 
     /// I1, I2 and I3: no TCP listener, one owner-only socket in the cluster
-    /// socket directory, and auth files that admit this OS user alone.
+    /// socket directory, and password-only authentication files.
     #[test]
     fn gated_the_cluster_listens_on_its_owner_only_socket_alone() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_the_cluster_listens_on_its_owner_only_socket_alone: no LUCIDOS_PG_BIN_DIR/LIB");
+            crate::diagnostic_log::test_notice(format_args!("SKIP gated_the_cluster_listens_on_its_owner_only_socket_alone: no LUCIDOS_PG_BIN_DIR/LIB"));
             return;
         };
         let c = gated_cluster();
@@ -2968,7 +3124,110 @@ mod tests {
         let hba = std::fs::read_to_string(c.data.join("pg_hba.conf")).unwrap();
         assert_eq!(hba, pg_hba_conf());
         let ident = std::fs::read_to_string(c.data.join("pg_ident.conf")).unwrap();
-        assert_eq!(ident, pg_ident_conf(&os_user_name().unwrap()).unwrap());
+        assert_eq!(ident, AUTH_FILE_HEADER);
+        assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
+
+        stop_cluster_robustly(&bin, &lib, &c.data);
+    }
+
+    /// The socket invariant (ADR 0645): this OS user, presenting no password,
+    /// does not get a session as [`PG_USER`]. An agent's subprocess is
+    /// exactly that caller.
+    fn assert_refuses_the_passwordless(bin: &Path, lib: &Path, socket_dir: &Path) {
+        let out = passwordless_sign_in(bin, lib, socket_dir);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "a passwordless session was granted");
+        assert!(stderr.contains("password"), "{stderr}");
+    }
+
+    /// Whether this OS user, presenting no password, gets a session.
+    fn admits_the_passwordless(bin: &Path, lib: &Path, socket_dir: &Path) -> bool {
+        passwordless_sign_in(bin, lib, socket_dir).status.success()
+    }
+
+    /// `psql` as [`PG_USER`] with no password from anywhere, never prompting.
+    fn passwordless_sign_in(bin: &Path, lib: &Path, socket_dir: &Path) -> std::process::Output {
+        let mut psql = Command::new(bin.join("psql"));
+        with_pg_libpath(&mut psql, lib);
+        psql.env_remove("PGPASSWORD")
+            .env("PGPASSFILE", "/dev/null")
+            .stdin(std::process::Stdio::null())
+            .arg("-h")
+            .arg(socket_dir)
+            .args(["-p", &EMBEDDED_PORT.to_string(), "-U", PG_USER])
+            .args(["-w", "-d", PG_ADMIN_DATABASE, "-tAXc", "SELECT 1"]);
+        psql.output().unwrap()
+    }
+
+    /// An adopted peer cluster converges even when disk already says password-only.
+    /// This reproduces a failed reload followed by another provisioning attempt.
+    #[test]
+    fn gated_a_running_peer_cluster_converges_in_place() {
+        let Some((bin, lib)) = gated_pg_dirs() else {
+            crate::diagnostic_log::test_notice(format_args!(
+                "SKIP gated_a_running_peer_cluster_converges_in_place: no LUCIDOS_PG_BIN_DIR/LIB"
+            ));
+            return;
+        };
+        let c = gated_cluster();
+        let mut initdb = Command::new(bin.join("initdb"));
+        with_pg_libpath(&mut initdb, &lib);
+        initdb.arg("-D").arg(&c.data);
+        initdb.args(["-U", PG_USER, "--auth-local=peer", "--encoding=UTF8"]);
+        assert!(
+            initdb.output().unwrap().status.success(),
+            "old-style initdb"
+        );
+        // Reproduce the previous release's peer-only cluster.
+        let os_user = Command::new("id").arg("-un").output().unwrap();
+        assert!(os_user.status.success());
+        let os_user = String::from_utf8(os_user.stdout).unwrap();
+        std::fs::write(
+            c.data.join("pg_hba.conf"),
+            "local all lucidos peer map=owner\n",
+        )
+        .unwrap();
+        std::fs::write(
+            c.data.join("pg_ident.conf"),
+            format!("owner \"{}\" lucidos\n", os_user.trim()),
+        )
+        .unwrap();
+        let log = c.data.join("server.log").to_string_lossy().to_string();
+        let opts = embedded_start_options(&c.socket_dir);
+        pg_ctl(
+            &bin,
+            &lib,
+            &c.data,
+            &["-l", &log, "-o", &opts, "-w", "start"],
+        )
+        .unwrap();
+        let pid_before = read_postmaster_pid(&c.data).unwrap();
+        psql_query_embedded(
+            &bin,
+            &lib,
+            &c.socket_dir,
+            PG_ADMIN_DATABASE,
+            "CREATE DATABASE lucidos_gated",
+        )
+        .unwrap();
+
+        // Disk matches the desired config, but Postgres still enforces peer.
+        write_auth_files(&c.data).unwrap();
+        assert!(admits_the_passwordless(&bin, &lib, &c.socket_dir));
+
+        // Adoption calls this convergence with the existing cluster's socket.
+        converge_running_auth(&bin, &lib, &c.data, &c.socket_dir).unwrap();
+
+        assert_eq!(
+            read_postmaster_pid(&c.data),
+            Some(pid_before),
+            "adopted, not restarted"
+        );
+        assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
+        // Repeated provisioning, including after gateway adoption, cannot downgrade auth.
+        ensure_embedded_cluster(&bin, &lib, &c.data, &c.socket_dir).unwrap();
+        assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
+        assert!(database_exists_embedded(&bin, &lib, &c.socket_dir, "lucidos_gated").unwrap());
 
         stop_cluster_robustly(&bin, &lib, &c.data);
     }
@@ -2978,7 +3237,7 @@ mod tests {
     #[test]
     fn gated_an_old_trust_cluster_converges_with_its_data() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_an_old_trust_cluster_converges_with_its_data: no LUCIDOS_PG_BIN_DIR/LIB");
+            crate::diagnostic_log::test_notice(format_args!("SKIP gated_an_old_trust_cluster_converges_with_its_data: no LUCIDOS_PG_BIN_DIR/LIB"));
             return;
         };
         let c = gated_cluster();
@@ -3045,6 +3304,7 @@ mod tests {
         assert_eq!(got, "7", "the old cluster's data survives");
         let hba = std::fs::read_to_string(c.data.join("pg_hba.conf")).unwrap();
         assert!(!hba.contains("trust"), "{hba}");
+        assert_refuses_the_passwordless(&bin, &lib, &c.socket_dir);
         assert!(
             std::net::TcpStream::connect(("127.0.0.1", old_port)).is_err(),
             "the old TCP listener is gone"
@@ -3062,9 +3322,9 @@ mod tests {
     #[test]
     fn gated_stale_lock_recovers_and_preserves_data() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!(
+            crate::diagnostic_log::test_notice(format_args!(
                 "SKIP gated_stale_lock_recovers_and_preserves_data: no LUCIDOS_PG_BIN_DIR/LIB"
-            );
+            ));
             return;
         };
         let c = gated_cluster();
@@ -3110,7 +3370,7 @@ mod tests {
     #[test]
     fn gated_locks_naming_a_reused_pid_do_not_block_the_next_start() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_locks_naming_a_reused_pid_do_not_block_the_next_start: no LUCIDOS_PG_BIN_DIR/LIB");
+            crate::diagnostic_log::test_notice(format_args!("SKIP gated_locks_naming_a_reused_pid_do_not_block_the_next_start: no LUCIDOS_PG_BIN_DIR/LIB"));
             return;
         };
         let c = gated_cluster();
@@ -3150,7 +3410,7 @@ mod tests {
     #[test]
     fn gated_foreign_version_is_refused_and_left_in_place() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_foreign_version_is_refused_and_left_in_place: no LUCIDOS_PG_BIN_DIR/LIB");
+            crate::diagnostic_log::test_notice(format_args!("SKIP gated_foreign_version_is_refused_and_left_in_place: no LUCIDOS_PG_BIN_DIR/LIB"));
             return;
         };
         let c = gated_cluster();

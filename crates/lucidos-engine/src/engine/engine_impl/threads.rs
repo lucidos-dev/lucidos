@@ -135,6 +135,42 @@ impl LucidosEngine {
         }
     }
 
+    /// Atomically hand over the batch or reserve its re-run.
+    pub(crate) fn hand_over_or_admit(
+        &self,
+        thread_id: Uuid,
+        prompts: Vec<InjectedPrompt>,
+    ) -> OrphanAdmission {
+        crate::engine::hand_over_or_admit(
+            &self.active_threads,
+            &self.thread_completion,
+            thread_id,
+            prompts,
+        )
+    }
+
+    /// The engine's entry point to
+    /// [`crate::engine::inject_the_rest_of_a_sentence`].
+    pub fn inject_the_rest_of_a_sentence(
+        &self,
+        thread_id: Uuid,
+        asked_turn: Uuid,
+        prompt: InjectedPrompt,
+    ) -> crate::engine::RestOfSentence {
+        crate::engine::inject_the_rest_of_a_sentence(
+            &self.active_threads,
+            thread_id,
+            asked_turn,
+            prompt,
+        )
+    }
+
+    /// Record that this turn is about to read its history. The engine's entry
+    /// point to [`crate::engine::record_history_read_begun`].
+    pub(crate) fn note_history_read_begun(&self, thread_id: Uuid, generation: u64) {
+        crate::engine::record_history_read_begun(&self.active_threads, thread_id, generation);
+    }
+
     /// Admit one run on `thread_id`, or refuse because a turn already owns it.
     /// The engine's entry point to [`crate::engine::try_register_thread`], where
     /// the single-flight contract is documented.
@@ -369,7 +405,7 @@ impl LucidosEngine {
             )
             .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Parent {} was awaiting this completion; its event wait carries the \
                  wake, so the fan-in callback stands down (one turn, not two)",
                 parent_thread_id
@@ -571,7 +607,7 @@ impl LucidosEngine {
         let tid_uuid = match uuid::Uuid::parse_str(thread_id) {
             Ok(u) => u,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Title] spawn_title_generation skipped: invalid thread_id {:?}: {}",
                     thread_id,
                     e
@@ -590,7 +626,7 @@ impl LucidosEngine {
                     Ok(Some((msg, desc, count))) => (msg, desc, count),
                     Ok(None) => return,
                     Err(e) => {
-                        log!("[Thread] Failed to get first message for title: {}", e);
+                        log_legacy!("[Thread] Failed to get first message for title: {}", e);
                         return;
                     }
                 };

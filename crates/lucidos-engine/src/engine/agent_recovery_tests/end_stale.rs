@@ -560,6 +560,7 @@ mod a_stale_recovery_keeps_withheld_work_visible {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
         ] {
             bus.emit(BusEvent::Thread {

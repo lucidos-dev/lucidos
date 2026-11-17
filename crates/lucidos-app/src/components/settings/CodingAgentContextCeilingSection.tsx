@@ -1,9 +1,10 @@
+import { PREF_CODING_AGENT_CONTEXT_CEILING } from '@lucidos/preference-catalog';
 import { currentContextCeiling, setContextCeiling } from '../../store/actions/preferences';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
 
-const DEFAULT_CEILING = PREFERENCE_CATALOG.coding_agent_context_ceiling.fallback;
+
+const DEFAULT_CEILING = PREF_CODING_AGENT_CONTEXT_CEILING.fallback;
 
 /** The values the picker offers. Any other the engine accepts, set through
  *  the CLI or a thread, still shows as the current one. */

@@ -48,6 +48,7 @@ struct LadderResponse {
     ladder: IntelligenceLadder,
     /// Absent without a thread, or when it recorded no model and effort.
     current: Option<CurrentIntelligenceRung>,
+    other_backend_ladders: Vec<IntelligenceLadder>,
 }
 
 async fn intelligence_ladder_route(
@@ -76,7 +77,21 @@ async fn intelligence_ladder_route(
         },
         None => None,
     };
-    Ok(Json(LadderResponse { ladder, current }))
+    let other_backend_ladders = if thread_id.is_some() {
+        intelligence_ladder::other_backend_ladders(
+            &state.pool,
+            &state.engine.model_routes(),
+            &ladder,
+        )
+        .await
+    } else {
+        Vec::new()
+    };
+    Ok(Json(LadderResponse {
+        ladder,
+        current,
+        other_backend_ladders,
+    }))
 }
 
 /// Whether a request comes from an agent rather than a person: a Lucidos

@@ -63,7 +63,7 @@ describe('postWithUploadProgress', () => {
   });
   afterEach(() => {
     observeSourceGeneration(null);
-    installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     vi.useRealTimers();
     delete (globalThis as any).XMLHttpRequest;
   });
@@ -74,7 +74,7 @@ describe('postWithUploadProgress', () => {
     let release!: () => void;
     let ready = false;
     const wait = new Promise<void>((resolve) => { release = resolve; });
-    installRestoreAdmission({ ready: () => ready, wait: () => wait });
+    installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => wait });
     const request = postWithUploadProgress('/api/v1/threads/t/blobs', new FormData());
     const rejected = expect(request).rejects.toMatchObject({ httpCode: 409 });
     observeSourceGeneration('00000000-0000-4000-8000-000000000001');

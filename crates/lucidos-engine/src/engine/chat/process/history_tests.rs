@@ -12,7 +12,7 @@ use super::history::{
 use crate::core::store::{newest_conversation_summary, CachedSummary, SessionMessage};
 use crate::core::EventRow;
 use crate::engine::thread_events::AgentParticipant;
-use crate::gateway_operators::{Operator, OperatorSnapshot};
+use crate::gateway_users::{User, UserSnapshot};
 use chrono::{TimeZone, Utc};
 use serde_json::json;
 use uuid::Uuid;
@@ -47,7 +47,7 @@ fn msg(role: &str, content: &str, event_id: Option<&str>) -> SessionMessage {
 fn format_msg(m: &SessionMessage, _verbatim: bool, _idx: usize) -> String {
     format!(
         "{}: {}",
-        speaker_label(m, &OperatorSnapshot::default()),
+        speaker_label(m, &UserSnapshot::default()),
         m.content
     )
 }
@@ -567,28 +567,6 @@ fn a_region_with_no_assistant_turn_never_summarises() {
     assert!(plan.refresh_boundary(&older, ContextMode::Off).is_none());
 }
 
-/// ADR 0124: a chat turn reads only its own thread's messages.
-///
-/// `get_recent_messages` returns every message from the 32 most recently
-/// active threads, since its limit bounds THREADS. A raw-new send used to seed
-/// itself from it, which put other conversations in this one's prompt. The
-/// reader stays for `/api/v1/messages`, so only a scan can hold the boundary.
-#[test]
-fn no_chat_turn_reads_another_threads_messages() {
-    let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
-        .into_iter()
-        .filter(|(rel, _)| rel.starts_with("engine/chat/"))
-        .filter(|(_, text)| text.contains("get_recent_messages"))
-        .map(|(rel, _)| rel)
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "the chat turn must read only its own thread, but these call \
-         get_recent_messages: {:?}",
-        offenders
-    );
-}
-
 /// THE attribution invariant (ADR 0150). A guest agent's turn reaches the
 /// doer under the guest's own name.
 ///
@@ -627,11 +605,11 @@ fn a_user_turn_is_never_relabelled_by_an_agent_actor() {
     spoken.agent = Some(AgentParticipant::Guest {
         label: "Voice".into(),
     });
-    assert_eq!(speaker_label(&spoken, &OperatorSnapshot::default()), "User");
+    assert_eq!(speaker_label(&spoken, &UserSnapshot::default()), "User");
 }
 
-fn operator(id: &str, name: &str, device: &str) -> Operator {
-    Operator {
+fn user(id: &str, name: &str, device: &str) -> User {
+    User {
         id: id.into(),
         name: name.into(),
         emails: vec![],
@@ -639,11 +617,11 @@ fn operator(id: &str, name: &str, device: &str) -> Operator {
     }
 }
 
-fn team() -> OperatorSnapshot {
-    OperatorSnapshot {
-        operators: vec![
-            operator("op-sam", "Sam", "dev-sam"),
-            operator("op-alex", "Alex", "dev-alex"),
+fn team() -> UserSnapshot {
+    UserSnapshot {
+        users: vec![
+            user("op-sam", "Sam", "dev-sam"),
+            user("op-alex", "Alex", "dev-alex"),
         ],
         relayed: vec![],
     }
@@ -652,7 +630,7 @@ fn team() -> OperatorSnapshot {
 /// On a team gateway each person's message reads under their name, from the
 /// snapshot, so the agent can tell who asked (ADR 0649).
 #[test]
-fn a_team_gateway_labels_each_person_by_operator_name() {
+fn a_team_gateway_labels_each_person_by_user_name() {
     let mut from_sam = msg("user", "use the blue one", None);
     from_sam.sender_device_id = Some("dev-sam".into());
     let mut from_alex = msg("user", "no, the red one", None);
@@ -661,13 +639,13 @@ fn a_team_gateway_labels_each_person_by_operator_name() {
     assert_eq!(speaker_label(&from_alex, &team()), "Alex");
 }
 
-/// A personal gateway keeps "User", and so does a sender no operator holds.
+/// A personal gateway keeps "User", and so does a sender no user holds.
 #[test]
 fn a_personal_gateway_or_an_unknown_sender_keeps_user() {
     let mut from_sam = msg("user", "hi", None);
     from_sam.sender_device_id = Some("dev-sam".into());
-    let personal = OperatorSnapshot {
-        operators: vec![operator("op-sam", "Sam", "dev-sam")],
+    let personal = UserSnapshot {
+        users: vec![user("op-sam", "Sam", "dev-sam")],
         relayed: vec![],
     };
     assert_eq!(speaker_label(&from_sam, &personal), "User");
@@ -777,4 +755,28 @@ fn a_failed_turn_keeps_the_image_it_generated() {
         failed.image_handles,
         vec![image_handle(ImageRef::InlineBase64("R0lGODlh"))]
     );
+}
+
+mod guard_tests {
+    /// ADR 0124: a chat turn reads only its own thread's messages.
+    ///
+    /// `get_recent_messages` returns every message from the 32 most recently
+    /// active threads, since its limit bounds THREADS. A raw-new send used to seed
+    /// itself from it, which put other conversations in this one's prompt. The
+    /// reader stays for `/api/v1/messages`, so only a scan can hold the boundary.
+    #[test]
+    fn no_chat_turn_reads_another_threads_messages() {
+        let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
+            .into_iter()
+            .filter(|(rel, _)| rel.starts_with("engine/chat/"))
+            .filter(|(_, text)| text.contains("get_recent_messages"))
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "the chat turn must read only its own thread, but these call \
+         get_recent_messages: {:?}",
+            offenders
+        );
+    }
 }

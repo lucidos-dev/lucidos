@@ -228,7 +228,7 @@ fn read_document(raw: Option<&str>) -> Vec<StyleEntry> {
     match validate_document(raw) {
         Ok(entries) => entries,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[ResponseStyle] '{}' is unusable ({}). Falling back to the shipped styles",
                 prefs::RESPONSE_STYLES.key(),
                 e
@@ -340,7 +340,7 @@ pub fn section_for(
     let instruction = match library.iter().find(|s| s.id == selected) {
         Some(style) => style.instruction.as_str(),
         None => {
-            log!(
+            log_legacy!(
                 "[ResponseStyle] selected style '{}' is not in the library. Using Standard",
                 selected
             );

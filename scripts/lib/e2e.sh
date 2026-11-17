@@ -1,19 +1,25 @@
 #!/bin/bash
 
-# Honor an inherited value — a hard assignment here would clobber the sandbox a
-# test pins before sourcing us, and this variable is load-bearing for signalling:
-# `e2e_workspace_env` exports it as $WORKSPACE, whose engine `stop_e2e_engine`
-# sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a
-# test aims that signal at the REAL e2e-test engine instead of the sandbox.
-# Same convention as `e2e_lock.sh` (`${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}`).
-# Nothing in the production path pre-sets it — `e2e-api.sh` / `e2e-browser.sh`
-# only bare-`export` it after we assign — so the default is unchanged there.
-E2E_WORKSPACE="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
-
 # Resolve paths: scripts/lib/e2e.sh → scripts/lib/ → scripts/ → project root
 _E2E_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _E2E_SCRIPTS_DIR="$(dirname "$_E2E_LIB_DIR")"
 _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
+
+# shellcheck source=e2e_root.sh
+source "$_E2E_LIB_DIR/e2e_root.sh"
+# Every local run keeps its secrets and Postgres under the e2e root, sandboxed
+# or not, so nothing here asks whether it runs in an agent's sandbox.
+e2e_root_env
+# shellcheck source=ps_tools.sh
+source "$_E2E_LIB_DIR/ps_tools.sh"
+ps_tools_env
+
+# Honor an inherited value. A hard assignment here would clobber the sandbox a
+# test pins before sourcing us, and this variable is load-bearing for
+# signalling: `e2e_workspace_env` exports it as $WORKSPACE, whose engine
+# `stop_e2e_engine` sends SIGUSR1 to. Clobbered, a `source e2e.sh` from a test
+# aims that signal at the REAL e2e-test engine instead of the sandbox.
+E2E_WORKSPACE="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
 
 # The e2e stack is deliberately allowed to run from a coding-agent worktree: a CC
 # session's whole job is exercising the checkout it was invoked from, and the
@@ -122,6 +128,8 @@ source "$_E2E_LIB_DIR/webkit_reaper.sh"
 source "$_E2E_LIB_DIR/host_load_guard.sh"
 source "$_E2E_LIB_DIR/host_memory_guard.sh"
 source "$_E2E_LIB_DIR/e2e_gateway.sh"
+# shellcheck source=scripts/lib/e2e_stamp.sh
+source "$_E2E_LIB_DIR/e2e_stamp.sh"
 source "$_E2E_LIB_DIR/engine_manifest.sh"
 # shellcheck source=scripts/lib/e2e_projects.sh
 source "$_E2E_LIB_DIR/e2e_projects.sh"
@@ -177,9 +185,16 @@ assert_e2e_workspace_is_disposable || exit 1
 # it can't rely on ensure_workspace_running having gone first.
 e2e_workspace_env() {
     assert_e2e_workspace_is_disposable || return 1
+    # Here, not at source time: the GitHub driver sources this file and binds
+    # no local socket.
+    e2e_root_fits_socket || return 1
+    e2e_root_writable || return 1
     export WORKSPACE="$E2E_WORKSPACE"
     resolve_workspace
     allocate_ports "$WORKSPACE"
+    # The e2e cluster has one fixed port, not the workspace's offset.
+    PG_PORT="$(e2e_pg_port)"
+    export PG_PORT
     detect_tls
 }
 
@@ -200,25 +215,31 @@ build_e2e_engine_once() {
         build_or_find_engine
         return 0
     fi
-    local profile cached
+    local profile cached launch_dir
     profile="$(engine_build_profile)"
     cached="$(engine_cache_find "$PROJECT_DIR" "$profile" "$ENGINE_BUILD_FEATURES")"
     if [ -n "$cached" ]; then
         echo "Engine: REUSED cached build ${cached##*/}, built from this tree's Rust"
-        publish_launch_binaries "$cached" "$(launch_bin_dir)" || return 1
+        launch_dir="$(launch_bin_dir)" || return 1
+        publish_launch_binaries "$cached" "$launch_dir" || return 1
         BUILD=""
         build_or_find_engine
     else
         BUILD="1"
-        build_or_find_engine || return 1
-        engine_cache_store "$PROJECT_DIR" "$PROJECT_DIR/target/$profile" "$profile" "$ENGINE_BUILD_FEATURES" \
-            || echo "Engine cache: this build was not filed, so the next run compiles again."
+        ENGINE_BUILD_AFTER=file_e2e_engine_build build_or_find_engine || return 1
     fi
     # Apps loaded in iframes fetch /api/v1/sdk.js — without dist/sdk.js the
     # engine serves a stub that lacks lucidos.ui/data, breaking SDK e2e tests.
     # The frontend build reads the generated files this writes too.
     REUSED_CODEGEN_BIN="${cached:+$cached/lucidos-codegen}" generate_build_outputs || return 1
     export LUCIDOS_E2E_ENGINE_BUILT=1
+}
+
+# File the build just published in the engine cache. build_or_find_engine runs
+# it before a launch tree can move, so the manifest matches the binaries.
+file_e2e_engine_build() {
+    engine_cache_store "$LAUNCH_SOURCE_DIR" "$LAUNCH_UPLIFT_DIR" "$(engine_build_profile)" "$ENGINE_BUILD_FEATURES" \
+        || echo "Engine cache: this build was not filed, so the next run compiles again."
 }
 
 # ── frontend build: one shot, but never a STALE one ─────────────────────
@@ -389,6 +410,9 @@ ensure_workspace_running() {
         setup_postgres
         swap_ports
         attach_e2e_gateway || return 1
+        ENGINE_STAMP_KEY_FILE="$(e2e_stamp_key_path "$WORKSPACE")"
+        mint_e2e_stamp_key "$ENGINE_STAMP_KEY_FILE" \
+            "$(e2e_stamp_workspace_id "${LUCIDOS_WORKSPACE_ID:-}" "$WORKSPACE")" || return 1
         start_engine
     fi
 

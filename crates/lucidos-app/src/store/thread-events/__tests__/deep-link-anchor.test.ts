@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 // @ts-expect-error: same
 import { dirname, resolve } from 'node:path';
-import { landingTarget, deepLinkAnchorForEvent, deepLinkTargetIndex, stampedEventIds } from '../exchange-anchors';
+import { readerHasReached, landingTarget, deepLinkAnchorForEvent, deepLinkTargetIndex, stampedEventIds } from '../exchange-anchors';
 import type { Exchange } from '../exchange';
 import type { StoredEvent } from '../thread-event-types';
 
@@ -322,5 +322,36 @@ describe('landingTarget from Review', () => {
     const exchanges = [exchange('start-1', [['ResponseFailed', 'fail']]), exchange('start-2')];
     expect(landingTarget(exchanges, 'idle', 'review')).toEqual({ kind: 'turn', eventId: 'start-2' });
     expect(landingTarget(exchanges, 'failed', 'review')).toEqual({ kind: 'turn', eventId: 'start-2' });
+  });
+});
+
+
+describe('readerHasReached', () => {
+  const exchanges = [exchange('older'), exchange('target', [['ResponseFailed', 'failure']]), exchange('later', [['ResponseGenerated', 'later-reply']])];
+  const target = landingTarget(exchanges, 'failed', 'blocked');
+
+  it('compares a failure card by its turn, including a saved line in that turn', () => {
+    expect(readerHasReached(exchanges, target, {
+      kind: 'line', eventId: 'target', relTop: -40, turnRelTop: -200, path: [1], kinds: 'ffffffff',
+    })).toBe(true);
+  });
+
+  it.each(['target', 'later'])('preserves an anchor in %s', eventId => {
+    expect(readerHasReached(exchanges, target, { kind: 'anchor', eventId, relTop: 0 })).toBe(true);
+  });
+
+  it.each(['target', 'failure', 'later', 'later-reply'])('preserves a row owned by a reached turn: %s', rowEventId => {
+    expect(readerHasReached(exchanges, target, { kind: 'row', rowEventId, relTop: -40 })).toBe(true);
+  });
+
+  it('preserves the live edge', () => {
+    expect(readerHasReached(exchanges, target, { kind: 'live-edge' })).toBe(true);
+  });
+
+  it.each([null, { kind: 'offset' as const, top: 500 }, { kind: 'row' as const, rowEventId: 'older', relTop: 0 },
+    { kind: 'row' as const, rowEventId: 'unloaded', relTop: 0 },
+    { kind: 'anchor' as const, eventId: 'older', relTop: 0 },
+    { kind: 'anchor' as const, eventId: 'unloaded', relTop: 0 }])('keeps landing for an unproven position %j', saved => {
+    expect(readerHasReached(exchanges, target, saved)).toBe(false);
   });
 });

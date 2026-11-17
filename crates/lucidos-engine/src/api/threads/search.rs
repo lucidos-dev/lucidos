@@ -21,7 +21,7 @@ pub struct ThreadSearchQuery {
 
 /// GET /api/v1/threads/search?q=<query>&limit=<n>: search threads by
 /// title, content and unsent draft (text + semantic). Each result carries its
-/// reader fields.
+/// reader fields and its liveness.
 pub(in crate::api) async fn search_threads(
     State(state): State<AppState>,
     Query(query): Query<ThreadSearchQuery>,
@@ -31,7 +31,7 @@ pub(in crate::api) async fn search_threads(
         crate::engine::thread_search::combined_thread_search(&state.engine, &query.q, limit)
             .await
             .map_err(|e| {
-                log!("[API] Thread search failed: {}", e);
+                log_legacy!("[API] Thread search failed: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Search failed: {}", e),
@@ -46,5 +46,10 @@ pub(in crate::api) async fn search_threads(
         merged.iter_mut().map(|r| &mut r.info),
         &state.engine.workspace_name(),
     );
+    crate::engine::thread_liveness::attach(
+        state.engine.pool(),
+        merged.iter_mut().map(|r| &mut r.info),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "results": merged })))
 }

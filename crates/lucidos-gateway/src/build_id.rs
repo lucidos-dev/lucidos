@@ -55,6 +55,7 @@ pub(crate) fn disk_upgrade_verdict(
 /// `paths::repo_root`, resolved from the binary rather than compile-time paths.
 pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
     exe.ancestors()
+        .take_while(|a| a.extension().is_none_or(|ext| ext != "app"))
         .find(|a| a.join(REPO_MARKER).exists())
         .map(Path::to_path_buf)
 }
@@ -116,7 +117,7 @@ pub(crate) async fn disk_id_is_upgrade(exe: &Path, disk_id: &str, running_id: &s
         _ => None,
     };
     if is_older == Some(true) {
-        crate::log!(
+        crate::log_legacy!(
             "[Gateway] on-disk gateway binary ({}) is OLDER than the running one ({}) — \
              not offering a downgrade as a new version. Rebuild it forward with \
              `web-dev.sh -w <ws> -b`.",
@@ -182,6 +183,14 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
 
         assert_eq!(repo_root_above(&exe).as_deref(), Some(dir));
+        assert_eq!(
+            repo_root_above(
+                &dir.join(
+                    "target/release/bundle/macos/Demo.app/Contents/Resources/lucidos-gateway"
+                )
+            ),
+            None
+        );
         assert_eq!(
             repo_root_above(Path::new("/tmp/nowhere/lucidos-gateway")),
             None

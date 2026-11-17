@@ -68,8 +68,8 @@ pub(crate) use turn_tail::TurnTail;
 /// consequence of the first. "The event is already on the wire" says nothing
 /// about whether the input is a message the person sent, yet a live thread
 /// routes the two differently: a message is injected as `UserText` and
-/// acknowledged with a `PromptInjected`, and it arms the Codex redirect
-/// interrupt; an engine re-entry is injected as `ReentryFromEngine`, silently.
+/// acknowledged with a `PromptInjected`, and it can arm a redirect
+/// interrupt when urgent or unsupported; an engine re-entry is injected as `ReentryFromEngine`, silently.
 ///
 /// Modelling both as one nullable id made every reader infer the second from
 /// the first (`pre_emitted_origin.is_none()` == "genuine user follow-up").
@@ -108,6 +108,13 @@ pub(crate) enum PreEmittedOrigin {
     /// own hidden `PromptInjected`. It only ever starts a fresh `--resume` turn:
     /// it never enters a live session, waits on a hold, or supersedes a card.
     KeepAlive(Uuid),
+}
+
+/// The lane an orphaned input re-runs on.
+pub(crate) enum OrphanLane {
+    /// Keeps the admission the orphan chain already won, if any.
+    LucidosAgent(Option<crate::engine::PreAdmission>),
+    CodingAgent(Vec<crate::engine::AgentUserInput>),
 }
 
 impl PreEmittedOrigin {
@@ -244,6 +251,8 @@ impl LucidosEngine {
                 None,
                 crate::engine::FollowUpUrgency::Normal,
                 None,
+                None,
+                Vec::new(),
             )
             .await?;
         // A continuing fire may coalesce into a live turn. Then the thread's
@@ -331,6 +340,58 @@ impl LucidosEngine {
             voice_session_id,
             urgency,
             input_turn,
+            None,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// Orphan-only entry, on the lane the thread's agent decides (ADR 0678).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn process_orphan(
+        &self,
+        text: &str,
+        images: Option<&[crate::api::ChatImage]>,
+        thread_id: Uuid,
+        spawning_event_id: Option<Uuid>,
+        mode: ActorMode,
+        origin: Option<PreEmittedOrigin>,
+        lane: OrphanLane,
+    ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        let (use_coding_agent, admission, followups) = match lane {
+            OrphanLane::LucidosAgent(admission) => (None, admission, Vec::new()),
+            OrphanLane::CodingAgent(followups) => (Some(true), None, followups),
+        };
+        self.process_message_with_steps_internal(
+            text,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            images,
+            None,
+            use_coding_agent,
+            None,
+            Some(thread_id),
+            None,
+            None,
+            None,
+            None,
+            spawning_event_id,
+            None,
+            mode,
+            None,
+            None,
+            origin,
+            None,
+            None,
+            None,
+            crate::engine::FollowUpUrgency::Normal,
+            None,
+            admission,
+            followups,
         )
         .await
     }
@@ -412,3 +473,7 @@ mod history_tests;
 #[cfg(test)]
 #[path = "context_release_tests.rs"]
 mod context_release_tests;
+
+#[cfg(test)]
+#[path = "withdrawn_tests.rs"]
+mod withdrawn_tests;

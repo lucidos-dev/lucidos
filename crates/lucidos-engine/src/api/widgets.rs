@@ -33,6 +33,63 @@ pub(super) struct WidgetBody {
 pub(super) struct FitBody {
     app_id: String,
     thread_id: Option<String>,
+    renderer_session_id: Option<String>,
+    device_id: Option<String>,
+}
+
+/// Register only under this thread's verified subprocess origin. The returned
+/// secret belongs in launcher memory and an exact host-only report channel.
+#[derive(Deserialize)]
+struct FitSessionBody {
+    thread_id: uuid::Uuid,
+    app_id: String,
+    device_id: String,
+}
+
+const FIT_RENDERER_HEADER: &str = "x-lucidos-fit-renderer";
+
+fn require_fit_source(headers: &HeaderMap, thread: uuid::Uuid) -> Result<(), ApiError> {
+    match super::actor::subprocess_origin(headers) {
+        super::actor::SubprocessOrigin::Subprocess {
+            source_thread_id: Some(source),
+            ..
+        } if source == thread => Ok(()),
+        _ => Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "A verified origin for this thread is required",
+        )
+        .with_reason("fit-renderer-origin-required")),
+    }
+}
+
+async fn register_fit_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FitSessionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_fit_source(&headers, body.thread_id)?;
+    let app = state
+        .app_manager
+        .get_app(&body.app_id)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if !app.is_widget() {
+        return Err(ApiError::bad_request("Fit renderers require a widget"));
+    }
+    let grant = state
+        .engine
+        .widget_fit_sessions
+        .register(
+            Some(body.thread_id),
+            crate::engine::widget_fit_sessions::FitScope {
+                thread: body.thread_id,
+                app: body.app_id,
+                device: body.device_id,
+            },
+        )
+        .map_err(|reason| ApiError::new(StatusCode::CONFLICT, reason))?;
+    Ok(Json(
+        serde_json::json!({ "renderer_session_id": grant.handle, "credential": grant.credential, "expires_in_seconds": crate::engine::widget_fit_sessions::SESSION_TTL.as_secs() }),
+    ))
 }
 
 /// A page's answer to a widget fit check: what each box measured.
@@ -270,6 +327,19 @@ async fn check_fit(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let caller = super::actor::user_actor(&headers, None);
     let thread_id = required_thread(body.thread_id.as_deref())?;
+    if let Some(handle) = body.renderer_session_id.as_deref() {
+        require_fit_source(&headers, thread_id)?;
+        let device = body
+            .device_id
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("device_id is required for a renderer"))?;
+        let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
+        let note = state
+            .engine
+            .check_widget_fit_with_renderer(&body.app_id, thread_id, handle, device, actor)
+            .await;
+        return Ok(Json(serde_json::json!({ "note": note })));
+    }
     let preferred = match &caller {
         Some(crate::engine::thread_events::MessageOrigin::Device { device_id }) => {
             Some(device_id.as_str())
@@ -292,6 +362,28 @@ async fn submit_fit_report(
     Json(body): Json<FitReportBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     use crate::engine::pending_answers::{resolve_answer, AnswerRefusal};
+    if let Some(credential) = headers.get(FIT_RENDERER_HEADER) {
+        // Keep the ordinary door credential and attribution gate. This fit
+        // secret is never admitted as a general actor or owner credential.
+        super::actor::require_user_actor(&headers, &state.pool, body.device_id.as_deref()).await?;
+        let credential = credential
+            .to_str()
+            .map_err(|_| ApiError::bad_request("Invalid fit renderer credential"))?;
+        state
+            .engine
+            .widget_fit_sessions
+            .answer(
+                credential,
+                &body.request_id,
+                body.device_id.as_deref().unwrap_or(""),
+                body.boxes,
+            )
+            .map_err(|reason| {
+                ApiError::new(StatusCode::CONFLICT, reason)
+                    .with_reason("fit-check-for-another-renderer")
+            })?;
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
     let claimed = body.device_id.as_deref();
     let answering = match super::actor::require_user_actor(&headers, &state.pool, claimed).await? {
         crate::engine::thread_events::MessageOrigin::Device { device_id } => Some(device_id),
@@ -325,6 +417,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/widgets", get(list_reusable_widgets))
         .route("/widgets/size", post(size_cards))
         .route("/widgets/fit", post(check_fit))
+        .route("/widgets/fit-session", post(register_fit_session))
         .route("/widgets/fit-report", post(submit_fit_report))
         .route("/widgets/make-reusable", post(make_reusable))
         .route("/widgets/stop-reusing", post(stop_reusing))
@@ -332,4 +425,81 @@ pub(super) fn router() -> Router<AppState> {
         .route("/widgets/dashboard-remove", post(remove_from_dashboard))
         .route("/widgets/arrange", post(arrange_dashboard))
         .route("/dashboard", get(get_dashboard))
+}
+
+#[cfg(test)]
+mod fit_source_tests {
+    use super::*;
+    use crate::api::actor::{
+        init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+    };
+
+    #[test]
+    fn only_a_valid_origin_for_the_requested_thread_can_register_or_select() {
+        init_agent_origin_secret("fit-origin-test-secret".into());
+        let thread = uuid::Uuid::new_v4();
+        let mut headers = HeaderMap::new();
+        assert!(require_fit_source(&headers, thread).is_err());
+        headers.insert("x-lucidos-device-id", "registered-device".parse().unwrap());
+        headers.insert("x-lucidos-local-token", "local-token".parse().unwrap());
+        let forged_stamp = format!(
+            "v1.{}.{}",
+            lucidos_gateway_stamp::now_unix(),
+            "0".repeat(64)
+        );
+        headers.insert(
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+            forged_stamp.parse().unwrap(),
+        );
+        assert!(require_fit_source(&headers, thread).is_err());
+        headers.insert(
+            "x-lucidos-agent-origin-token",
+            "forged-token".parse().unwrap(),
+        );
+        assert!(require_fit_source(&headers, thread).is_err());
+        let token = mint_agent_origin_token(Some(uuid::Uuid::new_v4()), 0, None).unwrap();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        assert!(require_fit_source(&headers, thread).is_err());
+        let token = mint_agent_origin_token(Some(thread), 0, None).unwrap();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        assert!(require_fit_source(&headers, thread).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_live_fit_credential_never_authorizes_an_owner_operation() {
+        use crate::api::owner_door::OnUnattested;
+        use crate::engine::widget_fit_sessions::{FitScope, FitSessions};
+
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        init_agent_origin_secret("fit-origin-test-secret".into());
+        let thread = uuid::Uuid::new_v4();
+        let sessions = FitSessions::default();
+        let scope = FitScope {
+            thread,
+            app: "example-widget".into(),
+            device: "fit-renderer".into(),
+        };
+        let grant = sessions.register(Some(thread), scope.clone()).unwrap();
+        let wait = sessions.select(&grant.handle, &scope, "request").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(FIT_RENDERER_HEADER, grant.credential.parse().unwrap());
+        let refusal =
+            super::super::actor::require_owner_device(&headers, &pool, OnUnattested::Refuse)
+                .await
+                .expect_err("a fit credential provides no general identity");
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+
+        let token = mint_agent_origin_token(Some(thread), 0, None).unwrap();
+        headers.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+        let refusal =
+            super::super::actor::require_owner_device(&headers, &pool, OnUnattested::Refuse)
+                .await
+                .expect_err("an identified renderer agent is still not the owner");
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        sessions
+            .answer(&grant.credential, "request", &scope.device, vec![])
+            .unwrap();
+        assert!(wait.await.unwrap().is_empty());
+        crate::test_support::teardown_test_db(&db).await;
+    }
 }

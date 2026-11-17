@@ -37,7 +37,7 @@ impl LucidosEngine {
     pub fn start_parent_callback_listener(self: &Arc<Self>) {
         let rx = PARENT_CALLBACK_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            crate::log!("[FanOut] No parent callback receiver found — listener not started");
+            crate::log_legacy!("[FanOut] No parent callback receiver found — listener not started");
             return;
         };
         let engine = self.clone();
@@ -45,7 +45,7 @@ impl LucidosEngine {
             while let Some(cb) = rx.recv().await {
                 let engine = engine.clone();
                 tokio::spawn(async move {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[FanOut] Child {} completed, notifying parent {}",
                         cb.child_thread_id,
                         cb.parent_thread_id
@@ -60,7 +60,7 @@ impl LucidosEngine {
                         )
                         .await
                     {
-                        crate::log!(
+                        crate::log_legacy!(
                             "[FanOut] Failed to notify parent {} of child {}: {}",
                             cb.parent_thread_id,
                             cb.child_thread_id,
@@ -120,7 +120,7 @@ impl LucidosEngine {
                             thread_id,
                             event_id,
                         } => {
-                            crate::log!(
+                            crate::log_legacy!(
                                 "[SpawnConsumer] Continue thread={} event={} — invoking run_direct_agent (--resume + non-empty stdin placeholder)",
                                 thread_id,
                                 event_id
@@ -146,7 +146,7 @@ impl LucidosEngine {
                                         {
                                             Ok(o) => Some(o),
                                             Err(e) => {
-                                                crate::log!(
+                                                crate::log_legacy!(
                                                     "[SpawnConsumer] Continue event {} has malformed actor payload: {} — chip will fall back to engine",
                                                     event_id, e
                                                 );
@@ -163,7 +163,7 @@ impl LucidosEngine {
                                 }
                                 Ok(None) => (None, None),
                                 Err(e) => {
-                                    crate::log!(
+                                    crate::log_legacy!(
                                         "[SpawnConsumer] Failed to load continue event {}: {} — chip will fall back to engine and the resume boundary will be skipped",
                                         event_id, e
                                     );
@@ -191,17 +191,13 @@ impl LucidosEngine {
                                         let routed = engine
                                             .route_to_live_run(
                                                 thread_id,
-                                                crate::engine::AgentUserInput {
-                                                    text: input,
-                                                    images: None,
-                                                    origin_event_id: Some(event_id),
-                                                    kind: crate::engine::AgentInputKind::User,
-                                                    completion: None,
-                                                },
+                                                crate::engine::AgentUserInput::continuation(
+                                                    input, event_id,
+                                                ),
                                             )
                                             .await;
                                         if routed {
-                                            crate::log!(
+                                            crate::log_legacy!(
                                                 "[SpawnConsumer] Continue thread={} event={} routed to the live run",
                                                 thread_id,
                                                 event_id
@@ -281,7 +277,7 @@ impl LucidosEngine {
                                         .claim_pending_change(change.id)
                                         .await
                                         .unwrap_or_else(|e| {
-                                            crate::log!(
+                                            crate::log_legacy!(
                                                 "[SpawnConsumer] Could not claim change {} for its merge duty: {}",
                                                 change.id,
                                                 e
@@ -289,7 +285,7 @@ impl LucidosEngine {
                                             None
                                         });
                                     if claim.is_none() {
-                                        crate::log!(
+                                        crate::log_legacy!(
                                             "[SpawnConsumer] Continue thread={} leaves the merge duty for change {} to the apply that holds it",
                                             thread_id,
                                             change.id
@@ -351,7 +347,8 @@ impl LucidosEngine {
                                 .map_or(&[][..], |u| u.event_ids.as_slice());
                             let continue_images = undelivered
                                 .as_ref()
-                                .and_then(|u| engine.resolve_queued_image_hashes(&u.image_hashes));
+                                .map(|u| engine.resolve_message_image_hashes(&u.image_hashes))
+                                .unwrap_or(Ok(None));
                             let continue_input = match &undelivered {
                                 Some(u) => u.text.clone(),
                                 None => {
@@ -364,15 +361,16 @@ impl LucidosEngine {
                                     .await
                                 }
                             };
-                            let mut result = match claim.as_mut() {
-                                Err(e) => Err(e.to_string().into()),
-                                Ok(claim) => {
+                            let mut result = match (claim.as_mut(), continue_images.as_ref()) {
+                                (_, Err(e)) => Err(e.to_string().into()),
+                                (Err(e), _) => Err(e.to_string().into()),
+                                (Ok(claim), Ok(images)) => {
                                     engine
                                         .run_direct_agent(
                                             claim,
                                             request_id,
                                             &continue_input,
-                                            continue_images.as_deref(),
+                                            images.as_deref(),
                                             event_id,
                                             carried_event_ids,
                                             None,
@@ -406,7 +404,7 @@ impl LucidosEngine {
                                 retried,
                             ) == ContinueRecovery::RetryFresh
                             {
-                                crate::log!(
+                                crate::log_legacy!(
                                     "[SpawnConsumer] Stale resume on continuation thread={} — retrying with a fresh session",
                                     thread_id
                                 );
@@ -438,7 +436,10 @@ impl LucidosEngine {
                                                 claim,
                                                 request_id,
                                                 &retry_text,
-                                                continue_images.as_deref(),
+                                                continue_images
+                                                    .as_ref()
+                                                    .expect("only a started session can request a fresh retry")
+                                                    .as_deref(),
                                                 event_id,
                                                 carried_event_ids,
                                                 None,
@@ -470,18 +471,16 @@ impl LucidosEngine {
                             // a spawn refusal, or the CLI's own exit. Land that as
                             // the turn's failure while the claim still holds, so no
                             // new turn can start under it. A failed claim owned no
-                            // turn, and another session may hold the thread.
+                            // turn, and another session may hold the thread. A run
+                            // parked on the owner's card is waiting, not failed.
                             if let (true, Err(error), Ok(_)) = (settle, &result, &claim) {
-                                crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
+                                crate::engine::agentic_loop::ensure_run_failure_terminator_emitted(
                                     &engine.event_bus,
                                     engine.pool(),
                                     thread_id,
                                     event_id,
                                     Some(crate::engine::thread_events::EventChannel::ClaudeCode),
-                                    &error.to_string(),
-                                    crate::engine::agent_session::start_failure::agent_exit_of(
-                                        error.as_ref(),
-                                    ),
+                                    error.as_ref(),
                                 )
                                 .await;
                             }
@@ -489,7 +488,7 @@ impl LucidosEngine {
                             drop(claim);
                             if settle {
                                 let e = final_err.as_deref().unwrap_or_default();
-                                crate::log!(
+                                crate::log_legacy!(
                                     "[SpawnConsumer] Continue thread={} event={} failed: {}",
                                     thread_id,
                                     event_id,
@@ -514,7 +513,7 @@ impl LucidosEngine {
                                         .conflict_pairing_open(thread_id, change.id)
                                         .await
                                         .unwrap_or_else(|e| {
-                                            crate::log!(
+                                            crate::log_legacy!(
                                                 "[SpawnConsumer] pairing re-check failed for change {}: {} — leaving duty as-is",
                                                 change.id,
                                                 e
@@ -563,12 +562,12 @@ impl LucidosEngine {
                                     )
                                     .await
                                 {
-                                    Ok(true) => crate::log!(
+                                    Ok(true) => crate::log_legacy!(
                                         "[SpawnConsumer] Settled thread {} left `running` by a failed continuation",
                                         thread_id
                                     ),
                                     Ok(false) => {}
-                                    Err(e) => crate::log!(
+                                    Err(e) => crate::log_legacy!(
                                         "[SpawnConsumer] Failed to settle thread {} after a failed continuation: {}",
                                         thread_id,
                                         e
@@ -592,7 +591,7 @@ impl LucidosEngine {
                     }
                 });
             }
-            crate::log!("[SpawnConsumer] channel closed — consumer exiting");
+            crate::log_legacy!("[SpawnConsumer] channel closed — consumer exiting");
         });
     }
 
@@ -631,7 +630,7 @@ impl LucidosEngine {
             Ok(Some(c)) => c,
             Ok(None) => return None,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[SpawnConsumer] Continue thread={}: conflict-duty lookup failed: {} — resuming without re-attaching the merge",
                     thread_id,
                     e
@@ -673,7 +672,7 @@ impl LucidosEngine {
                 // that may ride on a probe that never ran. The duty stays
                 // parked for the next boot instead.
                 crate::engine::git_ops::WorktreeLookup::Unknown => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[SpawnConsumer] Continue thread={} could not locate the worktree for branch {} (git worktree list gave no answer); leaving the conflict duty parked",
                         thread_id,
                         change.branch_name
@@ -684,7 +683,7 @@ impl LucidosEngine {
         };
         match worktree {
             Some(pair) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[SpawnConsumer] Continue thread={} re-attaching conflict resolution for change {} (branch {})",
                     thread_id,
                     change.id,
@@ -719,7 +718,7 @@ impl LucidosEngine {
         why: &str,
         merge_worktree: Option<&std::path::Path>,
     ) {
-        crate::log!(
+        crate::log_legacy!(
             "[SpawnConsumer] Closing stranded conflict resolution for change {} ({}) — emitting the failure the hand-off deferred",
             change.id,
             why
@@ -749,7 +748,7 @@ impl LucidosEngine {
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[SpawnConsumer] Temp merge state for change {} needs manual cleanup ({}): the merge columns are cleared below, so nothing points at it any more",
                     change.id,
                     e
@@ -823,7 +822,7 @@ impl LucidosEngine {
         // creates the file on first boot, appends new entries (e.g. data/blobs/)
         // on existing workspaces, no-ops once everything is already in place.
         if let Err(e) = crate::core::ensure_workspace_gitignore_entries(&workspace_path) {
-            log!(
+            log_legacy!(
                 "[Startup] Failed to ensure workspace .gitignore entries: {}",
                 e
             );
@@ -834,9 +833,9 @@ impl LucidosEngine {
         // boot, which is what converges a workspace created before the ADR.
         // Silent once correct, and never fatal.
         match crate::core::ensure_state_dir_excluded_from_file_backup(&workspace_path) {
-            Ok(true) => log!("[Startup] Excluded .lucidos/ from file-level backup"),
+            Ok(true) => log_legacy!("[Startup] Excluded .lucidos/ from file-level backup"),
             Ok(false) => {}
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Startup] Failed to exclude .lucidos/ from file-level backup: {}",
                 e
             ),
@@ -865,19 +864,19 @@ impl LucidosEngine {
             {
                 Some(vite_port) if vite_port >= 5173 => {
                     match crate::core::pin_workspace_vite_port(&workspace_path, vite_port) {
-                        Ok(true) => log!(
+                        Ok(true) => log_legacy!(
                             "[Startup] Pinned vite port {} in lucidos.toml",
                             vite_port
                         ),
                         Ok(false) => {}
-                        Err(e) => log!("[Startup] Failed to pin vite port in lucidos.toml: {}", e),
+                        Err(e) => log_legacy!("[Startup] Failed to pin vite port in lucidos.toml: {}", e),
                     }
                 }
-                Some(vite_port) => log!(
+                Some(vite_port) => log_legacy!(
                     "[Startup] LUCIDOS_API_PORT={} is below the 5173 minimum scripts/lib/ports.sh accepts — skipping lucidos.toml port pin",
                     vite_port
                 ),
-                None => log!(
+                None => log_legacy!(
                     "[Startup] LUCIDOS_API_PORT not set or invalid — skipping lucidos.toml port pin"
                 ),
             }
@@ -928,7 +927,7 @@ impl LucidosEngine {
         let migrator = sqlx::migrate!();
         let migrate_started = std::time::Instant::now();
         let migrated = migrator.run(&pool).await;
-        log!(
+        log_legacy!(
             "[Startup] Migrations checked in {}ms",
             migrate_started.elapsed().as_millis()
         );
@@ -984,8 +983,10 @@ impl LucidosEngine {
         crate::core::backup::key::move_legacy_file_at_boot(&workspace_path);
         // Subprocesses sign in as the agent role, which cannot read a secret
         // column. Without it, boot fails rather than hand out this role.
+        let workspace_origin = std::env::var("LUCIDOS_WORKSPACE_ORIGIN").ok();
         crate::core::set_agent_database_url(
-            crate::core::agent_role::provision(&pool, database_url).await?,
+            crate::core::agent_role::provision(&pool, database_url, workspace_origin.as_deref())
+                .await?,
         );
         // The boot load in main.rs ran before this migrator. On a fresh database
         // it found no `models` table, and every model would read as unknown.
@@ -1006,6 +1007,7 @@ impl LucidosEngine {
             .await?;
         crate::engine::restore_boot::complete_before_dispatch(&event_bus, restore_boot).await?;
         crate::core::secret_reference::install_notice_bus(&event_bus);
+        crate::runtime::agent_sandbox::install_notice_bus(&event_bus);
         // Recover durable archive jobs under both locks before HTTP or the
         // scheduler can start another archive operation. Reuse this slot in Engine.
         let archive_job_slot = crate::core::snapshot::ArchiveJobSlot::default();
@@ -1025,13 +1027,13 @@ impl LucidosEngine {
         match crate::core::image_migration::migrate_legacy_image_payloads(&pool, &workspace_path)
             .await
         {
-            Ok((events, drafts)) if events > 0 || drafts > 0 => log!(
+            Ok((events, drafts)) if events > 0 || drafts > 0 => log_legacy!(
                 "[ImageMigration] migrated {} event(s) and {} draft(s) to content-addressed blobs",
                 events,
                 drafts
             ),
             Ok(_) => {}
-            Err(e) => log!("[ImageMigration] failed: {}", e),
+            Err(e) => log_legacy!("[ImageMigration] failed: {}", e),
         }
 
         // One-shot, idempotent: emit `ImageDescribed` events for legacy
@@ -1048,11 +1050,11 @@ impl LucidosEngine {
         .await
         {
             Ok(0) => {}
-            Ok(n) => log!(
+            Ok(n) => log_legacy!(
                 "[ImageDescribedBackfill] backfilled {} ImageDescribed event(s) from legacy MessageReceived rows",
                 n
             ),
-            Err(e) => log!("[ImageDescribedBackfill] failed: {}", e),
+            Err(e) => log_legacy!("[ImageDescribedBackfill] failed: {}", e),
         }
 
         // One-shot, idempotent: the SQL backfill in migration
@@ -1061,7 +1063,7 @@ impl LucidosEngine {
         // pre-rename trigger thread. Recover from the events table first…
         let from_events = event_store.backfill_trigger_id_from_events().await?;
         if from_events > 0 {
-            log!(
+            log_legacy!(
                 "[Engine] Backfilled {} thread_summaries rows: trigger_id NULL → first TriggerStarted event",
                 from_events
             );
@@ -1072,7 +1074,7 @@ impl LucidosEngine {
         // Subsequent runs update zero rows.
         let backfilled = event_store.backfill_trigger_id_v5_to_config_id().await?;
         if backfilled > 0 {
-            log!(
+            log_legacy!(
                 "[Engine] Backfilled {} thread_summaries rows: trigger_id v5-hash → config.id",
                 backfilled
             );
@@ -1084,7 +1086,7 @@ impl LucidosEngine {
         // basename preserved in `changes.repo_root`.
         let repo_names = event_store.backfill_repo_names_from_changes().await?;
         if repo_names > 0 {
-            log!(
+            log_legacy!(
                 "[Engine] Backfilled {} repo_names rows from changes.repo_root (pre-RepositoryAdded repos)",
                 repo_names
             );
@@ -1102,7 +1104,7 @@ impl LucidosEngine {
             crate::runtime::is_packaged(),
         );
         if let Some(warning) = &system_widgets_warning {
-            log!("{}", warning);
+            log_legacy!("{}", warning);
         }
         let app_manager =
             Arc::new(AppManager::new(&workspace_path)?.with_system_widgets(system_widgets_dir));
@@ -1132,11 +1134,11 @@ impl LucidosEngine {
         let memory_index = match PgVectorIndex::new(pool.clone()).await {
             Ok(index) => {
                 let count = index.len().await.unwrap_or(0);
-                log!("[Memory] Index initialized (pgvector, {} entries)", count);
+                log_legacy!("[Memory] Index initialized (pgvector, {} entries)", count);
                 Some(index)
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Memory] Could not initialize index: {}. Memory search disabled.",
                     e
                 );
@@ -1160,9 +1162,9 @@ impl LucidosEngine {
             .unwrap_or_default();
 
         if user_timezone.is_empty() {
-            log!("[Engine] User timezone: not set (LLM will ask)");
+            log_legacy!("[Engine] User timezone: not set (LLM will ask)");
         } else {
-            log!("[Engine] User timezone: {}", user_timezone);
+            log_legacy!("[Engine] User timezone: {}", user_timezone);
         }
 
         // Load user language preference from database
@@ -1172,9 +1174,9 @@ impl LucidosEngine {
             .unwrap_or_default();
 
         if user_language.is_empty() {
-            log!("[Engine] User language: not set (will detect from conversation)");
+            log_legacy!("[Engine] User language: not set (will detect from conversation)");
         } else {
-            log!("[Engine] User language: {}", user_language);
+            log_legacy!("[Engine] User language: {}", user_language);
         }
 
         // Resolve the engine-shipped `system-knowhow/` reference set. In a packaged
@@ -1192,7 +1194,7 @@ impl LucidosEngine {
             crate::runtime::is_packaged(),
         );
         if let Some(warning) = &system_knowhow_warning {
-            log!("{}", warning);
+            log_legacy!("{}", warning);
         }
 
         // Register the Lucidos repo so it appears in the Files view without manual
@@ -1227,7 +1229,7 @@ impl LucidosEngine {
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[Startup] Failed to register default Lucidos repository: {}",
                     e
                 );
@@ -1246,16 +1248,16 @@ impl LucidosEngine {
                 .backfill_cc_repo_id_to_deterministic(default_repo_det_id)
                 .await
             {
-                Ok(n) if n > 0 => log!(
+                Ok(n) if n > 0 => log_legacy!(
                     "[Engine] Backfilled {} thread_summaries rows: cc_repo_id → deterministic repo id {}",
                     n,
                     default_repo_det_id
                 ),
                 Ok(_) => {}
-                Err(e) => log!("[Startup] cc_repo_id deterministic backfill failed: {}", e),
+                Err(e) => log_legacy!("[Startup] cc_repo_id deterministic backfill failed: {}", e),
             }
         } else {
-            log!("[Startup] Packaged build (no source checkout) — skipping Lucidos source repo registration");
+            log_legacy!("[Startup] Packaged build (no source checkout) — skipping Lucidos source repo registration");
         }
 
         // Auto-commit safe files (docs) if dirty — a dirty working tree blocks
@@ -1274,8 +1276,8 @@ impl LucidosEngine {
             .await
         {
             Ok(0) => {}
-            Ok(n) => log!("[Startup] Rebuilt {} missing change row(s) from events", n),
-            Err(e) => log!("[Startup] rebuild_missing_from_events failed: {}", e),
+            Ok(n) => log_legacy!("[Startup] Rebuilt {} missing change row(s) from events", n),
+            Err(e) => log_legacy!("[Startup] rebuild_missing_from_events failed: {}", e),
         }
 
         // Clean up stale merge worktrees left by crashed apply_change operations.
@@ -1285,7 +1287,7 @@ impl LucidosEngine {
         let stale_merges = match event_bus.changes_projection().with_merge_worktree().await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Startup] with_merge_worktree: {} — skipping stale merge cleanup",
                     e
                 );
@@ -1306,7 +1308,7 @@ impl LucidosEngine {
         let stale_merges = match &retained_worktrees {
             Ok(_) => stale_merges,
             Err(e) => {
-                log!("[Startup] cannot read restore worktree exemptions ({e}); keeping stale merge state");
+                log_legacy!("[Startup] cannot read restore worktree exemptions ({e}); keeping stale merge state");
                 Vec::new()
             }
         };
@@ -1338,11 +1340,11 @@ impl LucidosEngine {
                 }
                 match cleared {
                     TempMergeCleanup::Retained => {}
-                    TempMergeCleanup::Cleared(Ok(())) => log!(
+                    TempMergeCleanup::Cleared(Ok(())) => log_legacy!(
                         "[Startup] Cleaned up stale merge worktree for change {}",
                         change.id
                     ),
-                    TempMergeCleanup::Cleared(Err(e)) => log!(
+                    TempMergeCleanup::Cleared(Err(e)) => log_legacy!(
                         "[Startup] Stale merge state for change {} needs manual cleanup ({}): the merge columns are cleared, so nothing points at it any more",
                         change.id,
                         e
@@ -1362,7 +1364,7 @@ impl LucidosEngine {
         let stale = match event_bus.changes_projection().list_pending().await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Startup] list_pending: {} — skipping stale branch surface log",
                     e
                 );
@@ -1389,7 +1391,7 @@ impl LucidosEngine {
             .await
             .or_unknown(true);
             if !branch_ok {
-                log!(
+                log_legacy!(
                     "[Engine] Pending change {} references missing branch {} — left in Review for user to resolve",
                     change.id,
                     change.branch_name
@@ -1436,7 +1438,7 @@ impl LucidosEngine {
             web_search,
             selection,
         } = crate::llm::build_active_provider(Some(&pool), &provider_build_ctx).await?;
-        log!("[Startup] LLM provider installed: {:?}", selection);
+        log_legacy!("[Startup] LLM provider installed: {:?}", selection);
 
         // Wrap the active provider in the swappable handle BEFORE the struct is
         // assembled, so the credential subscriber below shares the very handle
@@ -1529,7 +1531,7 @@ impl LucidosEngine {
 
         let version_tracking = crate::engine::engine_version::VersionTracking::from_env();
         if version_tracking == crate::engine::engine_version::VersionTracking::PinnedToBuild {
-            crate::log!(
+            crate::log_legacy!(
                 "[Rebuild] engine version pinned to {} ({}): newer commits neither rebuild nor announce this engine",
                 crate::ENGINE_BUILD_ID,
                 crate::engine::engine_version::PIN_ENGINE_VERSION_ENV
@@ -1596,7 +1598,7 @@ impl LucidosEngine {
                     match crate::api::proxy_wasm_signer::load_wasm_modules(&dir, &wasm_engine) {
                         Ok(m) => {
                             if !m.is_empty() {
-                                log!(
+                                log_legacy!(
                                     "[Startup] loaded {} WASM auth module(s) from {}",
                                     m.len(),
                                     dir.display()
@@ -1608,7 +1610,7 @@ impl LucidosEngine {
                             // A bad .wasm shouldn't take the engine down — log
                             // loud, start with an empty map. Operators fix it
                             // and POST /api/v1/proxy-modules/reload (Phase 9).
-                            log!(
+                            log_legacy!(
                                 "[Startup] WASM auth module load failed at {}: {} \
                                  (proceeding with no signer modules)",
                                 dir.display(),
@@ -1626,6 +1628,7 @@ impl LucidosEngine {
             user_profile,
             user_timezone: tokio::sync::RwLock::new(user_timezone),
             user_language: tokio::sync::RwLock::new(user_language),
+            input_order: event_bus.input_order.clone(),
             event_bus: {
                 // parent_callback_rx is stored temporarily in a thread-local;
                 // it's extracted and wired up after Arc::new(engine) via start_parent_callback_listener().
@@ -1641,6 +1644,7 @@ impl LucidosEngine {
             wasm_engine,
             pending_captures: Arc::default(),
             pending_widget_fits: Arc::default(),
+            widget_fit_sessions: Arc::default(),
             claude_gateway_sign_in: Arc::default(),
             chatgpt_plan_sign_in: Arc::default(),
             chatgpt_plan_access: plan_access,
@@ -1671,7 +1675,6 @@ impl LucidosEngine {
             },
             cc_system_prompts: std::sync::Mutex::new(HashMap::new()),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
-            input_order: Default::default(),
             accepted_messages: Default::default(),
             turn_start_gate: Default::default(),
             cc_startup_semaphore: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -1713,7 +1716,7 @@ impl LucidosEngine {
             standing_applies: Arc::new(crate::engine::standing_apply::ArmedThreads::default()),
             self_arc: std::sync::OnceLock::new(),
             trigger_configs,
-            trigger_groups: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            trigger_groups: Arc::default(),
             trigger_group_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             trigger_write_lock,
             bash_background: crate::engine::tools::bash_background::BackgroundBashRegistry::new(),
@@ -1726,7 +1729,7 @@ impl LucidosEngine {
         let path = workspace.join(".lucidos/cc-commands.json");
         match std::fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
-                log!("[ClaudeCode] Failed to parse CC commands cache: {}", e);
+                log_legacy!("[ClaudeCode] Failed to parse CC commands cache: {}", e);
                 HashMap::new()
             }),
             Err(_) => HashMap::new(),
@@ -1749,7 +1752,7 @@ async fn clear_unretained_temp_merge_state(
     retained: &std::collections::BTreeSet<std::path::PathBuf>,
 ) -> TempMergeCleanup {
     if retained.iter().any(|path| worktree.starts_with(path)) {
-        log!("[Startup] Preserving temp merge worktree retained by snapshot restore");
+        log_legacy!("[Startup] Preserving temp merge worktree retained by snapshot restore");
         return TempMergeCleanup::Retained;
     }
     TempMergeCleanup::Cleared(

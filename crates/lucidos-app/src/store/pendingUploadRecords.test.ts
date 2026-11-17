@@ -1,5 +1,6 @@
 import { observeSourceGeneration } from '../utils/restoreSourceGeneration';
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { DEVICE_DATABASE_STALL_MS, DeviceDatabaseStalledError } from './deviceDatabase';
 
 import {
   PENDING_UPLOAD_MAX_BYTES,
@@ -123,6 +124,24 @@ describe('persistPendingUpload', () => {
     await readPendingUploadStore();
     const messages = toasts.value.map((t) => t.message);
     expect(messages).toEqual([pendingUploadStorageFailureMessage(new DOMException('quota', 'QuotaExceededError'))]);
+  });
+
+  it('fails a read stuck behind a stalled write within the bound, and keeps the write', async () => {
+    vi.useFakeTimers();
+    try {
+      const backend = createMemoryPendingUploadBackend();
+      let land!: () => void;
+      _resetPendingUploadRecordsForTesting({ ...backend,
+        putUpload: (stored) => new Promise<void>((resolve) => { land = () => { void backend.putUpload(stored).then(resolve); }; }) });
+      persist('u-1');
+      const read = expect(readPendingUploadStore(true)).rejects.toBeInstanceOf(DeviceDatabaseStalledError);
+      await vi.advanceTimersByTimeAsync(DEVICE_DATABASE_STALL_MS);
+      await read;
+      land();
+      expect((await readPendingUploadStore()).uploads.map((u) => u.localId)).toEqual(['u-1']);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

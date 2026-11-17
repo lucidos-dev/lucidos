@@ -49,8 +49,9 @@ impl Store {
         {
             return Err("invalid snapshot database name".into());
         }
-        let home = lucidos_home::path().ok_or("Lucidos home is unavailable")?;
-        Ok(home.join("snapshots").join(database))
+        let snapshots = lucidos_home::private_entry(lucidos_home::private::SNAPSHOTS_DIR)
+            .ok_or("Lucidos home is unavailable")?;
+        Ok(snapshots.join(database))
     }
 
     /// Explicit root for the offline worker and disposable test stores.
@@ -311,7 +312,7 @@ pub struct StoreLock(File, PathBuf);
 impl Drop for StoreLock {
     fn drop(&mut self) {
         if fs2::FileExt::unlock(&self.0).is_err() {
-            crate::log!("[Snapshots] Cannot release archive lock");
+            crate::log_legacy!("[Snapshots] Cannot release archive lock");
         }
     }
 }

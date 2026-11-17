@@ -29,7 +29,7 @@ import { makeThreadState } from '../actions/threads-test-helpers';
 import type { ThreadAggregate, ThreadEvent, ThreadState } from '../thread-events';
 import { applyingNowThreadIds, applyNowRequests, threadMap } from '../store';
 import { flushThreadMap, handleThreadEvent } from '../actions/thread-sync';
-import { endClaudeCodeAndApply } from '../actions/chat-claude-code';
+import { endClaudeCodeAndApply } from '../actions/codingAgentChanges';
 import { applyNow, ApiError } from '../../api/client';
 
 type Mock = ReturnType<typeof vi.fn>;

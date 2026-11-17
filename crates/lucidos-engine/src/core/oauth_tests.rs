@@ -1228,7 +1228,12 @@ fn refresh_omits_the_client_secret_for_a_public_client() {
 fn token_error_surfaces_the_providers_own_words() {
     // The exact body Entra returns for the failure this work chased down.
     let body = r#"{"error":"invalid_request","error_description":"AADSTS90023: The provided value for the input parameter 'redirect_uri' is not valid.","error_codes":[90023],"trace_id":"t","correlation_id":"c"}"#;
-    let msg = describe_token_error("Token exchange", reqwest::StatusCode::BAD_REQUEST, body);
+    let msg = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::BAD_REQUEST,
+        body,
+        None,
+    );
     assert!(msg.contains("400 Bad Request"), "{msg}");
     assert!(msg.contains("invalid_request"), "{msg}");
     assert!(msg.contains("AADSTS90023"), "{msg}");
@@ -1246,22 +1251,158 @@ fn token_error_falls_back_to_the_raw_body_when_it_is_not_an_oauth_error() {
         "Token refresh",
         reqwest::StatusCode::BAD_GATEWAY,
         "<html><body>Bad gateway</body></html>",
+        None,
     );
     assert!(msg.contains("502 Bad Gateway"), "{msg}");
     assert!(msg.contains("Bad gateway"), "{msg}");
 
-    let empty = describe_token_error("Token exchange", reqwest::StatusCode::FORBIDDEN, "   ");
+    let empty = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::FORBIDDEN,
+        "   ",
+        None,
+    );
     assert!(empty.contains("empty response body"), "{empty}");
 }
 
 #[test]
 fn token_error_truncates_a_huge_body_on_a_char_boundary() {
     let body = "é".repeat(5000);
-    let msg = describe_token_error("Token exchange", reqwest::StatusCode::BAD_REQUEST, &body);
+    let msg = describe_token_error(
+        "Token exchange",
+        reqwest::StatusCode::BAD_REQUEST,
+        &body,
+        None,
+    );
     assert!(
         msg.len() < body.len(),
         "an oversized body must be truncated"
     );
+}
+
+// ---------------------------------------------------------------------------
+// invalid_client diagnostics and the repeated-secret refusal
+// ---------------------------------------------------------------------------
+
+const INVALID_CLIENT_BODY: &str =
+    r#"{"error":"invalid_client","error_description":"Invalid client_id or client_secret"}"#;
+
+#[test]
+fn an_invalid_client_error_gains_the_hint_and_other_errors_do_not() {
+    let status = reqwest::StatusCode::BAD_REQUEST;
+    let hinted = describe_token_error("Token exchange", status, INVALID_CLIENT_BODY, Some("HINT"));
+    // The hint leads, so a clamped error toast still shows the fix.
+    assert_eq!(
+        hinted,
+        "Token exchange failed (400 Bad Request): invalid_client — HINT — \
+         Invalid client_id or client_secret"
+    );
+
+    let other = describe_token_error(
+        "Token exchange",
+        status,
+        r#"{"error":"invalid_grant"}"#,
+        Some("HINT"),
+    );
+    assert!(!other.contains("HINT"), "{other}");
+}
+
+#[test]
+fn the_invalid_client_hint_states_the_client_type_redirect_and_shape_counts() {
+    let secret = ClientAuth::from_secret(Some("a-real-looking-secret"));
+    let hint = invalid_client_hint(
+        "app\u{200b}key",
+        &secret,
+        "http://127.0.0.1:1/oauth/callback",
+    );
+    assert!(
+        hint.starts_with("Re-enter the client secret"),
+        "the fix leads the hint: {hint}"
+    );
+    assert!(hint.contains("http://127.0.0.1:1/oauth/callback"), "{hint}");
+    assert!(
+        hint.contains("1 character outside visible ASCII in the client ID"),
+        "{hint}"
+    );
+    assert!(hint.contains("0 in the client secret"), "{hint}");
+    assert!(
+        !hint.contains("a-real-looking-secret") && !hint.contains("appkey"),
+        "the hint must carry counts, never the values: {hint}"
+    );
+
+    let public = invalid_client_hint("appkey", &ClientAuth::from_secret(None), "http://x/cb");
+    assert!(public.contains("PKCE"), "{public}");
+    assert!(
+        public.contains("add it")
+            && !public.contains("clear it")
+            && !public.contains("in the client secret"),
+        "a public client sent no secret, so the fix is adding one: {public}"
+    );
+}
+
+#[test]
+fn a_client_secret_equal_to_the_client_id_is_detected_after_trimming() {
+    let repeats = |id: &str, secret: Option<&str>| {
+        let mut config = serde_json::json!({ "client_id": id });
+        if let Some(secret) = secret {
+            config["client_secret"] = serde_json::json!(secret);
+        }
+        client_secret_repeats_client_id(&config)
+    };
+    assert!(repeats("abc123", Some("abc123")));
+    assert!(repeats(" abc123", Some("abc123\n")));
+    assert!(!repeats("abc123", Some("different")));
+    assert!(!repeats("abc123", Some("")));
+    assert!(!repeats("abc123", None));
+    assert!(!repeats("", Some("")));
+}
+
+#[tokio::test]
+async fn connecting_with_the_client_id_stored_as_the_secret_is_refused_before_the_browser_opens() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "same-value",
+            "client_secret": "same-value",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": "https://oauth.example.com/token",
+        })
+        .to_string(),
+    )
+    .await;
+
+    let opened = std::sync::atomic::AtomicBool::new(false);
+    let open_auth_url = async |_: &str, _: uuid::Uuid| -> Result<(), BoxError> {
+        opened.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(
+        &pool,
+        &bus,
+        "acme",
+        "read",
+        None,
+        CallbackRoute::OwnListener,
+        open_auth_url,
+    )
+    .await
+    else {
+        panic!("a secret equal to the client ID must refuse the flow");
+    };
+    let error = error.to_string();
+    assert!(error.contains("client secret"), "{error}");
+    assert!(
+        !error.contains("same-value"),
+        "never echo the value: {error}"
+    );
+    assert!(!opened.load(std::sync::atomic::Ordering::SeqCst));
+
+    crate::test_support::teardown_test_db(&db_name).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1378,7 +1519,9 @@ async fn callback_recovers_a_long_code_split_across_reads() {
 
     let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
         .await
-        .unwrap();
+        .unwrap()
+        .grant
+        .code;
     assert_eq!(
         got, code,
         "the full authorization code must survive a split read"
@@ -1411,6 +1554,81 @@ async fn callback_surfaces_a_provider_denial() {
     assert!(
         msg.contains("denied consent"),
         "provider description missing: {msg}"
+    );
+}
+
+/// A browser at the callback: sends the redirect, then reads the whole response.
+fn browser_at_callback(
+    addr: std::net::SocketAddr,
+    query: String,
+) -> tokio::task::JoinHandle<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET /oauth/callback?{query} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    })
+}
+
+#[tokio::test]
+async fn the_browser_hears_connected_only_after_the_flow_settles() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("code=c&state={TEST_STATE}"),
+    );
+
+    let received = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(!browser.is_finished(), "the page waits for the outcome");
+
+    received.reply.settle(true);
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(response.contains("<h1>Connected</h1>"), "{response}");
+}
+
+#[tokio::test]
+async fn the_browser_hears_a_failed_exchange_as_a_failure() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("code=c&state={TEST_STATE}"),
+    );
+
+    let received = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
+    received.reply.settle(false);
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<h1>Connection failed</h1>"),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn the_browser_hears_a_provider_denial_at_once() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let browser = browser_at_callback(
+        listener.local_addrs()[0],
+        format!("error=access_denied&state={TEST_STATE}"),
+    );
+
+    assert!(wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .is_err());
+    let response = browser.await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    assert!(
+        response.contains("<h1>Authorization failed</h1>"),
+        "{response}"
     );
 }
 
@@ -1451,7 +1669,9 @@ async fn callback_is_received_on_every_bound_loopback_family() {
         .await;
         let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
             .await
-            .unwrap();
+            .unwrap()
+            .grant
+            .code;
         assert_eq!(got, "family-code", "callback over {addr} must be received");
     }
 }
@@ -1482,7 +1702,9 @@ async fn callback_ignores_browser_noise_before_the_real_redirect() {
 
     let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
         .await
-        .unwrap();
+        .unwrap()
+        .grant
+        .code;
     assert_eq!(got, "the-real-code");
 }
 
@@ -1541,7 +1763,9 @@ async fn callback_survives_a_connection_that_closes_without_sending() {
 
     let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
         .await
-        .unwrap();
+        .unwrap()
+        .grant
+        .code;
     assert_eq!(got, "survived");
 }
 
@@ -1832,7 +2056,9 @@ async fn a_callback_from_another_flow_is_ignored_and_the_real_one_still_lands() 
 
     let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
         .await
-        .unwrap();
+        .unwrap()
+        .grant
+        .code;
     assert_eq!(
         got, "our-code",
         "only the callback carrying this flow's state may be redeemed"
@@ -2003,8 +2229,11 @@ async fn a_flow_started_with_a_legacy_prefix_connects_the_canonical_account() {
         let state = authorize_param(auth_url, "state").expect("the URL carries a state");
         let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
         assert!(matches!(
-            deliver_callback(&query),
-            CallbackDelivery::Accepted { ok: true, .. }
+            deliver_callback(&query).await,
+            CallbackDelivery::Accepted {
+                state: CallbackPageState::Connected,
+                ..
+            }
         ));
         Ok(())
     };
@@ -2080,8 +2309,11 @@ async fn a_gateway_flow_completes_by_delivery_without_binding_the_port() {
         drop(slot);
         let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
         assert!(matches!(
-            deliver_callback(&query),
-            CallbackDelivery::Accepted { ok: true, .. }
+            deliver_callback(&query).await,
+            CallbackDelivery::Accepted {
+                state: CallbackPageState::Connected,
+                ..
+            }
         ));
         Ok(())
     };
@@ -2098,18 +2330,74 @@ async fn a_gateway_flow_completes_by_delivery_without_binding_the_port() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// A token endpoint that refuses the client must reach the browser as a failed
+/// connection, never as a completed authorization.
+#[tokio::test]
+async fn a_gateway_flow_whose_exchange_is_refused_shows_the_failure_page() {
+    use crate::core::oauth_callback::{deliver_callback, BrowserContext, CallbackDelivery};
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let refusal = serde_json::json!({"error": "invalid_client"}).to_string();
+    let token_url = serve_one_response(format!(
+        "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{refusal}",
+        refusal.len()
+    ))
+    .await;
+    crate::test_support::seed_credential(
+        &pool,
+        "acme",
+        "https://api.example.com",
+        crate::core::AuthType::OauthClient,
+        &serde_json::json!({
+            "client_id": "cid",
+            "client_secret": "secret",
+            "auth_url": "https://oauth.example.com/authorize",
+            "token_url": token_url,
+        })
+        .to_string(),
+    )
+    .await;
+
+    let route = CallbackRoute::Gateway(BrowserContext {
+        prefix: "/dev@cloud/".into(),
+        local: true,
+        origin: None,
+    });
+    let open_auth_url = async |auth_url: &str, _request_id: uuid::Uuid| -> Result<(), BoxError> {
+        let state = authorize_param(auth_url, "state").expect("the URL carries a state");
+        let query = format!("code=granted-code&state={}", urlencoding::encode(&state));
+        let CallbackDelivery::Accepted { state, page } = deliver_callback(&query).await else {
+            panic!("the open flow owns its state");
+        };
+        assert_eq!(state, CallbackPageState::Failed);
+        assert!(page.contains("<h1>Connection failed</h1>"), "{page}");
+        Ok(())
+    };
+    let Err(error) = run_oauth_flow(&pool, &bus, "acme", "read", None, route, open_auth_url).await
+    else {
+        panic!("a refused exchange fails the flow");
+    };
+    assert!(error.to_string().contains("invalid_client"), "{error}");
+    assert!(OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .is_none());
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 // ---------------------------------------------------------------------------
 // callback_page: the last screen of the flow
 // ---------------------------------------------------------------------------
 
-/// The success page must name the provider and state the honest tense. It is
-/// written at callback RECEIPT, before the code is exchanged, so it cannot claim
-/// the account is connected.
+/// The connected page names the provider. It is written only after the account
+/// was stored, so it may say so.
 #[test]
-fn callback_success_page_names_the_provider_and_what_happens_next() {
-    let page = callback_page("dropbox", true);
+fn callback_connected_page_names_the_provider_and_says_it_is_done() {
+    let page = callback_page("dropbox", CallbackPageState::Connected);
     assert!(page.contains("dropbox"), "{page}");
-    assert!(page.contains("Authorization complete"), "{page}");
+    assert!(page.contains("<h1>Connected</h1>"), "{page}");
     assert!(page.contains("close this tab"), "{page}");
     assert!(
         !page.contains("Authorization successful!"),
@@ -2117,15 +2405,39 @@ fn callback_success_page_names_the_provider_and_what_happens_next() {
     );
 }
 
-/// The failure page says nothing was connected and sends the user back for the
-/// reason, which lives in the engine.
+/// A failed exchange or store says nothing was connected and sends the user
+/// back for the reason, which lives in the engine.
 #[test]
-fn callback_failure_page_points_back_at_lucidos() {
-    let page = callback_page("dropbox", false);
-    assert!(page.contains("Authorization failed"), "{page}");
+fn callback_failed_page_points_back_at_lucidos() {
+    let page = callback_page("dropbox", CallbackPageState::Failed);
+    assert!(page.contains("<h1>Connection failed</h1>"), "{page}");
     assert!(page.contains("Nothing was connected"), "{page}");
     assert!(page.contains("Return to Lucidos"), "{page}");
 }
+
+/// A flow still working when the wait ends claims neither outcome.
+#[test]
+fn callback_pending_page_claims_neither_outcome() {
+    let page = callback_page("dropbox", CallbackPageState::Pending);
+    assert!(page.contains("<h1>Authorization received</h1>"), "{page}");
+    assert!(page.contains("Return to Lucidos for the result"), "{page}");
+    assert!(!page.contains("Connected"), "{page}");
+    assert!(!page.contains("failed"), "{page}");
+}
+
+#[test]
+fn callback_refused_page_says_authorization_failed() {
+    let page = callback_page("dropbox", CallbackPageState::Refused);
+    assert!(page.contains("<h1>Authorization failed</h1>"), "{page}");
+    assert!(page.contains("Nothing was connected"), "{page}");
+}
+
+const ALL_PAGE_STATES: [CallbackPageState; 4] = [
+    CallbackPageState::Connected,
+    CallbackPageState::Pending,
+    CallbackPageState::Failed,
+    CallbackPageState::Refused,
+];
 
 /// The injection guard, pinned. NOTHING the provider sends in the redirect may
 /// be rendered: `error_description` is attacker-controllable, and echoing it
@@ -2134,14 +2446,14 @@ fn callback_failure_page_points_back_at_lucidos() {
 #[test]
 fn callback_page_renders_no_provider_supplied_text() {
     let hostile = "err=<script>alert(1)</script>&error_description=<img onerror=x>";
-    for ok in [true, false] {
-        let page = callback_page("dropbox", ok);
+    for state in ALL_PAGE_STATES {
+        let page = callback_page("dropbox", state);
         assert!(!page.contains("<script>"), "{page}");
         assert!(!page.contains(&hostile[..10]), "{page}");
     }
     // And the one value that IS interpolated is escaped, so a richer provider
     // name can never open a tag either.
-    let page = callback_page("<script>alert(1)</script>", true);
+    let page = callback_page("<script>alert(1)</script>", CallbackPageState::Connected);
     assert!(!page.contains("<script>"), "{page}");
     assert!(page.contains("&lt;script&gt;"), "{page}");
 }
@@ -2162,8 +2474,8 @@ fn callback_page_renders_no_provider_supplied_text() {
 #[test]
 fn callback_page_fetches_nothing() {
     const SVG_NS: &str = "xmlns=\"http://www.w3.org/2000/svg\"";
-    for ok in [true, false] {
-        let page = callback_page("dropbox", ok);
+    for state in ALL_PAGE_STATES {
+        let page = callback_page("dropbox", state);
         for needle in ["<link", "<script", "src=", "@import", "url(http"] {
             assert!(
                 !page.contains(needle),
@@ -2190,7 +2502,7 @@ fn callback_page_fetches_nothing() {
 /// standalone-screen treatment, whose values this page copies.
 #[test]
 fn callback_page_wears_the_brand_surface() {
-    let page = callback_page("dropbox", true);
+    let page = callback_page("dropbox", CallbackPageState::Connected);
     // The picker's gradient stops, and the mark itself.
     assert!(page.contains("#4a97ee"), "{page}");
     assert!(page.contains("#0c52ad"), "{page}");
@@ -2204,11 +2516,11 @@ fn callback_page_wears_the_brand_surface() {
 /// an empty `<title>`, a stray label, or a hairline ruling off nothing.
 #[test]
 fn callback_page_tolerates_a_blank_provider() {
-    let page = callback_page("", true);
+    let page = callback_page("", CallbackPageState::Connected);
     assert!(page.contains("<title>Lucidos</title>"), "{page}");
-    assert!(page.contains("Authorization complete"), "{page}");
+    assert!(page.contains("<h1>Connected</h1>"), "{page}");
     assert!(!page.contains("<dl>"), "no value, no row: {page}");
-    assert!(!page.contains("Authorized with"), "{page}");
+    assert!(!page.contains("Connected to"), "{page}");
 }
 
 /// The provider id never appears on its own. It used to be a bare trailing word
@@ -2217,18 +2529,15 @@ fn callback_page_tolerates_a_blank_provider() {
 /// authorization did with it.
 #[test]
 fn callback_page_labels_the_provider_it_names() {
-    let ok = callback_page("dropbox", true);
-    assert!(
-        ok.contains("<dt>Authorized with</dt><dd>dropbox</dd>"),
-        "{ok}"
-    );
-    let failed = callback_page("dropbox", false);
+    let ok = callback_page("dropbox", CallbackPageState::Connected);
+    assert!(ok.contains("<dt>Connected to</dt><dd>dropbox</dd>"), "{ok}");
+    let failed = callback_page("dropbox", CallbackPageState::Failed);
     assert!(
         failed.contains("<dt>Tried to connect</dt><dd>dropbox</dd>"),
         "{failed}"
     );
     // The label wraps the ESCAPED value, so the row can never open a tag either.
-    let hostile = callback_page("<script>alert(1)</script>", true);
+    let hostile = callback_page("<script>alert(1)</script>", CallbackPageState::Connected);
     assert!(
         hostile.contains("<dd>&lt;script&gt;alert(1)&lt;/script&gt;</dd>"),
         "{hostile}"
@@ -2243,7 +2552,7 @@ fn callback_page_labels_the_provider_it_names() {
 /// because the brand lockup legitimately centers its own two children.
 #[test]
 fn callback_page_shell_is_top_anchored_and_left_aligned() {
-    let page = callback_page("dropbox", true);
+    let page = callback_page("dropbox", CallbackPageState::Connected);
     let body = css_rule(&page, "body{");
     assert!(body.contains("align-items:flex-start"), "{body}");
     assert!(!body.contains("align-items:center"), "{body}");
@@ -2556,6 +2865,7 @@ fn row(userinfo_method: Option<&str>) -> OAuthProviderRow {
         console_url: None,
         setup_hint: None,
         permissions_hint: None,
+        sign_in_scopes: None,
     }
 }
 
@@ -2946,8 +3256,8 @@ fn an_echoed_offline_access_does_not_stand_in_for_the_token() {
 
 #[test]
 fn the_sign_in_scopes_are_never_reported_from_the_echo() {
-    // Every Connect asks for `openid email profile` (the frontend's
-    // SIGN_IN_SCOPES). GitHub has no such scopes and echoes none of them,
+    // Every Connect asks for `openid email profile` (the engine's
+    // default sign-in scopes). GitHub has no such scopes and echoes none of them,
     // which reported every GitHub account as short of all three.
     assert!(missing_requested_scopes("openid email profile repo", "repo", NO_REFRESH).is_empty());
 }
@@ -3552,4 +3862,92 @@ async fn connecting_with_a_stored_cleartext_token_url_is_refused_before_the_brow
     );
 
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+// ── Sign-in scopes ───────────────────────────────────────────────────────
+
+fn credential_on(auth_url: &str) -> String {
+    serde_json::json!({ "client_id": "id", "auth_url": auth_url, "token_url": "https://t.test/token" })
+        .to_string()
+}
+
+#[test]
+fn a_purpose_that_names_a_sign_in_scope_is_not_requested_twice() {
+    assert_eq!(
+        merge_scopes("account_info.read", "files.content.write account_info.read"),
+        "account_info.read files.content.write"
+    );
+}
+
+mod guard_tests {
+    use super::*;
+
+    fn shipped_registry_rows() -> Vec<crate::core::oauth_registry::OAuthProviderRow> {
+        let dir = crate::paths::repo_root()
+            .expect("repo root resolves under cargo test")
+            .join("system-knowhow");
+        crate::core::oauth_registry::load_providers(Some(dir.as_path()))
+    }
+
+    #[test]
+    fn every_shipped_row_without_sign_in_scopes_keeps_the_generic_set() {
+        let rows = shipped_registry_rows();
+        assert!(!rows.is_empty());
+        for row in rows.iter().filter(|r| r.sign_in_scopes.is_none()) {
+            assert_eq!(
+                sign_in_scopes_for(None, &credential_on(&row.auth_url), &rows),
+                "openid email profile",
+                "{} changed its sign-in scopes",
+                row.id
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_with_sign_in_scopes_decides_for_a_credential_on_its_endpoint() {
+        let rows = shipped_registry_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.sign_in_scopes.is_some())
+            .expect("a shipped row declares sign_in_scopes");
+        let expected = row.sign_in_scopes.clone().unwrap();
+        assert_eq!(
+            sign_in_scopes_for(None, &credential_on(&row.auth_url), &rows),
+            expected
+        );
+        assert!(
+            !expected.contains("openid"),
+            "the override exists to drop openid"
+        );
+    }
+
+    #[test]
+    fn an_unknown_endpoint_or_unparseable_credential_gets_the_generic_set() {
+        let rows = shipped_registry_rows();
+        assert_eq!(
+            sign_in_scopes_for(None, &credential_on("https://idp.example/authorize"), &rows),
+            "openid email profile"
+        );
+        assert_eq!(
+            sign_in_scopes_for(None, "not json", &rows),
+            "openid email profile"
+        );
+    }
+
+    #[test]
+    fn the_named_row_decides_when_a_hand_typed_auth_url_matches_no_host() {
+        let rows = shipped_registry_rows();
+        let row = rows
+            .iter()
+            .find(|r| r.sign_in_scopes.is_some())
+            .expect("a shipped row declares sign_in_scopes");
+        assert_eq!(
+            sign_in_scopes_for(
+                Some(row),
+                &credential_on("https://idp.example/authorize"),
+                &rows
+            ),
+            row.sign_in_scopes.clone().unwrap()
+        );
+    }
 }

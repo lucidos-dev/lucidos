@@ -324,7 +324,9 @@ fn verify_stored_size(stored: Option<u64>, expected: u64) -> Result<(), String> 
         )),
         Some(_) => Ok(()),
         None => {
-            crate::log!("[Backup] Drive reported no size for the upload, so it cannot be verified");
+            crate::log_legacy!(
+                "[Backup] Drive reported no size for the upload, so it cannot be verified"
+            );
             Ok(())
         }
     }
@@ -339,7 +341,7 @@ fn finish_upload(
 ) -> Result<String, BoxError> {
     verify_stored_size(uploaded.stored_size, total_size)?;
     progress(total_size, total_size);
-    crate::log!(
+    crate::log_legacy!(
         "[Backup] Upload complete: {} / {} bytes",
         total_size,
         total_size
@@ -598,7 +600,7 @@ where
             .into());
         }
         let backoff = (cfg.backoff)(retry);
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] Opening the upload session failed (retry {}/{} after {:?}): {}",
             retry + 1,
             MAX_RETRIES_PER_CHUNK,
@@ -609,7 +611,7 @@ where
         retry += 1;
         match refresh_token().await {
             Ok(fresh) => token = fresh,
-            Err(e) => crate::log!("[Backup] Token refresh before the retry failed: {}", e),
+            Err(e) => crate::log_legacy!("[Backup] Token refresh before the retry failed: {}", e),
         }
     }
 }
@@ -752,7 +754,7 @@ async fn upload_chunks(
                         Resume::At(n) => {
                             start = n;
                             progress(start, total_size);
-                            crate::log!(
+                            crate::log_legacy!(
                                 "[Backup] Uploaded chunk: {} / {} bytes",
                                 start,
                                 total_size
@@ -773,7 +775,7 @@ async fn upload_chunks(
                 .into());
             }
             let backoff = (cfg.backoff)(retry);
-            crate::log!(
+            crate::log_legacy!(
                 "[Backup] Chunk failed at byte {} (retry {}/{} after {:?}): {}",
                 start,
                 retry + 1,
@@ -795,13 +797,16 @@ async fn upload_chunks(
                     if let Resume::At(n) = resume_from(start, end, server_next) {
                         start = n;
                         progress(start, total_size);
-                        crate::log!("[Backup] Resuming at byte {} (server-side progress)", start);
+                        crate::log_legacy!(
+                            "[Backup] Resuming at byte {} (server-side progress)",
+                            start
+                        );
                         break;
                     }
                     // Server is no further along than we are: send it again.
                 }
                 Err(qe) => {
-                    crate::log!("[Backup] Progress query failed (will retry chunk): {}", qe);
+                    crate::log_legacy!("[Backup] Progress query failed (will retry chunk): {}", qe);
                 }
             }
         }
@@ -928,7 +933,7 @@ impl BackupProvider for GoogleDriveBackupProvider {
             "parents": [folder_id],
         });
 
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] Starting resumable upload: {} ({} bytes, chunk {} bytes)",
             filename,
             total_size,

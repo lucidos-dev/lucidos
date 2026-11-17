@@ -44,6 +44,7 @@ const PARSED_MODEL_FIELDS = ['value', 'resolvedModel', 'displayName', 'descripti
 // parsed set is reported as a notice: Claude Code grew something new.
 const KNOWN_IGNORED = new Set([
   'system/hook_started', 'system/hook_progress', 'system/hook_response', 'system/status',
+  'system/informational',
   'system/thinking_tokens', 'command_lifecycle', 'rate_limit_event', 'assistant',
   'stream_event/content_block_start', 'stream_event/content_block_delta',
   'stream_event/content_block_stop', 'stream_event/message_stop',

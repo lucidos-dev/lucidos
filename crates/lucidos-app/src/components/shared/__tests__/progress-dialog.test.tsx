@@ -1,17 +1,18 @@
-import { describe, it, expect } from 'vitest';
+// @vitest-environment jsdom
+import { describe, it, expect, afterEach } from 'vitest';
+import { render } from 'preact';
+import { act } from 'preact/test-utils';
 import type { ComponentChildren, VNode } from 'preact';
-import { progressDialogBody } from '../ProgressDialog';
+import { ProgressDialog, progressDialogBody } from '../ProgressDialog';
+import { progressDialog } from '../../../store/store';
 import { restartDialogState, appUpdateDialogState } from '../../../store/progressDialogCopy';
 import type { ProgressDialogState } from '../../../store/types';
 
 /**
  * The progress dialog's pure body, which is hook-free for exactly this reason.
  *
- * Two properties matter, and neither needs a DOM. A determinate phase draws a
- * bar and an indeterminate one draws a spinner: a bar that invents a percentage
- * is a lie the user waits on. And the panel is always programmatically
- * focusable. That is what lets the container move focus off the button that
- * opened the dialog, even in a phase with no Cancel to focus.
+ * Pure markup checks cover the readout and Cancel. A mounted dialog checks
+ * the frame's anatomy and focus through the transition to a committed phase.
  *
  * The version below is a fixed synthetic value, deliberately not a real
  * release, so it can never collide with the `RELEASE` file being shipped.
@@ -83,12 +84,34 @@ describe('progressDialogBody', () => {
   it('never renders a dismiss X: the operation runs whatever the user presses', () => {
     expect(byClass(progressDialogBody({ state: base }), 'toast-close')).toHaveLength(0);
   });
+});
 
-  it('keeps the panel focusable without making it a Tab stop', () => {
-    // The container focuses this when a phase has no Cancel, so focus leaves
-    // the button that opened the dialog. -1 keeps it out of the tab order.
-    const panel = byClass(progressDialogBody({ state: base }), 'progress-dialog-body')[0];
-    expect((panel.props as { tabIndex?: number }).tabIndex).toBe(-1);
+describe('the rendered progress dialog', () => {
+  const host = document.createElement('div');
+
+  afterEach(() => {
+    act(() => render(null, host));
+    progressDialog.value = { ...base, visible: false };
+    host.remove();
+  });
+
+  it('keeps the shared anatomy and focus on the frame when Cancel disappears', () => {
+    document.body.append(host);
+    act(() => {
+      progressDialog.value = { ...base, cancel: { label: 'Cancel', onClick: () => {} } };
+      render(<ProgressDialog />, host);
+    });
+    const panel = document.querySelector<HTMLElement>('.progress-dialog')!;
+    expect(panel.querySelector(':scope > .surface-head')).not.toBeNull();
+    expect(panel.querySelector(':scope > .surface-body')).not.toBeNull();
+    expect(panel.querySelector(':scope > .surface-foot')).not.toBeNull();
+    expect(document.activeElement).toBe(panel.querySelector('button'));
+
+    act(() => { progressDialog.value = { ...base, message: 'Restarting background services…' }; });
+    expect(panel.querySelector('.surface-foot')).toBeNull();
+    expect(panel.lastElementChild?.classList.contains('surface-body')).toBe(true);
+    expect(panel.tabIndex).toBe(-1);
+    expect(document.activeElement).toBe(panel);
   });
 });
 

@@ -125,7 +125,7 @@ a *secure origin* (https or localhost), so to use Lucidos from other devices:
 - `tailscale serve --bg 5252`: trusted HTTPS on your tailnet.
 - Or expose it directly:
   `./install.sh --bind all --tls-cert <cert.pem> --tls-key <key.pem>`.
-  `--bind` writes the machine-global `~/.lucidos/network.toml` (the same knob
+  `--bind` writes the machine-global `network.toml` in the private subtree (the same knob
   as the picker's Settings → Network access); the TLS pair makes the gateway
   serve https (push needs a certificate your browsers trust). A bare
   `--bind all` without TLS serves the app over `http://<host>`, usable, but

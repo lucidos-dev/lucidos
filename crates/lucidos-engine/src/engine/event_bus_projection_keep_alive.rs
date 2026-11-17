@@ -110,7 +110,7 @@ impl EventBus {
                 .execute(self.pool())
                 .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[KeepAlive] Could not set keep_alive_turn={on} on thread {thread_id}: {e}"
             );
         }
@@ -127,12 +127,14 @@ impl EventBus {
         .execute(self.pool())
         .await
         {
-            Ok(done) if done.rows_affected() > 0 => crate::log!(
+            Ok(done) if done.rows_affected() > 0 => crate::log_legacy!(
                 "[KeepAlive] Cleared {} keep-alive turn(s) a restart cut off",
                 done.rows_affected()
             ),
             Ok(_) => {}
-            Err(e) => crate::log!("[KeepAlive] Could not clear the keep-alive flags at boot: {e}"),
+            Err(e) => {
+                crate::log_legacy!("[KeepAlive] Could not clear the keep-alive flags at boot: {e}")
+            }
         }
     }
 

@@ -10,7 +10,7 @@ import { formatClipped, walkFocusRings } from './focusRingClip';
 
 const SETTINGS_VIEWS = [
   'main', 'system', 'system-overview', 'providers', 'models', 'intelligence', 'appearance', 'memory', 'devices',
-  'accounts', 'backup', 'coding-agents', 'locale', 'marketplaces', 'permissions',
+  'users', 'accounts', 'backup', 'coding-agents', 'locale', 'marketplaces', 'permissions',
   'mcp', 'keyboard-shortcuts', 'access', 'webhooks', 'environment-variables',
   'thread-queue', 'release-notices', 'debugging', 'communication-surfaces',
 ];

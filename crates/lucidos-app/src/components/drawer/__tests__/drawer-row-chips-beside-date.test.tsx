@@ -119,7 +119,7 @@ describe('the agent mark', () => {
   it.each([
     [{ channel: 'claude_code', codingAgent: 'claude-code' }, '.claude-icon', 'Claude Code'],
     [{ channel: 'claude_code', codingAgent: 'codex' }, '.codex-icon', 'Codex'],
-    [{ channel: 'chat', codingAgent: undefined }, '.lucidos-mark-icon', 'Lucidos Agent'],
+    [{ channel: 'chat', codingAgent: undefined }, '.lucidos-mark', 'Lucidos Agent'],
     [{ channel: 'trigger', codingAgent: undefined }, 'svg', 'Trigger'],
   ] as const)('draws the mark for %o', (overrides, iconSelector, label) => {
     mount(0, overrides);
@@ -127,6 +127,14 @@ describe('the agent mark', () => {
     expect(mark.querySelector(iconSelector)).not.toBeNull();
     expect(mark.getAttribute('aria-label')).toBe(label);
     expect(host.querySelector('.message-channel-tag')).toBeNull();
+  });
+
+  it('carries the original flat Lucidos mark and the optional brand tile in the same centred slot', () => {
+    mount(0, { channel: 'chat', codingAgent: undefined });
+    const mark = host.querySelector('.thread-row-agent')!;
+    expect(mark.querySelector('.lucidos-mark-icon')?.getAttribute('fill')).toBe('currentColor');
+    expect(mark.querySelector('.lucidos-mark .lmk-bg')).not.toBeNull();
+    expect(host.querySelectorAll('.thread-row-agent')).toHaveLength(1);
   });
 
   it('keeps the red ERROR tag for an unknown channel', () => {

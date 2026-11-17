@@ -7,8 +7,10 @@ import { toastHasClose, toastTabTarget } from './toastFocus';
 import { toastTap } from './toastTap';
 import { computeToastShifts } from './toastReflow';
 import { toastStackUrgency } from './toastUrgency';
-import { focusPaneMainControl } from '../layout/paneFocus';
+import { focusPaneMainControl, visibleFocusables } from '../layout/paneFocus';
+import { topPanelOverlay } from '../../store/overlayStack';
 import { isReducedMotion } from '../../utils/motion';
+import { hasHoverPointer } from '../../utils/platform';
 import { progressFillWidth } from './progressBar';
 
 // Reflow (FLIP) timing for the toast stack. When a toast is added/removed the
@@ -88,8 +90,8 @@ function handleToastKeyDown(e: KeyboardEvent): void {
 
 /** Move keyboard focus to the first control of the newest toast that has one,
  *  so its Tab trap and Escape take over. Toasts never take focus themselves, so
- *  this shortcut is the keyboard's way in. A timed passive toast has nothing to
- *  act on and is skipped. A no-op when no toast offers a control, and while a
+ *  this shortcut is the keyboard's way in, including for timed toasts' close X.
+ *  A no-op when no toast offers a control, and while a
  *  standing stack sits under an open overlay (the rule keyed on
  *  `data-toast-urgency` in components.css): focus must not leave the overlay
  *  for something drawn beneath it. */
@@ -131,6 +133,8 @@ export function Toast() {
 
   const oldTops = new Map<number, number>();
   const container = containerRef.current;
+  const active = document.activeElement;
+  const focusedControl = active && container?.contains(active) ? active : null;
   if (container) {
     for (const el of container.querySelectorAll<HTMLElement>('[data-toast-id]')) {
       oldTops.set(Number(el.dataset.toastId), el.getBoundingClientRect().top);
@@ -138,6 +142,16 @@ export function Toast() {
   }
 
   useLayoutEffect(() => {
+    // Restore only focus removed with a toast, never focus the user moved away.
+    if (hasHoverPointer() && focusedControl && !focusedControl.isConnected && document.activeElement === document.body) {
+      focusNewestToast();
+      if (document.activeElement === document.body) {
+        const overlay = topPanelOverlay();
+        const panel = overlay && document.querySelector<HTMLElement>(`[data-overlay-panel="${overlay.id}"]`);
+        if (panel) (visibleFocusables(panel)[0] ?? panel).focus({ preventScroll: true });
+        else if (!overlay) focusPaneMainControl(focusedPane.value);
+      }
+    }
     const el = containerRef.current;
     const before = prevIds.current;
     prevIds.current = new Set(items.map((t) => t.id));

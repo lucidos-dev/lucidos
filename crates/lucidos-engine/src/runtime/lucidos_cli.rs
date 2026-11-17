@@ -84,11 +84,11 @@ pub fn pin_cli_for_workspace(workspace: &Path, launched_as: Option<FileId>) {
     };
     match pinned {
         Ok(pin_dir) => {
-            crate::log!("[LucidosCLI] pinned the CLI into {}", pin_dir.display());
+            crate::log_legacy!("[LucidosCLI] pinned the CLI into {}", pin_dir.display());
             // A second call keeps the first pin, the one already handed out.
             let _ = PINNED_CLI_DIR.set(pin_dir);
         }
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[LucidosCLI] CLI not pinned, using {}: {}",
             source_dir.display(),
             e
@@ -212,7 +212,7 @@ pub(crate) fn ensure_workspace_bin_symlink(
     }
     let bin_dir = workspace_bin_dir(workspace);
     if let Err(e) = std::fs::create_dir_all(&bin_dir) {
-        crate::log!("[LucidosCLI] failed to create {}: {}", bin_dir.display(), e);
+        crate::log_legacy!("[LucidosCLI] failed to create {}: {}", bin_dir.display(), e);
         return None;
     }
     let link = bin_dir.join(LUCIDOS_BIN_NAME);
@@ -227,7 +227,7 @@ pub(crate) fn ensure_workspace_bin_symlink(
         return Some(bin_dir);
     }
     if let Err(e) = std::os::unix::fs::symlink(&target, &link) {
-        crate::log!(
+        crate::log_legacy!(
             "[LucidosCLI] failed to symlink {} -> {}: {}",
             link.display(),
             target.display(),
@@ -256,7 +256,8 @@ pub(crate) fn path_with_prefixes(
 /// Env vars to inject into every Lucidos-spawned script (Python, bash,
 /// scheduled tasks). Always sets `LUCIDOS_WORKSPACE`; prepends to `PATH`
 /// `<workspace>/.lucidos/bin` (when the bundled CLI is reachable, so scripts
-/// resolve bare `lucidos …`) AND `pg_bin_dir` (when given + present, so
+/// resolve bare `lucidos …`), then `ps_shim_dir` (a macOS sandbox's `ps`
+/// stand-in), AND `pg_bin_dir` (when given + present, so
 /// `psql "$LUCIDOS_DATABASE_URL"` resolves — in a packaged build psql lives at
 /// `<resources>/postgres/bin` = `LUCIDOS_PG_BIN_DIR`, which is not on the
 /// launchd minimal PATH). `pg_bin_dir` is passed in (from the caller's
@@ -267,6 +268,7 @@ pub(crate) fn path_with_prefixes(
 pub(crate) fn workspace_script_env_vars(
     workspace: &Path,
     cli_dir: Option<&Path>,
+    ps_shim_dir: Option<&Path>,
     pg_bin_dir: Option<&Path>,
 ) -> Vec<(String, String)> {
     let mut vars = vec![(
@@ -277,6 +279,7 @@ pub(crate) fn workspace_script_env_vars(
     if let Some(bin_dir) = ensure_workspace_bin_symlink(workspace, cli_dir) {
         prefixes.push(bin_dir);
     }
+    prefixes.extend(ps_shim_dir.map(Path::to_path_buf));
     if let Some(pg_bin) = pg_bin_dir {
         if pg_bin.is_dir() {
             prefixes.push(pg_bin.to_path_buf());
@@ -285,7 +288,7 @@ pub(crate) fn workspace_script_env_vars(
     if !prefixes.is_empty() {
         match path_with_prefixes(&prefixes) {
             Ok(p) => vars.push(("PATH".to_string(), p.to_string_lossy().into_owned())),
-            Err(e) => crate::log!("[LucidosCLI] failed to join PATH: {}", e),
+            Err(e) => crate::log_legacy!("[LucidosCLI] failed to join PATH: {}", e),
         }
     }
     vars
@@ -320,7 +323,7 @@ pub(crate) async fn place_lucidos_cli_skill(
         CodingAgentKind::Lucidos => {}
         CodingAgentKind::App | CodingAgentKind::External => {
             if let Err(e) = write_lucidos_cli_skill(cwd, engine_copy) {
-                crate::log!(
+                crate::log_legacy!(
                     "[LucidosCLI] failed to install lucidos-cli skill into {}: {}",
                     cwd.display(),
                     e

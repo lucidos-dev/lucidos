@@ -152,21 +152,6 @@ mod tests {
         }
     }
 
-    /// The language is stated once, in `instructions_for`. A resident section
-    /// reading it back would put one rule in two places. The block is what the
-    /// talker KNOWS, not what it must do.
-    #[test]
-    fn no_resident_section_states_the_language() {
-        use crate::test_support::source_scan::{read_production_source, src_root};
-
-        let sections = read_production_source(&src_root().join("voice/sections.rs"));
-        assert!(
-            !sections.contains("\"language\""),
-            "voice/sections.rs reads the language preference again, so the \
-             resident block and the instructions can now disagree"
-        );
-    }
-
     #[test]
     fn a_dropdown_name_reaches_the_transcriber_as_a_code() {
         assert_eq!(resolved("Norwegian").code.as_deref(), Some("no"));
@@ -239,6 +224,23 @@ mod tests {
                     code
                 );
             }
+        }
+    }
+
+    mod guard_tests {
+        /// The language is stated once, in `instructions_for`. A resident section
+        /// reading it back would put one rule in two places. The block is what the
+        /// talker KNOWS, not what it must do.
+        #[test]
+        fn no_resident_section_states_the_language() {
+            use crate::test_support::source_scan::{read_production_source, src_root};
+
+            let sections = read_production_source(&src_root().join("voice/sections.rs"));
+            assert!(
+                !sections.contains("\"language\""),
+                "voice/sections.rs reads the language preference again, so the \
+             resident block and the instructions can now disagree"
+            );
         }
     }
 }

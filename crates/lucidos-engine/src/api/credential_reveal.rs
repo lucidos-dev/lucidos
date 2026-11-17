@@ -43,11 +43,15 @@ pub(super) async fn mint_reveal_token(
     Query(query): Query<CredentialIdQuery>,
 ) -> Result<Json<RevealTokenResponse>, (StatusCode, String)> {
     if !reveal_request_allowed(&headers, RefererRule::Required) {
-        log!("[Credentials] refused a reveal-token mint from an app document");
+        log_legacy!("[Credentials] refused a reveal-token mint from an app document");
         return Err(forbidden(SUBJECT_LABEL));
     }
-    crate::api::actor::refuse_agent_caller(&headers, AGENT_REFUSAL)
-        .map_err(|e| (e.status, e.message))?;
+    crate::api::actor::require_attested_owner(
+        &headers,
+        AGENT_REFUSAL,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .map_err(|e| (e.status, e.message))?;
     // Refuse to mint against a row that does not exist, so a caller learns that
     // here rather than after spending the token.
     match CredentialStore::get_by_id(&state.pool, query.id).await {
@@ -101,13 +105,17 @@ pub(super) async fn get_credential_value(
     Query(query): Query<CredentialValueQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if !reveal_request_allowed(&headers, RefererRule::WhenPresent) {
-        log!("[Credentials] refused a credential-value read from an app document");
+        log_legacy!("[Credentials] refused a credential-value read from an app document");
         return Err(forbidden(SUBJECT_LABEL));
     }
     // Before the redeem, which is one-shot: a caller refused after it would
     // have spent its token on a request that never saw the credential.
-    crate::api::actor::refuse_agent_caller(&headers, AGENT_REFUSAL)
-        .map_err(|e| (e.status, e.message))?;
+    crate::api::actor::require_attested_owner(
+        &headers,
+        AGENT_REFUSAL,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .map_err(|e| (e.status, e.message))?;
     let actor = crate::api::actor::require_user_actor(&headers, &state.pool, None)
         .await
         .map_err(|e| (e.status, e.message))?;
@@ -116,7 +124,7 @@ pub(super) async fn get_credential_value(
         .reveal_tokens
         .redeem(presented, RevealSubject::Credential(query.id))
     {
-        log!("[Credentials] refused a credential-value read: no live reveal token");
+        log_legacy!("[Credentials] refused a credential-value read: no live reveal token");
         return Err(token_required(MINT_ROUTE));
     }
     match CredentialStore::get_by_id(&state.pool, query.id).await {

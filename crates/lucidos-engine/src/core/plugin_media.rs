@@ -531,7 +531,7 @@ fn read_dirs(dir: &Path) -> impl Iterator<Item = std::fs::DirEntry> {
 
 fn log_removal(path: &Path, result: std::io::Result<()>) {
     if let Err(e) = result {
-        log!("[PluginMedia] could not remove {}: {}", path.display(), e);
+        log_legacy!("[PluginMedia] could not remove {}: {}", path.display(), e);
     }
 }
 

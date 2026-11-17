@@ -1,6 +1,8 @@
 use super::LucidosEngine;
-use crate::core::grants::{self, GrantFile};
+use crate::core::grants::GrantFile;
 use crate::engine::command_guard::TrustedHeads;
+use crate::engine::event_bus::EventBus;
+use crate::engine::permission::tool_grants;
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::types::CcCommandsInfo;
 use std::collections::HashMap;
@@ -81,14 +83,11 @@ pub(crate) const CLAUDE_CODE_COMMAND_TOOL: &str = "Bash";
 
 /// Where a granted "Always allow" click is remembered.
 ///
-///   * `Narrow` / `Broad`: persisted to this workspace's `cc-allowed-tools` and
-///     handed to CC via `--allowedTools` on every spawn. Survives engine
-///     restart, but only takes effect for tools/paths CC actually respects.
-///   * `Session` — cached on `PermissionState::session_allows`, scoped to one
-///     thread, and durable: the grant is persisted as the resolution event's
-///     `persist_scope`, and `cc_permission::hydrate_session_allows` refills the
-///     cache from the event store on the first prompt after an engine restart.
-///     Works for *every* tool and *every* file path (including CC's own
+///   * `Narrow` / `Broad`: a standing *tool grant* of this workspace, handed to
+///     CC via `--allowedTools` on every spawn. Survives engine restart, but
+///     only takes effect for tools/paths CC actually respects.
+///   * `Session`: a *tool grant* the thread holds, durable across an engine
+///     restart. Works for *every* tool and *every* file path (including CC's own
 ///     protected paths like `.claude/` and `.git/`), because the engine
 ///     intercepts before the prompt fires. A command that may write there is
 ///     the exception: only the bare `Bash` line covers it.
@@ -114,12 +113,31 @@ pub struct GrantOffer {
     /// "Always allow `<head>` commands": a persisted line such as `Bash(git:*)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrow: Option<String>,
-    /// "Allow for this thread": a pattern for this thread's session set.
+    /// "Allow for this thread": a pattern the thread holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Why the card offers no lasting grant at all, which it tells the owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withheld: Option<OfferWithheld>,
+}
+
+/// Why a card offers only Allow once and Deny.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OfferWithheld {
+    /// The request reads a secret path, and no grant covers a secret read.
+    SecretRead,
 }
 
 impl GrantOffer {
+    /// An offer of no lasting grant, for `reason`.
+    pub fn withheld(reason: OfferWithheld) -> Self {
+        Self {
+            withheld: Some(reason),
+            ..Self::default()
+        }
+    }
+
     pub fn pattern(&self, scope: AllowScope) -> Option<&str> {
         match scope {
             AllowScope::Broad => self.broad.as_deref(),
@@ -132,8 +150,8 @@ impl GrantOffer {
 /// Derive the pattern to record when the user grants an "Always allow"-style
 /// click. Interpretation depends on `scope`:
 ///
-///   * `Broad` / `Narrow` → appended verbatim to `cc-allowed-tools` so it
-///     reaches CC as `--allowedTools` on the next spawn. Returns `None`
+///   * `Broad` / `Narrow` → a standing grant, verbatim, so it reaches CC as
+///     `--allowedTools` on the next spawn. Returns `None`
 ///     (no button) when any of these hold:
 ///       1. The tool is in `BROAD_ALLOW_INEFFECTIVE` (Edit / Write /
 ///          NotebookEdit / ExitPlanMode) — CC always routes those through
@@ -156,8 +174,8 @@ impl GrantOffer {
 ///
 ///     All other tools return `None` for `Narrow` (the UI hides that button).
 ///
-///   * `Session` → stored on `PermissionState::session_allows` and matched
-///     exact-string against patterns derived from future prompts in the same
+///   * `Session` → a grant the thread holds, matched exact-string against
+///     patterns derived from future prompts in the same
 ///     thread, including the `Edit` / `Write` paths the persisted scopes
 ///     can't reach:
 ///       * `Edit | Write` → `Tool(<file_path>)` (per-file)
@@ -324,20 +342,26 @@ pub(crate) const ENGINE_ALLOWED_TOOLS: &[&str] = &[
 ];
 
 /// Resolve the comma-separated tool allowlist for `claude --allowedTools`:
-/// [`ENGINE_ALLOWED_TOOLS`], then the user's grants.
+/// [`ENGINE_ALLOWED_TOOLS`], then the workspace's standing coding-agent grants.
 ///
-/// Reads [`GrantFile::CodingAgentTools`] out of this workspace's grants dir
-/// (ADR 0095). On first use it seeds the file with its header, so the user has
-/// something to discover and edit before ever clicking "Always allow".
-pub(crate) fn cc_allowed_tools(dir: &Path) -> String {
-    let file = GrantFile::CodingAgentTools;
-    if !grants::exists(dir, file) {
-        seed_allowed_tools_file(dir);
-    }
-    let grants = grants::patterns(dir, file).into_iter().filter(|pattern| {
+/// Reading the grants reconciles the `cc-allowed-tools` mirror. So a hand edit
+/// is acted on before the spawn freezes the flag, and a missing file is written
+/// back.
+pub(crate) async fn cc_allowed_tools(bus: &EventBus, dir: &Path) -> String {
+    allowed_tools_flag(
+        tool_grants::granted_lines(bus, dir, GrantFile::CodingAgentTools, None)
+            .await
+            .standing,
+    )
+}
+
+/// [`ENGINE_ALLOWED_TOOLS`], then each of `grants` Claude Code may match
+/// itself, comma-separated.
+pub(crate) fn allowed_tools_flag(grants: Vec<String>) -> String {
+    let grants = grants.into_iter().filter(|pattern| {
         let engine_only = only_the_engine_may_match(pattern);
         if engine_only {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] Left {} out of --allowedTools: Claude Code would match it unchecked",
                 pattern
             );
@@ -356,19 +380,6 @@ pub(crate) fn cc_allowed_tools(dir: &Path) -> String {
 /// floor. Native matching would bypass that floor, even for a bare Bash grant.
 fn only_the_engine_may_match(pattern: &str) -> bool {
     pattern == "Bash" || pattern.starts_with("Bash(")
-}
-
-/// Write the instructional header into a not-yet-existing allowlist file.
-/// Best-effort: a failure costs discoverability, never a spawn.
-fn seed_allowed_tools_file(dir: &Path) {
-    let file = GrantFile::CodingAgentTools;
-    if let Err(e) = grants::write_raw(dir, file, file.header()) {
-        log!(
-            "[ClaudeCode] Failed to seed {}: {}",
-            dir.join(file.file_name()).display(),
-            e
-        );
-    }
 }
 
 pub(crate) const AUTO_HARDEN_MESSAGE: &str = "Run /harden now.";
@@ -552,7 +563,7 @@ pub(crate) async fn emit_background_task_failure(
     let still_running = match thread_is_running(engine.pool(), thread_id).await {
         Ok(running) => running,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] Cannot tell whether thread {} is still running ({}), so {} goes unreported: {}",
                 thread_id,
                 e,
@@ -570,7 +581,9 @@ pub(crate) async fn emit_background_task_failure(
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                         error: error.to_string(),
+                        spend_cap: None,
                         agent_exit: None,
+                        provider_error: None,
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },

@@ -53,6 +53,8 @@ pub struct WebSearchResult {
     pub usage: Option<ApiUsage>,
     /// The model that answered, for the cost row.
     pub model: String,
+    /// Billing proved by this backend's endpoint and authentication.
+    pub provider: Option<crate::runtime::billing_provider::BillingProvider>,
 }
 
 /// One web-search backend. Implementations wrap whatever search facility a
@@ -193,12 +195,13 @@ impl WebSearchProvider for WebSearchChain {
         let mut failures: Vec<String> = Vec::new();
 
         for backend in &self.backends {
+            crate::llm::call_trace::backend_began();
             match backend.search(query, max_results, call).await {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     // Not silent: a backend dropping out is worth a log line
                     // even when a later one rescues the search.
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Search] backend '{}' unavailable, trying the next: {}",
                         backend.id(),
                         e
@@ -270,6 +273,7 @@ mod tests {
                     text: body.clone(),
                     usage: None,
                     model: self.id.to_string(),
+                    provider: None,
                 }),
                 Err(msg) => Err(msg.clone().into()),
             }

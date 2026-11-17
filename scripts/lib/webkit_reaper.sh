@@ -47,6 +47,9 @@ WEBKIT_REAPER_PID="${WEBKIT_REAPER_PID:-}"
 # For `proc_env_has_entry`: a candidate must carry this run's e2e run marker.
 # shellcheck source=proc_env.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_env.sh"
+# For E2E_DEFAULT_WORKSPACE.
+# shellcheck source=e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 
 # ── config resolution ──────────────────────────────────────────────────
 _reaper_cap_mb() { printf '%s' "${E2E_WEBKIT_RSS_CAP_MB:-6144}"; }
@@ -86,7 +89,7 @@ _reaper_match() {
 }
 
 _reaper_pidfile() {
-    printf '%s' "${E2E_WEBKIT_REAPER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/webkit-reaper.pid}"
+    printf '%s' "${E2E_WEBKIT_REAPER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/webkit-reaper.pid}"
 }
 
 # ── process sampling (the test seam) ───────────────────────────────────

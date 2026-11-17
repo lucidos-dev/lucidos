@@ -4,6 +4,10 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { focusedThreadId, threadMap } from '../store';
 import type { ThreadMeta, ThreadState } from '../thread-events';
 import { handleThreadEvent, handleGlobalEvent } from './thread-sync';
+import { refreshThreadList } from './thread-list-refresh';
+
+vi.mock('./thread-list-refresh', () => ({ refreshThreadList: vi.fn(async () => {}) }));
+
 import { noteLocalComposeEdit, _resetComposeSyncForTesting } from '../composeSync';
 import {
   _resetThreadNavForTesting,
@@ -290,9 +294,47 @@ describe('SSE ThreadDiscarded from peer returns this device to compose view', ()
     expect(focusedThreadId.value).toBe('t-1');
     expect(getDraft('t-1').text).toBe('half-typed draft');
   });
+
+  /** An agent's draft (ADR 0665) arrives as a new thread and its compose
+   *  report. It joins the drafts and never takes the screen. */
+  it("an agent's new draft lands without moving focus or the user's own draft", () => {
+    focusPromptOnThread('t-1');
+    const meta = makeActiveThread({ id: 'agent-draft' }).meta;
+    handleThreadEvent({
+      thread_id: 'agent-draft',
+      seq: 1,
+      created: '2026-11-12T10:00:00Z',
+      event: { type: 'ThreadStarted', mode: 'lucidos' },
+      aggregate: {
+        ...meta, threadId: 'agent-draft', state: 'composing', initiator: 'system',
+        summaryVersion: 1, lastActivity: '', isSaved: false,
+      },
+    });
+    handleGlobalEvent('ThreadComposeChanged', {
+      id: 'agent-draft',
+      summary_version: 2,
+      compose_epoch: 0,
+      text: 'Here is the weekly summary.',
+      image_hashes: [],
+      mode: 'lucidos',
+    });
+
+    expect(focusedThreadId.value).toBe('t-1');
+    expect(getDraft('t-1').text).toBe('half-typed draft');
+    expect(threadMap.value.get('agent-draft')?.meta.state).toBe('composing');
+    expect(getDraft('agent-draft').text).toBe('Here is the weekly summary.');
+  });
 });
 
 describe('SSE ThreadComposeChanged is a compose report', () => {
+  it.each(['DraftSubmissionAccepted', 'OrdinarySubmissionAccepted'])('%s reads the committed compose report', (type) => {
+    vi.mocked(refreshThreadList).mockClear();
+    handleGlobalEvent(type, {
+      receipt: { thread_id: 't-1' },
+    });
+    expect(refreshThreadList).toHaveBeenCalledOnce();
+  });
+
   beforeEach(() => {
     localStorage.setItem('lucidos-device-id', 'me-device');
     focusedThreadId.value = 't-1';

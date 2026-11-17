@@ -2,6 +2,9 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-04
+- **Amended by**: [0664: Permissions and the pause family](0664-permissions-and-the-pause-family.md).
+  The two widest Always-allow grants are read aloud too. The caller's own
+  words settle them, never the talker's pick.
 
 Record: `docs/plans/2026-10-04-tree-memory-module-and-the-home-thread.md`.
 Amends [ADR 0124](0124-a-new-thread-starts-clean.md) and
@@ -586,3 +589,9 @@ request order. A Tree turn now sends the snapshot, the stable context block, the
 thread memory view, the recent workspace entries and the message. The snapshot
 is still first and still shared byte for byte. The thread view's rungs read the
 stable block through their own prefix.
+
+## Amendment, 2026-11-10: unattended writes and spend cap holds
+
+Artifact events now name their writer at write time.
+New unattended trigger writes stay out of workspace leaves; legacy events keep their positions.
+See [ADR 0652](0652-unattended-writes-and-spend-cap-holds.md).

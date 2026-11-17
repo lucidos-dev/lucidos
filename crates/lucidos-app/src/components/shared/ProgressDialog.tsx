@@ -1,4 +1,4 @@
-import type { Ref, VNode } from 'preact';
+import type { VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
 import { activeProgressDialog } from '../../store/store';
 import type { ProgressDialogState } from '../../store/types';
@@ -25,20 +25,12 @@ import { progressFillWidth } from './progressBar';
  *  The `backupReminderBody` / `connectionBannerBody` idiom. */
 export function progressDialogBody(props: {
   state: ProgressDialogState;
-  panelRef?: Ref<HTMLDivElement>;
 }): VNode {
   const { title, message, progress, cancel } = props.state;
   return (
-    // `tabIndex={-1}` makes the panel programmatically focusable without
-    // becoming a Tab stop. A committed phase has no Cancel, so it has no
-    // focusable control at all. Focus goes here then, leaving whatever button
-    // opened the dialog.
-    //
-    // It paints no focus ring. The box is containment, not a control. The
-    // dialog also opens by itself while the user is typing, which is when
-    // Chrome carries :focus-visible into a programmatic focus. The suppression
-    // is in components.css, beside the confirm dialog's.
-    <div ref={props.panelRef} class="progress-dialog-body" tabIndex={-1}>
+    // The frame owns the flex layout, as in ConfirmDialog. Keep the body and
+    // optional foot directly in it so their insets contribute to its size.
+    <>
       {/* Determinate only where the operation has an honest percentage. A
           download does; a service restart does not, and a bar that invents one
           is a lie the user waits on. The indeterminate case leads the title. */}
@@ -67,7 +59,7 @@ export function progressDialogBody(props: {
           </button>
         </div>
       )}
-    </div>
+    </>
   );
 }
 
@@ -105,10 +97,14 @@ export function ProgressDialog() {
       onClose={() => false}
       overlayClass="protected-surface"
       panelClass="surface surface-raised confirm-dialog progress-dialog protected-surface"
+      panelRef={panelRef}
+      // A committed phase has no Cancel. Focus the frame then, without making
+      // it a Tab stop or painting a control's focus ring (components.css).
+      panelProps={{ tabIndex: -1 }}
       panelRole="dialog"
       ariaModal
     >
-      {progressDialogBody({ state, panelRef })}
+      {progressDialogBody({ state })}
     </Overlay>
   );
 }

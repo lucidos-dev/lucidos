@@ -54,26 +54,21 @@ describe('compose destination final selection focus', () => {
     expect(deps.scrollToSetting).toHaveBeenCalledWith('coding-agents:repositories');
   });
 
-  it('writes the coding agent to the focused draft, never a global, and focuses the prompt', () => {
-    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
+  it('remembers the coding agent for the focused draft and focuses the prompt', () => {
+    const deps = { selectAgent: vi.fn(), focusPrompt: vi.fn() };
 
     handleComposeCodingAgentSelection('thread-1', 'codex', deps);
 
-    // Per-draft: only this draft's backend changes; the account default is left
-    // to Settings (draft-only).
-    expect(deps.patchSelection).toHaveBeenCalledWith('thread-1', { codingAgent: 'codex' });
+    expect(deps.selectAgent).toHaveBeenCalledWith('thread-1', 'codex');
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 
-  it('with no focused draft, writes the PENDING slot (null), never a global', () => {
-    const deps = { patchSelection: vi.fn(), focusPrompt: vi.fn() };
+  it('remembers the coding agent with no focused draft', () => {
+    const deps = { selectAgent: vi.fn(), focusPrompt: vi.fn() };
 
     handleComposeCodingAgentSelection(null, 'claude-code', deps);
 
-    // patchComposeSelection(null, …) routes to the pending slot — a fresh-compose
-    // pick must NOT write `coding_agent_default` (every override-less draft reads
-    // it, so that would leak the pick to all drafts).
-    expect(deps.patchSelection).toHaveBeenCalledWith(null, { codingAgent: 'claude-code' });
+    expect(deps.selectAgent).toHaveBeenCalledWith(null, 'claude-code');
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
   });
 

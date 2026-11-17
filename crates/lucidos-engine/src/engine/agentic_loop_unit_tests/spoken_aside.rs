@@ -49,6 +49,28 @@ mod spoken_aside_tests {
         }
     }
 
+    /// The rest of a spoken sentence reopens a finished answer. It reaches only
+    /// a turn whose history may have missed its row, so without the reopen the
+    /// caller hears an answer to half a question.
+    #[test]
+    fn the_rest_of_a_spoken_sentence_reopens_a_finished_answer() {
+        assert!(injections_reopen_a_finished_answer(&[prompt(
+            InjectedPromptKind::SpokenContinuation
+        )]));
+    }
+
+    /// It still starts no turn of its own. Re-submitted from the teardown
+    /// window, it would make the caller hear a second answer.
+    #[test]
+    fn the_rest_of_a_spoken_sentence_carries_no_turn() {
+        let kind = InjectedPromptKind::SpokenContinuation;
+        assert!(!kind.can_carry_a_turn());
+        assert!(
+            kind.is_engine_reentry(),
+            "it would add a PromptInjected row"
+        );
+    }
+
     /// An aside beside a real follow-up rides along rather than being dropped.
     /// The round is reopening anyway, and telling it what the caller was just
     /// told in its name is the whole point of offering the aside.

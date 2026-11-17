@@ -109,28 +109,6 @@ fn keeps_the_workspace_scale_over_device_scales_below_it() {
     assert_eq!(largest_scale(150.0, &devices).percent, 150.0);
 }
 
-/// The pre-grid names paint what the SDK paints for them.
-#[test]
-fn reads_a_pre_grid_scale_name_as_the_sdk_does() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../packages/lucidos-sdk/src/appearance.ts");
-    let sdk = std::fs::read_to_string(&path).expect("the SDK's appearance.ts");
-    let table = sdk
-        .split("export const LEGACY_UI_SCALES: Record<string, number> = {")
-        .nth(1)
-        .and_then(|rest| rest.split("};").next())
-        .expect("LEGACY_UI_SCALES is declared in appearance.ts");
-    let names: Vec<(&str, f64)> = table
-        .lines()
-        .filter_map(|line| line.trim().trim_end_matches(',').split_once(": "))
-        .map(|(name, value)| (name, value.parse().unwrap()))
-        .collect();
-    assert_eq!(names.len(), 3, "{table}");
-    for (name, percent) in names {
-        assert_eq!(parse_scale(name), Some(percent), "{name}");
-    }
-}
-
 #[test]
 fn skips_a_device_value_that_is_no_scale() {
     let devices = [(PHONE.into(), "huge".into()), (LAPTOP.into(), "900".into())];
@@ -312,6 +290,97 @@ fn reads_the_report_a_page_posts() {
 }
 
 // ---- The round trip ----
+
+#[tokio::test]
+async fn agent_renderer_round_trip_retains_measurements_and_source_without_device_authority() {
+    let mut b = bench().await;
+    let sessions = Arc::new(FitSessions::default());
+    let thread = Uuid::new_v4();
+    let scope = FitScope {
+        thread,
+        app: APP.into(),
+        device: PHONE.into(),
+    };
+    let grant = sessions.register(Some(thread), scope.clone()).unwrap();
+    let (bus, pool, pending, workspace, registry, handle) = (
+        b.bus.clone(),
+        b.pool.clone(),
+        b.pending.clone(),
+        b.workspace.clone(),
+        sessions.clone(),
+        grant.handle.clone(),
+    );
+    let check = tokio::spawn(async move {
+        let apps = AppManager::new(workspace.path()).unwrap();
+        let cx = WidgetFitContext {
+            bus: &bus,
+            pool: &pool,
+            apps: &apps,
+            pending: &pending,
+        };
+        check_widget_fit_with_responder(
+            &cx,
+            APP,
+            thread,
+            FitResponder::AgentRenderer {
+                sessions: &registry,
+                handle: &handle,
+                device: PHONE,
+                actor: MessageOrigin::Api {
+                    user_agent: None,
+                    mode: crate::engine::thread_events::ActorMode::Agent,
+                    source_thread_id: Some(thread),
+                    emitting_trigger_id: None,
+                },
+            },
+            WIDGET_FIT_BOX_BUDGET,
+        )
+        .await
+    });
+    let event = b.events.recv().await.unwrap();
+    let BusEvent::Thread {
+        thread_id,
+        event:
+            ThreadEvent::WidgetFitRequested {
+                request_id,
+                sizes,
+                renderer_session_id,
+                renderer_device_id,
+                ..
+            },
+        meta,
+    } = event.typed
+    else {
+        panic!("expected fit request")
+    };
+    assert_eq!(thread_id, thread);
+    assert_eq!(renderer_session_id.as_deref(), Some(grant.handle.as_str()));
+    assert_eq!(renderer_device_id.as_deref(), Some(PHONE));
+    assert!(
+        matches!(meta.actor, Some(MessageOrigin::Api { source_thread_id: Some(id), .. }) if id == thread)
+    );
+    assert!(resolve_answer(&b.pending, &request_id, Some(PHONE), vec![]).is_err());
+    assert!(sessions
+        .answer(&grant.credential, &request_id, LAPTOP, vec![])
+        .is_err());
+    let mut boxes = clean(&sizes);
+    boxes[0] = measured(
+        FitSurface::DeskTile,
+        Small,
+        vec![ellipsis("Important data")],
+        1,
+    );
+    sessions
+        .answer(&grant.credential, &request_id, PHONE, boxes)
+        .unwrap();
+    let note = check.await.unwrap();
+    assert!(note.contains("content is cut off"), "{note}");
+    assert!(note.contains("Important data"), "{note}");
+    assert!(sessions
+        .answer(&grant.credential, &request_id, PHONE, vec![])
+        .is_err());
+    teardown_test_db(&b.db).await;
+}
 
 struct Bench {
     bus: Arc<EventBus>,
@@ -675,4 +744,30 @@ async fn a_write_with_no_widget_file_adds_no_note() {
     assert_eq!(notes, "");
     assert!(no_request_sent(&mut b.events));
     teardown_test_db(&b.db).await;
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// The pre-grid names paint what the SDK paints for them.
+    #[test]
+    fn reads_a_pre_grid_scale_name_as_the_sdk_does() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../packages/lucidos-sdk/src/appearance.ts");
+        let sdk = std::fs::read_to_string(&path).expect("the SDK's appearance.ts");
+        let table = sdk
+            .split("export const LEGACY_UI_SCALES: Record<string, number> = {")
+            .nth(1)
+            .and_then(|rest| rest.split("};").next())
+            .expect("LEGACY_UI_SCALES is declared in appearance.ts");
+        let names: Vec<(&str, f64)> = table
+            .lines()
+            .filter_map(|line| line.trim().trim_end_matches(',').split_once(": "))
+            .map(|(name, value)| (name, value.parse().unwrap()))
+            .collect();
+        assert_eq!(names.len(), 3, "{table}");
+        for (name, percent) in names {
+            assert_eq!(parse_scale(name), Some(percent), "{name}");
+        }
+    }
 }

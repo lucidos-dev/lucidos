@@ -28,7 +28,7 @@ vi.mock('../../../api/client', async (importOriginal) => ({
 }));
 
 import { SummaryTreeBrowser, THREADS_PAGE_SIZE } from '../SummaryTreeBrowser';
-import { operators } from '../../../store/actions/operators';
+import { gatewayUsers } from '../../../store/actions/gatewayUsers';
 
 const THREAD = '3f2c1d4e-0000-4000-8000-000000000000';
 const DATE = { from: '2026-09-02T10:00:00Z', to: '2026-09-19T10:00:00Z' };
@@ -59,7 +59,7 @@ function line(id: string): HTMLButtonElement {
 }
 
 beforeEach(() => {
-  operators.value = { status: 'not-loaded' };
+  gatewayUsers.value = { status: 'not-loaded' };
   for (const fn of Object.values(api)) fn.mockReset();
   api.getRecallDate.mockImplementation(async (id) => ({ id, ...DATE }));
   host = document.createElement('div');
@@ -164,10 +164,10 @@ it('draws a line\'s entry kind as a label and keeps the rest as its text', async
 });
 
 it('labels a human prompt with the operator holding its sending device', async () => {
-  operators.value = {
+  gatewayUsers.value = {
     status: 'loaded',
     data: {
-      operators: [{ id: 'owner', name: 'Sam', emails: [], device_ids: ['sams-device'] }],
+      users: [{ id: 'owner', name: 'Sam', emails: [], device_ids: ['sams-device'] }],
       relayed: [],
     },
   };

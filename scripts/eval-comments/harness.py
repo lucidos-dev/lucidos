@@ -440,7 +440,8 @@ class WindowEnded(Exception):
 class Window:
     """A wall-clock budget for one invocation.
 
-    The engine kills a background task after an hour, so a long run is a chain
+    The engine kills a background task at its timeout, an hour by default and
+    4 h at most. So a long run is a chain
     of windows. Each step asks whether it fits before it starts, and every
     subprocess timeout is clamped to the window, so nothing outlives it.
     """

@@ -74,7 +74,7 @@ pub(crate) fn log_request(
     if !enabled() {
         return;
     }
-    crate::log!(
+    crate::log_legacy!(
         "{}",
         request_line(request, model, request_url, provider_tag, current())
     );
@@ -85,7 +85,7 @@ pub(crate) fn log_response(meta: &TurnMeta, provider_tag: &str) {
     if !enabled() {
         return;
     }
-    crate::log!("{}", response_line(meta, provider_tag, current()));
+    crate::log_legacy!("{}", response_line(meta, provider_tag, current()));
 }
 
 // ===== Line builders (pure, so the tests can call them with the probe off) =====

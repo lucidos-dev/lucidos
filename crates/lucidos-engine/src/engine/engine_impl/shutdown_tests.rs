@@ -41,11 +41,7 @@ fn device_actor() -> Option<MessageOrigin> {
 /// hangs on the header actually resolving to a `Device`, so the test derives it
 /// from the header exactly as production does.
 fn gateway_restart_actor(device_id: &str) -> Option<MessageOrigin> {
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        crate::api::actor::HEADER_DEVICE_ID,
-        axum::http::HeaderValue::from_str(device_id).expect("valid header value"),
-    );
+    let headers = crate::api::gateway_stamp::test_support::stamped_device_headers(device_id);
     crate::api::actor::user_actor(&headers, None)
 }
 
@@ -153,6 +149,8 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -341,6 +339,7 @@ async fn teardown_emits_abort_when_question_already_answered() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "toolu_teardown_2".into(),
             quiet: false,
             answer: AnswerKind::Selected {

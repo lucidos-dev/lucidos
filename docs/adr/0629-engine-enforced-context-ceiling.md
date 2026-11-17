@@ -6,6 +6,13 @@
 
 Plan: `docs/plans/2026-11-08-engine-enforced-context-ceiling.md`.
 
+**Amended by [0701](0701-context-ceiling-at-safe-boundaries.md):** live captures
+record crossings; safe-boundary delivery and the opening guard replace the
+turn-end-only rule and first-turn exemption below. Its deferred mid-turn signal
+is implemented. The ceiling value, scopes and raise authority remain unchanged.
+
+**Amended by [0705](0705-ceiling-successor-after-interrupted-turn.md):** an agent's narrative handoff starts after its turn when ceiling re-entry interrupted running work. Natural turn ends and engine briefs still wait for input.
+
 ## Context
 
 A coding-agent session hands off only where its own flow says so. A flow
@@ -192,7 +199,7 @@ to do would write a fresh context, then draw keep-alive beats. Deferred, it
 writes once, and only if an input comes. A waiting session then costs nothing
 while it waits.
 
-**The turn end is the only safe boundary.** A tool call may hold a build, a
+**Original rationale, amended by ADR 0701: the turn end was the only safe boundary.** A tool call may hold a build, a
 take or a lock. Cutting it loses work, and the agent's own narrative is the
 best carry-over. The re-entry already sends agents back for plan markers and
 `/harden`, so the ceiling reuses that path.
@@ -217,8 +224,8 @@ person's decision.
   from the narrative written at the turn end. Under the ceiling, 0609 stands.
 - **Every workspace changes behaviour at once** with the `300k` default. A
   heavy session now ends in a successor where it used to grow.
-- **A session that crosses the ceiling mid-turn overshoots** until that turn
-  ends. The plan measures the overshoot and names when to add a mid-turn signal.
+- **Amended by ADR 0701:** a crossing can now deliver a mid-turn steer without
+  interrupting. This replaces the plan's deferred mid-turn signal.
 - **Prose rules like "hand off past 300k" become redundant.** Workspace
   knowhow may drop them.
 - **The auto-compact trial's window arm (400k) never trips** under the default.

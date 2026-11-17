@@ -190,7 +190,7 @@
 
 # -E (errtrace) is REQUIRED, not optional: it makes the ERR trap (on_err, below)
 # inherit into shell functions, subshells, and command substitutions. Without it,
-# an unguarded failure inside sign_app_bundle / refresh_dmg_payload / sign_dmg /
+# an unguarded failure inside sign_app_bundle / dmg_volume_assemble / sign_dmg /
 # upload_release_assets would exit via `set -e` WITHOUT firing on_err — so no
 # ReleaseStepFailed would be emitted and the cockpit would stall mid-stage, the
 # exact "silent stall" this refactor exists to kill.
@@ -330,7 +330,7 @@ source "$SCRIPT_DIR/lib/release_pg_major.sh"
 # shellcheck source=scripts/lib/release_upload.sh
 source "$SCRIPT_DIR/lib/release_upload.sh"
 
-# Which file under target/release/bundle/dmg is THE release DMG. refresh_dmg_payload
+# Which file under target/release/bundle/dmg is THE release DMG. dmg_volume_assemble
 # writes two intermediates (.rw.dmg / .zlib.dmg) next to the real artifact, and a
 # run killed mid-refresh leaves one behind; both match `*.dmg`, and the
 # version-stamp guard cannot tell them apart because they carry the same version
@@ -338,6 +338,8 @@ source "$SCRIPT_DIR/lib/release_upload.sh"
 # that EXCLUDES them cannot drift (F4). Public-mirror-safe; source unconditionally.
 # shellcheck source=scripts/lib/release_dmg.sh
 source "$SCRIPT_DIR/lib/release_dmg.sh"
+# shellcheck source=scripts/lib/dmg_volume.sh
+source "$SCRIPT_DIR/lib/dmg_volume.sh"
 
 # Updater-payload repack + re-sign + the Developer ID publish gate. `cargo tauri
 # build` packs Lucidos.app.tar.gz from the app BEFORE this script signs it (see
@@ -1065,7 +1067,7 @@ notarize_announce_credentials() {
 # the caller can persist it before anything can kill this process.
 notarize_submit() {
     local dmg="$1" out errfile
-    errfile="$(mktemp -t lucidos-notarytool)"
+    errfile="$(mktemp "${TMPDIR:-/tmp}/lucidos-notarytool.XXXXXX")"
     if ! out="$(notarytool_run submit "$dmg" --no-wait --output-format json 2>"$errfile")"; then
         local err; err="$(cat "$errfile")"; rm -f "$errfile"
         die "notarytool submit failed for $(basename "$dmg"): $err"
@@ -1095,7 +1097,7 @@ notarize_submit() {
 notarize_poll() {
     local id="$1"
     local waited=0 fails=0 out status lowered err errfile
-    errfile="$(mktemp -t lucidos-notarytool)"
+    errfile="$(mktemp "${TMPDIR:-/tmp}/lucidos-notarytool.XXXXXX")"
     while :; do
         # Checked at the TOP of the loop as well as before each sleep, so a
         # deadline already in the past when polling starts (a resume picked up
@@ -1777,7 +1779,7 @@ notarize_submit_and_wait() {
 notarize_adopt_submission() {
     local head_commit="$1" dmg_dir dmg sha
     dmg_dir="$REPO_ROOT/target/release/bundle/dmg"
-    # release_dmg_find excludes refresh_dmg_payload's intermediates and refuses an
+    # release_dmg_find excludes dmg_volume_assemble's intermediates and refuses an
     # ambiguous directory: a run killed mid-refresh can leave a .rw.dmg /
     # .zlib.dmg behind, and adopting one of those would record a checksum for
     # bytes Apple never saw. Its reason lands on stderr just above this die.
@@ -1811,63 +1813,6 @@ sign_dmg() {
     local dmg="$1"
     codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
     codesign --verify --strict --verbose=2 "$dmg"
-}
-
-# refresh_dmg_payload_cleanup <rw> <out> <mnt>: unwind whatever this refresh has
-# created so far. Called on every failure branch below and on the success path.
-#
-# It exists because the two intermediates are the raw material of F4: a run that
-# dies between the convert and the trailing `rm -f` leaves a `.rw.dmg` sitting in
-# the bundler's output dir permanently, where the next build's discovery has to
-# know to skip it. The exclusion in release_dmg.sh is the guard; not creating the
-# litter in the first place is the fix. A left-behind MOUNT is worse still: the
-# volume stays attached after the build exits, and the next `hdiutil attach` of
-# the same image fails.
-#
-# Explicit calls rather than a `trap … RETURN`: under `set -e` a failing command
-# does not return from the function, it exits the shell through the ERR trap, and
-# a RETURN trap never fires on that path.
-refresh_dmg_payload_cleanup() {
-    local rw="$1" out="$2" mnt="$3"
-    if [ -n "$mnt" ] && [ -d "$mnt" ]; then
-        hdiutil detach "$mnt" -force >/dev/null 2>&1 || true
-        rmdir "$mnt" 2>/dev/null || true
-    fi
-    rm -f "$rw" "$out"
-}
-
-refresh_dmg_payload() {
-    local dmg="$1"
-    local app="$2"
-    local rw out mnt
-    rw="$(release_dmg_rw_path "$dmg")"
-    out="$(release_dmg_zlib_path "$dmg")"
-    mnt="$(mktemp -d)"
-    # Clear BOTH intermediates up front, not just the read-write one: a previous
-    # run killed during the recompress leaves the .zlib.dmg behind, and hdiutil
-    # refuses to convert onto an existing path.
-    rm -f "$rw" "$out"
-    hdiutil convert "$dmg" -format UDRW -o "$rw" >/dev/null \
-        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "hdiutil could not convert $(basename "$dmg") to a read-write image"; }
-    hdiutil attach "$rw" -nobrowse -noautoopen -mountpoint "$mnt" >/dev/null \
-        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "hdiutil could not mount $(basename "$rw")"; }
-    # ${mnt:?} so a hypothetically-empty mountpoint can never turn this into an
-    # `rm -rf /<app-name>` against the live filesystem.
-    rm -rf "${mnt:?}/$(basename "$app")"
-    ditto "$app" "$mnt/$(basename "$app")" \
-        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "could not copy $(basename "$app") into the mounted DMG"; }
-    [ -f "$mnt/.VolumeIcon.icns" ] && chflags hidden "$mnt/.VolumeIcon.icns"
-    hdiutil detach "$mnt" -force >/dev/null
-    rmdir "$mnt" 2>/dev/null || true
-    mnt=""
-    # Recompress to a temp path, then atomically swap onto the original: never
-    # delete the only good artifact before its replacement is fully written, so
-    # a failed recompress can't lose the (expensive) build output.
-    hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out" >/dev/null \
-        || { refresh_dmg_payload_cleanup "$rw" "$out" ""; die "hdiutil could not recompress $(basename "$rw")"; }
-    mv -f "$out" "$dmg" \
-        || { refresh_dmg_payload_cleanup "$rw" "$out" ""; die "could not move the recompressed image onto $(basename "$dmg")"; }
-    refresh_dmg_payload_cleanup "$rw" "$out" ""
 }
 
 # ── The .app notarization stage (F5) ─────────────────────────────────────────
@@ -2077,10 +2022,8 @@ run_app_notarize_resume() {
         || die "could not read the .app path from $NOTARIZE_STATE_FILE"
     [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ] \
         || die "the .app this submission was made from is gone: '$APP_PATH'. Rebuild."
-    # The DMG this build produced is still the pre-refresh one from `cargo tauri
-    # build`; run_dmg_notarize_stage injects the stapled app into it below.
-    DMG_PATH="$(release_dmg_find "$BUNDLE_DIR/dmg")" \
-        || die "resuming the .app notarization needs the DMG this build produced (the reason is above)."
+    DMG_PATH="$(dmg_volume_app_path "$BUNDLE_DIR/dmg" "$APP_PATH")" \
+        || die "could not compute the DMG output path"
 
     notarize_credentials_present \
         || die "resuming the .app notarization needs APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID to ask Apple about submission $submission_id."
@@ -2102,8 +2045,9 @@ run_app_notarize_resume() {
 # notarization and inventing one it does not render would be worse); this
 # function closes it.
 run_dmg_notarize_stage() {
-    step "Refreshing DMG payload and hiding .VolumeIcon.icns"
-    refresh_dmg_payload "$DMG_PATH" "$APP_PATH"
+    step "Assembling DMG with Finder layout"
+    dmg_volume_assemble "$DMG_PATH" "$APP_PATH" \
+        || die "could not assemble the DMG"
 
     # ── 6. sign DMG + notarize (env-gated) ──────────────────────────────────────
     # In --release mode signing + notarization are MANDATORY: a missing credential
@@ -2596,7 +2540,7 @@ if ! cargo tauri --version >/dev/null 2>&1; then
 fi
 command -v npm >/dev/null || die "npm not found — install Node.js."
 
-begin_step build "Compiling engine + gateway + app, fetching PostgreSQL $PG_VERSION + pgvector, running cargo tauri build (.app + .dmg)."
+begin_step build "Compiling engine + gateway + app, fetching PostgreSQL $PG_VERSION + pgvector, running cargo tauri build (.app)."
 
 # Staging steps 1–4 are the platform-agnostic spine shared with the Linux/headless
 # path; they live in scripts/lib/stage_runtime.sh so the recipe exists once.
@@ -2649,14 +2593,14 @@ resource_contract_assert_staged "$STAGE" \
     || die "the staged tree does not match the resource contract (see the errors above)"
 
 # ── 5. tauri build ──────────────────────────────────────────────────────────
-step "Running cargo tauri build (app + dmg)"
+step "Running cargo tauri build (app)"
 # Inject the resource map at build time (kept out of the committed tauri.conf.json
 # so normal `cargo check` / dev builds aren't tied to staged artifacts).
 RESOURCES_CONFIG="$(tauri_build_config_json)"
 # Trailing `-- --locked` is forwarded to the inner `cargo build` so the release
 # bundle is built strictly from the committed Cargo.lock (fail-closed on any
 # manifest↔lock drift), matching every other build path.
-TAURI_BUILD_ARGS=(tauri build --bundles "app,dmg" --config "$RESOURCES_CONFIG" -- --locked)
+TAURI_BUILD_ARGS=(tauri build --bundles "app" --config "$RESOURCES_CONFIG" -- --locked)
 
 # A no-password updater key is still signed with an EMPTY password, not "no
 # password env at all". Tauri defaults the password to empty when the var is
@@ -2684,20 +2628,17 @@ else
     (cd "$APP_DIR" && cargo "${TAURI_BUILD_ARGS[@]}")
 fi
 
-# release_dmg_find, not a bare `find … | head -1`: that returned DIRECTORY order
-# over everything matching `*.dmg`, so a .rw.dmg / .zlib.dmg left by a run killed
-# mid-refresh could be adopted as the release DMG and then signed, notarized,
-# stapled and published. The version-stamp guard below cannot catch that, because
-# the leftovers carry the same version string (F4). The adopt path has had this
-# exclusion since it was written; this is the site that did not.
-DMG_PATH="$(release_dmg_find "$BUNDLE_DIR/dmg")" \
-    || die "could not identify the .dmg this build produced (the reason is above)."
+dmg_volume_prepare_directory "$BUNDLE_DIR/dmg" \
+    || die "could not clear previous DMG build outputs"
+
 APP_PATH="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1 || true)"
 [ -n "$APP_PATH" ] || die "no .app produced under $BUNDLE_DIR/macos"
+# The DMG is assembled from the final app after signing and stapling.
+DMG_PATH="$(dmg_volume_app_path "$BUNDLE_DIR/dmg" "$APP_PATH")" \
+    || die "could not compute the DMG output path"
 
-# Version-stamp guard (post-build half). Tauri names the artifact
-# Lucidos_<version>_<arch>.dmg from the --config version override; assert the
-# produced DMG actually carries EFFECTIVE_VERSION so a stamping failure can't ship
+# Version-stamp guard (post-build half). The computed artifact name
+# must carry EFFECTIVE_VERSION so a stamping failure can't ship
 # a misnamed asset (the v0.10.1 "DMG built as 0.10.0 while the tag is v0.10.1"
 # class of bug). Only enforced when a version is known (always, in release mode).
 if [ -n "$EFFECTIVE_VERSION" ]; then
@@ -2707,7 +2648,7 @@ if [ -n "$EFFECTIVE_VERSION" ]; then
     esac
 fi
 
-end_step build "Built $(basename "$DMG_PATH") (.app + .dmg + updater artifacts)."
+end_step build "Built .app and updater artifacts; DMG assembly follows signing."
 
 # ── 5b. sign (env-gated) ────────────────────────────────────────────────────
 # sign_app_bundle <app> <identity> [<codesign-arg>…]: sign every Mach-O file in
@@ -2874,14 +2815,14 @@ claims."
 # from the app as the bundler left it, and the build above deliberately ran with
 # APPLE_SIGNING_IDENTITY stripped from its env so Tauri would skip its own
 # (insufficient) codesign pass. So the tarball on disk holds an UNSIGNED bundle.
-# refresh_dmg_payload re-injects the signed app into the DMG a few lines below,
+# dmg_volume_assemble copies the signed app into the DMG below,
 # which is why the DMG has always been correct; nothing did the same for the
 # updater payload, so every auto-update since replaced a notarized Developer ID
 # app with an ad-hoc one whose designated requirement is a bare cdhash. macOS TCC
 # keys grants on code identity, so each update silently destroyed every
 # permission the user had ever granted.
 #
-# Ordering: this MUST run after sign_app_bundle and before refresh_dmg_payload,
+# Ordering: this MUST run after sign_app_bundle and before dmg_volume_assemble,
 # so it packs the signed bundle and leaves the DMG path untouched.
 #
 # Pre-staple by design, matching the accepted cost already documented for the
@@ -3005,7 +2946,7 @@ fi
 # build with the full Apple credential set is deliberately reproducing the
 # release and gets both submissions; one without them gets neither. A third
 # behaviour keyed on release mode would be a special case with no user.
-begin_step notarize "Notarizing and stapling the .app, then refreshing the DMG payload around it, signing the DMG, submitting it, polling for the verdict and stapling the ticket."
+begin_step notarize "Notarizing and stapling the .app, then assembling the DMG around it, signing the DMG, submitting it, polling for the verdict and stapling the ticket."
 if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && notarize_credentials_present; then
     notarize_announce_credentials
     notarize_app_submit_and_persist

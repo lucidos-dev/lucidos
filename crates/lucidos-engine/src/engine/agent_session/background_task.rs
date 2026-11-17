@@ -9,6 +9,8 @@
 //! thread when the job finishes. The agent reaches this through `lucidos
 //! background-task` over `/api/v1/threads/:thread_id/background-tasks`.
 
+use std::path::PathBuf;
+
 use tokio::sync::broadcast::error::RecvError;
 use uuid::Uuid;
 
@@ -18,7 +20,22 @@ use crate::engine::event_wait::{OwnerTurn, StoppedTask};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::tools::bash_background::{BackgroundBashRegistry, CompletionDelivery, TaskSpec};
 use crate::engine::LucidosEngine;
-use crate::llm::tools::BG_MAX_TIMEOUT_SECS;
+
+/// The longest a coding agent's background task may run, in seconds: 4 h, so
+/// an unattended run such as a filmed take finishes. The chat agent's
+/// background tools keep their own `BG_MAX_TIMEOUT_SECS`.
+pub(crate) const AGENT_BG_MAX_TIMEOUT_SECS: u64 = 14_400;
+
+/// How long a background task runs when the agent names no `--timeout-secs`.
+/// A forgotten run still dies at the hour.
+pub(crate) const AGENT_BG_DEFAULT_TIMEOUT_SECS: u64 = 3_600;
+
+/// The watchdog for one task: the agent's ask, between 1 s and the ceiling.
+fn agent_task_timeout_secs(asked: Option<u64>) -> u64 {
+    asked
+        .unwrap_or(AGENT_BG_DEFAULT_TIMEOUT_SECS)
+        .clamp(1, AGENT_BG_MAX_TIMEOUT_SECS)
+}
 
 /// The longest one `lucidos background-task wait` blocks, in seconds. The
 /// Claude Code prompt cache lives 5 minutes or 1 hour from the last request's
@@ -108,7 +125,7 @@ pub(crate) fn ended_waits_note(ended_with_others: &[String]) -> String {
 async fn kill_threads_tasks(registry: &BackgroundBashRegistry, thread_id: Uuid, why: &str) {
     let killed = registry.kill_for_thread(thread_id).await;
     if killed > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[BackgroundTask] {why} killed {killed} background task(s) of thread {thread_id}"
         );
     }
@@ -159,9 +176,9 @@ impl LucidosEngine {
     /// command when there is none. Under [`CompletionDelivery::Poll`] nothing
     /// is armed: the agent polls with `lucidos background-task wait`.
     ///
-    /// `timeout_secs` defaults to the ceiling rather than to the chat tool's
-    /// ten minutes. A coding agent reaches for this exactly when the work is
-    /// long, and a watchdog firing mid-suite reads as a failure.
+    /// `timeout_secs` defaults to an hour rather than to the chat tool's ten
+    /// minutes. A coding agent reaches for this exactly when the work is long,
+    /// and a watchdog firing mid-suite reads as a failure.
     pub(crate) async fn start_background_task_for_agent(
         &self,
         thread_id: Uuid,
@@ -177,20 +194,7 @@ impl LucidosEngine {
         // The agent's own permission check saw only `lucidos background-task
         // run -- …`, and its Bash guard read head `lucidos`. This is the one
         // place that reads the real command.
-        let cwd = {
-            let sessions = self.agent_sessions.lock().await;
-            sessions
-                .get(&thread_id)
-                .and_then(|s| s.worktree_path.clone())
-        };
-        let Some(cwd) = cwd else {
-            return Err(
-                "This thread has no live coding-agent session with a worktree, so \
-                 there is nowhere to run a background task. Run it in the foreground \
-                 instead."
-                    .to_string(),
-            );
-        };
+        let cwd = self.agent_worktree(thread_id).await?;
         if let Some(reason) =
             crate::engine::command_guard::catastrophic_reason_for_command_at(command, Some(&cwd))
         {
@@ -199,11 +203,15 @@ impl LucidosEngine {
         if crate::engine::command_guard::command_reads_secret(command) {
             return Err("Refused: background tasks cannot read Lucidos secrets.".to_string());
         }
-        let timeout_secs = timeout_secs
-            .unwrap_or(BG_MAX_TIMEOUT_SECS)
-            .clamp(1, BG_MAX_TIMEOUT_SECS);
+        let timeout_secs = agent_task_timeout_secs(timeout_secs);
 
-        let env_vars = self.build_agent_task_env_vars(thread_id, &cwd).await;
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), self.workspace_path())
+                .await
+                .map_err(|e| e.to_string())?;
+        let env_vars = self
+            .build_agent_task_env_vars(thread_id, &cwd, sandbox.compile_cache())
+            .await?;
         let spec = TaskSpec {
             timeout_secs,
             description,
@@ -211,7 +219,7 @@ impl LucidosEngine {
             inherited: crate::core::InheritedSecrets::Keep,
         };
         let (task_id, _started_at) = self
-            .start_background_task(thread_id, command, &cwd, &env_vars, spec)
+            .start_background_task(&sandbox, thread_id, command, &cwd, &env_vars, spec)
             .await?;
         if delivery == CompletionDelivery::Poll {
             return Ok(BackgroundTaskStart::Polled {
@@ -240,6 +248,20 @@ impl LucidosEngine {
                 Ok(BackgroundTaskStart::Finished { task_id, output })
             }
         }
+    }
+
+    /// The worktree of this thread's live coding-agent session, where its
+    /// background tasks run.
+    pub(crate) async fn agent_worktree(&self, thread_id: Uuid) -> Result<PathBuf, String> {
+        let sessions = self.agent_sessions.lock().await;
+        sessions
+            .get(&thread_id)
+            .and_then(|s| s.worktree_path.clone())
+            .ok_or_else(|| {
+                "This thread has no live coding-agent session with a worktree, so there is \
+                 nowhere to run a background task. Run it in the foreground instead."
+                    .to_string()
+            })
     }
 
     /// The output of one of this thread's background tasks: what arrived since

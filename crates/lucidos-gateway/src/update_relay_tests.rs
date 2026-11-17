@@ -343,3 +343,28 @@ mod refreshing {
         assert_eq!(origin.requests(), 0);
     }
 }
+
+#[test]
+fn requests_follow_semver_precedence_including_prereleases() {
+    for (current, offered, upgrade) in [
+        (
+            "9.2.0-nightly.20261116.2",
+            "9.2.0-nightly.20261116.10",
+            true,
+        ),
+        ("9.2.0-nightly.20261116.1", "9.2.0", true),
+        ("9.2.0-nightly.20261116.1", "9.1.0", false),
+        ("9.2.0", "9.2.0-beta.1", false),
+        ("9.2.0+a", "9.2.0+z", false),
+        ("unknown", "9.2.0", false),
+    ] {
+        let now = Instant::now();
+        let relay = UpdateRelay::default();
+        relay.heartbeat(beat(current, None), now);
+        assert_eq!(
+            relay.request(Some(offered), now).is_ok(),
+            upgrade,
+            "{current} -> {offered}"
+        );
+    }
+}

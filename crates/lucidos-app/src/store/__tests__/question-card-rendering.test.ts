@@ -6,6 +6,7 @@ import {
   computeSubmitMultiCount,
   promptPlaceholder,
   threadHasConversation,
+  PLACEHOLDER_AGENT_PAUSED,
   PLACEHOLDER_ANSWERING,
   PLACEHOLDER_SIDE_QUESTION,
   PLACEHOLDER_FOLLOW_UP,
@@ -266,6 +267,14 @@ describe('promptPlaceholder', () => {
     expect(promptPlaceholder(true, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
   });
 
+  it('says the agent is paused, so nothing else has to (ADR 0657)', () => {
+    expect(promptPlaceholder(true, false, false, true)).toBe(PLACEHOLDER_AGENT_PAUSED);
+  });
+
+  it('lets a pending card and the side-question mode win over the pause', () => {
+    expect(promptPlaceholder(true, true, false, true)).toBe(PLACEHOLDER_ANSWERING);
+    expect(promptPlaceholder(true, false, true, true)).toBe(PLACEHOLDER_SIDE_QUESTION);
+  });
 });
 
 describe('threadHasConversation', () => {

@@ -113,7 +113,7 @@ pub(crate) async fn enforce_target_workspace(
     if check_target_workspace(asserted.as_deref(), &actual) == TargetCheck::WrongWorkspace {
         // `asserted` is Some here: `Proceed` covers every absent / blank case.
         let asserted = asserted.unwrap_or_default();
-        crate::log!(
+        crate::log_legacy!(
             "[API] Refusing request asserted for workspace '{}' on the engine serving '{}': {} {}",
             asserted.trim(),
             actual,

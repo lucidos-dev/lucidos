@@ -1,51 +1,20 @@
 #!/usr/bin/env bash
 # release_dmg.sh: which file under target/release/bundle/dmg is THE release DMG.
 #
-# ── WHY THIS EXISTS ──────────────────────────────────────────────────────────
-# refresh_dmg_payload rewrites the DMG in place by way of two intermediates that
-# it writes NEXT TO the real artifact, and both of them match `*.dmg`:
-#
-#     Lucidos_<ver>_aarch64.rw.dmg     the uncompressed read-write image
-#     Lucidos_<ver>_aarch64.zlib.dmg   the recompressed output, before the mv
-#
-# A run killed between `hdiutil convert` and the trailing `rm -f` leaves one
-# behind permanently. build-dmg.sh's main discovery was a bare
-# `find "$BUNDLE_DIR/dmg" -name '*.dmg' | head -1`, which returns DIRECTORY
-# order (not newest, not sorted), so a leftover could be picked up as the
-# release DMG and then signed, notarized, stapled, staged and published. The
-# version-stamp guard cannot catch it: `Lucidos_0.19.0_aarch64.rw.dmg` carries
-# `_0.19.0_` exactly like the real one does.
-#
-# The codebase already knew this. `notarize_adopt_submission` excluded both
-# suffixes and required exactly one candidate; the main path had neither. That
-# is the finding (F4 in docs/audits/2026-08-02-macos-update-path-audit.md), and
-# a second copy of the exclusion would have been the same bug waiting to happen
-# again. So the suffixes are defined ONCE here, and the two consumers read them
-# from the same place:
-#
-#   1. refresh_dmg_payload asks for the paths it is about to WRITE
-#      (release_dmg_rw_path / release_dmg_zlib_path);
-#   2. every discovery asks whether a candidate is one of them
-#      (release_dmg_is_intermediate, via release_dmg_find).
-#
-# Adding a third intermediate therefore means touching one predicate, and the
-# writer and the exclusion cannot drift apart.
-#
-# ── Public-mirror safety ─────────────────────────────────────────────────────
-# `build-dmg.sh --release-build` is a legitimate public path and this lib is on
-# its critical path, so this file must stay OUT of RELEASE_TREE_EXCLUDE_PATHS
-# and is sourced unconditionally, exactly like updater_payload.sh.
-#
-# Pure path arithmetic plus `find`, so the whole file is offline-testable with
-# fixture files. Unit tests: scripts/lib/release_dmg_test.sh.
+# dmg_volume_assemble writes two intermediates beside the final artifact:
+#   Lucidos_<ver>_aarch64.rw.dmg     read-write volume
+#   Lucidos_<ver>_aarch64.zlib.dmg   compressed output before atomic rename
+# A killed run can leave either behind. Discovery must exclude both (F4).
+# This library owns their names so assembly and discovery cannot drift.
+# It ships with build-dmg.sh on the public mirror.
+# Tests: scripts/lib/release_dmg_test.sh.
 
-# release_dmg_rw_path <dmg>: the uncompressed read-write intermediate
-# refresh_dmg_payload converts the DMG into before it mounts it.
+# release_dmg_rw_path <dmg>: the read-write assembly intermediate.
 release_dmg_rw_path() {
     printf '%s' "${1%.dmg}.rw.dmg"
 }
 
-# release_dmg_zlib_path <dmg>: the recompressed intermediate refresh_dmg_payload
+# release_dmg_zlib_path <dmg>: the recompressed intermediate dmg_volume_assemble
 # writes before atomically moving it onto the real DMG. It exists so a failed
 # recompress cannot destroy the only good copy of an expensive build output.
 release_dmg_zlib_path() {
@@ -97,9 +66,9 @@ release_dmg_find() {
         echo "ERROR: no .dmg found directly under $dir" >&2
         listing="$(/usr/bin/find "$dir" -maxdepth 1 -type f -name '*.dmg' 2>/dev/null || true)"
         if [ -n "$listing" ]; then
-            echo "       Only refresh_dmg_payload intermediates are present, and those are never the release DMG:" >&2
+            echo "       Only DMG assembly intermediates are present, and those are never the release DMG:" >&2
             printf '%s\n' "$listing" | sed 's/^/         /' >&2
-            echo "       A run killed mid-refresh leaves these behind. Delete them and rebuild." >&2
+            echo "       A run killed mid-assembly leaves these behind. Delete them and rebuild." >&2
         fi
         return 1
     fi

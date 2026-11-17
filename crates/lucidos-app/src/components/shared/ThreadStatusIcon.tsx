@@ -1,16 +1,16 @@
 import type { VisualStatus } from './threadVisualStatus';
-import { DiffIcon, PauseIcon } from './icons';
+import { DiffIcon, PauseIcon, EventWaitClockIcon } from './icons';
 
-/** User-facing label + one-line explanation for each status dot, shown in its
- *  hover tooltip. Single source of truth so the dot and its explanation can
- *  never drift. (idle has no dot, so it needs no entry.) */
+/** User-facing label + one-line explanation for each status mark, shown in its
+ *  hover tooltip. Single source of truth so the mark and its explanation can
+ *  never drift. (idle has no mark, so it needs no entry.) */
 const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   { status: 'running', label: 'Running', desc: 'Actively working on a response.' },
-  // One description for both causes, because one dot covers both (see
+  // One description for both causes, because one clock covers both (see
   // `resolveVisualStatus`). Naming only children would be a lie on a thread
   // that is watching for an event, and the per-wait detail is one tap away in
   // the waiting indicator. A thread with a change and only children reads
-  // `changes` instead, so this dot never sits on an applicable change.
+  // `changes` instead, so this clock never sits on an applicable change.
   { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to. While it waits on an event, any proposed change waits with it.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
@@ -19,7 +19,7 @@ const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   { status: 'failed', label: 'Failed', desc: 'The last response failed.' },
 ];
 
-/** Tooltip for a status dot: its status name as the bold title, the one-line
+/** Tooltip for a status mark: its status name as the bold title, the one-line
  *  explanation as the body — consumed by the global tooltip system
  *  (`data-tooltip-title` / `data-tooltip`). */
 export function statusTooltip(status: VisualStatus): { title: string; text: string } {
@@ -38,7 +38,7 @@ export function ThreadStatusIcon({ status }: Props) {
       <span class="progress-dot progress-dot-loading" />
     </span>
   );
-  // idle has no dot to hover, so skip the tooltip (it'd attach to a 0-size span).
+  // idle has no mark to hover, so skip the tooltip (it'd attach to a 0-size span).
   const tip = status === 'idle' ? null : statusTooltip(status);
   return (
     <span
@@ -50,7 +50,7 @@ export function ThreadStatusIcon({ status }: Props) {
         <span class="mini-spinner" />
       )}
       {status === 'waiting' && (
-        <span class="progress-dot progress-dot-waiting" />
+        <span class="thread-status-waiting-icon" aria-label="Waiting"><EventWaitClockIcon /></span>
       )}
       {status === 'changes' && (
         <span class="thread-status-changes-icon" aria-label="Changes to review">

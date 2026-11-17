@@ -9,7 +9,7 @@ import { sourceGeneration, type RestoreSourceOrigin } from '../utils/restoreSour
 import type { UploadSendIntent } from './uploadSendIntents';
 import { signal } from '@preact/signals';
 import { WORKSPACE_ID } from '../utils/basePath';
-import { deviceDatabaseName } from './deviceDatabase';
+import { awaitQueuedWrites, deviceDatabaseName } from './deviceDatabase';
 import { createIndexedDbBackend } from './pendingUploadBackend';
 export { createMemoryPendingUploadBackend } from './pendingUploadBackend';
 import { createMemoryPendingUploadBackend } from './pendingUploadBackend';
@@ -245,7 +245,7 @@ export async function readPendingUploadStore(includeHistory = false): Promise<{
   uploads: PendingUploadRecord[];
   queuedUploadSendRecords: QueuedUploadSendRecord[];
 }> {
-  await writes;
+  await awaitQueuedWrites(writes, DB_NAME);
   const [uploads, queuedUploadSendRecords] = await Promise.all([(includeHistory ? store().listUploadHistory() : store().listUploads()), (includeHistory ? store().listQueuedUploadHistory() : store().listQueuedUploadSends())]);
   return { uploads, queuedUploadSendRecords };
 }

@@ -209,7 +209,7 @@ export function findMcpPermissionResolution(
  *  transcript draws these as bubbles, and its find bar searches them. */
 export function isUserBubbleEvent(userEvent: { type: string }): boolean {
   return userEvent.type === 'MessageReceived' || userEvent.type === 'SpokenMessageReceived'
-    || userEvent.type === 'PeopleMessagePosted';
+    || userEvent.type === 'UserOnlyMessagePosted';
 }
 
 /**
@@ -308,7 +308,7 @@ export function modeToInitiator(mode: ActorMode | undefined): ThreadInitiator {
  *  renderer via `<img src="/api/v1/blobs/<hash>">`. */
 export function exchangeUserImageHashes(exchange: Exchange): string[] {
   const type = exchange.userEvent.type;
-  if (type !== 'MessageReceived' && type !== 'PeopleMessagePosted') return [];
+  if (type !== 'MessageReceived' && type !== 'UserOnlyMessagePosted') return [];
   const raw = (exchange.userEvent as { user_image_hashes?: unknown }).user_image_hashes;
   if (!Array.isArray(raw)) return [];
   return raw.filter((h): h is string => typeof h === 'string');

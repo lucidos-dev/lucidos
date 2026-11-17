@@ -7,6 +7,7 @@
 //! first word of a phone call. Read what is already projected, cap what you
 //! return, and leave anything expensive to the doer.
 
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 
@@ -15,7 +16,11 @@ use chrono::Utc;
 use super::decision::{open_on, DecisionKind, OpenDecision};
 use super::{choices_for, clip, fenced_card_text, PERMISSION_NEEDS_THEIR_WORDS, READ_ALOUD_CHARS};
 use crate::core::prefs;
-use crate::core::store::{EventStore, StatusFilter, ThreadSummaryFilters, UNTITLED_THREAD};
+use crate::core::store::{
+    EventStore, SessionMessage, StatusFilter, ThreadSummaryFilters, UNTITLED_THREAD,
+};
+use crate::core::EventRow;
+use crate::engine::thread_events::VoiceSessionEndReason;
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::LucidosEngine;
 use crate::scheduler::NotificationStore;
@@ -95,14 +100,19 @@ const WAITING_LABEL: &str = "Threads stopped, waiting on their answer";
 /// What the record of the conversation opens with.
 ///
 /// It names the two labels, because nothing else says which speaker is which.
-/// Each label is one word on purpose: a label is inside
+/// Each plain label is one word on purpose: a label is inside
 /// [`THREAD_RECALL_BYTES`], so every byte of it is a byte no turn can have.
 ///
 /// **It claims no completeness.** The caps drop turns, and a claim here would
 /// sit directly above [`EARLIER_TURNS_DROPPED`] saying the opposite.
+///
+/// It says the spoken lines are left out, so a gap between a question and its
+/// written answer reads as expected (ADR 0213).
 const RECORD_OPENS: &str = "\
 What has already been said on this conversation, oldest first. `Them` is the \
-person on this call, and `You` is Lucidos.\n";
+person on this call, and `You` is what Lucidos wrote back. What was said aloud \
+on earlier calls is left out. Lines marked as left when a call ended, or as \
+after it, are on screen and owed nothing. Bring them up only if asked.\n";
 
 /// What closes it, and the load-bearing half (ADR 0213).
 ///
@@ -225,9 +235,10 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
 
         let events = events?;
         let messages = store.build_messages_now(&events).await;
-        let turns = recent_turns(&messages);
-        let dropped = earlier_turns_were_dropped(events.len(), messages.len(), turns.len());
-        out.push_str(&fenced_record(&turns, dropped));
+        let record = record_of(&events, &messages);
+        let lines = recent_lines(&record);
+        let dropped = earlier_turns_were_dropped(events.len(), record.len(), lines.len());
+        out.push_str(&fenced_record(&lines, dropped));
 
         for decision in &open {
             out.push_str(&open_decision_block(decision));
@@ -246,37 +257,182 @@ fn this_thread(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFuture<'
 /// alone, since a window that truncated still hands back every message it
 /// built. A block under both caps would then read as the whole thread, and a
 /// talker that believes that asserts where it should ask.
-fn earlier_turns_were_dropped(events: usize, messages: usize, turns: usize) -> bool {
-    turns < messages || events as i64 >= THREAD_EVENT_WINDOW
+fn earlier_turns_were_dropped(events: usize, record: usize, shown: usize) -> bool {
+    shown < record || events as i64 >= THREAD_EVENT_WINDOW
 }
 
-/// The newest turns that fit both caps, oldest first, each as its own line.
+/// The rows the talker wrote itself, which the record leaves out (ADR 0213).
+///
+/// Its spoken lines read as a script, and a Live talker continued one at a
+/// caller who had only chuckled. Every fact they carried is in the doer's
+/// written answer, which stays. The delegation's reason is the talker's note
+/// on the caller's words, which stay too.
+const TALKER_ROWS: &[&str] = &["SpokenReplyGenerated", "WorkDelegated"];
+
+/// One line of the record.
+enum RecordLine<'a> {
+    Turn(&'a SessionMessage),
+    CallEnded(CallEnd),
+}
+
+/// Where an earlier call ended, so its last lines read as a finished call.
+struct CallEnd {
+    /// `None` on a row whose reason this build cannot read. The mark still
+    /// stands, without saying how.
+    reason: Option<VoiceSessionEndReason>,
+    /// The call's last spoken row was the talker's reply, cut off. The mark
+    /// says so, and says to repeat it only on request.
+    mid_reply: bool,
+}
+
+/// The conversation as the talker reads it: the turns nobody spoke aloud, with
+/// a mark where each earlier call ended.
+///
+/// Filtered here and never in the fold, because the doer reads the same fold
+/// and must keep every spoken row. Placed by event order, never by clock: the
+/// fold dates some turns by their request rather than their answer.
+fn record_of<'a>(events: &[EventRow], messages: &'a [SessionMessage]) -> Vec<RecordLine<'a>> {
+    let position: HashMap<String, usize> = events
+        .iter()
+        .enumerate()
+        .map(|(index, event)| (event.id.to_string(), index))
+        .collect();
+    let by_talker: HashSet<String> = events
+        .iter()
+        .filter(|event| TALKER_ROWS.contains(&event.event_type.as_str()))
+        .map(|event| event.id.to_string())
+        .collect();
+
+    let mut at = 0usize;
+    let mut turns = Vec::new();
+    for message in messages {
+        let id = message.event_id.as_deref();
+        if id.is_some_and(|id| by_talker.contains(id)) {
+            continue;
+        }
+        // A turn with no row of its own sits where the turn before it did.
+        at = id.and_then(|id| position.get(id)).copied().unwrap_or(at);
+        turns.push((at, message));
+    }
+
+    let mut ends = call_ends(events).into_iter().peekable();
+    let mut record = Vec::new();
+    for (at, message) in turns {
+        while let Some((_, end)) = ends.next_if(|(end_at, _)| *end_at < at) {
+            record.push(RecordLine::CallEnded(end));
+        }
+        record.push(RecordLine::Turn(message));
+    }
+    record.extend(ends.map(|(_, end)| RecordLine::CallEnded(end)));
+    record
+}
+
+/// Every call end in the window, with its position in `events`.
+fn call_ends(events: &[EventRow]) -> Vec<(usize, CallEnd)> {
+    // Per call, whether its newest spoken row is a talker reply cut off.
+    let mut cut_off: HashMap<&str, bool> = HashMap::new();
+    let mut ends = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let payload = &event.payload;
+        let session = payload
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        match event.event_type.as_str() {
+            "SpokenReplyGenerated" => {
+                let interrupted = payload.get("interrupted").and_then(|v| v.as_bool());
+                cut_off.insert(session, interrupted.unwrap_or(false));
+            }
+            "SpokenMessageReceived" => {
+                cut_off.insert(session, false);
+            }
+            "VoiceSessionEnded" => {
+                let reason = payload
+                    .get("reason")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok());
+                let mid_reply = cut_off.get(session).copied().unwrap_or(false);
+                ends.push((index, CallEnd { reason, mid_reply }));
+            }
+            _ => {}
+        }
+    }
+    ends
+}
+
+/// The mark the talker reads where a call ended.
+fn call_end_line(end: &CallEnd) -> String {
+    let how = match end.reason {
+        Some(VoiceSessionEndReason::Hangup) => ": they hung up",
+        Some(VoiceSessionEndReason::AgentHangup) => ": you rang off",
+        Some(VoiceSessionEndReason::Disconnected) => ": the line dropped",
+        Some(VoiceSessionEndReason::ProviderFailed | VoiceSessionEndReason::EngineShutdown) => {
+            ": it failed"
+        }
+        None => "",
+    };
+    let cut = if end.mid_reply {
+        ", while you were still speaking. Repeat that answer only if they ask"
+    } else {
+        ""
+    };
+    format!("(A call ended here{}{}.)\n", how, cut)
+}
+
+/// A caller line a call ended on. The talker's own reply is not in the record,
+/// so the line reads as unanswered and must say it is not owed (ADR 0666).
+const LEFT_WHEN_THE_CALL_ENDED: &str = "Them, left when the call ended";
+
+/// A written answer that landed after its call ended, which nobody heard.
+const AFTER_THE_CALL_ENDED: &str = "You, after the call ended";
+
+/// Who said the turn at `index`, by record position, never by clock.
+///
+/// One word each, and no verb. `They said` reads as a beat in a script the
+/// talker is next to speak, and it costs recall bytes a turn (ADR 0213).
+/// [`RECORD_OPENS`] says which label is which.
+fn speaker_label(record: &[RecordLine], index: usize, message: &SessionMessage) -> &'static str {
+    let ends_a_call = |line: Option<&RecordLine>| matches!(line, Some(RecordLine::CallEnded(_)));
+    if message.role == "user" {
+        if ends_a_call(record.get(index + 1)) {
+            LEFT_WHEN_THE_CALL_ENDED
+        } else {
+            "Them"
+        }
+    } else {
+        let before = record[..index]
+            .iter()
+            .rev()
+            .find(|line| !matches!(line, RecordLine::Turn(m) if m.role != "user"));
+        if ends_a_call(before) {
+            AFTER_THE_CALL_ENDED
+        } else {
+            "You"
+        }
+    }
+}
+
+/// The newest record lines that fit both caps, oldest first.
 ///
 /// Walked newest-first and reversed, because the cap is spent from the newest
-/// end: the last thing said is the one the talker most needs. A turn that would
+/// end: the last thing said is the one the talker most needs. A line that would
 /// cross the character budget stops the walk, so the budget is a ceiling rather
 /// than a target.
 ///
-/// **At least one turn, whatever its length.** A single message longer than the
+/// **At least one line, whatever its length.** A single message longer than the
 /// budget would otherwise leave the block claiming an empty conversation. That
 /// reads as a thread nobody has spoken on.
-fn recent_turns(messages: &[crate::core::store::SessionMessage]) -> Vec<String> {
+fn recent_lines(record: &[RecordLine]) -> Vec<String> {
     let mut lines = Vec::new();
     let mut spent = 0usize;
-    for message in messages.iter().rev().take(THREAD_TURNS) {
-        // One word each, and no verb. `They said` reads as a beat in a script
-        // the talker is next to speak, and it costs five bytes of recall a
-        // turn (ADR 0213). [`RECORD_OPENS`] says which label is which.
-        let speaker = if message.role == "user" {
-            "Them"
-        } else {
-            "You"
+    for (index, entry) in record.iter().enumerate().rev().take(THREAD_TURNS) {
+        let line = match entry {
+            RecordLine::Turn(message) => format!(
+                "{}: {}\n",
+                speaker_label(record, index, message),
+                clip(&message.content, READ_ALOUD_CHARS)
+            ),
+            RecordLine::CallEnded(end) => call_end_line(end),
         };
-        let line = format!(
-            "{}: {}\n",
-            speaker,
-            clip(&message.content, READ_ALOUD_CHARS)
-        );
         if spent + line.len() > THREAD_RECALL_BYTES && !lines.is_empty() {
             break;
         }
@@ -287,7 +443,8 @@ fn recent_turns(messages: &[crate::core::store::SessionMessage]) -> Vec<String> 
     lines
 }
 
-/// The turns with a line saying what they are, and a line saying they are over.
+/// The record's lines, with a line saying what they are and one saying they
+/// are over.
 ///
 /// **The closing line is the fix** (ADR 0213). An unfenced record reads as a
 /// conversation still running, and its last line as a turn nobody answered. So
@@ -299,19 +456,19 @@ fn recent_turns(messages: &[crate::core::store::SessionMessage]) -> Vec<String> 
 /// Nothing but the caveat for a thread nobody has spoken on. A fence around no
 /// turns says a record exists and is empty, which is one more thing to be wrong
 /// about.
-fn fenced_record(turns: &[String], earlier_dropped: bool) -> String {
+fn fenced_record(lines: &[String], earlier_dropped: bool) -> String {
     let caveat = if earlier_dropped {
         EARLIER_TURNS_DROPPED
     } else {
         ""
     };
-    if turns.is_empty() {
+    if lines.is_empty() {
         return caveat.to_string();
     }
     let mut out = String::from(RECORD_OPENS);
     out.push_str(caveat);
-    for turn in turns {
-        out.push_str(turn);
+    for line in lines {
+        out.push_str(line);
     }
     out.push_str(RECORD_CLOSES);
     out
@@ -334,26 +491,30 @@ fn fenced_record(turns: &[String], earlier_dropped: bool) -> String {
 fn open_decision_block(decision: &OpenDecision) -> String {
     // Exhaustive, so a fourth kind has to decide what the caller hears rather
     // than inheriting the permission wording by default.
-    let (waiting, consent) = match decision.kind {
+    const PICK_ONE: &str = "They can settle it out loud, by picking one of the choices below.";
+    let (waiting, how) = match decision.kind {
         DecisionKind::Question => (
             "Lucidos asked this and it is still unanswered",
-            String::new(),
+            PICK_ONE.to_string(),
         ),
         DecisionKind::CommandPermission
         | DecisionKind::McpPermission
         | DecisionKind::CodingAgentPermission => (
             "Lucidos needs their say-so before it can carry on",
-            format!(" {}", PERMISSION_NEEDS_THEIR_WORDS),
+            format!("{} {}", PICK_ONE, PERMISSION_NEEDS_THEIR_WORDS),
+        ),
+        DecisionKind::PermissionRequest { words_answer, .. } => (
+            "Lucidos asks them for a permission",
+            super::permission_request_read_back(words_answer).to_string(),
         ),
     };
     // The prompt itself is never cut, unlike the turns above it. A truncated
     // question is a different question, and the talker is about to state it as
     // the one being asked.
     format!(
-        "\nWaiting on them: {}. They can settle it out loud, by picking one of \
-         the choices below.{}\n{}{}",
+        "\nWaiting on them: {}. {}\n{}{}",
         waiting,
-        consent,
+        how,
         fenced_card_text(&decision.prompt),
         choices_for(&decision.choices),
     )
@@ -401,7 +562,7 @@ fn workspace_shape(engine: &LucidosEngine, thread_id: uuid::Uuid) -> SectionFutu
         let (unread, running, waiting) = tokio::join!(
             NotificationStore::get_filtered(
                 engine.pool(),
-                &crate::gateway_operators::Reader::Team,
+                &crate::gateway_users::Reader::Team,
                 "unread",
                 SHAPE_ITEMS as i64,
                 None
@@ -454,7 +615,7 @@ fn thread_line(label: &str, read: Result<Vec<String>, BoxError>) -> String {
     match read {
         Ok(names) => list_line(label, &names),
         Err(e) => {
-            log!("[Voice] Could not read '{}': {}", label, e);
+            log_legacy!("[Voice] Could not read '{}': {}", label, e);
             format!("{}: could not be read, so say you do not know\n", label)
         }
     }
@@ -789,7 +950,6 @@ mod tests {
                 },
             ],
             multi_select,
-            false,
         )
     }
 
@@ -824,11 +984,13 @@ mod tests {
     /// A permission card reads as one, rather than as a question Lucidos asked.
     #[test]
     fn a_permission_card_reads_as_a_request_for_a_say_so() {
-        let block = open_decision_block(&OpenDecision::command_permission(
-            "req-1",
-            "run_bash",
-            "gh release delete v1",
-            "Deletes a published release.",
+        let block = open_decision_block(&OpenDecision::tool_permission(
+            &crate::engine::permission::legacy::LegacyCard::command(
+                "req-1",
+                "run_bash",
+                "gh release delete v1",
+                "Deletes a published release.",
+            ),
         ));
         assert!(block.contains("their say-so"), "{}", block);
         assert!(block.contains("gh release delete v1"), "{}", block);
@@ -839,6 +1001,28 @@ mod tests {
         );
         assert!(block.contains("- Deny [command:req-1#deny]"), "{}", block);
         assert!(block.contains(PERMISSION_NEEDS_THEIR_WORDS), "{}", block);
+    }
+
+    /// Words settle an engine-raised permission request. No words reach one an
+    /// agent prepared, so the talker sends the caller to the card instead.
+    #[test]
+    fn a_permission_request_says_how_the_caller_settles_it() {
+        let block = |awaited: bool, words_answer: bool| {
+            open_decision_block(&OpenDecision::permission_request(
+                "toolu_p0",
+                "Create workspace film-take-3?",
+                &[],
+                crate::engine::agent_recovery::OpenRequest {
+                    awaited,
+                    words_answer,
+                },
+            ))
+        };
+        let raised = block(false, true);
+        assert!(raised.contains(super::super::PERMISSION_REQUEST_READ_BACK));
+        let prepared = block(true, false);
+        assert!(prepared.contains(super::super::PERMISSION_REQUEST_NEEDS_A_TAP));
+        assert!(!prepared.contains("from their own words"), "{}", prepared);
     }
 
     /// The resident block fences card text exactly as the mid-call note does.
@@ -867,7 +1051,6 @@ mod tests {
             "toolu_q1",
             "What should I call it?",
             &[],
-            false,
             false,
         ));
         assert!(block.contains("What should I call it?"), "{}", block);
@@ -918,6 +1101,271 @@ mod tests {
         }
     }
 
+    /// Folded turns as the record holds them, with no call in between.
+    fn as_record(messages: &[SessionMessage]) -> Vec<RecordLine<'_>> {
+        messages.iter().map(RecordLine::Turn).collect()
+    }
+
+    /// One persisted row, `ms` after the first one.
+    fn row(event_type: &str, payload: serde_json::Value, ms: i64) -> EventRow {
+        let mut event = EventRow::new(event_type, payload);
+        event.created = chrono::DateTime::UNIX_EPOCH + chrono::Duration::milliseconds(ms);
+        event
+    }
+
+    fn caller(session: &str, text: &str, ms: i64) -> EventRow {
+        row(
+            "SpokenMessageReceived",
+            serde_json::json!({"session_id": session, "text": text}),
+            ms,
+        )
+    }
+
+    fn talker(session: &str, text: &str, interrupted: bool, ms: i64) -> EventRow {
+        row(
+            "SpokenReplyGenerated",
+            serde_json::json!({"session_id": session, "text": text, "interrupted": interrupted}),
+            ms,
+        )
+    }
+
+    fn answer(text: &str, ms: i64) -> EventRow {
+        row("ResponseGenerated", serde_json::json!({"text": text}), ms)
+    }
+
+    fn call_ended(session: &str, reason: &str, ms: i64) -> EventRow {
+        row(
+            "VoiceSessionEnded",
+            serde_json::json!({"session_id": session, "reason": reason, "duration_secs": 60}),
+            ms,
+        )
+    }
+
+    /// What the talker reads, built from rows exactly as the section builds it.
+    fn record_text(events: &[EventRow]) -> String {
+        let messages = crate::core::store::messages::build_session_messages(events);
+        fenced_record(&recent_lines(&record_of(events, &messages)), false)
+    }
+
+    const DROPPED: &str = "95b92809-b7bd-441a-bbf3-ec83fe667497";
+    const HUNG_UP: &str = "057600ad-6d38-41ad-b95f-762ee99db172";
+
+    /// The two calls the record failed on, in the order they were written.
+    ///
+    /// The talker's own lines are quoted from them. On the second call it
+    /// recited the first one's lines back, at a caller who had said nothing.
+    fn two_calls() -> Vec<EventRow> {
+        vec![
+            answer("Started the review thread with the coding agent.", 0),
+            caller(DROPPED, "[chuckle", 1_000),
+            talker(DROPPED, "Mm-h Hmm. Hmm. Good. Mm-hmm.", false, 2_000),
+            caller(DROPPED, "Um... GPT Live One", 3_000),
+            talker(
+                DROPPED,
+                "Sure. I'm handing the transcript over.",
+                false,
+                7_000,
+            ),
+            talker(DROPPED, "That's with the coding agent.", false, 11_000),
+            caller(DROPPED, "Yeah, I wasn't really asking about that", 19_000),
+            caller(DROPPED, "now", 19_090),
+            talker(DROPPED, "Ah. Sorry. What did you mean?", false, 21_000),
+            caller(DROPPED, "Is it better to use GPT Realtime?", 35_000),
+            row(
+                "WorkDelegated",
+                serde_json::json!({"reason": "Compare the two talker models."}),
+                36_000,
+            ),
+            talker(DROPPED, "I'm still reading,", false, 86_000),
+            talker(DROPPED, "just a minute.", false, 87_000),
+            answer("Not automatically. GPT Live 1 is the better fit.", 105_000),
+            talker(DROPPED, "GPT Realtime is", true, 116_000),
+            call_ended(DROPPED, "disconnected", 116_040),
+            caller(HUNG_UP, "a outro lado", 280_000),
+            talker(HUNG_UP, "Hmm. I'm glad!", false, 286_000),
+            talker(HUNG_UP, "Here's what I can say.", true, 313_000),
+            call_ended(HUNG_UP, "hangup", 313_010),
+        ]
+    }
+
+    /// **No line the talker said aloud reaches the record** (ADR 0213, I8).
+    ///
+    /// They read as a script, and a Live talker continued it on the next call.
+    /// The caller's rows and the doer's written answers all stay.
+    #[test]
+    fn a_new_call_reads_no_line_the_talker_said_aloud() {
+        let events = two_calls();
+
+        let record = record_text(&events);
+
+        for event in &events {
+            let text = event.payload["text"].as_str().unwrap_or_default();
+            match event.event_type.as_str() {
+                "SpokenReplyGenerated" => assert!(!record.contains(text), "{}", record),
+                "SpokenMessageReceived" | "ResponseGenerated" => {
+                    assert!(record.contains(text), "{} missing:\n{}", text, record)
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !record.contains("Compare the two talker models"),
+            "{}",
+            record
+        );
+    }
+
+    /// The doer's own history keeps every spoken row (I9). Only the talker's
+    /// record leaves them out.
+    #[test]
+    fn the_doer_still_reads_what_was_said_aloud() {
+        let messages = crate::core::store::messages::build_session_messages(&two_calls());
+        assert!(messages.iter().any(|m| m.content == "GPT Realtime is"));
+    }
+
+    /// Each earlier call ends with a mark, in place, so its last lines read as
+    /// a finished call rather than the one now starting.
+    ///
+    /// Both calls ended while the talker was mid-reply, so both marks say the
+    /// caller did not hear all of it.
+    #[test]
+    fn each_earlier_call_ends_with_a_mark_saying_how() {
+        let record = record_text(&two_calls());
+
+        let dropped = record
+            .find("(A call ended here: the line dropped, while you were still speaking")
+            .expect(&record);
+        let hung_up = record
+            .find("(A call ended here: they hung up, while you were still speaking")
+            .expect(&record);
+        let answer = record.find("Not automatically").expect(&record);
+        let next_call = record.find("a outro lado").expect(&record);
+        assert!(answer < dropped && dropped < next_call, "{}", record);
+        assert!(next_call < hung_up, "{}", record);
+    }
+
+    /// A call that ended in silence claims nothing was cut off.
+    #[test]
+    fn a_call_ended_between_turns_says_only_that_it_ended() {
+        let events = vec![
+            caller(HUNG_UP, "thanks", 0),
+            talker(HUNG_UP, "Bye.", false, 1_000),
+            call_ended(HUNG_UP, "hangup", 2_000),
+        ];
+
+        let record = record_text(&events);
+
+        assert!(
+            record.contains("(A call ended here: they hung up.)\n"),
+            "{}",
+            record
+        );
+    }
+
+    /// A barge-in cuts a reply on purpose, and the caller then spoke. Hanging
+    /// up after that is not a reply they missed.
+    #[test]
+    fn a_reply_the_caller_talked_over_is_not_a_missed_one() {
+        let events = vec![
+            talker(HUNG_UP, "The first thing is", true, 0),
+            caller(HUNG_UP, "never mind, bye", 500),
+            call_ended(HUNG_UP, "hangup", 2_000),
+        ];
+
+        let record = record_text(&events);
+
+        assert!(
+            !record.contains("while you were still speaking"),
+            "{}",
+            record
+        );
+    }
+
+    /// A cut reply is no cue to answer again. The mark says so in words.
+    #[test]
+    fn a_cut_reply_is_repeated_only_on_request() {
+        let record = record_text(&two_calls());
+        assert!(record.contains("only if they ask"), "{}", record);
+        assert!(!record.contains("did not hear"), "{}", record);
+    }
+
+    const LAST_EVENING: &str = "5b0fd3c2-8f0e-4d7e-9a43-2f5f8b1c6e10";
+
+    /// The 20:24 call: the doer's answer landed two seconds after the hang-up,
+    /// so nobody heard it. It stays in the record, marked (I5).
+    #[test]
+    fn an_answer_written_after_the_call_ended_is_marked_as_such() {
+        let events = vec![
+            caller(LAST_EVENING, "Can you check the landing?", 0),
+            talker(LAST_EVENING, "On it.", false, 1_000),
+            call_ended(LAST_EVENING, "hangup", 10_000),
+            answer("That batch lost its landing ownership.", 12_000),
+        ];
+
+        let record = record_text(&events);
+
+        assert!(
+            record.contains(&format!(
+                "{}: That batch lost its landing ownership.\n",
+                AFTER_THE_CALL_ENDED
+            )),
+            "{}",
+            record
+        );
+    }
+
+    /// The 20:28 call: the record ended on the caller's last line, and the
+    /// talker answered it on the next call. It stays, marked as left (I5).
+    #[test]
+    fn a_caller_line_the_call_ended_on_is_marked_as_left() {
+        let events = vec![
+            caller(LAST_EVENING, "You are gonna add a draft for me to fix", 0),
+            call_ended(LAST_EVENING, "hangup", 1_000),
+        ];
+
+        let record = record_text(&events);
+
+        assert!(
+            record.contains(&format!(
+                "{}: You are gonna add a draft for me to fix\n",
+                LEFT_WHEN_THE_CALL_ENDED
+            )),
+            "{}",
+            record
+        );
+    }
+
+    /// A typed exchange after a call is an ordinary one, so it reads plain.
+    #[test]
+    fn a_typed_exchange_after_a_call_reads_plain() {
+        let messages = [said("user", "typed later"), said("assistant", "answered")];
+        let record = vec![
+            RecordLine::CallEnded(CallEnd {
+                reason: None,
+                mid_reply: false,
+            }),
+            RecordLine::Turn(&messages[0]),
+            RecordLine::Turn(&messages[1]),
+        ];
+
+        let turns = recent_lines(&record);
+
+        assert_eq!(
+            turns,
+            vec![
+                "(A call ended here.)\n",
+                "Them: typed later\n",
+                "You: answered\n"
+            ]
+        );
+    }
+
+    /// The opening tells the talker what the two marks mean.
+    #[test]
+    fn the_record_says_a_marked_line_is_owed_nothing() {
+        assert!(RECORD_OPENS.contains("owed nothing"), "{}", RECORD_OPENS);
+    }
+
     /// A whole call's worth of short spoken rows fits, which is the report.
     ///
     /// A caller came back to a thread four minutes later and found the talker
@@ -930,7 +1378,7 @@ mod tests {
             messages.push(said("assistant", &format!("row {}", index)));
         }
 
-        let turns = recent_turns(&messages);
+        let turns = recent_lines(&as_record(&messages));
 
         assert_eq!(turns.len(), messages.len(), "{:?}", turns);
         assert!(turns[0].contains("MCP server"), "{:?}", turns[0]);
@@ -942,7 +1390,7 @@ mod tests {
     #[test]
     fn the_turns_read_in_the_order_they_were_said() {
         let messages = vec![said("user", "first"), said("assistant", "second")];
-        let turns = recent_turns(&messages);
+        let turns = recent_lines(&as_record(&messages));
         assert_eq!(turns, vec!["Them: first\n", "You: second\n"]);
     }
 
@@ -954,7 +1402,10 @@ mod tests {
     /// the whole thing back, in order.
     #[test]
     fn the_record_never_ends_on_a_turn() {
-        let turns = recent_turns(&[said("user", "first"), said("assistant", "second")]);
+        let turns = recent_lines(&as_record(&[
+            said("user", "first"),
+            said("assistant", "second"),
+        ]));
 
         let record = fenced_record(&turns, false);
 
@@ -970,7 +1421,7 @@ mod tests {
     /// the two read as a claim and its own contradiction.
     #[test]
     fn the_dropped_turns_caveat_is_part_of_the_record() {
-        let turns = recent_turns(&[said("user", "first")]);
+        let turns = recent_lines(&as_record(&[said("user", "first")]));
 
         let record = fenced_record(&turns, true);
 
@@ -1012,7 +1463,7 @@ mod tests {
         let long = "x".repeat(READ_ALOUD_CHARS);
         let messages: Vec<_> = (0..THREAD_TURNS * 2).map(|_| said("user", &long)).collect();
 
-        let turns = recent_turns(&messages);
+        let turns = recent_lines(&as_record(&messages));
 
         let spent: usize = turns.iter().map(String::len).sum();
         assert!(spent <= THREAD_RECALL_BYTES, "the block spent {}", spent);
@@ -1024,7 +1475,7 @@ mod tests {
     #[test]
     fn one_turn_over_budget_is_still_the_conversation() {
         let messages = vec![said("user", &"x".repeat(THREAD_RECALL_BYTES * 2))];
-        assert_eq!(recent_turns(&messages).len(), 1);
+        assert_eq!(recent_lines(&as_record(&messages)).len(), 1);
     }
 
     /// A turn count is still a cap, for a thread of one-word turns that the
@@ -1032,7 +1483,7 @@ mod tests {
     #[test]
     fn a_thread_of_tiny_turns_is_bounded_by_the_turn_count() {
         let messages: Vec<_> = (0..THREAD_TURNS * 2).map(|_| said("user", "ok")).collect();
-        assert_eq!(recent_turns(&messages).len(), THREAD_TURNS);
+        assert_eq!(recent_lines(&as_record(&messages)).len(), THREAD_TURNS);
     }
 
     /// A whole conversation says nothing about earlier turns, because there are

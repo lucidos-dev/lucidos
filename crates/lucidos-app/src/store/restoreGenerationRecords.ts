@@ -8,7 +8,7 @@ import type { ComposeDraft } from './composeDrafts';
 import type { ComposeSelectionOverride } from './composeSelections';
 import type { PendingUploadRecord, QueuedUploadSendRecord } from './pendingUploadRecords';
 import type { UnsentMessageRecord } from './unsentMessageRecords';
-import { deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
+import { BOUNDED, deviceDatabaseName, openDeviceDatabase } from './deviceDatabase';
 import type { GenerationExpectation, RestoreGeneration, RestoreGenerationStore } from './restoreGeneration';
 
 export interface PreservedComposeIntent {
@@ -84,11 +84,13 @@ RestoreIntentStore {
   const { transact } = openDeviceDatabase(restoreGenerationDbName(workspaceId), (db) => {
     db.createObjectStore(STORE);
   });
-  const read = () => transact<Observation>(STORE, 'readonly', (s) => s.get(KEY));
+  const read = () => transact<Observation>(STORE, 'readonly', (s) => s.get(KEY), BOUNDED);
   async function write(generation: RestoreGeneration, intent?: PreservedComposeIntent, expected?: GenerationExpectation): Promise<void> {
     let conflicted = false;
     // Read/modify/write in ONE transaction: tabs cannot erase each other's
     // preserved intent, and an observation cannot commit without its capture.
+    // Bounded, a preserve included: an aborted capture is captured again on
+    // the retry, and the backoff gives a large one longer each time.
     await transact(STORE, 'readwrite', (s) => {
       const request = s.get(KEY);
       request.onsuccess = () => {
@@ -108,7 +110,7 @@ RestoreIntentStore {
             : recoveries,
         } satisfies Observation, KEY);
       };
-    });
+    }, BOUNDED);
     if (conflicted) throw new Error('Restore generation changed in another tab');
   }
   return {
@@ -148,7 +150,7 @@ RestoreIntentStore {
           } });
           s.put(observation, KEY);
         };
-      });
+      }, BOUNDED);
       if (!accepted) throw new Error('Restore generation changed before historical capture');
     },
     async prepareRecovery(source, target, allocateId, liveOwners = null, review) {
@@ -235,7 +237,7 @@ RestoreIntentStore {
               .filter((m) => m.generation === target).flatMap((m) => m.completed)))]
               .filter((id) => result!.drafts.some((d) => d.threadId === id)) };
         };
-      });
+      }, BOUNDED);
       if (missing) throw new Error('Preserved restore source is missing');
       return result;
     },
@@ -255,7 +257,7 @@ RestoreIntentStore {
             s.put(observation, KEY);
           }
         };
-      });
+      }, BOUNDED);
       if (!accepted) throw new Error('Restore draft destination is no longer current');
     },
   };

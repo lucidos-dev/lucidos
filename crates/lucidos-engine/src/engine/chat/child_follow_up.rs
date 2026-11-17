@@ -139,8 +139,8 @@ pub enum FollowUpUrgency {
     /// the next turn. For the messages that cannot wait for a tool timeout: a
     /// cancellation, a "stop, you are working from a wrong assumption".
     ///
-    /// No-op on Codex, which always interrupts because its protocols cannot
-    /// surface a queued message mid-turn at all. See
+    /// Codex app-servers with steer support preserve ordinary turns too.
+    /// Older app-servers and exec retain interrupt-and-redirect. See
     /// `process_helpers::should_redirect_followup`.
     Urgent,
 }
@@ -228,7 +228,7 @@ impl FollowUpDelivery {
     /// is what makes the ordering invariant true), and exactly when there is no
     /// live turn to reorder against. When the child IS in flight the existing
     /// lane owns the emit, which is what happens today: the coding-agent lane
-    /// deliberately waits for a Codex interrupt to reach a turn boundary before
+    /// waits for a legacy or urgent interrupt to reach a turn boundary before
     /// emitting, so pre-empting it would reorder the child's timeline.
     ///
     /// `WaitingForUserAnswer` counts as in flight here for the same reason it
@@ -381,21 +381,21 @@ impl crate::engine::LucidosEngine {
         urgency: FollowUpUrgency,
     ) -> Result<(ChildRow, FollowUpAck), ChildFollowUpError> {
         if caller_workspace.is_some() {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: cross-workspace caller for child {}",
                 child_thread_id
             );
             return Err(ChildFollowUpError::CrossWorkspaceUnsupported);
         }
         let Some(caller_thread_id) = caller_thread_id else {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: no caller thread for child {}",
                 child_thread_id
             );
             return Err(ChildFollowUpError::NoCaller);
         };
         if caller_thread_id == child_thread_id {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: thread {} addressed itself",
                 caller_thread_id
             );
@@ -410,7 +410,7 @@ impl crate::engine::LucidosEngine {
         .fetch_optional(pool)
         .await
         .map_err(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Failed to read child {} for caller {}: {}",
                 child_thread_id,
                 caller_thread_id,
@@ -420,7 +420,7 @@ impl crate::engine::LucidosEngine {
         })?;
 
         let Some((parent_thread_id, source, state, status, title, first_message)) = row else {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: caller {} addressed unknown thread {}",
                 caller_thread_id,
                 child_thread_id
@@ -441,7 +441,7 @@ impl crate::engine::LucidosEngine {
                 .await
                 .map_err(|e| ChildFollowUpError::Internal(e.to_string()))?;
         let Some(reach) = reach else {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: thread {} is not a child of caller {}",
                 child_thread_id,
                 caller_thread_id
@@ -449,7 +449,7 @@ impl crate::engine::LucidosEngine {
             return Err(ChildFollowUpError::NotYourChild(child_thread_id));
         };
         if row.state.as_deref() == Some("discarded") {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: child {} of caller {} is discarded",
                 child_thread_id,
                 caller_thread_id
@@ -457,7 +457,7 @@ impl crate::engine::LucidosEngine {
             return Err(ChildFollowUpError::ChildDiscarded(child_thread_id));
         }
         if row.state.as_deref() == Some("composing") {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Refused: thread {} is a draft",
                 child_thread_id
             );
@@ -569,16 +569,15 @@ impl crate::engine::LucidosEngine {
     ///
     /// ## The pre-emit rule
     ///
-    /// `chat_message_is_pre_emittable` cannot be reused: it requires
-    /// `mode == Human` and a non-coding-agent target, and a follow-up is
-    /// Agent-mode and may target a coding-agent child. The two exclusions are
-    /// handled rather than ignored:
+    /// Human inputs accept durably and record during execution. This Agent
+    /// follow-up instead announces its own message before dispatch, including
+    /// for a coding-agent child. Its routing exclusions are handled explicitly:
     ///
     /// - The **Human** exclusion is about routing (a Human message on a
     ///   question-parked thread becomes `UserQuestionAnswered`). An Agent
     ///   follow-up never takes that route, so the exclusion does not apply.
     /// - The **coding-agent** exclusion is a real ordering rule. The
-    ///   coding-agent lane deliberately blocks on a Codex interrupt reaching a
+    ///   coding-agent lane blocks on a required interrupt reaching a
     ///   turn boundary BEFORE emitting the follow-up's `MessageReceived`, so
     ///   the interrupted turn's terminal sequences first and coding-agent
     ///   exchanges group correctly. Pre-emitting ahead of that would reorder
@@ -649,7 +648,7 @@ impl crate::engine::LucidosEngine {
             {
                 Ok(t) => t.map(|t| t.chars().take(80).collect()),
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ChildFollowUp] Failed to read parent {}'s title: {}; \
                          the child's message-route panel will resolve it live",
                         caller_thread_id,
@@ -664,7 +663,7 @@ impl crate::engine::LucidosEngine {
                 .pre_emit_follow_up(child_thread_id, ack.delivered_to, text, images, &origin)
                 .await?;
 
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Parent {} follows up on child {} ({:?}, coding_agent={})",
                 caller_thread_id,
                 child_thread_id,
@@ -755,7 +754,7 @@ impl crate::engine::LucidosEngine {
                         // No terminator here: the turn settles its own
                         // exchange, anchored. An unanchored copy is what the
                         // idempotency gate cannot match, so it double-fired.
-                        Err(e) => crate::log!(
+                        Err(e) => crate::log_legacy!(
                             "[ChildFollowUp] Follow-up turn failed on child {}: {}",
                             child_thread_id,
                             e
@@ -806,7 +805,7 @@ impl crate::engine::LucidosEngine {
                 .unwrap_or(false)
         };
         if live_session {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildFollowUp] Child {} came alive between the row read and the \
                  pre-emit; letting the coding-agent lane sequence the message",
                 child_thread_id
@@ -824,7 +823,7 @@ impl crate::engine::LucidosEngine {
             })
             .await
             .map_err(|e| {
-                crate::log!(
+                crate::log_legacy!(
                     "[ChildFollowUp] Failed to pre-emit the follow-up on child {}: {}",
                     child_thread_id,
                     e

@@ -150,6 +150,59 @@ describe('a stamped position written by an older build still parses', () => {
   });
 });
 
+describe('the line form parses, and every older form still opens where it did', () => {
+  // I13 of docs/plans/2026-11-12-conversation-return-fixes.md. A browser holds
+  // whatever an older build wrote, and the line form must not change its answer.
+  it.each([
+    ['250', { kind: 'offset', top: 250 }],
+    ['1500:12', { kind: 'offset', top: 1500 }],
+    [LIVE_EDGE_VALUE, { kind: 'live-edge' }],
+    ['anchor:-150:t2', { kind: 'anchor', eventId: 't2', relTop: -150 }],
+    ['anchor:30:a:b', { kind: 'anchor', eventId: 'a:b', relTop: 30 }],
+    ['row:-10:call-7', { kind: 'row', rowEventId: 'call-7', relTop: -10 }],
+    ['following:row:0:call-7', { kind: 'row', rowEventId: 'call-7', relTop: 0 }],
+    ['following:anchor:-150:t2', { kind: 'anchor', eventId: 't2', relTop: -150 }],
+  ])('reads %s as before', (raw, expected) => {
+    expect(parseSavedScroll(raw)).toEqual(expected);
+  });
+
+  it('reads the block offset, the turn offset, the id, the path and its kinds', () => {
+    expect(parseSavedScroll('line:-400:-1320:t2:2~0a1b2c3d'))
+      .toEqual({ kind: 'line', eventId: 't2', path: [2], kinds: '0a1b2c3d', relTop: -400, turnRelTop: -1320 });
+    expect(parseSavedScroll('line:0:-80:t2:1.0.3~ffffffff'))
+      .toEqual({ kind: 'line', eventId: 't2', path: [1, 0, 3], kinds: 'ffffffff', relTop: 0, turnRelTop: -80 });
+  });
+
+  it('keeps an id that carries colons whole', () => {
+    expect(parseSavedScroll('line:-5:-90:call:abc:def:4~0a1b2c3d'))
+      .toEqual({ kind: 'line', eventId: 'call:abc:def', path: [4], kinds: '0a1b2c3d', relTop: -5, turnRelTop: -90 });
+  });
+
+  it('reads a line behind an older build\'s marker as the bare line', () => {
+    expect(parseSavedScroll('following:line:-5:-90:t2:4~0a1b2c3d'))
+      .toEqual({ kind: 'line', eventId: 't2', path: [4], kinds: '0a1b2c3d', relTop: -5, turnRelTop: -90 });
+  });
+
+  it.each([
+    'line:',
+    'line:-5',
+    'line:-5:-90',
+    'line:-5:-90:t2',
+    'line:-5:-90::4~0a1b2c3d',
+    'line:-5:-90:t2:',
+    'line:-5:-90:t2:4',
+    'line:-5:-90:t2:4~',
+    'line:-5:-90:t2:4~0A1B2C3D',
+    'line:-5:-90:t2:4~0a1b2c3',
+    'line:-5:-90:t2:1.~0a1b2c3d',
+    'line:-5:-90:t2:a~0a1b2c3d',
+    'line:x:-90:t2:4~0a1b2c3d',
+    'line:-5:9x:t2:4~0a1b2c3d',
+  ])('answers null for %s, a value we did not write', (raw) => {
+    expect(parseSavedScroll(raw)).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The teardown flush must write what THIS key observed, never what the next
 // render is holding. `attachScrollMemory` is the hook's whole body, extracted
@@ -3016,6 +3069,140 @@ describe('a restored reading position holds while the transcript settles', () =>
     el.scrollTop = 700;
     onScroll();
     el.setTurnHeightOf('t0', 900);
+    onResize();
+
+    expect(el.scrollTop).toBe(700);
+    detach();
+  });
+});
+
+describe('a return puts back the line the reader was on, not only its turn', () => {
+  // The reported case: "when i go back to threads, it's almost always scrolled
+  // higher up than where i left it". A long answer is one turn, so a turn anchor
+  // sits thousands of pixels above the line. Content between the two may be
+  // taller on return than when the place was saved. It pushes the line down the
+  // viewport, and the reader sees earlier content.
+  // Plan: docs/plans/2026-11-12-conversation-return-fixes.md (I8, I9, I11).
+  const IDS = ['t0', 't1', 't2', 't3', 't4', 't5'];
+  const opts = { live: () => ({}), resetOnEmpty: true, anchorsToContent: true };
+  let origRO: unknown;
+  let origMO: unknown;
+
+  beforeEach(() => {
+    localStorage.clear();
+    clearPendingEventScroll();
+    origRO = (globalThis as any).ResizeObserver;
+    origMO = (globalThis as any).MutationObserver;
+    class Inert { observe() {} disconnect() {} takeRecords() { return []; } }
+    (globalThis as any).ResizeObserver = Inert;
+    (globalThis as any).MutationObserver = Inert;
+  });
+  afterEach(() => {
+    clearPendingEventScroll();
+    (globalThis as any).ResizeObserver = origRO;
+    (globalThis as any).MutationObserver = origMO;
+  });
+
+  /** Park the reader at `scrollTop` over a transcript whose turn t2 has
+   *  `blocks`, and leave: the place is saved under 'k'. */
+  function leaveAt(blocks: number[], scrollTop: number) {
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: blocks } });
+    const detach = attachScrollMemory(el, 'k', opts);
+    el.scrollTop = scrollTop;
+    el.fireScroll();
+    detach();
+  }
+
+  it('records the block the line runs through, inside its named turn', () => {
+    leaveAt([20, 100, 1000, 200], 1320);   // t2 at -520, block 2 at -400
+    expect(localStorage.getItem('k')).toMatch(/^line:-400:-520:t2:2~[0-9a-f]{8}$/);
+  });
+
+  it('records the turn over a head-clamped turn, whose block indices are not its own', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
+    el.setHeadClamped('t2', true);
+    const detach = attachScrollMemory(el, 'k', opts);
+    el.scrollTop = 1320;
+    el.fireScroll();
+    detach();
+    expect(localStorage.getItem('k')).toBe('anchor:-520:t2');
+  });
+
+  it('places the turn at once when the path does not resolve inside the rendered turn', () => {
+    leaveAt([20, 100, 1000, 200], 1320);
+    // The turn came back as one block, so step 2 of the path is missing.
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [2000] } });
+    const detach = attachScrollMemory(el, 'k', opts);
+    expect(el.scrollTop).toBe(1320);       // t2 back at -520, with no wait
+    detach();
+  });
+
+  it('holds the line when a block above it, inside the turn, grows after the return', () => {
+    // An image above the line had not loaded when the reader left, and loads
+    // once they are back.
+    leaveAt([20, 100, 1000, 200], 1320);   // block 2 sits at -400
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    el.setBlockHeight('t2', 0, 300);
+    onResize();
+
+    expect(Math.abs(el.blockRelTop('t2', 2) - -400)).toBeLessThanOrEqual(2);
+    detach();
+  });
+
+  it('holds the turn once a re-set reply replaced the block on the line', () => {
+    leaveAt([20, 100, 1000, 200], 1320);   // block 2 sits at -400
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    // The reply's html is set again, then a turn above grows.
+    el.replaceBlocks('t2');
+    el.setTurnHeightOf('t1', 600);
+    onResize();
+
+    expect(Math.abs(el.blockRelTop('t2', 2) - -400)).toBeLessThanOrEqual(2);
+    detach();
+  });
+
+  it('opens on the line when the turn re-wrapped taller since the reader left', () => {
+    // A narrower pane on return: every block of the long answer is taller, so
+    // the turn's top is no longer the same distance above the line.
+    leaveAt([100, 100, 1000, 200], 1400);  // block 2 sits at -400
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [200, 200, 2000, 400] } });
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    expect(Math.abs(el.blockRelTop('t2', 2) - -400)).toBeLessThanOrEqual(2);
+    detach();
+  });
+
+  it('moves nobody when a block below the line grows during the hold', () => {
+    leaveAt([100, 100, 1000, 200], 1400);
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [100, 100, 1000, 200] } });
+    const { onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+    const landed = el.scrollTop;
+
+    el.setBlockHeight('t2', 3, 900);       // a widget below the line sizes itself
+    el.setTurnHeightOf('t5', 2000);        // a reply streams in at the bottom
+    onResize();
+
+    expect(el.scrollTop).toBe(landed);
+    detach();
+  });
+
+  it('lets go of the line once the reader scrolls', () => {
+    leaveAt([100, 100, 1000, 200], 1400);
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [100, 100, 1000, 200] } });
+    const { onScroll, onResize } = makeScrollObservers(el);
+    const detach = attachScrollMemory(el, 'k', opts);
+
+    readerGestureForTest(el);
+    el.scrollTop = 700;
+    onScroll();
+    el.setBlockHeight('t2', 0, 300);
     onResize();
 
     expect(el.scrollTop).toBe(700);

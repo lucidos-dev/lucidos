@@ -254,7 +254,7 @@ pub(crate) async fn verify_branch(
             }
         }
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] `git rev-parse --abbrev-ref HEAD` failed in {}: {}",
                 worktree_path.display(),
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -264,7 +264,7 @@ pub(crate) async fn verify_branch(
             })
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] cannot read the checked-out branch in {}: {}",
                 worktree_path.display(),
                 e
@@ -489,7 +489,7 @@ async fn branch_provenance(
         // otherwise silent about it, and this rules out more than the ancestry
         // check it replaced: reflogs off, and a branch created before the
         // checkout that moved onto it.
-        log!(
+        log_legacy!(
             "[AgentSession] No reflog shows how branch '{}' came from '{}', refusing adoption",
             current_branch,
             tracked_branch

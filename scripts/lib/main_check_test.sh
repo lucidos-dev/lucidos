@@ -529,6 +529,20 @@ test_no_verdict_is_its_own_answer
 test_a_shard_whose_setup_failed_is_no_verdict_and_names_the_task
 test_a_crash_with_no_report_still_fails_with_a_tail
 test_the_verdict_maps_every_exit
+
+test_the_follow_relays_the_run_and_the_start_of_the_tests() {
+    echo "test: the follow prints the run line and the tests-started line, and logs everything"
+    local log="$SANDBOX/follow.log" out
+    out="$(printf '%s\n' "[e2e-github] run x: remote engine" "$E2E_GITHUB_LINKED_MARK$RUN_URL $RUN_BRANCH" \
+        "[e2e-github] run in_progress: 1 queued" "$E2E_GITHUB_TESTS_STARTED_MARK" | main_check_follow "$log")"
+    if [ "$out" = "$MAIN_CHECK_RUN_PREFIX$RUN_URL $RUN_BRANCH
+$MAIN_CHECK_TESTS_STARTED_LINE" ] && [ "$(wc -l <"$log" | tr -d ' ')" = 4 ]; then
+        pass "two protocol lines, four logged lines"
+    else
+        fail "out: $out"
+    fi
+}
+
 test_a_cargo_failure_names_its_test_and_panic
 test_a_playwright_failure_names_its_spec_and_last_attempt
 test_a_flaky_playwright_test_is_not_a_failure
@@ -540,6 +554,7 @@ test_flaky_tests_never_hide_a_real_failure
 test_nothing_parsed_leaves_the_tail_to_speak
 test_shutdown_leaves_the_driver_time_to_cancel_its_run
 test_a_detach_lets_the_driver_leave_its_run
+test_the_follow_relays_the_run_and_the_start_of_the_tests
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

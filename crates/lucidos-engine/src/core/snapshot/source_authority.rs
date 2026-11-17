@@ -49,11 +49,16 @@ impl VerifiedSource {
             .build()
             .map_err(|_| "snapshot_restore_caller_unverified")?;
         let verify = async {
-            for scheme in crate::net_config::peer_scheme_order() {
+            for scheme in crate::net_config::gateway_scheme_order() {
                 let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{source_hint}/snapshot-restore-caller");
                 let response = match client
                     .post(&url)
-                    .json(&serde_json::json!({"origin_token": token}))
+                    // The gateway refuses an agent restore into a user workspace
+                    // here too, since policy "allow" never reaches `spend`.
+                    .json(&serde_json::json!({
+                        "origin_token": token,
+                        "target_workspace_id": target.gateway_slug,
+                    }))
                     .send()
                     .await
                 {
@@ -98,13 +103,13 @@ impl VerifiedSource {
             }))
             .send()
             .await
-            .map_err(|_| "snapshot_restore_approval_required")?;
+            .map_err(|_| "snapshot_restore_permission_required")?;
         let proof = decode(response)
             .await
-            .map_err(|_| "snapshot_restore_approval_required")?;
+            .map_err(|_| "snapshot_restore_permission_required")?;
         validate(&proof, &self.workspace, &target.gateway_slug)?;
         if proof.source_thread_id != self.thread {
-            return Err("snapshot_restore_approval_required".into());
+            return Err("snapshot_restore_permission_required".into());
         }
         Ok(())
     }
@@ -120,10 +125,27 @@ fn validate(proof: &Proof, source: &str, target: &str) -> Result<(), BoxError> {
     Ok(())
 }
 
+const TARGET_PROTECTED: &str = "snapshot_restore_target_protected";
+
 async fn decode(mut response: reqwest::Response) -> Result<Proof, BoxError> {
-    if response.status() != reqwest::StatusCode::OK {
+    let status = response.status();
+    let bytes = read_bounded(&mut response).await?;
+    if status == reqwest::StatusCode::FORBIDDEN && refusal_slug(&bytes) == Some(TARGET_PROTECTED) {
+        return Err(TARGET_PROTECTED.into());
+    }
+    if status != reqwest::StatusCode::OK {
         return Err("snapshot_restore_caller_unverified".into());
     }
+    serde_json::from_slice(&bytes).map_err(|_| "snapshot_restore_caller_unverified".into())
+}
+
+/// Only a known slug leaves this module. The gateway's body never passes through.
+fn refusal_slug(bytes: &[u8]) -> Option<&'static str> {
+    let body: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    (body.get("error")?.as_str()? == TARGET_PROTECTED).then_some(TARGET_PROTECTED)
+}
+
+async fn read_bounded(response: &mut reqwest::Response) -> Result<Vec<u8>, BoxError> {
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -135,7 +157,7 @@ async fn decode(mut response: reqwest::Response) -> Result<Proof, BoxError> {
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice(&bytes).map_err(|_| "snapshot_restore_caller_unverified".into())
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -239,7 +261,9 @@ mod tests {
             let app = Router::new().route(
                 "/~/api/v1/control/workspaces/source/snapshot-restore-caller",
                 post(move |Json(body): Json<serde_json::Value>| async move {
-                    assert_eq!(body, serde_json::json!({"origin_token": "signed-token"}));
+                    assert_eq!(body, serde_json::json!({
+                        "origin_token": "signed-token", "target_workspace_id": "target"
+                    }));
                     Json(serde_json::json!({"workspace_id": returned_source, "source_thread_id": thread}))
                 }),
             );
@@ -257,6 +281,40 @@ mod tests {
                 assert_eq!(source.workspace(), "source");
                 assert_eq!(source.thread(), thread);
             }
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn verify_keeps_only_the_protected_target_slug_from_a_refusal() {
+        use axum::{routing::post, Router};
+        for (body, expected) in [
+            (
+                r#"{"error":"snapshot_restore_target_protected"}"#,
+                "snapshot_restore_target_protected",
+            ),
+            (
+                r#"{"error":"secret-token leaked"}"#,
+                "snapshot_restore_caller_unverified",
+            ),
+            ("not json", "snapshot_restore_caller_unverified"),
+        ] {
+            let app = Router::new().route(
+                "/~/api/v1/control/workspaces/source/snapshot-restore-caller",
+                post(move || async move { (axum::http::StatusCode::FORBIDDEN, body) }),
+            );
+            let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { axum::serve(socket, app).await.unwrap() });
+            let target = super::super::service::OfflineRestoreRequest {
+                restore_id: Uuid::new_v4(),
+                gateway_slug: "target".into(),
+                workspace_name: "Target".into(),
+            };
+            let error = VerifiedSource::verify(port, "source", "secret-token", &target)
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.to_string(), expected);
             server.abort();
         }
     }

@@ -102,9 +102,8 @@ export const FONT_PREFERENCES: readonly FontPreference[] = [
 const FONTS_BY_ID = {} as Record<FontId, FontEntry>;
 for (const font of FONT_CATALOG) FONTS_BY_ID[font.id] = font;
 
-/** The CSS value each font resolves to. The fallback's stack is the full
- *  system-mono chain (ADR 0077). It paints before the web font decodes, and on
- *  any device where it never loads. */
+/** The CSS value each font resolves to, including fallbacks for when a web
+ *  font has not decoded or cannot load (ADR 0077). */
 export const FONT_STACKS = {} as Record<FontId, string>;
 for (const font of FONT_CATALOG) FONT_STACKS[font.id] = font.stack;
 
@@ -568,8 +567,7 @@ export const STYLE_RESET_PARAM = 'style-reset';
  *  tens of values; a map in the thousands is a runaway writer, not a user. */
 export const MAX_STYLE_OVERRIDES = MAX_RESOLVED_TOKENS;
 
-/** Cap on one value's length: the engine's cap on a theme value. The longest
- *  real token in `base.css` is a layered box-shadow at 94 characters. */
+/** Cap on one value's UTF-16 length, shared with the engine's theme validator. */
 export const MAX_STYLE_VALUE_LENGTH = MAX_VALUE_LENGTH;
 
 /** Only a custom property can be set: never `color`, never a selector. */

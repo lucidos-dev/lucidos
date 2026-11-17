@@ -1695,16 +1695,13 @@
     /* The chevron follows the prompt down, but stops short by the bottom safe
        area, so it never lands on the home indicator once the prompt is away. */
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .scroll-to-bottom {
-        bottom: calc(
-            var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap)
-            + var(--mobile-prompt-height, 0rem)
-        );
+        bottom: calc(var(--scroll-chevron-inset) + var(--mobile-prompt-height, 0rem));
         translate: 0 max(0rem, calc(var(--mobile-prompt-offset, 0rem) - var(--safe-area-bottom)));
     }
 
     /* The follow toggle rides the prompt, so it stops short by the same safe
        area: it takes back what the prompt travels past the chevron's floor. So
-       it stays one slot under the chevron. */
+       it stays in the chevron's row. */
     :root[data-mobile-dynamic-bars] .mobile-swipe-pane .thread-pane:not(.compose-empty) .follow-toggle {
         translate: 0 calc(-1 * min(var(--mobile-prompt-offset, 0rem), var(--safe-area-bottom)));
     }

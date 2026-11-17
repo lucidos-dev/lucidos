@@ -5,7 +5,7 @@
  * `mainCheck.ts`, which the first paint loads.
  */
 
-import { cancelLaneBatch as apiCancelLaneBatch, closeMainCheckRed, removeFromLandingLane as apiRemoveFromLandingLane } from '../../api/client/landingLane';
+import { fixMainNow as apiFixMainNow, cancelLaneBatch as apiCancelLaneBatch, closeMainCheckRed, removeFromLandingLane as apiRemoveFromLandingLane } from '../../api/client/landingLane';
 import { landingLaneCanceling, mainCheckClosing, showToast } from '../store';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -40,5 +40,14 @@ export async function closeMainCheck(checkId: string): Promise<void> {
   } catch (e) {
     mainCheckClosing.value = null;
     showToast(errorDetail(e) || 'Failed to close the red main check', 'error');
+  }
+}
+
+/** Ask the engine to admit the main repair immediately. */
+export async function fixMainNow(): Promise<void> {
+  try {
+    await apiFixMainNow();
+  } catch (e) {
+    showToast(errorDetail(e) || 'Failed to start the main repair', 'error');
   }
 }

@@ -103,7 +103,7 @@ pub struct TriggerInfo {
 impl TriggerInfo {
     fn from_config(config: &TriggerConfig) -> Self {
         let run = serde_json::to_value(&config.run).unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[Triggers] Failed to serialize run for trigger '{}': {}",
                 config.id,
                 e
@@ -382,7 +382,7 @@ pub(super) async fn list_historical_triggers(
         .list_historical_triggers()
         .await
         .map_err(|e| {
-            log!("[API] Failed to list historical triggers: {}", e);
+            log_legacy!("[API] Failed to list historical triggers: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to list historical triggers: {}", e),
@@ -409,10 +409,18 @@ fn is_unowned_caller(headers: &HeaderMap) -> bool {
 /// Refuse a write that `widens` a trigger's grants from anyone but a person.
 /// The coding-agent grant and the side-effect grant both make the owner face,
 /// per trigger, what its unattended runs may do (ADR 0641). An agent or an app
-/// frame widening one would skip that choice. Narrowing, or sending back a
+/// frame widening one would skip that choice, and an unattested caller's
+/// widening waits for the owner's Allow once. Narrowing, or sending back a
 /// grant the trigger already holds, stays open to every caller.
-pub(super) fn refuse_unowned_grant(headers: &HeaderMap, widens: bool) -> Result<(), String> {
-    if widens && is_unowned_caller(headers) {
+pub(super) fn refuse_unowned_grant(
+    headers: &HeaderMap,
+    trigger_name: &str,
+    widens: bool,
+) -> Result<(), String> {
+    if !widens {
+        return Ok(());
+    }
+    if is_unowned_caller(headers) {
         return Err(
             "Only the owner can widen a trigger's grants: ask them to tick 'Allow coding \
              agents' or the allowed side-effects on the trigger. Restoring older work on a \
@@ -420,7 +428,20 @@ pub(super) fn refuse_unowned_grant(headers: &HeaderMap, widens: bool) -> Result<
                 .to_string(),
         );
     }
+    if crate::api::actor::owner_attestation(headers)
+        == crate::api::actor::OwnerAttestation::Unattested
+    {
+        return Err(ask_about_trigger("widen the grants of", trigger_name));
+    }
     Ok(())
+}
+
+/// Park an unattested caller's trigger write on an owner card naming the
+/// trigger, so the owner sees which one they allow.
+fn ask_about_trigger(verb: &str, trigger_name: &str) -> String {
+    let name = super::permission_requests::one_line(trigger_name);
+    let act = crate::api::owner_door::OwnerAct::new(format!("{verb} the trigger \"{name}\""));
+    crate::api::owner_door::ask(act).message
 }
 
 /// Refuse an agent's trigger model pick off the chat intelligence ladder,
@@ -566,7 +587,7 @@ pub(super) async fn create_trigger(
         }
     }
     let widens = request.coding_agent_grant || !request.side_effect_grant.is_empty();
-    if let Err(e) = refuse_unowned_grant(&headers, widens) {
+    if let Err(e) = refuse_unowned_grant(&headers, name, widens) {
         return ApiResult::err(e);
     }
     // Side-effect grant (Phase 5): only stamp when non-empty so legacy/no-grant
@@ -654,7 +675,7 @@ pub(super) async fn create_trigger(
         .write_created_minting_slug(&trigger_id_str, payload, name, actor)
         .await
     {
-        log!("[Triggers] TriggerCreated emit failed: {}", e);
+        log_legacy!("[Triggers] TriggerCreated emit failed: {}", e);
         return ApiResult::err(format!("Failed to create trigger: {e}"));
     }
 
@@ -887,10 +908,20 @@ pub(super) async fn update_trigger(
     {
         return ApiResult::err(e);
     }
-    if let Err(e) = refuse_unowned_grant(&headers, existing.widens_a_grant(&next)) {
+    if let Err(e) = refuse_unowned_grant(&headers, &existing.name, existing.widens_a_grant(&next)) {
         return ApiResult::err(e);
     }
-    let clears_grants = existing.unowned_edit_clears_grants(&next) && is_unowned_caller(&headers);
+    let edits_granted = existing.unowned_edit_clears_grants(&next);
+    // An unattested caller's edit asks rather than clearing: it may be the
+    // owner, and an Allow keeps the grants they gave.
+    if edits_granted
+        && crate::api::actor::owner_attestation(&headers)
+            == crate::api::actor::OwnerAttestation::Unattested
+        && !is_unowned_caller(&headers)
+    {
+        return ApiResult::err(ask_about_trigger("change what runs in", &existing.name));
+    }
+    let clears_grants = edits_granted && is_unowned_caller(&headers);
     if clears_grants {
         TriggerConfig::clear_grants_in(&mut update_payload);
         event_warnings.push(existing.grants_cleared_notice());
@@ -911,7 +942,7 @@ pub(super) async fn update_trigger(
         )
         .await
     {
-        log!("[Triggers] TriggerUpdated emit failed: {}", e);
+        log_legacy!("[Triggers] TriggerUpdated emit failed: {}", e);
         return ApiResult::err(format!("Failed to update trigger: {e}"));
     }
     if clears_grants {
@@ -956,7 +987,7 @@ pub(super) async fn delete_trigger(
         )
         .await
     {
-        log!("[Triggers] TriggerDeleted emit failed: {}", e);
+        log_legacy!("[Triggers] TriggerDeleted emit failed: {}", e);
         return ApiResult::err(format!("Failed to delete trigger: {e}"));
     }
 
@@ -1053,8 +1084,9 @@ mod tests {
         h
     }
 
-    /// Only a person widens a trigger's grants. An agent or an app frame may
-    /// narrow them, or send back what the trigger holds.
+    /// Only the attested owner widens a trigger's grants. An agent, an app
+    /// frame or a typed device id may narrow them, or send back what the
+    /// trigger holds.
     #[test]
     fn only_a_person_widens_a_grant() {
         use crate::api::actor::{
@@ -1071,7 +1103,8 @@ mod tests {
             (super::super::app_reach::APP_ID_HEADER, "habit-tracker"),
             (HEADER_DEVICE_ID, "owner-phone"),
         ]);
-        let owner = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+        let typed = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+        let owner = crate::api::gateway_stamp::test_support::stamped_device_headers("owner-phone");
 
         let held = TriggerConfig::from_created_payload(&serde_json::json!({
             "trigger_id": "t", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
@@ -1094,20 +1127,22 @@ mod tests {
             serde_json::json!({ "coding_agent_grant": true }),
             serde_json::json!({ "coding_agent_grant": false }),
         ];
-        for caller in [&agent, &app] {
+        for caller in [&agent, &app, &typed] {
             for update in &wider {
-                let err = refuse_unowned_grant(caller, widens(update.clone())).unwrap_err();
-                assert!(err.contains("Only the owner"), "{update}: {err}");
+                assert!(
+                    refuse_unowned_grant(caller, "T", widens(update.clone())).is_err(),
+                    "{update}"
+                );
             }
             for update in &same_or_narrower {
                 assert!(
-                    refuse_unowned_grant(caller, widens(update.clone())).is_ok(),
+                    refuse_unowned_grant(caller, "T", widens(update.clone())).is_ok(),
                     "{update}"
                 );
             }
         }
         for update in &wider {
-            assert!(refuse_unowned_grant(&owner, widens(update.clone())).is_ok());
+            assert!(refuse_unowned_grant(&owner, "T", widens(update.clone())).is_ok());
         }
     }
 

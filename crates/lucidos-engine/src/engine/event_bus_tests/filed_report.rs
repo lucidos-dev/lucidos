@@ -159,7 +159,9 @@ async fn a_declined_report_still_wakes_for_every_unclean_finish() {
     let unclean = [
         ThreadEvent::ResponseFailed {
             error: "the API refused".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         ThreadEvent::ResponseCanceled {
             text: "partial".into(),
@@ -317,6 +319,39 @@ async fn a_spent_no_never_files_the_next_report() {
         1,
         "the result wakes the parent"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A paused coding-agent parent is not woken (I1). Each report is filed, so
+/// the parent's next turn reads it, and one request asks whether to wake it.
+#[tokio::test]
+async fn a_paused_coding_agent_parent_files_reports_and_asks_once() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+    let parent_id = crate::test_support::seed_coding_thread(&bus, None).await;
+    crate::engine::automation_pause::pause_automation(&pool, &bus, parent_id, "pause", None)
+        .await
+        .unwrap();
+    for text in ["The first is done.", "The second is done."] {
+        let child_id = Uuid::new_v4();
+        spawn_child_of(&bus, parent_id, child_id, EventChannel::Chat, None).await;
+        emit(&bus, child_id, reply(text)).await;
+    }
+
+    assert_eq!(count_on(&pool, parent_id, "ChildReportFiled").await, 2);
+    assert_eq!(count_on(&pool, parent_id, "ChildThreadCompleted").await, 0);
+    assert_eq!(drain_callbacks(&mut callback_rx), 0, "no parent turn");
+    let asked: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->'permission_request'->>'action' FROM events \
+          WHERE aggregate_id = $1 AND event_type = 'UserQuestionAsked'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(asked, ["read-waiting-reports"]);
 
     pool.close().await;
     teardown_test_db(&db_name).await;

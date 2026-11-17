@@ -205,7 +205,7 @@ pub(crate) async fn ff_main_to_locked(
             // because the Tier-3 fast path discards the Err.
             if let Some(err) = sync_err {
                 let short = &branch_sha[..branch_sha.floor_char_boundary(8)];
-                log!(
+                log_legacy!(
                     "[Changes] ERROR: checkout -f main after update-ref failed: {}. main advanced to {} but the repo-root working tree did not, so this merge is reported as failed rather than left to be silently reverted by the next auto-commit of data/.",
                     err,
                     short
@@ -280,7 +280,7 @@ pub(crate) async fn ff_merge_to_main(
     let err = match merged {
         Ok(shas) => {
             if temp_branch == feature_branch {
-                log!(
+                log_legacy!(
                     "[Changes] ff-merge applied {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
                     feature_branch
                 );
@@ -307,7 +307,7 @@ pub(crate) async fn ff_merge_to_main(
         let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
         let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
     } else {
-        log!(
+        log_legacy!(
             "[Changes] ff-merge failed for {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
             temp_branch
         );
@@ -362,7 +362,7 @@ pub(crate) fn push_main_in_background(repo_root: &Path, bus: &EventBus) {
     let bus = bus.clone();
     tokio::spawn(async move {
         if let Some(reason) = push_main(&repo_root).await {
-            log!("[Changes] Push main to origin failed: {}", reason);
+            log_legacy!("[Changes] Push main to origin failed: {}", reason);
             bus.emit_or_log(
                 BusEvent::System(SystemEvent::MainPushFailed {
                     repo: repo_root.display().to_string(),
@@ -390,7 +390,7 @@ pub(super) async fn push_main(repo_root: &Path) -> Option<String> {
     };
     match push_to_origin_main(repo_root, &main).await {
         PushOutcome::Pushed => {
-            log!("[Changes] Pushed main to origin");
+            log_legacy!("[Changes] Pushed main to origin");
             None
         }
         PushOutcome::Rejected(e) => Some(format!(
@@ -509,7 +509,7 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
     let rebase_merge = repo_root.join(".git/rebase-merge");
     let rebase_apply = repo_root.join(".git/rebase-apply");
     if rebase_merge.exists() || rebase_apply.exists() {
-        log!("[Changes] Stale rebase state detected -- aborting");
+        log_legacy!("[Changes] Stale rebase state detected -- aborting");
         let abort = git_cmd(&["rebase", "--abort"], repo_root).await;
         let detail = match &abort {
             Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
@@ -518,18 +518,18 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         match classify_rebase_abort(&abort) {
             StaleRebase::Aborted => {}
             StaleRebase::Residue => {
-                log!("[Changes] git rebase --abort refused: {}", detail);
+                log_legacy!("[Changes] git rebase --abort refused: {}", detail);
                 for dir in [&rebase_merge, &rebase_apply] {
                     if dir.exists() {
                         if let Err(e) = std::fs::remove_dir_all(dir) {
-                            log!("[Changes] Failed to remove {}: {}", dir.display(), e);
+                            log_legacy!("[Changes] Failed to remove {}: {}", dir.display(), e);
                         }
                     }
                 }
-                log!("[Changes] Removed stale rebase directories directly");
+                log_legacy!("[Changes] Removed stale rebase directories directly");
             }
             StaleRebase::Unanswered => {
-                log!(
+                log_legacy!(
                     "[Changes] cannot run git rebase --abort: {}. Leaving the rebase state \
                      and HEAD untouched",
                     detail
@@ -549,17 +549,17 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         .await
         .or_unknown(true);
     if !head_ok {
-        log!("[Changes] HEAD is detached -- re-attaching to main");
+        log_legacy!("[Changes] HEAD is detached -- re-attaching to main");
         // Same lock contention as the sync in ff_main_to_locked: a detached HEAD that
         // stays detached because a concurrent artifact commit held a lock makes
         // every later `git status` report false dirty files.
         match git_cmd_await_lock_file(&["checkout", "-f", "main"], repo_root).await {
             Ok(o) if o.status.success() => {}
-            Ok(o) => log!(
+            Ok(o) => log_legacy!(
                 "[Changes] Failed to re-attach HEAD: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => log!("[Changes] Failed to re-attach HEAD: {}", e),
+            Err(e) => log_legacy!("[Changes] Failed to re-attach HEAD: {}", e),
         }
     }
 }
@@ -569,24 +569,24 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
 /// or `None` when there is no `origin` remote (so the worktree will branch from HEAD).
 pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<String> {
     if !origin_remote(repo_root).await.or_unknown(false) {
-        log!("[Changes] No 'origin' remote found -- will branch from HEAD");
+        log_legacy!("[Changes] No 'origin' remote found -- will branch from HEAD");
         return None;
     }
 
     // Fetch latest from origin so we branch from up-to-date default branch
     match git_cmd(&["fetch", "origin"], repo_root).await {
         Ok(o) if o.status.success() => {}
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[Changes] git fetch origin warning: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[Changes] Failed to run git fetch: {}", e),
+        Err(e) => log_legacy!("[Changes] Failed to run git fetch: {}", e),
     }
 
     let remote_ref = match read_origin_head_ref(repo_root).await {
         Some(branch) => format!("origin/{}", branch),
         None => {
-            log!("[Changes] Could not detect default branch, falling back to origin/main");
+            log_legacy!("[Changes] Could not detect default branch, falling back to origin/main");
             "origin/main".to_string()
         }
     };
@@ -604,17 +604,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         Some(b) if b == local_branch => {
             // We're on the default branch -- merge ff-only to update it in place
             match git_cmd(&["merge", "--ff-only", &remote_ref], repo_root).await {
-                Ok(o) if o.status.success() => log!(
+                Ok(o) if o.status.success() => log_legacy!(
                     "[Changes] Fast-forwarded local {} to {}",
                     local_branch,
                     remote_ref
                 ),
-                Ok(_) => log!(
+                Ok(_) => log_legacy!(
                     "[Changes] Could not fast-forward {} (diverged) -- worktree will branch from {}",
                     local_branch,
                     remote_ref
                 ),
-                Err(e) => log!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
+                Err(e) => log_legacy!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
             }
         }
         Some(_) => {
@@ -623,17 +623,17 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             // also refuses a branch checked out in another worktree.
             let refspec = format!("refs/remotes/{remote_ref}:refs/heads/{local_branch}");
             match git_cmd(&["fetch", ".", &refspec], repo_root).await {
-                Ok(o) if o.status.success() => log!(
+                Ok(o) if o.status.success() => log_legacy!(
                     "[Changes] Updated local {} to match {}",
                     local_branch,
                     remote_ref
                 ),
-                Ok(_) => log!(
+                Ok(_) => log_legacy!(
                     "[Changes] Could not update local {} -- worktree will branch from {}",
                     local_branch,
                     remote_ref
                 ),
-                Err(e) => log!("[Changes] Failed to update local {}: {}", local_branch, e),
+                Err(e) => log_legacy!("[Changes] Failed to update local {}: {}", local_branch, e),
             }
         }
         None => {
@@ -641,7 +641,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
             // arm above is known to fit. Leave the local ref alone; worktrees
             // branch from a slightly older base, which both arms already treat
             // as an acceptable outcome.
-            log!(
+            log_legacy!(
                 "[Changes] Could not read the current branch; leaving local {} alone (worktree will branch from {})",
                 local_branch,
                 remote_ref
@@ -1107,13 +1107,13 @@ async fn remove_temp_merge_state(
     let _ = git_cmd(&["merge", "--abort"], std::path::Path::new(worktree)).await;
     let worktree_gone = match git_ran_ok(&["worktree", "remove", "--force", worktree], repo).await {
         Ok(()) => {
-            log!("{} Removed temp merge worktree {}", tag, worktree);
+            log_legacy!("{} Removed temp merge worktree {}", tag, worktree);
             true
         }
         // A stat, not a git probe: the directory is either there or it is not.
         Err(_) if !std::path::Path::new(worktree).exists() => true,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "{} Failed to remove temp merge worktree {}: {}",
                 tag,
                 worktree,
@@ -1124,7 +1124,7 @@ async fn remove_temp_merge_state(
     };
     let branch_gone = match git_ran_ok(&["branch", "-D", temp_branch], repo).await {
         Ok(()) => {
-            log!("{} Deleted temp merge branch {}", tag, temp_branch);
+            log_legacy!("{} Deleted temp merge branch {}", tag, temp_branch);
             true
         }
         Err(e) => {
@@ -1135,7 +1135,7 @@ async fn remove_temp_merge_state(
                 .await
                 .or_unknown(true);
             if still_there {
-                log!(
+                log_legacy!(
                     "{} Failed to delete temp merge branch {}: {}",
                     tag,
                     temp_branch,
@@ -1207,7 +1207,7 @@ async fn keep_temp_merge_work(
                     "Lucidos could not rename {temp_branch} to keep its work ({e}). Try Apply again."
                 )
             })?;
-        log!("{tag} Kept a temp merge pair's work on branch {kept_branch}");
+        log_legacy!("{tag} Kept a temp merge pair's work on branch {kept_branch}");
     }
     Ok(())
 }

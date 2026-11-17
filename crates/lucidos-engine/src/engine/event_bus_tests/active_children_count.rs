@@ -212,7 +212,9 @@ async fn test_cc_child_response_failed_then_idled_decrements_parent() {
         thread_id: child_id,
         event: ThreadEvent::ResponseFailed {
             error: "agentic loop blew up".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: EventMeta::NONE,
     })
@@ -361,6 +363,7 @@ async fn test_continuation_requested_re_increments_parent_after_restart_park() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -658,6 +661,8 @@ async fn emit_question_asked(bus: &EventBus, thread_id: Uuid) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })

@@ -11,7 +11,7 @@ import { unfocusThread, visibleCandidatesAround } from './threads';
 import { openListedThread } from './event-navigation';
 import { forgetThreadEventsFailures, noteThreadDeleted } from './thread-loading';
 import { removeThreadNavEntries } from './thread-navigation';
-import { pruneRecents } from './entityReferences';
+import { pruneRecents } from './searchRecents';
 
 /** Drop a deleted family from the client.
  *

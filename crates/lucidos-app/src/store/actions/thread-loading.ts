@@ -4,7 +4,7 @@ import { threadPassesChannelFilter } from '../threadFilter';
 import { settleDeliveredUnsentMessage } from './sendSettlement';
 import { noteImageLanded } from '../landedImages';
 import { liftRowIntent, overlayRowIntent } from '../rowIntents';
-import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
+import { handleEvent, isCallerUtterance, isChannelDefiningEvent, offerCallerUtterance, PENDING_TITLE_PLACEHOLDER, applyAggregateToThread, firstSendUnsettled, applySummaryVersion, isSummaryCurrent, createdKey, isExcludedFromSections, type ThreadAggregate, type ThreadState, type ThreadEvent, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { runWithConcurrency } from '../../utils/concurrentPool';
@@ -46,7 +46,8 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       messageCount: info.message_count || 0,
       section: (info.section as ThreadMeta['section']) || 'archived',
       activeChildrenCount: info.active_children_count || 0,
-      waitingChildrenCount: info.waiting_children_count || 0,
+      awaitedChildrenCount: info.awaited_children_count || 0,
+      awaitedByParent: !!info.awaited_by_parent,
       totalChildrenCount: info.total_children_count || 0,
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
@@ -91,6 +92,7 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   acceptComposeReport(info.thread_id, {
     revision: info.summary_version ?? null,
     epoch: info.compose_epoch ?? null,
+    restorations: info.compose_restorations ?? [],
     text: info.compose_text || '',
     // The backend column is named `compose_images`, but the JSONB array holds
     // hash strings.
@@ -143,8 +145,7 @@ export function upsertThread(
     // before a live event landed carries an older version and changes none of
     // them: not the status, the counts, the waits or the flags.
     const summaryIsCurrent = applySummaryVersion(existing.meta, info.summary_version, info.status);
-    const firstSendUnsettled = info.state === 'composing'
-      && (existing.pendingUserMessages.length > 0 || (existing.unsentMessageSeqs?.size ?? 0) > 0);
+    const unsettledFirstSend = firstSendUnsettled(existing, info.state);
     if (summaryIsCurrent) {
       liftRowIntent(existing.meta);
       if (info.message_count) existing.meta.messageCount = info.message_count;
@@ -155,7 +156,8 @@ export function upsertThread(
       if (info.section) existing.meta.section = info.section as ThreadMeta['section'];
       existing.meta.codingAgentChangeState = info.coding_agent_change_state;
       existing.meta.activeChildrenCount = info.active_children_count || 0;
-      existing.meta.waitingChildrenCount = info.waiting_children_count || 0;
+      existing.meta.awaitedChildrenCount = info.awaited_children_count || 0;
+      existing.meta.awaitedByParent = !!info.awaited_by_parent;
       existing.meta.totalChildrenCount = info.total_children_count || 0;
       existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
       existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
@@ -195,13 +197,13 @@ export function upsertThread(
       // swap the transcript back for the compose view. Otherwise this also
       // rescues an SSE skeleton stuck at `composing`, which no drawer section
       // draws.
-      if (!firstSendUnsettled) existing.meta.state = info.state;
+      if (!unsettledFirstSend) existing.meta.state = info.state;
       // An archive, pin or discard the server has not yet reflected at this
       // version holds over the row (ADR 0437).
       overlayRowIntent(existing.meta);
     }
     // The draft the unsettled first send was written from is stale too.
-    if (existing.meta.state !== 'discarded' && !firstSendUnsettled) stageDraftFromApi(info, draftBatch);
+    if (existing.meta.state !== 'discarded' && !unsettledFirstSend) stageDraftFromApi(info, draftBatch);
   }
 }
 
@@ -613,9 +615,9 @@ let staleMarkedAtToken = 0;
  *  PWA session, and it is why the failure maps next door need a
  *  `dropDepartedThreads` reconcile at all.
  *
- *  Only `eventsLoaded` threads are marked. A thread with no events is not
- *  behind, it is unloaded, which is the LOAD path's business.
- *  `refreshThreadEvents` would decline it anyway.
+ *  Loaded threads are marked, and so are threads whose first load is in
+ *  flight: that snapshot may predate the gap. A thread with no events and no
+ *  load is not behind, it is unloaded, which is the LOAD path's business.
  *
  *  The FOCUSED thread is marked with the rest, even though its caller
  *  refreshes it at once. A landed fetch then stays the only thing that clears
@@ -624,7 +626,7 @@ let staleMarkedAtToken = 0;
 export function markLoadedThreadsStale(): void {
   const next = new Set<string>();
   for (const [id, thread] of threadMap.value) {
-    if (thread.eventsLoaded) next.add(id);
+    if (thread.eventsLoaded || loadingThreads.has(id)) next.add(id);
   }
   staleThreadEvents = next;
   staleMarkedAtToken = fetchAttemptSeq;
@@ -995,6 +997,9 @@ export async function loadThreadEvents(threadId: string): Promise<void> {
         // because a mark raised while this load was in flight describes a gap
         // this snapshot may predate (see `staleMarkedAtToken`).
         clearStaleMark(threadId, attemptToken);
+        // The gap's resync skipped this thread while it had no events, so the
+        // open thread catches up now. The others catch up when opened.
+        if (threadId === focusedThreadId.value) refreshStaleThreadEvents(threadId);
         return;
       } catch (err) {
         if (attempt < MAX_RETRIES) {
@@ -1095,11 +1100,7 @@ export async function refreshThreadEvents(
   const markReported = () => lastRefreshReport.set(threadId, attemptToken);
 
   try {
-    const snapshot = await fetchThreadEvents(threadId, thread.lastDbSeq || undefined)
-      .catch(err => {
-        if (!isTransientFetchError(err)) throw err;
-        return fetchThreadEvents(threadId, thread.lastDbSeq || undefined);
-      });
+    const snapshot = await retryTransient(() => fetchThreadEvents(threadId, thread.lastDbSeq || undefined));
     // Always apply currentAggregate even when no new events arrived — the
     // snapshot may have advanced (e.g. status flipped) since the last refresh.
     // Re-read from the CURRENT map, the same guard `loadThreadEvents` carries.
@@ -1774,7 +1775,7 @@ function applyEventRows(
     // changes nothing (`ThreadMeta.summaryVersion`).
     const current = isSummaryCurrent(thread.meta, currentAggregate.summaryVersion);
     if (current) liftRowIntent(thread.meta);
-    applyAggregateToMeta(thread.meta, currentAggregate);
+    applyAggregateToThread(thread, currentAggregate);
     // A replay started before the user's archive or pin ships the row as it
     // was. The row intent holds over it, as on the SSE path (ADR 0437).
     if (current) overlayRowIntent(thread.meta);

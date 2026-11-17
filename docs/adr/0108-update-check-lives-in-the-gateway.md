@@ -7,6 +7,12 @@
   payload and announce-never-install all stand)
 - **Date**: 2026-08-23
 
+## Diagnostic reporting amendment
+
+[ADR 0716](0716-diagnostic-bundles.md) adds owner-approved diagnostic bundles.
+Lucidos sends diagnostics only when the owner taps Send, to the chosen recipient.
+The update check remains the only automatic request to a server we run.
+
 ## Context
 
 The update check runs in the workspace frontend. `startAppUpdateChecks()` in

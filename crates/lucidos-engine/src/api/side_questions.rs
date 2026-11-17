@@ -48,7 +48,7 @@ async fn side_question_target(
     state: &AppState,
     headers: &HeaderMap,
     thread_id: &str,
-    verb: super::thread_reach::ThreadReachVerb,
+    verb: crate::engine::permission::Action,
 ) -> Result<(uuid::Uuid, crate::engine::thread_events::MessageOrigin), ApiError> {
     let thread_id =
         uuid::Uuid::parse_str(thread_id).map_err(|_| ApiError::bad_request("Invalid thread_id"))?;
@@ -75,7 +75,7 @@ pub(super) async fn ask_side_question(
         &state,
         &headers,
         &body.thread_id,
-        super::thread_reach::ThreadReachVerb::AskSideQuestion,
+        crate::engine::permission::Action::AskSideQuestion,
     )
     .await?;
     // Detached, so a reload mid-ask still records the answer: dropping this
@@ -109,7 +109,7 @@ pub(super) async fn dismiss_side_question(
         &state,
         &headers,
         &body.thread_id,
-        super::thread_reach::ThreadReachVerb::DismissSideQuestion,
+        crate::engine::permission::Action::DismissSideQuestion,
     )
     .await?;
     state

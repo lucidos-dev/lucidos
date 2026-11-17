@@ -2,7 +2,8 @@ import { test, expect } from './fixtures';
 import {
   navigateToApp, assertHealthy, newThread, pickComposeDestination,
   sendMessageCapturingThreadId, waitForCCToStart, waitForActionPanel, dismissCCSession,
-  waitForActiveSession, openRungList, readRungRows, pickRung, currentRungValue,
+  waitForActiveSession, openRungList, readRungRows, pickRung, expectPickRanOrSubstituted,
+  modelSubstitutions,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -13,7 +14,8 @@ import { clearAllThreads } from './db-helpers';
  *
  * This test picks a ladder rung from the prompt bar's rung control before
  * starting a session. It checks the commands API and the control reflect the
- * rung's model and effort after session start.
+ * rung's model and effort after session start. An account that may not run
+ * the pick gets the served model instead, beside a substitution step.
  */
 
 test.describe('CC model pre-session selection', () => {
@@ -42,17 +44,20 @@ test.describe('CC model pre-session selection', () => {
 
     // === Core bug assertion ===
     const cmdData = await waitForActiveSession(page, sentThreadId);
-    expect(cmdData.current_model).toBe(picked!.model);
+    // Init may have landed already. Its substitution event follows the model
+    // update, so a served model gets a moment to show its event.
+    await expect(() => {
+      const served = modelSubstitutions(sentThreadId).map((s) => s.served);
+      expect([picked!.model, ...served]).toContain(cmdData.current_model);
+    }).toPass({ timeout: 5_000 });
     expect(cmdData.current_reasoning_effort).toBe(picked!.effort);
 
     await waitForActionPanel(page, 'Archive', 120_000);
 
-    // The rung is the checked row once the session runs on it.
-    await openRungList(page);
-    expect(await currentRungValue(page)).toBe(picked!.value);
+    // The rung is the checked row once the session runs on it, or the served
+    // model at that effort beside a substitution step.
+    await expectPickRanOrSubstituted(page, sentThreadId, picked!);
 
-    // Cleanup
-    await page.keyboard.press('Escape');
     await dismissCCSession(page);
   });
 });

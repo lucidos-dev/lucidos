@@ -72,6 +72,7 @@ async fn bare_unanswered_question_is_parked() {
 async fn answer_ends_the_park() {
     assert!(
         !parked_after(Some(ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "toolu_park".into(),
             quiet: false,
             answer: AnswerKind::Selected {
@@ -148,6 +149,7 @@ async fn terminal_ends_the_park() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }))
         .await,
         "a terminal ends the turn that owned the question"
@@ -162,6 +164,7 @@ async fn terminal_ends_the_park() {
 async fn pending_change_reemit_keeps_the_park() {
     assert!(
         parked_after(Some(ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: Uuid::new_v4().to_string(),
             description: Some("wip".into()),
             files: vec!["a.txt".into()],
@@ -450,6 +453,7 @@ async fn an_answered_question_reads_back_as_nothing() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "toolu_park".into(),
             quiet: false,
             answer: AnswerKind::Canceled,

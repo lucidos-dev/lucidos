@@ -12,9 +12,10 @@ import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { appsList, contextViewer, repositories } from '../../store/store';
 import { devices } from '../../store/actions/devices';
-import { operators } from '../../store/actions/operators';
+import { gatewayUsers } from '../../store/actions/gatewayUsers';
 import { pairedDevices } from '../../store/actions/pairedDevices';
 import type { EngineReason, Exchange, StoredEvent, ThreadMeta } from '../../store/thread-events';
+import { originMode } from '../../store/thread-events';
 
 /** Wrap a single StoredEvent as an Exchange so each test can keep declaring
  *  the userEvent inline — `resolveOrigin` takes the full exchange (it walks
@@ -565,22 +566,35 @@ describe('executorExtras', () => {
 });
 
 describe('renderChannelSection', () => {
+  it('distinguishes saved owner content from the thread that submitted it', () => {
+    const origin = {
+      kind: 'saved_draft' as const,
+      submission_event_id: 'acceptance',
+      submitted_by_thread_id: 'sender',
+    };
+    const rendered = JSON.stringify(renderChannelSection(origin, undefined, () => 'Submitting thread'));
+    expect(originMode(origin)).toBe('human');
+    expect(rendered).toContain('Your saved draft');
+    expect(rendered).toContain('Submitted by');
+    expect(rendered).toContain('Submitting thread');
+    expect(rendered).not.toContain('Device');
+  });
   it('device origin renders the name the devices list holds for its id', () => {
     seedDevice('d1', 'Chrome on Mac');
     const node = renderChannelSection({ kind: 'device', device_id: 'd1' });
     expect(JSON.stringify(node)).toContain('Chrome on Mac');
   });
-  it('device origin names the person on a team gateway, and not on a personal one', () => {
+  it('device origin names the user on a team gateway, and not on a personal one', () => {
     seedDevice('d1', 'Chrome on Mac');
     const holder = (id: string, name: string, device_ids: string[]) => ({ id, name, emails: [], device_ids });
-    operators.value = {
+    gatewayUsers.value = {
       status: 'loaded',
-      data: { operators: [holder('o1', 'Owner', ['mine']), holder('o2', 'Sam', ['d1'])], relayed: [] },
+      data: { users: [holder('o1', 'Owner', ['mine']), holder('o2', 'Sam', ['d1'])], relayed: [] },
     };
     expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).toContain('Sam');
-    operators.value = { status: 'loaded', data: { operators: [holder('o2', 'Sam', ['d1'])], relayed: [] } };
-    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).not.toContain('Person');
-    operators.value = { status: 'not-loaded' };
+    gatewayUsers.value = { status: 'loaded', data: { users: [holder('o2', 'Sam', ['d1'])], relayed: [] } };
+    expect(JSON.stringify(renderChannelSection({ kind: 'device', device_id: 'd1' }))).not.toContain('"User"');
+    gatewayUsers.value = { status: 'not-loaded' };
   });
   // The raw user-agent is machine words: it lives in Technical details.
   it('api origin names an outside app in words, not by its user-agent', () => {
@@ -675,6 +689,38 @@ function withoutTechnical(node: ComponentChildren): { body: string; technical: s
   };
   return { body: JSON.stringify(strip(node)), technical };
 }
+
+describe('executor rows', () => {
+  it.each([
+    ['only a branch', 'agent/turn-1', ''],
+    ['only a session id', '', 'sid-1'],
+    ['both', 'agent/turn-1', 'sid-1'],
+    ['neither', '', ''],
+  ])('shows plain rows without a fold with %s', (_name, branch, sessionId) => {
+    const session: StoredEvent = { type: 'SessionStarted', session_id: '', branch };
+    const settings: StoredEvent = { type: 'CodingAgentSettingsChanged', cc_session_id: sessionId };
+    const exchange = exch({ type: 'MessageReceived', text: 'go' }, [
+      { seq: 2, event: session }, { seq: 3, event: settings },
+    ]);
+    const events = new Map<number, StoredEvent>([
+      [1, exchange.userEvent], [2, session], [3, settings],
+    ]);
+    const node = renderExecutorSection(exchange, events, {} as ThreadMeta);
+    const body = JSON.stringify(node);
+    expect(body).not.toContain('Technical details');
+    expect(body).not.toContain('route-technical');
+    if (branch) {
+      expect(JSON.stringify(routeRowCells(node, 'Branch'))).toContain(branch);
+    } else {
+      expect(routeRowCells(node, 'Branch')).toBeNull();
+    }
+    if (sessionId) {
+      expect(JSON.stringify(routeRowCells(node, 'Session id'))).toContain(sessionId);
+    } else {
+      expect(routeRowCells(node, 'Session id')).toBeNull();
+    }
+  });
+});
 
 describe('Technical details', () => {
   const section = (userEvent: StoredEvent) =>
@@ -904,6 +950,7 @@ const EVERY_ENGINE_REASON: { [K in EngineReason['kind']]: Extract<EngineReason, 
   main_check_flaky: { kind: 'main_check_flaky' },
   missing_hardening: { kind: 'missing_hardening' },
   missing_plan: { kind: 'missing_plan' },
+  approved_plan_unstarted: { kind: 'approved_plan_unstarted' },
   context_ceiling: { kind: 'context_ceiling' },
   plugin_auto_update: {
     kind: 'plugin_auto_update', plugin_id: 'habit-tracker', marketplace_id: 'm1', marketplace_name: 'Example Market',
@@ -1220,12 +1267,22 @@ describe('route rows contribute exactly two grid cells', () => {
       codingAgentFolder: 'data/apps/habit-tracker',
     } as unknown as ThreadMeta;
 
-    // Model, Effort, Context, Repository, App, Branch. The session id is in
-    // Technical details, whose fold body brings its own grid.
-    expectTwoCellRows(
-      renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh'),
-      6,
+    // Every executor row shares the same grid, with Session id last.
+    const node = renderExecutorSection(exchange, events, meta, 'claude-opus-5[1m]', 'xhigh');
+    expectTwoCellRows(node, 7);
+    const body = JSON.stringify(node);
+    expect(body).not.toContain('Technical details');
+    const rows = renderedChildren(node.props.children).filter(
+      (child): child is VNode<{ class?: string; children?: ComponentChildren }> =>
+        typeof child === 'object' && (child as VNode<{ class?: string }>).props?.class === 'route-row',
     );
+    expect(rows.map(row => {
+      const label = renderedChildren(row.props.children)[0] as VNode<{ children: string }>;
+      return label.props.children;
+    })).toEqual(['Model', 'Effort', 'Context', 'Repository', 'App', 'Branch', 'Session id']);
+    for (const value of ['Repository', 'Lucidos', 'App', 'Habit Tracker', '\u{1F9ED}']) {
+      expect(body).toContain(value);
+    }
   });
 });
 

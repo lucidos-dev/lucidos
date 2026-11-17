@@ -546,6 +546,7 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-1".into(),
             branch: "lucidos-claude-code-first".into(),
@@ -567,6 +568,7 @@ async fn a_coding_agent_members_branch_is_read_before_the_events_go() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-2".into(),
             branch: "lucidos-claude-code-second".into(),

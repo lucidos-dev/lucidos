@@ -68,7 +68,7 @@ impl LucidosEngine {
             match crate::core::CredentialStore::get_oauth_client(&self.pool, &service).await {
                 Ok(found) => found?,
                 Err(e) => {
-                    log!("[Email] Failed to read the {} OAuth client: {}", service, e);
+                    log_legacy!("[Email] Failed to read the {} OAuth client: {}", service, e);
                     return None;
                 }
             };
@@ -514,6 +514,10 @@ impl LucidosEngine {
                 }
             }
             tn::SAVE_EMAIL_ATTACHMENT => {
+                let writer = crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id)
+                    .resolve(self.event_bus.pool())
+                    .await?;
+
                 use crate::core::email::EmailClient;
 
                 let uid = args["uid"].as_u64().unwrap_or(0) as u32;
@@ -606,11 +610,12 @@ impl LucidosEngine {
                             commit_hash: commit_sha.clone(),
                             summary: Some(format!("{} ({})", safe_filename, size_display)),
                             writer_thread_id: Some(thread_id),
+                            writer: Some(writer.clone()),
                         },
                     ))
                     .await
                 {
-                    log!("[Email] Failed to emit ArtifactImported: {}", e);
+                    log_legacy!("[Email] Failed to emit ArtifactImported: {}", e);
                 }
 
                 let short_sha = &commit_sha[..commit_sha.floor_char_boundary(7)];

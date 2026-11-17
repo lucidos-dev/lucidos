@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+pub use super::groups_projection::TriggerGroupProjection;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
@@ -47,79 +49,24 @@ impl TriggerGroup {
             created,
         })
     }
-
-    /// Apply a `TriggerGroupRenamed` payload. No-op if `name` is missing or non-string.
-    pub fn apply_renamed_payload(&mut self, payload: &Value) {
-        if let Some(name) = payload.get("name").and_then(|v| v.as_str()) {
-            self.name = name.to_string();
-        }
-    }
-
-    /// Apply a `TriggerGroupReordered` payload. No-op if `order` is missing.
-    pub fn apply_reordered_payload(&mut self, payload: &Value) {
-        if let Some(order) = payload.get("order").and_then(|v| v.as_i64()) {
-            self.order = order as i32;
-        }
-    }
 }
 
 /// A raw event row used for replaying trigger-group lifecycle events.
+#[derive(Clone)]
 pub struct TriggerGroupEventRow {
+    pub seq: i64,
     pub event_type: String,
     pub payload: Value,
     pub created: DateTime<Utc>,
 }
 
-/// Replay a sequence of trigger-group lifecycle events to rebuild the in-memory
-/// registry. Events must be in chronological order (oldest first).
-pub fn replay_trigger_group_events(
-    events: Vec<TriggerGroupEventRow>,
-) -> HashMap<String, TriggerGroup> {
-    let mut groups: HashMap<String, TriggerGroup> = HashMap::new();
-
+/// Rebuild a causal projection from persisted lifecycle rows.
+/// Delivery order and duplicate rows do not affect the visible state.
+pub fn replay_trigger_group_events(events: Vec<TriggerGroupEventRow>) -> TriggerGroupProjection {
+    let mut groups = TriggerGroupProjection::default();
     for row in events {
-        let group_id = row
-            .payload
-            .get("group_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if group_id.is_empty() {
-            continue;
-        }
-
-        match row.event_type.as_str() {
-            "TriggerGroupCreated" => {
-                match TriggerGroup::from_created_payload(&row.payload, row.created) {
-                    Ok(g) => {
-                        groups.insert(group_id, g);
-                    }
-                    // Every trigger pointing at this group renders as
-                    // "Ungrouped" instead. Say why, rather than dropping it.
-                    Err(e) => crate::log!(
-                        "[TriggerReplay] TriggerGroupCreated payload for {} did not parse: {}",
-                        group_id,
-                        e
-                    ),
-                }
-            }
-            "TriggerGroupRenamed" => {
-                if let Some(g) = groups.get_mut(&group_id) {
-                    g.apply_renamed_payload(&row.payload);
-                }
-            }
-            "TriggerGroupReordered" => {
-                if let Some(g) = groups.get_mut(&group_id) {
-                    g.apply_reordered_payload(&row.payload);
-                }
-            }
-            "TriggerGroupDeleted" => {
-                groups.remove(&group_id);
-            }
-            _ => {}
-        }
+        groups.apply(&row);
     }
-
     groups
 }
 
@@ -138,8 +85,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn replay(mut events: Vec<TriggerGroupEventRow>) -> TriggerGroupProjection {
+        for (i, row) in events.iter_mut().enumerate() {
+            row.seq = i as i64 + 1;
+        }
+        replay_trigger_group_events(events)
+    }
+
     fn make_event(event_type: &str, payload: Value) -> TriggerGroupEventRow {
         TriggerGroupEventRow {
+            seq: 0,
             event_type: event_type.to_string(),
             payload,
             created: Utc::now(),
@@ -156,7 +111,7 @@ mod tests {
             "TriggerGroupCreated",
             created_payload("g1", "Morning Routine", 10),
         )];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         let g = groups.get("g1").expect("group present");
         assert_eq!(g.name, "Morning Routine");
         assert_eq!(g.order, 10);
@@ -171,7 +126,7 @@ mod tests {
                 json!({ "group_id": "g1", "name": "New Name" }),
             ),
         ];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         assert_eq!(groups.get("g1").unwrap().name, "New Name");
         assert_eq!(
             groups.get("g1").unwrap().order,
@@ -189,7 +144,7 @@ mod tests {
                 json!({ "group_id": "g1", "order": 50 }),
             ),
         ];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         let g = groups.get("g1").unwrap();
         assert_eq!(g.order, 50);
         assert_eq!(g.name, "Group", "reorder does not touch name");
@@ -201,7 +156,7 @@ mod tests {
             make_event("TriggerGroupCreated", created_payload("g1", "Group", 0)),
             make_event("TriggerGroupDeleted", json!({ "group_id": "g1" })),
         ];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         assert!(groups.is_empty());
     }
 
@@ -211,7 +166,7 @@ mod tests {
             "TriggerGroupRenamed",
             json!({ "group_id": "g1", "name": "Ghost" }),
         )];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         assert!(groups.is_empty());
     }
 
@@ -221,7 +176,7 @@ mod tests {
             "TriggerGroupCreated",
             json!({ "name": "Anonymous", "order": 0 }),
         )];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         assert!(groups.is_empty());
     }
 
@@ -242,7 +197,7 @@ mod tests {
             make_event("TriggerGroupCreated", created_payload("g2", "Second", 5)),
             make_event("TriggerGroupDeleted", json!({ "group_id": "g1" })),
         ];
-        let groups = replay_trigger_group_events(events);
+        let groups = replay(events);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups.get("g2").unwrap().name, "Second");
         assert!(!groups.contains_key("g1"));

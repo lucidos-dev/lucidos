@@ -209,6 +209,7 @@ fn a_thread_below_the_default_is_offered_the_floor_and_the_risk_rung() {
     assert_eq!(
         offered(Some(0)),
         FloorRungs {
+            other_backends: Vec::new(),
             floor_rung: rung("medium"),
             risk_rung: rung("high"),
         }
@@ -216,6 +217,7 @@ fn a_thread_below_the_default_is_offered_the_floor_and_the_risk_rung() {
     assert_eq!(
         offered(Some(1)),
         FloorRungs {
+            other_backends: Vec::new(),
             floor_rung: None,
             risk_rung: rung("high"),
         },
@@ -248,6 +250,7 @@ fn the_risk_rung_is_never_the_top() {
     assert_eq!(
         FloorRungs::offered(&on, Some(3), Some(0)),
         FloorRungs {
+            other_backends: Vec::new(),
             floor_rung: rung("xhigh"),
             risk_rung: None,
         }
@@ -255,6 +258,7 @@ fn the_risk_rung_is_never_the_top() {
     assert_eq!(
         FloorRungs::offered(&on, Some(4), Some(0)),
         FloorRungs {
+            other_backends: Vec::new(),
             floor_rung: rung("max"),
             risk_rung: None,
         }
@@ -273,6 +277,7 @@ fn the_shipped_ladder_offers_the_default_and_the_rung_above_it() {
     assert_eq!(
         FloorRungs::on_ladder(&ladder, Some(&sonnet)),
         FloorRungs {
+            other_backends: Vec::new(),
             floor_rung: opus_at("medium"),
             risk_rung: opus_at("high"),
         }
@@ -380,6 +385,11 @@ mod db {
     /// Rungs a `--default-floor` run read off a ladder.
     fn offer() -> FloorRungs {
         FloorRungs {
+            other_backends: vec![super::OtherBackendRungs {
+                coding_agent: crate::runtime::CodingAgent::Codex,
+                floor_rung: IntelligenceRung::new("gpt-6.1-sol", "medium"),
+                risk_rung: Some(IntelligenceRung::new("gpt-6.1-sol", "high")),
+            }],
             floor_rung: Some(IntelligenceRung::new("claude-opus-5-5", "medium")),
             risk_rung: Some(IntelligenceRung::new("claude-opus-5-5", "high")),
         }
@@ -621,4 +631,21 @@ fn an_unknown_warmth_claims_neither_warm_nor_cold_costs() {
     assert!(unknown.saving_usd < cold.saving_usd);
     assert_eq!(unknown.cost_usd, cold.cost_usd);
     assert_eq!(unknown.saving_usd, warm.saving_usd);
+}
+
+#[test]
+fn other_backend_offers_default_and_next_rung_without_a_thread_position() {
+    use crate::runtime::intelligence_ladder::{tests::served, LadderSurface};
+    let mut ladder = served(LadderSurface::Codex, None, "medium", 0.0);
+    let offer = super::OtherBackendRungs::on_ladder(&ladder).unwrap();
+    assert_eq!(offer.coding_agent, crate::runtime::CodingAgent::Codex);
+    assert_eq!(Some(offer.floor_rung), ladder.default_intelligence_rung);
+    assert!(offer.risk_rung.is_none(), "the next Codex rung is the top");
+    let claude = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
+    let risk = super::OtherBackendRungs::on_ladder(&claude)
+        .unwrap()
+        .risk_rung;
+    assert_eq!(risk, Some(IntelligenceRung::new("claude-opus-5-5", "high")));
+    ladder.climbs = false;
+    assert!(super::OtherBackendRungs::on_ladder(&ladder).is_none());
 }

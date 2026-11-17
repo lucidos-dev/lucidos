@@ -607,7 +607,7 @@ mod tests {
             .map(|(name, n)| format!("  {n:>7} chars  {name}"))
             .collect::<Vec<_>>()
             .join("\n");
-        println!("workspace prompt footprint:\n{breakdown}\n  {total:>7} chars  TOTAL");
+        crate::log_legacy!("workspace prompt footprint:\n{breakdown}\n  {total:>7} chars  TOTAL");
 
         assert!(
             total <= WORKSPACE_PROMPT_FOOTPRINT_FIXTURE_BUDGET_CHARS,

@@ -38,7 +38,13 @@ tool, the `chat_submit` route and the picker all read this list.
 3. Check the engine log for `[CcModels]` lines.
 4. A list that follows the user's pins is correct. `ANTHROPIC_DEFAULT_SONNET_MODEL`
    and friends change what `sonnet` resolves to, and the picker says so.
-5. To force a re-probe, delete the cache file and restart the engine.
+5. A curated row missing from the picker may be a *learned refusal*.
+   `.lucidos/cc-refused-models.json` holds each model Claude Code ran another
+   model in place of, with the version and account that did it (ADR 0674).
+   It clears when Claude Code lists the model, a probe finds another version,
+   or a session reports another live account.
+6. To force a re-probe, delete the cache file and restart the engine. Delete
+   the refusals file too to drop the refusals.
 
 ## The curated file
 
@@ -48,7 +54,7 @@ cannot supply. Keep its rows roughly current.
 
 - Set `"offered": false` on a model that should leave the picker. The row stays
   as overlay only, so a thread already on it keeps its window, and a new spawn
-  refuses it. Opus 5 and the Fable rows are overlay only.
+  refuses it. Opus 5, Fable 5 and Fable 5.1 are overlay only.
 - A curated row never carries a `resolvedModel`. An alias shows "runs X" only
   from a discovered row.
 

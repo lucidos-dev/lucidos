@@ -12,11 +12,12 @@ use super::agent_runtime::{
     AccountPin, AgentEvent, AgentExitFacts, AgentInput, AgentRuntime, CodingAgent, ControlRequest,
     InputWithdrawal, NotesReminderDue, RunningAgent, SessionContextDue, SpawnArgs, WithdrawRequest,
 };
+use super::agent_sandbox::SandboxedCommand;
 use super::lucidos_cli::{
     ensure_workspace_bin_symlink, lucidos_cli_dir, place_lucidos_cli_skill, LUCIDOS_BIN_NAME,
     LUCIDOS_CLI_SKILL,
 };
-use super::spawn_env::{apply_lucidos_env, command_secret_values, AgentSandbox, StderrTail};
+use super::spawn_env::{apply_lucidos_env, command_secret_values, StderrTail};
 use super::startup_instructions::{self, claude_version, StartupDecision, StartupFollowUp};
 
 /// One `/model` or `/effort` picker entry. Claude Code's model rows come from
@@ -89,7 +90,7 @@ pub fn curated_cc_model_options() -> &'static [CcMenuOption] {
 }
 
 static OFFERED_CURATED_CC_MODEL_OPTIONS: std::sync::LazyLock<std::sync::Arc<[CcMenuOption]>> =
-    std::sync::LazyLock::new(|| offered_cc_model_options(None));
+    std::sync::LazyLock::new(|| offered_cc_model_options(None, &[]));
 
 /// The models a new Claude Code spawn may pick, and the picker's source: what
 /// discovery offers once Claude Code has answered, else the offered curated rows.
@@ -105,8 +106,13 @@ pub fn cc_model_options() -> std::sync::Arc<[CcMenuOption]> {
 /// keeps Claude Code's label and the `resolvedModel` it reported. A discovered
 /// row whose value a curated `offered: false` row withdraws is dropped, because
 /// a withdrawn model stays withdrawn whatever Claude Code lists.
+///
+/// `refused` holds the base ids Claude Code substituted for this account. A
+/// curated row running one is dropped, with its `[1m]` and `@` forms. A
+/// discovered row never is: Claude Code listing a model says it may run.
 pub(super) fn offered_cc_model_options(
     discovered: Option<&[CcMenuOption]>,
+    refused: &[String],
 ) -> std::sync::Arc<[CcMenuOption]> {
     let discovered = discovered.unwrap_or_default();
     let is_withdrawn = |value: &str| {
@@ -115,10 +121,17 @@ pub(super) fn offered_cc_model_options(
             .any(|c| !c.offered && c.value == value)
     };
     let kept = discovered.iter().filter(|d| !is_withdrawn(&d.value));
-    let unlisted = curated_cc_model_options()
-        .iter()
-        .filter(|c| c.offered && !discovered.iter().any(|d| d.value == c.value));
+    let unlisted = curated_cc_model_options().iter().filter(|c| {
+        c.offered
+            && !discovered.iter().any(|d| d.value == c.value)
+            && !refused.iter().any(|r| *r == cc_model_base(&c.value))
+    });
     kept.chain(unlisted).cloned().collect()
+}
+
+/// A model id without its `[1m]` window or `@` pin suffix.
+pub fn cc_model_base(id: &str) -> &str {
+    id.split(['[', '@']).next().unwrap_or(id)
 }
 
 pub fn cc_reasoning_effort_options() -> &'static [CcMenuOption] {
@@ -157,6 +170,28 @@ pub fn reconcile_cc_model(original: Option<&str>, cc_reported: &str) -> String {
         }
     }
     normalized.to_string()
+}
+
+/// The model Claude Code ran in place of the pinned one Lucidos asked for.
+///
+/// An account that may not run a model gets another one, named only by the
+/// Init line. A version-free alias (`default`, `opus`) is never a substitution,
+/// since Claude Code resolves it by design. `[1m]`, an `@` pin and a dated
+/// echo compare equal to the bare id.
+pub fn substituted_cc_model(requested: Option<&str>, reported: &str) -> Option<String> {
+    let requested = requested?;
+    if family_and_version(requested).1.is_empty() {
+        return None;
+    }
+    let (requested, served) = (cc_model_base(requested), cc_model_base(reported));
+    let is_dated_echo = |long: &str, short: &str| {
+        long.strip_prefix(short)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let same =
+        requested == served || is_dated_echo(served, requested) || is_dated_echo(requested, served);
+    (!same).then(|| reported.to_string())
 }
 
 #[path = "claude_code_parse.rs"]
@@ -235,8 +270,7 @@ fn model_run_by(option: &CcMenuOption) -> &str {
 /// has an empty version, so it sorts after every numbered one in its family.
 /// A dated id's date part is not a version, so a number stops the read.
 fn family_and_version(id: &str) -> (usize, Vec<u32>) {
-    let base = id.split(['[', '@']).next().unwrap_or(id);
-    let parts: Vec<&str> = base.split('-').collect();
+    let parts: Vec<&str> = cc_model_base(id).split('-').collect();
     for (rank, family) in CC_FAMILIES_STRONGEST_FIRST.iter().enumerate() {
         if let Some(at) = parts.iter().position(|p| p == family) {
             let version = parts[at + 1..]
@@ -338,6 +372,8 @@ pub struct SessionCopyReply {
     pub usage: Option<crate::engine::ApiUsage>,
     /// The model the copy's init line named.
     pub model: Option<String>,
+    /// Billing evidence from this copy's process, independent of its model.
+    pub billing: super::billing_provider::BillingAttribution,
 }
 
 /// The model a stdout `init` line names. `None` for any other line.
@@ -477,7 +513,7 @@ fn route_stdout_line(
 /// A cold process group: a side question or a model probe. It is killed if
 /// its caller goes away before the normal teardown runs, as when the browser
 /// abandons the request.
-struct ColdProcessGroup(Option<u32>);
+pub(super) struct ColdProcessGroup(pub(super) Option<u32>);
 
 impl ColdProcessGroup {
     /// Hand the leader's pid to the normal teardown, which reaps it.
@@ -489,7 +525,11 @@ impl ColdProcessGroup {
 /// Kill a cold process group and reap its leader, whatever the exchange did.
 /// Signals the group only while the leader is unreaped: a reaped pid may be
 /// recycled.
-async fn tear_down_cold_child(mut group: ColdProcessGroup, child: &mut Child, what: &str) {
+pub(super) async fn tear_down_cold_child(
+    mut group: ColdProcessGroup,
+    child: &mut Child,
+    what: &str,
+) {
     if let (Some(pid), Ok(None)) = (group.disarm(), child.try_wait()) {
         crate::runtime::spawn_env::kill_child_process_group_now(pid);
     }
@@ -498,7 +538,7 @@ async fn tear_down_cold_child(mut group: ColdProcessGroup, child: &mut Child, wh
         .await
         .is_err()
     {
-        log!("[ClaudeCode] {what} process did not exit after SIGKILL");
+        log_legacy!("[ClaudeCode] {what} process did not exit after SIGKILL");
     }
 }
 
@@ -608,12 +648,17 @@ async fn ask_session_copy_of(
     // could exit on its own, and a reaped leader is one whose group is no
     // longer safe to signal.
     let exchange = async {
+        stdin
+            .write_all(cc_billing_requests_json().as_bytes())
+            .await?;
         stdin.write_all(message.as_bytes()).await?;
         stdin.flush().await?;
         let mut reader = BufReader::new(stdout);
         let mut line = String::new();
         let mut model = None;
         let mut question_read = false;
+        let mut stream = CcStreamState::default();
+        let mut billing = super::billing_provider::BillingAttribution::default();
         loop {
             line.clear();
             if reader.read_line(&mut line).await? == 0 {
@@ -621,7 +666,13 @@ async fn ask_session_copy_of(
                     "Claude Code exited before it answered".into(),
                 );
             }
-            if let Some(named) = init_model(&line) {
+            if control_reply(&line).is_some() {
+                for event in parse_line(&mut stream, &line) {
+                    if let AgentEvent::BillingObserved { attribution } = event {
+                        billing = attribution;
+                    }
+                }
+            } else if let Some(named) = init_model(&line) {
                 model = Some(named);
             } else if replays_an_input(&line) {
                 question_read = true;
@@ -632,6 +683,7 @@ async fn ask_session_copy_of(
                     answer,
                     usage,
                     model,
+                    billing,
                 });
             }
         }
@@ -647,7 +699,7 @@ async fn ask_session_copy_of(
     };
     if let (Some(e), Some(stderr)) = (failure, child.stderr.take()) {
         let tail = StderrTail::spawn(stderr, Vec::new()).finish().await;
-        log!("[ClaudeCode] session copy failed: {} (stderr: {})", e, tail);
+        log_legacy!("[ClaudeCode] session copy failed: {} (stderr: {})", e, tail);
     }
     reply
 }
@@ -658,6 +710,20 @@ pub const CC_MODEL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// The `initialize` control request: what the Agent SDK sends first, and the
 /// one request whose reply lists the models Claude Code offers.
+const BILLING_INITIALIZE_REQUEST_ID: &str = "lucidos-billing-initialize";
+const BILLING_STATUS_REQUEST_ID: &str = "lucidos-billing-status";
+
+/// Request the serving process's account and effective endpoint evidence.
+fn cc_billing_requests_json() -> String {
+    cc_initialize_request_json(BILLING_INITIALIZE_REQUEST_ID)
+        + &serde_json::json!({
+            "type": "control_request", "request_id": BILLING_STATUS_REQUEST_ID,
+            "request": {"subtype": "get_status"},
+        })
+        .to_string()
+        + "\n"
+}
+
 fn cc_initialize_request_json(request_id: &str) -> String {
     let mut line = serde_json::to_string(&serde_json::json!({
         "type": "control_request",
@@ -687,7 +753,7 @@ pub async fn probe_cc_models(
     // The session command names this file with --settings, and a fresh install
     // may probe before any session wrote it.
     if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
-        log!(
+        log_legacy!(
             "[ClaudeCode] model probe could not write cc-settings.json: {}",
             e
         );
@@ -706,8 +772,13 @@ pub async fn probe_cc_models(
         deadline,
     )
     .await?;
+    let account = super::AccountPin::for_first_session(
+        crate::engine::agent_session::resume::live_claude_config_dir(args.user_env_vars),
+        crate::engine::agent_session::resume::default_claude_config_dir(),
+    );
     Ok(super::cc_model_discovery::CcModelCache {
         cc_version,
+        account,
         discovered_at: chrono::Utc::now(),
         models,
     })
@@ -761,7 +832,7 @@ async fn probe_models_of(
     };
     if let (Err(e), Some(stderr)) = (&models, child.stderr.take()) {
         let tail = StderrTail::spawn(stderr, Vec::new()).finish().await;
-        log!("[ClaudeCode] model probe failed: {} (stderr: {})", e, tail);
+        log_legacy!("[ClaudeCode] model probe failed: {} (stderr: {})", e, tail);
     }
     Ok(models?)
 }
@@ -887,7 +958,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let cc_settings_path =
             crate::engine::cc_settings::cc_settings_path_for_workspace(args.workspace_path);
         if let Err(e) = crate::engine::cc_settings::write_cc_settings(args.workspace_path).await {
-            crate::log!(
+            crate::log_legacy!(
                 "[ClaudeCode] failed to write cc-settings.json at {}: {}. Hooks will not fire and data/ is not granted",
                 cc_settings_path.display(),
                 e
@@ -905,7 +976,7 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let stream_state = CcStreamState::default();
         let secrets = command_secret_values(&cmd);
         let mut child = super::spawn_env::spawn_below_engine(&mut cmd)?;
-        let stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
+        let mut stdin = child.stdin.take().ok_or("Failed to capture stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to capture stdout")?;
         let stderr = StderrTail::spawn(
             child.stderr.take().ok_or("Failed to capture stderr")?,
@@ -920,6 +991,21 @@ impl AgentRuntime for ClaudeCodeRuntime {
         let initial_session_id = args.resume_session_id.map(str::to_string);
         let session_context = args.owed_session_context();
         let notes_reminder = args.owed_notes_reminder();
+        // Ask the SAME process that will serve the session. Its effective
+        // account includes managed policy and wrapper/container routing.
+        // Older CLIs may not answer; usage remains explicitly unresolved.
+        if !matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                stdin
+                    .write_all(cc_billing_requests_json().as_bytes())
+                    .await?;
+                stdin.flush().await
+            })
+            .await,
+            Ok(Ok(()))
+        ) {
+            log_legacy!("[ClaudeCode] billing initialize could not be written");
+        }
         tokio::spawn(async move {
             driver_task(
                 child,
@@ -1060,7 +1146,7 @@ const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 /// `E2BIG` for good. Argv is also world-readable in `/proc/<pid>/cmdline`.
 /// Each file is 0600 and is deleted on drop, so hold this until the child exits.
 struct CcCommand {
-    cmd: tokio::process::Command,
+    cmd: SandboxedCommand,
     system_prompt_file: Option<tempfile::TempPath>,
     /// The settings that exclude the startup files, when they ride in the
     /// system prompt instead.
@@ -1120,7 +1206,7 @@ async fn warm_claude_version(args: &SpawnArgs<'_>) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     if let Err(e) = tokio::task::spawn_blocking(move || claude_version(&claude_bin)).await {
-        log!("[ClaudeCode] the version probe did not finish: {}", e);
+        log_legacy!("[ClaudeCode] the version probe did not finish: {}", e);
     }
 }
 
@@ -1175,7 +1261,7 @@ fn plan_startup(
             follow_up: Some(StartupFollowUp::moved(args.workspace_path)),
         },
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] could not exclude the startup files: {}. Claude Code loads them.",
                 e
             );
@@ -1220,7 +1306,7 @@ pub fn sweep_stale_session_files(workspace: &Path) {
             .is_ok_and(|modified| modified < cutoff);
         if stale {
             if let Err(e) = std::fs::remove_file(entry.path()) {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] failed to delete stale system prompt file {}: {}",
                     entry.path().display(),
                     e
@@ -1252,7 +1338,10 @@ fn build_command_with_settings(
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let claude_bin = resolve_claude_binary(home.as_deref(), args.binary_override.map(Path::new));
     let startup = plan_startup(args, &claude_bin, home.as_deref(), settings);
-    let mut cmd = tokio::process::Command::new(claude_bin);
+    if args.sandbox.is_enforced() {
+        prepare_config_folder(home.as_deref());
+    }
+    let mut cmd = args.sandbox.command(claude_bin)?;
     // The user's `coding_agent_claude_permission_mode`, defaulting to
     // acceptEdits: in-cwd writes auto-approve, and out-of-cwd writes plus Bash
     // route through --permission-prompt-tool to a PermissionCard. The flag is
@@ -1337,7 +1426,7 @@ fn build_command_with_settings(
         &mut cmd,
         args,
         cli_dir,
-        AgentSandbox::Unsandboxed,
+        args.sandbox.compile_cache(),
         "ClaudeCode",
     );
     // Push CC's own byte-idle streaming deadline out past the engine's
@@ -1370,6 +1459,9 @@ fn build_command_with_settings(
     // another `.claude.json` once the variable exists, even at its default
     // path, and then reports "Not logged in".
     apply_account_pin(&mut cmd, args.account_pin);
+    if args.sandbox.is_enforced() {
+        move_config_into_a_folder(&mut cmd, home.as_deref());
+    }
     // The effort the thread records is the effort CC runs at. So it goes AFTER
     // `apply_lucidos_env`, where a workspace `CLAUDE_CODE_EFFORT_LEVEL` cannot
     // overwrite a pin.
@@ -1412,6 +1504,53 @@ fn build_command_with_settings(
     })
 }
 
+/// Keep a sandboxed session's config file in a folder, on Linux. With no
+/// `CLAUDE_CONFIG_DIR`, Claude Code saves `~/.claude.json` by atomic rename
+/// directly in `$HOME`, and Landlock refuses that (decision 11 of
+/// `docs/plans/2026-11-10-os-sandbox-for-agent-subprocesses.md`).
+///
+/// `CLAUDE_CONFIG_DIR=~/.claude` moves the file into that folder. Linux keeps
+/// the login and the transcripts there already, so neither moves. Lucidos
+/// copies `~/.claude.json` across once.
+#[cfg(target_os = "linux")]
+fn move_config_into_a_folder(cmd: &mut tokio::process::Command, home: Option<&Path>) {
+    const VAR: &str = "CLAUDE_CONFIG_DIR";
+    let Some(home) = home else { return };
+    let explicit = match cmd.as_std().get_envs().find(|(key, _)| *key == VAR) {
+        Some((_, value)) => value.is_some(),
+        None => std::env::var_os(VAR).is_some(),
+    };
+    if explicit {
+        return;
+    }
+    let dir = home.join(".claude");
+    let config = dir.join(".claude.json");
+    let legacy = home.join(".claude.json");
+    if !config.exists() && legacy.exists() {
+        if let Err(e) = std::fs::copy(&legacy, &config) {
+            crate::log_legacy!("[ClaudeCode] Could not copy ~/.claude.json into ~/.claude: {e}");
+        }
+    }
+    cmd.env(VAR, dir);
+}
+
+/// Make `~/.claude` before the sandbox is built. Landlock grants a folder that
+/// exists then, and one made later only inherits `$HOME`'s list right.
+#[cfg(target_os = "linux")]
+fn prepare_config_folder(home: Option<&Path>) {
+    let Some(home) = home else { return };
+    if let Err(e) = std::fs::create_dir_all(home.join(".claude")) {
+        crate::log_legacy!("[ClaudeCode] Could not create ~/.claude for the sandbox: {e}");
+    }
+}
+
+/// A seatbelt lets Claude Code save `~/.claude.json` where it is.
+#[cfg(not(target_os = "linux"))]
+fn move_config_into_a_folder(_cmd: &mut tokio::process::Command, _home: Option<&Path>) {}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_config_folder(_home: Option<&Path>) {}
+
 /// Replay a thread's account pin onto `cmd`.
 fn apply_account_pin(cmd: &mut tokio::process::Command, pin: Option<&AccountPin>) {
     match pin {
@@ -1439,9 +1578,10 @@ pub(crate) enum CcPermissionMode {
     Auto,
 }
 
-/// Env var CC requires before it will enter auto mode on a non-first-party
-/// provider. We run on Vertex, and without it CC's gate drops the session to
-/// `default`, which cards MORE than `acceptEdits` does.
+/// Env var CC requires before it will enter auto mode on any provider other
+/// than Anthropic's first party, such as Vertex, Bedrock or a gateway. Without
+/// it CC's gate drops the session to `default`, which cards MORE than
+/// `acceptEdits` does.
 const AUTO_MODE_OPT_IN_ENV: &str = "CLAUDE_CODE_ENABLE_AUTO_MODE";
 
 /// Removes `run_in_background` from the `Bash` and `Agent` schemas, and makes a
@@ -1600,11 +1740,11 @@ fn format_user_input(input: &AgentInput, session_id: Option<&str>) -> String {
 /// and the driver should stop; the failure is logged here.
 async fn write_stdin_line(stdin: &mut ChildStdin, line: &str, what: &str) -> bool {
     if let Err(e) = stdin.write_all(line.as_bytes()).await {
-        log!("[ClaudeCode] failed to write {} to stdin: {}", what, e);
+        log_legacy!("[ClaudeCode] failed to write {} to stdin: {}", what, e);
         return false;
     }
     if let Err(e) = stdin.flush().await {
-        log!("[ClaudeCode] failed to flush stdin after {}: {}", what, e);
+        log_legacy!("[ClaudeCode] failed to flush stdin after {}: {}", what, e);
         return false;
     }
     true
@@ -1812,7 +1952,7 @@ async fn driver_task(
                                 &events_tx,
                             );
                         }
-                        log!("[ClaudeCode] driver stdout EOF — closing session");
+                        log_legacy!("[ClaudeCode] driver stdout EOF — closing session");
                         stdout_closed = true;
                         break;
                     }
@@ -1836,7 +1976,7 @@ async fn driver_task(
                         line_buf.clear();
                     }
                     Err(e) => {
-                        log!("[ClaudeCode] stdout read error: {}", e);
+                        log_legacy!("[ClaudeCode] stdout read error: {}", e);
                         break;
                     }
                 }
@@ -1887,7 +2027,7 @@ async fn driver_task(
                 }
             }
             _ = cancel.cancelled() => {
-                log!("[ClaudeCode] cancellation signalled — terminating CC process");
+                log_legacy!("[ClaudeCode] cancellation signalled — terminating CC process");
                 break;
             }
             wait_result = child.wait() => {
@@ -1904,7 +2044,7 @@ async fn driver_task(
                 // After the exit, drain remaining stdout with a bounded
                 // timeout. A final `Result` line CC flushed before exiting is
                 // still forwarded, without blocking on a noisy grandchild.
-                log!(
+                log_legacy!(
                     "[ClaudeCode] CC process exited (pid={} status={}) — draining remaining stdout",
                     child_pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string()),
                     format_exit_status(&wait_result),
@@ -2021,9 +2161,9 @@ async fn driver_task(
         // Absence-of-evidence is itself evidence. Without this log we
         // can't distinguish "stderr was empty" (e.g. SIGKILL or clean
         // SIGTERM-handled exit) from "we forgot to log stderr".
-        log!("[ClaudeCode] Claude Code stderr: <empty>");
+        log_legacy!("[ClaudeCode] Claude Code stderr: <empty>");
     } else {
-        log!("[ClaudeCode] Claude Code stderr: {}", stderr_tail);
+        log_legacy!("[ClaudeCode] Claude Code stderr: {}", stderr_tail);
     }
     let killed_by_signal = natural_exit_status
         .as_ref()

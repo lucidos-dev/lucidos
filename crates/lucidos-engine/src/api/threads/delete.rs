@@ -56,7 +56,7 @@ fn gate_rejection(e: ApiError) -> Rejection {
 }
 
 fn internal(e: impl std::fmt::Display) -> Rejection {
-    log!("[Delete] {}", e);
+    log_legacy!("[Delete] {}", e);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(serde_json::json!({
@@ -125,9 +125,13 @@ pub(in crate::api) async fn delete_preflight(
     headers: HeaderMap,
     Query(query): Query<PreflightQuery>,
 ) -> Result<Json<DeletePreflight>, Rejection> {
-    crate::api::actor::require_owner_device(&headers, &state.pool)
-        .await
-        .map_err(gate_rejection)?;
+    crate::api::actor::require_owner_device(
+        &headers,
+        &state.pool,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .await
+    .map_err(gate_rejection)?;
 
     let mut tx = state.engine.pool().begin().await.map_err(internal)?;
     let family = load_family(&mut tx, query.thread_id)
@@ -206,11 +210,25 @@ pub(in crate::api) async fn delete_thread_family(
         )
     })?;
     // Before anything is read or written, so a refusal leaves no trace.
-    let actor = crate::api::actor::require_owner_device(&headers, &state.pool)
-        .await
-        .map_err(gate_rejection)?;
+    let act = format!(
+        "delete the thread {} and every sub-thread under it",
+        crate::api::owner_door::thread_named(&state.pool, thread_uuid).await
+    );
+    let actor = crate::api::actor::require_owner_device(
+        &headers,
+        &state.pool,
+        crate::api::owner_door::OnUnattested::Ask(crate::api::owner_door::OwnerAct::new(act)),
+    )
+    .await
+    .map_err(gate_rejection)?;
 
     let mut tx = state.engine.pool().begin().await.map_err(internal)?;
+    // Take the notice lock before locking the family rows, in worker order.
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(crate::engine::user_only_message_delivery::DELIVERY_LOCK)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
     let family = load_family(&mut tx, thread_uuid).await.map_err(internal)?;
 
     if let FamilyDecision::Reject { status, body } =
@@ -320,7 +338,7 @@ async fn remove_owned_widgets(
     let owned = match state.app_manager.widgets_owned_by(ids) {
         Ok(owned) => owned,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Delete] Could not read the deleted threads' widgets: {}",
                 e
             );
@@ -339,7 +357,7 @@ async fn remove_owned_widgets(
         Err(e) => {
             // The ones removed before the failure are committed and announced,
             // so the count reads back from disk rather than from the error.
-            log!(
+            log_legacy!(
                 "[Delete] Could not remove every widget of {:?}: {}",
                 owned,
                 e
@@ -394,6 +412,11 @@ async fn delete_family_rows(
         0
     };
 
+    // Notice intent may precede its event, so remove it by thread as well.
+    let thread_texts: Vec<String> = ids.iter().map(ToString::to_string).collect();
+    sqlx::query("DELETE FROM user_only_message_notices WHERE event_id = ANY($1) OR notice->>'thread_id' = ANY($2)")
+        .bind(&event_ids).bind(&thread_texts).execute(&mut **tx).await?;
+
     // 2. Notifications, by thread AND by the event they deep-link to. A row
     //    naming a deleted event would open a thread that no longer exists.
     sqlx::query("DELETE FROM notifications WHERE thread_id = ANY($1) OR event_id = ANY($2)")
@@ -419,6 +442,12 @@ async fn delete_family_rows(
         .await?;
     sqlx::query("DELETE FROM thread_input_chains WHERE thread_id = ANY($1)")
         .bind(ids)
+        .execute(&mut **tx)
+        .await?;
+    // A grant the family holds goes with it. A standing grant made in it
+    // stays, and its `granted_in_thread_id` turns NULL.
+    sqlx::query("DELETE FROM permissions WHERE holder_kind = 'thread' AND holder_id = ANY($1)")
+        .bind(&thread_texts)
         .execute(&mut **tx)
         .await?;
 
@@ -662,7 +691,7 @@ async fn drop_live_subscriptions(state: &AppState, ids: &[Uuid]) {
         dropped += state.engine.drop_waits_for_thread(*tid).await;
     }
     if dropped > 0 {
-        log!("[Delete] Dropped {} live event wait(s)", dropped);
+        log_legacy!("[Delete] Dropped {} live event wait(s)", dropped);
     }
 }
 
@@ -697,7 +726,7 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
             match detach_unless_on_recorded_branch(&worktree, member.branch.as_deref()).await {
                 Ok(on_recorded) => on_recorded,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Delete] Could not detach the worktree at {}, so it is left on disk: {}",
                         worktree.display(),
                         e
@@ -716,7 +745,7 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
         )
         .await
         else {
-            log!(
+            log_legacy!(
                 "[Delete] Could not remove the worktree at {}; it is left on disk",
                 worktree.display()
             );
@@ -724,7 +753,7 @@ async fn reclaim_worktrees(state: &AppState, coding_agents: &[CodingAgentMember]
             continue;
         };
         removed += 1;
-        log!(
+        log_legacy!(
             "[Delete] Removed the worktree at {} (branch_deleted={})",
             worktree.display(),
             outcome.branch_deleted
@@ -775,7 +804,7 @@ async fn delete_orphaned_branch(state: &AppState, member: &CodingAgentMember) {
         return;
     };
     let Some(root) = branch_home(state, member).await else {
-        log!(
+        log_legacy!(
             "[Delete] No repo holds the recorded branch {}; nothing to delete",
             branch
         );
@@ -783,20 +812,20 @@ async fn delete_orphaned_branch(state: &AppState, member: &CodingAgentMember) {
     };
     match git_cmd(&["branch", "-D", branch], &root).await {
         Ok(o) if o.status.success() => {
-            log!(
+            log_legacy!(
                 "[Delete] Deleted the orphaned branch {} in {}",
                 branch,
                 root.display()
             );
             sweep_branch_markers(state, &root, branch).await;
         }
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[Delete] git branch -D {} in {} failed: {}",
             branch,
             root.display(),
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[Delete] git branch -D {} errored: {}", branch, e),
+        Err(e) => log_legacy!("[Delete] git branch -D {} errored: {}", branch, e),
     }
 }
 
@@ -817,7 +846,7 @@ async fn branch_home(state: &AppState, member: &CodingAgentMember) -> Option<std
     let external = crate::core::repositories::RepositoryStore::list(&state.pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[Delete] Could not list external repos: {}", e);
+            log_legacy!("[Delete] Could not list external repos: {}", e);
             Vec::new()
         });
     let roots = crate::engine::agent_recovery::recovery_repo_roots(
@@ -868,7 +897,7 @@ async fn sweep_branch_markers(state: &AppState, repo_root: &std::path::Path, bra
             .execute(&state.pool)
             .await
         {
-            log!(
+            log_legacy!(
                 "[Delete] Could not sweep the {} row for {}: {}",
                 table,
                 branch,
@@ -913,10 +942,10 @@ async fn repair_ancestor_counts(state: &AppState) {
     // with no child left draws a chevron that expands to nothing.
     use crate::engine::event_bus::EventBus;
     if let Err(e) = EventBus::rebuild_children_counts(&state.pool).await {
-        log!("[Delete] Could not rebuild the child counts: {}", e);
+        log_legacy!("[Delete] Could not rebuild the child counts: {}", e);
     }
     if let Err(e) = EventBus::rebuild_blocking_descendant_count(&state.pool).await {
-        log!("[Delete] Could not rebuild the descendant counts: {}", e);
+        log_legacy!("[Delete] Could not rebuild the descendant counts: {}", e);
     }
 }
 

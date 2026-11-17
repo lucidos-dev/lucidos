@@ -14,6 +14,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 import type { StreamDrop, StreamHealth } from '@lucidos/event-stream';
 import { gapClearedProgress, gapRefreshedVersion } from '../eventGap';
+import type { RestoreAdmissionPhase } from '../../utils/restoreAdmission';
 
 const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog }));
@@ -28,6 +29,13 @@ vi.mock('../restoreRuntime', () => ({
   acceptRestoreHello,
 }));
 afterEach(() => { restoreRuntimeActive = false; });
+
+let admissionPhase: RestoreAdmissionPhase = 'admitted';
+vi.mock('../../utils/restoreAdmission', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  restoreAdmissionPhase: () => admissionPhase,
+}));
+afterEach(() => { admissionPhase = 'admitted'; });
 
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
 const markLoadedThreadsStale = vi.fn();
@@ -71,18 +79,28 @@ const openEventStream = vi.fn((targets, handlers, opts) => {
   opened = { handlers, opts, stream };
   return stream;
 });
+const openDirectEventStream = vi.fn((targets, handlers) => openEventStream(targets, handlers, {pongs: true}));
+let remoteGateway: string | null = null;
+vi.mock('../../utils/basePath', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  get REMOTE_GATEWAY() { return remoteGateway; },
+}));
+afterEach(() => { remoteGateway = null; });
 // Only the transport opener is stubbed. `eventStreamTargets` stays real, so a
 // renamed route would fail the URL assertion below rather than pass a stub.
 vi.mock('@lucidos/event-stream', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   openEventStream,
+  openDirectEventStream,
 }));
 
 /** What app frames hear about the stream, through the host relay. */
 const fanOutEventStreamStatus = vi.fn();
-vi.mock('./app-bridge', async (importOriginal) => ({
+const fanOutEventFrame = vi.fn();
+vi.mock('./app-frame-channel', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   fanOutEventStreamStatus,
+  fanOutEventFrame,
 }));
 
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
@@ -110,6 +128,7 @@ vi.mock('../store', () => ({
   showConfirm: vi.fn(),
   showToast: vi.fn(),
   dismissToast: vi.fn(),
+  removeToast: vi.fn(),
   repoSource: signal(null),
 }));
 
@@ -170,8 +189,28 @@ vi.mock('./entityReferences', () => ({
   PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
 }));
 
-const { connectThreadEvents, disconnectThreadEvents, reviveThreadEvents } = await import('./thread-sync');
+// Existing cases exercise the warm dispatcher; cold-start cases below hold it.
+let sinkLoaded = true;
+const sinkPreload = vi.fn(async () => true);
+const idleSinks: Array<{ preload(): Promise<unknown> }> = [];
+vi.mock('../../utils/idlePrefetch', () => ({
+  prefetchWhenIdle: (surface: { preload(): Promise<unknown> }) => idleSinks.push(surface),
+}));
+let sink: typeof import('./thread-sync');
+vi.mock('../../utils/lazyComponent', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../utils/lazyComponent')>();
+  return { ...actual, lazyModule: (loader: () => Promise<unknown>) =>
+    loader.toString().includes('thread-sync')
+      ? { isLoaded: () => sinkLoaded, preload: sinkPreload, get: () => sink }
+      : actual.lazyModule(loader) };
+});
+sink = await import('./thread-sync');
+const { connectThreadEvents, disconnectThreadEvents, reviveThreadEvents } = await import('./thread-stream');
 const { NO_BACKFILL_PROGRESS, applyTreeBackfillProgress, treeBackfill } = await import('./treeBackfill');
+const { RESTORE_ADMISSION_STALL_MS, noteRestoreAdmitted } = await import('../restoreAdmissionWatchdog');
+const { DeviceDatabaseReleasedError, DeviceDatabaseStalledError } = await import('../deviceDatabase');
+const { showToast, removeToast } = await import('../store');
+const { noteProvisionalRead } = await import('../../utils/restoreAdmission');
 
 /** What the shell reports to the DOM, which is the only thing telling a user
  *  the stream is down. */
@@ -196,7 +235,7 @@ describe('production restore generation admission', () => {
     expect(fanOutEventStreamStatus).not.toHaveBeenCalledWith('open');
     expect(processSSEForReferences).not.toHaveBeenCalled();
     admit(true);
-    await vi.waitFor(() => expect(processSSEForReferences).toHaveBeenCalledWith('RestoreAdmissionTestFrame', { value: 1 }));
+    await vi.waitFor(() => expect(processSSEForReferences).toHaveBeenCalledWith('RestoreAdmissionTestFrame', { value: 1 }, undefined));
     expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open');
   });
 
@@ -242,6 +281,26 @@ describe('production restore generation admission', () => {
     vi.useRealTimers();
   });
 
+  // Frames are dropped until admission, so a thread read that ran before it
+  // left a gap the first open's reads do not cover.
+  it.each([
+    ['reconciles the gap after a provisional read', true, 1],
+    ['adds nothing to the first admission without one', false, 0],
+  ])('%s', async (_name, provisionalRead, reconciles) => {
+    vi.useFakeTimers();
+    vi.clearAllMocks();
+    disconnectThreadEvents();
+    restoreRuntimeActive = true;
+    connectThreadEvents();
+    if (provisionalRead) noteProvisionalRead();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    await vi.runAllTimersAsync();
+    expect(refreshThreadList).toHaveBeenCalledTimes(reconciles);
+    vi.useRealTimers();
+  });
+
   it('discards frames when a restore hello requests reload instead of admission', async () => {
     vi.useRealTimers();
     vi.clearAllMocks();
@@ -256,6 +315,184 @@ describe('production restore generation admission', () => {
     await Promise.resolve(); await Promise.resolve();
     expect(fanOutEventStreamStatus).not.toHaveBeenCalledWith('open');
     expect(processSSEForReferences).not.toHaveBeenCalled();
+  });
+});
+
+describe('a stalled restore admission', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    disconnectThreadEvents();
+    // Earlier suites leave failed admissions behind, whose wait still counts.
+    noteRestoreAdmitted();
+    vi.clearAllMocks();
+    restoreRuntimeActive = true;
+  });
+  afterEach(() => {
+    disconnectThreadEvents();
+    vi.useRealTimers();
+  });
+
+  const restoreLogs = () => postClientLog.mock.calls.filter(([category]) => category === 'restore-admission');
+
+  it('restarts a stream whose hello has not come, once per connection epoch', async () => {
+    admissionPhase = 'awaiting-hello';
+    nextOwnsReconnect = true;
+    connectThreadEvents();
+    const shared = opened!;
+    shared.handlers.onOpen();
+    await vi.advanceTimersByTimeAsync(RESTORE_ADMISSION_STALL_MS * 3);
+    expect(shared.stream.restart).toHaveBeenCalledTimes(1);
+    expect(restoreLogs()).toEqual([['restore-admission', 'stalled',
+      { phase: 'awaiting-hello', waited_ms: RESTORE_ADMISSION_STALL_MS }]]);
+    // The restart drops and reopens the upstream: a new epoch, one more try.
+    shared.handlers.onError(ERROR);
+    shared.handlers.onOpen();
+    await vi.advanceTimersByTimeAsync(RESTORE_ADMISSION_STALL_MS);
+    expect(shared.stream.restart).toHaveBeenCalledTimes(2);
+    nextOwnsReconnect = false;
+  });
+
+  it('reports the total wait when the hello finally admits', async () => {
+    admissionPhase = 'awaiting-hello';
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    await vi.advanceTimersByTimeAsync(RESTORE_ADMISSION_STALL_MS);
+    admissionPhase = 'admitted';
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    // Flushes the frame chain without moving the clock, as `waitFor` would.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open');
+    expect(restoreLogs().slice(-1)[0]).toEqual(['restore-admission', 'admitted_after_stall',
+      { waited_ms: RESTORE_ADMISSION_STALL_MS }]);
+  });
+
+  it('costs a healthy admission no restart and no log line', async () => {
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    admissionPhase = 'awaiting-hello';
+    await vi.advanceTimersByTimeAsync(RESTORE_ADMISSION_STALL_MS * 3);
+    expect(opened!.stream.restart).not.toHaveBeenCalled();
+    expect(restoreLogs()).toEqual([]);
+  });
+
+  // The retry's new epoch resets the phase, so the failure names it first.
+  it('names the step a failed hello stopped in', async () => {
+    admissionPhase = 'journal';
+    acceptRestoreHello.mockRejectedValueOnce(new Error('storage stalled'));
+    connectThreadEvents();
+    const first = opened!;
+    first.handlers.onOpen();
+    first.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(first.stream.close).toHaveBeenCalled());
+    expect(restoreLogs()).toEqual([['restore-admission', 'failed',
+      { phase: 'journal', error: 'storage stalled' }]]);
+  });
+
+  /** Opens a connection whose hello fails with `error`, and waits for it to close. */
+  async function failHello(error: Error) {
+    acceptRestoreHello.mockRejectedValueOnce(error);
+    if (!opened || opened.stream.close.mock.calls.length > 0) await vi.advanceTimersByTimeAsync(10_000);
+    const connection = opened!;
+    connection.handlers.onOpen();
+    connection.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(connection.stream.close).toHaveBeenCalled());
+  }
+  const stalled = () => new DeviceDatabaseStalledError('lucidos-restore-generation:ws', 'transaction');
+
+  it('retries a device storage stall without a toast', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(stalled());
+    expect(showToast).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(openEventStream).toHaveBeenCalledTimes(2);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('says nothing about steps released when the page hid, and does not count them as stalls', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(new DeviceDatabaseReleasedError('lucidos-restore-generation:ws'));
+    await failHello(new DeviceDatabaseReleasedError('lucidos-restore-generation:ws'));
+    await failHello(stalled());
+    expect(showToast).not.toHaveBeenCalled();
+    // Admit, which resets the stall count the next case starts from.
+    await vi.advanceTimersByTimeAsync(10_000);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+  });
+
+  it('offers Retry once device storage keeps stalling, and clears it on admission', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(stalled());
+    await failHello(stalled());
+    expect(showToast).toHaveBeenCalledOnce();
+    const [message, type, opts] = vi.mocked(showToast).mock.calls[0];
+    expect(type).toBe('warning');
+    expect(message).not.toContain('lucidos-restore-generation');
+    expect(message).not.toMatch(/restore|corrupt|lost/i);
+    expect(opts).toMatchObject({ title: 'Device storage', key: expect.any(String) });
+
+    // Retry reconnects now, through a new connection epoch.
+    opts!.action!.onClick();
+    expect(openEventStream).toHaveBeenCalledTimes(3);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    expect(removeToast).toHaveBeenCalledWith(opts!.key);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(openEventStream).toHaveBeenCalledTimes(3);
+  });
+
+  it('restarts an attempt still waiting on storage when Retry is tapped', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(stalled());
+    await failHello(stalled());
+    const [, , opts] = vi.mocked(showToast).mock.calls[0];
+    // The reconnect timer has fired, and its hello waits on storage forever.
+    await vi.advanceTimersByTimeAsync(10_000);
+    const waiting = opened!;
+    acceptRestoreHello.mockReturnValueOnce(new Promise<boolean>(() => {}));
+    waiting.handlers.onOpen();
+    waiting.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(acceptRestoreHello).toHaveBeenCalledTimes(3));
+    expect(openEventStream).toHaveBeenCalledTimes(3);
+
+    opts!.action!.onClick();
+    expect(waiting.stream.close).toHaveBeenCalled();
+    expect(openEventStream).toHaveBeenCalledTimes(4);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    expect(removeToast).toHaveBeenCalledWith(opts!.key);
+  });
+
+  it('starts counting storage stalls again after an admission', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(stalled());
+    await vi.advanceTimersByTimeAsync(10_000);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    opened!.handlers.onError(ERROR);
+    await failHello(stalled());
+    expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('still reports a failure that is not a storage stall', async () => {
+    opened = null;
+    connectThreadEvents();
+    await failHello(new Error('storage full'));
+    expect(showToast).toHaveBeenCalledWith(expect.stringContaining('storage full'), 'error', { title: 'Workspace recovery' });
   });
 });
 
@@ -280,6 +517,13 @@ describe('the shell attaching to a transport', () => {
     expect(opened?.opts).toEqual({ pongs: true });
   });
 
+  it('opens a direct remote stream without requesting a foreign shared worker', () => {
+    remoteGateway = 'cloud';
+    connectThreadEvents();
+    expect(openDirectEventStream).toHaveBeenCalledOnce();
+    expect(openedTargets?.streamUrl).toBe('/api/v1/events');
+  });
+
   it('builds its three URLs off the one versioned API base', () => {
     // The shell and an app reach that base differently. They must still name
     // the same routes, so the suffixes come from the SDK, not from either side.
@@ -298,7 +542,18 @@ describe('the shell attaching to a transport', () => {
     connectThreadEvents();
     opened?.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-1"}}');
 
-    expect(processSSEForReferences).toHaveBeenCalledWith('NotificationCreated', { id: 'n-1' });
+    expect(processSSEForReferences).toHaveBeenCalledWith('NotificationCreated', { id: 'n-1' }, undefined);
+  });
+
+  it('passes stable system identity through the production host dispatch without changing target ids', () => {
+    connectThreadEvents();
+    const data = { event_id: 'tap-target', provider: 'example' };
+    for (const event_id of ['request-one', 'request-one', 'request-two']) {
+      opened!.handlers.onFrame(JSON.stringify({ type: 'OAuthAccountConnected', event_id, data }));
+    }
+    expect(processSSEForReferences.mock.calls.map((call) => call[2]))
+      .toEqual(['request-one', 'request-one', 'request-two']);
+    expect(processSSEForReferences).toHaveBeenCalledWith('OAuthAccountConnected', data, 'request-one');
   });
 
   it('marks connected on open and disconnected on error', () => {
@@ -348,7 +603,7 @@ describe('the shell attaching to a transport', () => {
       expect(openEventStream).toHaveBeenCalledTimes(1);
       expect(fanOutEventStreamStatus).not.toHaveBeenCalled();
       first.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-2"}}');
-      expect(processSSEForReferences).toHaveBeenCalledWith('NotificationCreated', { id: 'n-2' });
+      expect(processSSEForReferences).toHaveBeenCalledWith('NotificationCreated', { id: 'n-2' }, undefined);
     });
 
     it('replaces a stale stream with a fresh one', () => {
@@ -362,7 +617,7 @@ describe('the shell attaching to a transport', () => {
       expect(first.stream.close).toHaveBeenCalledTimes(1);
       expect(openEventStream).toHaveBeenCalledTimes(2);
       first.handlers.onFrame('{"type":"NotificationCreated","data":{"id":"n-3"}}');
-      expect(processSSEForReferences).not.toHaveBeenCalledWith('NotificationCreated', { id: 'n-3' });
+      expect(processSSEForReferences).not.toHaveBeenCalledWith('NotificationCreated', { id: 'n-3' }, undefined);
     });
   });
 
@@ -497,6 +752,17 @@ describe('the shell attaching to a transport', () => {
 
     opened?.handlers.onError(ERROR);
     opened?.handlers.onOpen();
+    expect(syncPendingFormRequests).toHaveBeenCalledTimes(2);
+  });
+
+  it('refreshes form eligibility on archive and unarchive without reconnecting', () => {
+    connectThreadEvents();
+    for (const type of ['ThreadArchived', 'ThreadUnarchived']) {
+      opened?.handlers.onFrame(JSON.stringify({
+        type: 'ThreadEvent',
+        data: { thread_id: 'archive-form-thread', seq: null, event: { type } },
+      }));
+    }
     expect(syncPendingFormRequests).toHaveBeenCalledTimes(2);
   });
 
@@ -737,5 +1003,112 @@ describe('a stalled stream', () => {
     await vi.runAllTimersAsync();
 
     expect(refreshThreadList).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe('cold store dispatch behind eager restore admission', () => {
+  beforeEach(() => {
+    disconnectThreadEvents();
+    vi.clearAllMocks();
+    idleSinks.length = 0;
+    sinkLoaded = false;
+    sinkPreload.mockReset().mockResolvedValue(true);
+    nextOwnsReconnect = true;
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+  });
+  afterEach(() => { disconnectThreadEvents(); sinkLoaded = true; });
+  const frame = (id: string) => JSON.stringify({ type: 'NotificationCreated', event_id: id, data: { id } });
+
+  it('retains early frames in arrival order and does not load before idle', async () => {
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(frame('first'));
+    opened!.handlers.onFrame(frame('second'));
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+    expect(sinkPreload).not.toHaveBeenCalled();
+    expect(fanOutEventFrame.mock.calls.map((call) => JSON.parse(call[0]).event_id)).toEqual(['first', 'second']);
+    await idleSinks[idleSinks.length - 1]!.preload();
+    expect(fanOutEventFrame).toHaveBeenCalledTimes(2);
+    expect(processSSEForReferences.mock.calls.map((call) => call[2])).toEqual(['first', 'second']);
+  });
+
+  it('keeps admitted frames across a routine reconnect while the chunk waits', async () => {
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(frame('before-reconnect'));
+    opened!.handlers.onError(ERROR);
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(frame('after-reconnect'));
+    await idleSinks[idleSinks.length - 1]!.preload();
+    expect(processSSEForReferences.mock.calls.map((call) => call[2])).toEqual(['before-reconnect', 'after-reconnect']);
+  });
+
+  it('keeps admitted frames when a dedicated transport reconnects before idle', async () => {
+    vi.useFakeTimers();
+    try {
+      nextOwnsReconnect = false;
+      connectThreadEvents();
+      opened!.handlers.onOpen();
+      opened!.handlers.onFrame(frame('before-replacement'));
+      opened!.handlers.onError(ERROR);
+      await vi.advanceTimersByTimeAsync(10_000);
+      opened!.handlers.onOpen();
+      opened!.handlers.onFrame(frame('after-replacement'));
+      await idleSinks[idleSinks.length - 1]!.preload();
+      expect(processSSEForReferences.mock.calls.map((call) => call[2])).toEqual(['before-replacement', 'after-replacement']);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps admitted frames when wake replaces a stale stream before idle', async () => {
+    nextHealth = 'stale';
+    connectThreadEvents();
+    opened!.handlers.onFrame(frame('before-wake'));
+    reviveThreadEvents();
+    opened!.handlers.onFrame(frame('after-wake'));
+    await idleSinks[idleSinks.length - 1]!.preload();
+    expect(processSSEForReferences.mock.calls.map((call) => call[2])).toEqual(['before-wake', 'after-wake']);
+    nextHealth = 'live';
+  });
+
+  it('retains frames after a failed chunk fetch and Retry drains them once', async () => {
+    sinkPreload.mockResolvedValueOnce(false);
+    connectThreadEvents();
+    opened!.handlers.onFrame(frame('waiting'));
+    await idleSinks[idleSinks.length - 1]!.preload();
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+    expect(fanOutEventFrame).toHaveBeenCalledWith(frame('waiting'));
+    const options = vi.mocked(showToast).mock.calls[vi.mocked(showToast).mock.calls.length - 1]![2]!;
+    expect(options.key).toBe('event-dispatch-error');
+    options.action!.onClick();
+    await vi.waitFor(() => expect(processSSEForReferences).toHaveBeenCalledTimes(1));
+    expect(processSSEForReferences.mock.calls[0][2]).toBe('waiting');
+  });
+
+  it('rejects late dispatch from a disconnected connection', async () => {
+    let finish!: (loaded: boolean) => void;
+    sinkPreload.mockImplementationOnce(() => new Promise<boolean>((resolve) => { finish = resolve; }));
+    connectThreadEvents();
+    opened!.handlers.onFrame(frame('stale'));
+    const loading = idleSinks[idleSinks.length - 1]!.preload();
+    disconnectThreadEvents();
+    finish(true);
+    await loading;
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+  });
+
+  it('admits restore hello without waiting for the dispatcher chunk', async () => {
+    restoreRuntimeActive = true;
+    connectThreadEvents();
+    opened!.handlers.onOpen();
+    opened!.handlers.onFrame(JSON.stringify({ type: 'StreamHello', data: { restore_generation: null } }));
+    opened!.handlers.onFrame(frame('admitted'));
+    await vi.waitFor(() => expect(fanOutEventStreamStatus).toHaveBeenCalledWith('open'));
+    expect(acceptRestoreHello).toHaveBeenCalled();
+    expect(sinkPreload).not.toHaveBeenCalled();
+    expect(processSSEForReferences).not.toHaveBeenCalled();
+    await idleSinks[idleSinks.length - 1]!.preload();
+    expect(processSSEForReferences.mock.calls.map((call) => call[2])).toEqual(['admitted']);
   });
 });

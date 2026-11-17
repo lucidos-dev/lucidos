@@ -8,6 +8,7 @@ import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { ConnectionBanner } from './components/layout/ConnectionBanner';
 import { IngressBanner } from './components/layout/IngressBanner';
 import { WebhookRefusalBanner } from './components/layout/WebhookRefusalBanner';
+import { AgentSandboxBanner } from './components/layout/AgentSandboxBanner';
 import { SlownessBanner } from './components/layout/SlownessBanner';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
 import { OverlayLayer } from './components/layout/OverlayLayer';
@@ -149,6 +150,7 @@ export function App() {
         <SlownessBanner layout="desktop" />
         <IngressBanner layout="desktop" />
         <WebhookRefusalBanner layout="desktop" />
+        <AgentSandboxBanner layout="desktop" />
         <BackupReminderBanner layout="desktop" />
         <DrawerSlot />
         {mobile ? (

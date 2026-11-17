@@ -22,7 +22,7 @@ vi.mock('../../api/client', () => ({
   API_BASE: 'http://localhost:3000',
   API: 'http://localhost:3000/api/v1',
 }));
-vi.mock('./thread-sync', () => ({
+vi.mock('./thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
@@ -47,7 +47,7 @@ const postClientLog = vi.fn();
 vi.mock('../../utils/clientLog', () => ({ postClientLog: (...a: unknown[]) => postClientLog(...a) }));
 
 const { checkConnection, noteWorkspaceStartAccepted, START_SETTLE_MS, START_BOOT_MS } = await import('./connection');
-const { connectThreadEvents } = await import('./thread-sync');
+const { connectThreadEvents } = await import('./thread-stream');
 
 const STARTED_AT = '2026-06-09T06:00:00Z';
 const loaded = {

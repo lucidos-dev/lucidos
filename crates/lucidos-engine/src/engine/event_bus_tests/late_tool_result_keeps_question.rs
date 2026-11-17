@@ -60,6 +60,8 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: codex_meta(),
     })
@@ -195,6 +197,7 @@ async fn an_answer_then_a_result_runs_again() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: QUESTION_ID.into(),
             answer: crate::engine::thread_events::AnswerKind::Selected {
                 option_id: "opt-0".into(),

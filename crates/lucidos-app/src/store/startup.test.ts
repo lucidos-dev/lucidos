@@ -35,10 +35,10 @@ const SOURCE = resolve(here, 'startup.ts');
 /** Every update surface that MUST be reconciled when the page comes back to the
  *  foreground, and what silently rots if its call goes missing. */
 const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
-  ['reg?.update()', 'a new frontend build is never picked up by the service worker'],
+  ['reg.update()', 'a new frontend build is never picked up by the service worker'],
   ['syncClientUpdateFromBuild(', 'the client-update badge misses a build that landed while away'],
-  ['checkEngineVersion(', 'an engine build that finished while away shows as still spinning'],
-  ['refreshReleaseCheck(', 'a published release goes unannounced until the gateway backstop fires'],
+  ['backgroundChecks.refreshEngine(', 'an engine build that finished while away shows as still spinning'],
+  ['refreshReleaseCheckIfShown(', 'a published release goes unannounced until the gateway backstop fires'],
   ['flushPendingPreferenceWrites(', 'a settings change WebKit aborted at suspend never reaches the engine, so the device and the server disagree until the next reload'],
   ['flushUndeliveredComposeDrafts(', 'a draft whose PUT failed while offline is never re-sent, and since a draft lives only in memory it dies with the next iOS eviction'],
 ];
@@ -47,11 +47,11 @@ describe('startClient resume reconciliation', () => {
   const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onResume()');
 
   // Proves the brace match actually bounded the handler.
-  // `startAppUpdateProgress` is called once in the effect body and never on
+  // `startEngineUpdateChecks` is called once in the effect body and never on
   // resume. Seeing it here would mean the slice overran, and every assertion
   // below had become vacuous.
   it('bounds the handler rather than swallowing the whole effect', () => {
-    expect(body).not.toContain('startAppUpdateProgress(');
+    expect(body).not.toContain('startEngineUpdateChecks(');
     expect(body.length).toBeGreaterThan(0);
   });
 
@@ -74,8 +74,8 @@ describe('startClient resume reconciliation', () => {
  * the branch and the platform fix silently stops reaching the surfaces the user
  * actually taps. Same source-scan reasoning as the resume guard above.
  */
-describe('startClient external-link delegation', () => {
-  const body = handlerBody(readFileSync(SOURCE, 'utf8'), 'function onGlobalClick(');
+describe('the global click handler\'s external-link delegation', () => {
+  const body = handlerBody(readFileSync(resolve(here, 'globalClick.ts'), 'utf8'), 'function onGlobalClick(');
 
   it('bounds the handler rather than swallowing the whole effect', () => {
     expect(body).not.toContain('startAppUpdateProgress(');
@@ -273,6 +273,18 @@ describe('startShell runs when the shell chunk resolves', () => {
       expect(main).not.toContain(install);
     });
   }
+
+  it('subscribes to updater progress before deferring background checks', () => {
+    const body = handlerBody(client, 'export function startClient');
+    expect(body.indexOf('startAppUpdateProgress()')).toBeGreaterThan(-1);
+    expect(body.indexOf('startAppUpdateProgress()')).toBeLessThan(body.indexOf('startDeferredBackgroundChecks()'));
+    expect(body).toContain('provideReleaseCheck(async () => { backgroundChecks.refreshRelease(); })');
+    expect(shell).not.toContain('startAppUpdateProgress()');
+    const background = stripComments(readFileSync(resolve(dirname(SOURCE), 'backgroundChecks.ts'), 'utf8'));
+    expect(background).toContain('resumeUpdateRelay()');
+    expect(background).toContain('refreshReleaseCheck()');
+    expect(client).not.toContain('resumeUpdateRelay()');
+  });
 });
 
 /**

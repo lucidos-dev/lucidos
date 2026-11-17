@@ -58,6 +58,8 @@ async fn ask(bus: &EventBus, id: Uuid) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -69,6 +71,28 @@ fn find(rows: &[TriageRow], id: Uuid) -> &TriageRow {
     rows.iter()
         .find(|r| r.facts.thread_id == id)
         .unwrap_or_else(|| panic!("{id} should be a root"))
+}
+
+#[tokio::test]
+async fn completed_ids_exclude_discarded_and_home_rows() {
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let parent = spawn(&bus, None).await;
+    let child = spawn(&bus, Some(parent)).await;
+    let deleted = spawn(&bus, Some(parent)).await;
+    let home = crate::engine::home_thread::ensure_home_thread(&bus, &pool)
+        .await
+        .unwrap();
+    settle(&pool, child, "archive_state = 'inbox'").await;
+    settle(&pool, deleted, "state = 'discarded'").await;
+
+    let rows = load(&pool, TriageScope::CompletedIds(&[child, deleted, home]))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].facts.thread_id, child);
+
+    teardown_test_db(&db).await;
 }
 
 #[tokio::test]

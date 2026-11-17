@@ -116,6 +116,7 @@ async fn rebuild_missing_from_events_uses_latest_proposed_payload() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("latest desc".to_string()),
             files: vec!["x.rs".to_string(), "y.rs".to_string(), "z.rs".to_string()],
@@ -176,6 +177,7 @@ async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("d".to_string()),
             files: vec!["a.rs".to_string()],

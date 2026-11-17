@@ -25,6 +25,7 @@
 //! claim under the registry lock, and the loser writes nothing.
 
 use crate::core::shell::{command_shell, TaskOutcome};
+use crate::runtime::agent_sandbox::Sandbox;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::path::Path;
@@ -574,7 +575,8 @@ impl BackgroundBashRegistry {
             delivery: CompletionDelivery::EventWait,
             inherited: crate::core::InheritedSecrets::Keep,
         };
-        self.spawn_task(command, cwd, env, thread_id, spec).await
+        self.spawn_task(&Sandbox::unsandboxed(), command, cwd, env, thread_id, spec)
+            .await
     }
 
     /// Spawn a child process. Inserts the task into the registry before
@@ -596,6 +598,7 @@ impl BackgroundBashRegistry {
     /// polled task in between.
     pub async fn spawn_task(
         &self,
+        sandbox: &Sandbox,
         command: &str,
         cwd: &Path,
         env: &[(String, String)],
@@ -616,7 +619,7 @@ impl BackgroundBashRegistry {
         // Built through `command_shell()` so the command runs under `pipefail`
         // — without it a `… | tee build.log` reports tee's 0 and a failing
         // build reaches the LLM as a clean success. See `core::shell`.
-        let mut cmd = command_shell().command(command);
+        let mut cmd = command_shell().command(sandbox, command)?;
         cmd.current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -1447,23 +1450,6 @@ async fn drain_pipe<R: AsyncRead + Unpin + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Both exits, the drain window and the completion record, leave through
-    /// the one mask. Sibling of the scans in `bash.rs` and `python.rs`.
-    #[test]
-    fn both_background_exits_leave_through_the_secret_redaction() {
-        let src = crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/tools/bash_background.rs"),
-        );
-        assert!(src.contains("subprocess_secret_values(env,"));
-        assert_eq!(
-            src.matches("crate::core::redact_subprocess_output(")
-                .count(),
-            5,
-            "stdout and stderr at the drain and at the completion record, plus the progress tail"
-        );
-        assert!(!src.contains("redact_secret_values("));
-    }
 
     #[tokio::test]
     async fn spawn_returns_task_id_and_output_is_drainable() {
@@ -2397,7 +2383,12 @@ mod tests {
     async fn end_task_keeps_the_verdict_of_a_child_that_already_exited() {
         let dir = tempfile::tempdir().expect("tempdir");
         let done = dir.path().join("done");
-        let mut cmd = command_shell().command(&format!("touch {}; exit 3", done.display()));
+        let mut cmd = command_shell()
+            .command(
+                &Sandbox::unsandboxed(),
+                &format!("touch {}; exit 3", done.display()),
+            )
+            .expect("unsandboxed command");
         crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
         let mut child = cmd.spawn().expect("spawn");
         let pid = child.id();
@@ -3140,6 +3131,7 @@ mod tests {
         };
         let (polled, _rx1) = reg
             .spawn_task(
+                &Sandbox::unsandboxed(),
                 "sleep 30",
                 tmp,
                 &[],
@@ -3150,6 +3142,7 @@ mod tests {
             .expect("spawn");
         let (watched, _rx2) = reg
             .spawn_task(
+                &Sandbox::unsandboxed(),
                 "sleep 30",
                 tmp,
                 &[],
@@ -3183,6 +3176,7 @@ mod tests {
         };
         let (task_id, _rx) = reg
             .spawn_task(
+                &Sandbox::unsandboxed(),
                 "sleep 0.3",
                 std::path::Path::new("/tmp"),
                 &[],
@@ -3890,5 +3884,25 @@ mod tests {
             "exit code 141 (probable SIGPIPE)",
             "the 141 must be decoded, not left as a bare number"
         );
+    }
+
+    mod guard_tests {
+        /// Both exits, the drain window and the completion record, leave through
+        /// the one mask. Sibling of the scans in `bash.rs` and `python.rs`.
+        #[test]
+        fn both_background_exits_leave_through_the_secret_redaction() {
+            let src = crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root()
+                    .join("engine/tools/bash_background.rs"),
+            );
+            assert!(src.contains("subprocess_secret_values(env,"));
+            assert_eq!(
+                src.matches("crate::core::redact_subprocess_output(")
+                    .count(),
+                5,
+                "stdout and stderr at the drain and at the completion record, plus the progress tail"
+            );
+            assert!(!src.contains("redact_secret_values("));
+        }
     }
 }

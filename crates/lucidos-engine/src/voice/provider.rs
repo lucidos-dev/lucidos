@@ -99,6 +99,14 @@ pub enum VoiceEvent {
     /// The provider decided the caller stopped talking. Semantic or
     /// audio-native, never a silence timer we wrote (parent plan, decision 11).
     UserTurnEnded { transcript: String },
+    /// The rest of a sentence the talker already asked the doer about.
+    ///
+    /// The ask went out on what was heard by then, so these words reach the
+    /// seam after the turn they belong to was started. They are still the
+    /// caller's own, never something the talker said.
+    ///
+    /// A provider whose turn ends are stated before any ask never emits one.
+    UserTurnContinued { transcript: String },
     /// A piece of what the talker is saying, as it says it.
     TalkerTranscript { text: String },
     /// The talker called `delegate`: this needs the doer.

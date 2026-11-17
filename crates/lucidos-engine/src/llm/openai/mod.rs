@@ -94,7 +94,7 @@ pub fn resolve_openai_api_key(
                 }
             }
             other => {
-                log!(
+                log_legacy!(
                     "[Startup] OpenAI credential auth_type {} unsupported (expected api_key or bearer) — ignoring it and falling back to OPENAI_API_KEY / Codex CLI",
                     other
                 );
@@ -133,7 +133,7 @@ pub async fn openai_api_key(pool: &sqlx::PgPool) -> Option<(String, OpenAiKeySou
             .map(|secret| (c.auth_type, secret)),
         Ok(None) => None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[OpenAI] Could not read the '{}' credential: {}",
                 service,
                 e
@@ -203,6 +203,7 @@ pub(crate) enum OpenAiEndpoint {
 }
 
 pub struct OpenAiProvider {
+    provider_kind: crate::llm::ProviderKind,
     endpoint: OpenAiEndpoint,
     model: String,
     /// Full Chat Completions endpoint (`{base}/chat/completions`). Configurable
@@ -235,7 +236,14 @@ impl OpenAiProvider {
         api_key: String,
         model: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_base_url(api_key, model, OPENAI_DEFAULT_BASE_URL, Vec::new(), false)
+        Self::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
+            api_key,
+            model,
+            OPENAI_DEFAULT_BASE_URL,
+            Vec::new(),
+            false,
+        )
     }
 
     /// Build an OpenAI-compatible provider against an arbitrary `base_url`
@@ -245,6 +253,7 @@ impl OpenAiProvider {
     /// `extra_headers` ride every request; `force_chat_completions` pins the
     /// Chat Completions path for backends without a Responses API.
     pub fn new_with_base_url(
+        provider_kind: crate::llm::ProviderKind,
         api_key: String,
         model: String,
         base_url: &str,
@@ -258,6 +267,7 @@ impl OpenAiProvider {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
+            provider_kind,
             endpoint: OpenAiEndpoint::Platform { api_key },
             model,
             chat_url,
@@ -282,8 +292,14 @@ impl OpenAiProvider {
             )
             .into());
         }
-        let mut provider =
-            Self::new_with_base_url(String::new(), model, base_url, Vec::new(), false)?;
+        let mut provider = Self::new_with_base_url(
+            crate::llm::ProviderKind::ChatGptPlan,
+            String::new(),
+            model,
+            base_url,
+            Vec::new(),
+            false,
+        )?;
         let models_url = format!("{}/models", base_url.trim_end_matches('/'));
         provider.endpoint = OpenAiEndpoint::ChatGptPlan {
             access,
@@ -554,6 +570,13 @@ impl StreamMeta {
 
 #[async_trait]
 impl LlmProvider for OpenAiProvider {
+    fn resolved_provider_kind(
+        &self,
+        _selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Some(self.provider_kind))
+    }
+
     async fn chat(
         &self,
         messages: Vec<Message>,
@@ -656,6 +679,61 @@ async fn serve_recording(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn spend_caps_send_one_request_on_chat_and_responses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (force_chat, kind, status, body) in [
+            (
+                true,
+                crate::llm::ProviderKind::OpenRouter,
+                402,
+                "Payment required",
+            ),
+            (
+                false,
+                crate::llm::ProviderKind::OpenAi,
+                429,
+                r#"{"error":{"code":"insufficient_quota","message":"spent"}}"#,
+            ),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let seen = calls.clone();
+            let app = axum::Router::new().fallback(axum::routing::post(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async move { (axum::http::StatusCode::from_u16(status).unwrap(), body) }
+            }));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let provider = OpenAiProvider::new_with_base_url(
+                kind,
+                "key".into(),
+                "gpt-6.1-sol".into(),
+                &format!("http://{address}/v1"),
+                Vec::new(),
+                force_chat,
+            )
+            .unwrap();
+            let error = provider
+                .chat(
+                    Vec::new(),
+                    Vec::new(),
+                    ModelSelection::model("gpt-6.1-sol"),
+                    None,
+                    None,
+                    crate::llm::metered::CallToken::for_test(),
+                )
+                .await
+                .unwrap_err();
+            let cap = error
+                .downcast_ref::<crate::llm::spend_cap::SpendCapReached>()
+                .unwrap();
+            assert_eq!(cap.provider, kind);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            server.abort();
+        }
+    }
 
     /// Above-u32 token counts must clamp rather than panic — a single
     /// corrupt upstream usage block shouldn't tank the stream.
@@ -821,6 +899,7 @@ mod tests {
         assert_eq!(openai.responses_url, "https://api.openai.com/v1/responses");
 
         let local = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             String::new(),
             "llama3.1".to_string(),
             "http://localhost:11434/v1/", // trailing slash trimmed
@@ -901,6 +980,7 @@ mod tests {
         assert!(!openai.should_use_responses("gpt-4o"));
 
         let openrouter = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             "k".to_string(),
             "z-ai/glm-5.2".to_string(),
             "https://openrouter.ai/api/v1",
@@ -951,6 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn request_headers_omit_auth_when_keyless_and_include_extras() {
         let keyless = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             String::new(),
             "llama3.1".to_string(),
             "http://localhost:11434/v1",
@@ -965,6 +1046,7 @@ mod tests {
         );
 
         let openrouter = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             "sk-or".to_string(),
             "z-ai/glm-5.2".to_string(),
             "https://openrouter.ai/api/v1",

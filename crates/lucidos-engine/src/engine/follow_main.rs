@@ -1,7 +1,8 @@
 //! Following `origin`'s `main` (ADR 0589). Another gateway lands on `origin`,
 //! so this engine asks `origin` on an interval and fast-forwards local `main`
 //! to it. Only while its gateway holds a pairing: an unpaired engine lands
-//! local-first, and nobody else lands for it. A pulled version then builds in the background, and switching to it
+//! local-first, and nobody else lands for it. A pulled version builds in the background
+//! when automatic builds are enabled, and switching to it
 //! waits for a tap: nothing here ever restarts the engine.
 //!
 //! A paired gateway that just landed nudges this task through its gateway, so
@@ -28,6 +29,7 @@ pub(crate) trait FollowHost: Send + Sync + 'static {
     /// The repository whose `main` follows `origin`.
     fn follow_repo(&self) -> &Path;
     async fn follow_interval(&self) -> Duration;
+    async fn automatic_builds_enabled(&self) -> bool;
     /// Origin-first while the gateway holds a pairing. Asked every round.
     async fn landing_order(&self) -> LandingOrder;
     /// Wakes the task before the interval runs out.
@@ -38,6 +40,9 @@ pub(crate) trait FollowHost: Send + Sync + 'static {
     fn start_build(self: &Arc<Self>);
     /// Tell the user why `main` could not follow `origin`.
     async fn follow_refused(&self, reason: String);
+    /// Record that `main` followed `origin`, which the main check reads as a
+    /// landing.
+    async fn main_followed(&self, from: String, to: String);
 }
 
 /// What the follow task remembers between rounds, so a lasting refusal or
@@ -54,20 +59,23 @@ impl Follower {
             FollowOutcome::NoOrigin => return,
             FollowOutcome::Unreachable(why) => {
                 if self.unreachable.as_ref() != Some(&why) {
-                    log!("[FollowMain] origin did not answer: {}", why);
+                    log_legacy!("[FollowMain] origin did not answer: {}", why);
                 }
                 self.unreachable = Some(why);
                 return;
             }
             FollowOutcome::UpToDate => self.refused = None,
             FollowOutcome::Followed { from, to } => {
-                log!("[FollowMain] main followed origin from {} to {}", from, to);
+                log_legacy!("[FollowMain] main followed origin from {} to {}", from, to);
                 self.refused = None;
-                host.start_build();
+                host.main_followed(from, to).await;
+                if host.automatic_builds_enabled().await {
+                    host.start_build();
+                }
             }
             FollowOutcome::Refused(why) => {
                 if self.refused.as_ref() != Some(&why) {
-                    log!("[FollowMain] main could not follow origin: {}", why);
+                    log_legacy!("[FollowMain] main could not follow origin: {}", why);
                     host.follow_refused(why.clone()).await;
                 }
                 self.refused = Some(why);
@@ -99,7 +107,7 @@ pub(crate) async fn follow_round<H: FollowHost>(host: &Arc<H>, follower: &mut Fo
         }
         // A landing that waited for `origin` or the gateway now lands locally.
         LandingOrder::LocalFirst => host.origin_answered(),
-        LandingOrder::Unknown(why) => log!("[FollowMain] skipped a round: {}", why),
+        LandingOrder::Unknown(why) => log_legacy!("[FollowMain] skipped a round: {}", why),
     }
 }
 
@@ -114,6 +122,12 @@ pub(crate) async fn wait_for_next_round<H: FollowHost>(host: &H) {
 }
 
 impl LucidosEngine {
+    /// Read the workspace policy for every automatic build decision. Explicit
+    /// builds and local Apply deliberately do not use this gate.
+    pub(crate) async fn automatic_source_builds_enabled(&self) -> bool {
+        automatic_source_builds_enabled(self.pool()).await
+    }
+
     /// Start following `origin`'s `main`. A packaged install follows
     /// releases instead, so it starts nothing.
     pub fn start_follow_main(self: &Arc<Self>) {
@@ -130,6 +144,10 @@ impl LucidosEngine {
     }
 }
 
+async fn automatic_source_builds_enabled(pool: &sqlx::PgPool) -> bool {
+    prefs::FOLLOW_MAIN_BUILD.read(pool).await == "auto"
+}
+
 #[async_trait::async_trait]
 impl FollowHost for LucidosEngine {
     fn follow_repo(&self) -> &Path {
@@ -139,6 +157,10 @@ impl FollowHost for LucidosEngine {
     async fn follow_interval(&self) -> Duration {
         let minutes = prefs::FOLLOW_MAIN_INTERVAL_MINUTES.read(self.pool()).await;
         Duration::from_secs_f64(minutes * 60.0)
+    }
+
+    async fn automatic_builds_enabled(&self) -> bool {
+        self.automatic_source_builds_enabled().await
     }
 
     async fn landing_order(&self) -> LandingOrder {
@@ -165,6 +187,19 @@ impl FollowHost for LucidosEngine {
                     reason,
                 }),
                 "[FollowMain] MainFollowRefused",
+            )
+            .await;
+    }
+
+    async fn main_followed(&self, from: String, to: String) {
+        self.event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::MainFollowed {
+                    repo: self.repo_root().display().to_string(),
+                    from_sha: from,
+                    to_sha: to,
+                }),
+                "[FollowMain] MainFollowed",
             )
             .await;
     }

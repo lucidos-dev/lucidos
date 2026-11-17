@@ -17,22 +17,26 @@ mod command_checkpoint;
 mod command_permission;
 pub(crate) mod credential_reveal;
 mod data_api;
+mod diagnostic_bundles;
+mod diagnostic_snapshot;
 pub(crate) mod diff;
 mod disk_usage;
 pub mod engine_socket;
 pub(crate) mod error;
 mod file_response;
-mod follow_main;
 mod fonts;
 mod form_requests;
 mod frame_capability;
 mod frame_file_cors;
 mod frontend_preview;
 pub(crate) mod frontend_snapshot;
+mod gateway_signals;
+pub mod gateway_stamp;
 pub(crate) mod handshake_scripts;
 pub(crate) mod hex;
 mod history;
 mod intelligence_ladder;
+mod internal_faults;
 mod snapshots;
 pub(crate) use history::{ROUTE_FRAMES, SSE_KEEPALIVE_EVENT, SSE_KEEPALIVE_INTERVAL};
 #[cfg(test)]
@@ -50,13 +54,14 @@ mod model_prices;
 pub(crate) mod mutating_gate;
 mod notifications;
 mod onepassword;
-mod operators;
 mod recall;
 mod restore_generation;
 #[cfg(test)]
 pub(crate) mod route_scan;
 mod side_questions;
+mod spend_cap_holds;
 mod themes;
+mod users;
 
 /// Where every `/api/v1` route is mounted, as one value.
 ///
@@ -64,8 +69,11 @@ mod themes;
 /// `MatchedPath`, which reports the FULL path a nest resolved to. Two copies
 /// would let a prefix change refuse every exempt route instead.
 pub(crate) const API_V1_PREFIX: &str = "/api/v1";
-pub(crate) mod owner_approval;
-mod people_messages;
+mod gateway_control;
+mod host_log_transfer;
+pub(crate) mod owner_door;
+pub(crate) mod permission_requests;
+mod permissions;
 mod plugin_media;
 mod plugins;
 mod presence;
@@ -98,18 +106,22 @@ mod settings;
 pub mod sse_connections;
 pub(crate) mod standing_instruction;
 pub(crate) mod target_workspace;
-mod thread_people;
 mod thread_queue;
 pub(crate) mod thread_reach;
+mod thread_users;
 pub(crate) mod threads;
 mod threads_compose;
 mod trigger_groups;
 mod triggers;
+mod user_only_messages;
 mod voice;
 pub(crate) mod voice_ticket;
 mod webhooks;
 mod widgets;
+pub(crate) mod workspace_broker;
+mod workspace_calls;
 mod workspace_label;
+mod workspace_list;
 mod workspace_prompt_footprint;
 mod ws_echo;
 
@@ -441,16 +453,18 @@ pub struct AppState {
     /// Live one-shot call tickets, the voice socket's caller proof.
     /// Ephemeral by design; see `api::voice_ticket`.
     pub call_tickets: voice_ticket::CallTickets,
+    /// The `/api/v1` router, for replaying an act the owner allowed once.
+    pub door_router: owner_door::DoorRouter,
 }
 
 /// App context sent when an app UI is open — tells the LLM which app is active.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppContext {
     pub app_id: String,
 }
 
 /// File context sent when a file preview window is focused
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileContext {
     pub path: String,
     /// Inclusive 1-based line range the user has selected in the preview, when
@@ -460,7 +474,7 @@ pub struct FileContext {
 }
 
 /// Repo file context sent when the user is viewing a file from a registered repo
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoFileContext {
     pub repo_id: String,
     pub path: String,
@@ -509,7 +523,7 @@ impl ChatImage {
         let raw = match base64::engine::general_purpose::STANDARD.decode(&self.base64) {
             Ok(bytes) => bytes,
             Err(e) => {
-                crate::log!("[Image] base64 decode failed, skipping compression: {}", e);
+                crate::log_legacy!("[Image] base64 decode failed, skipping compression: {}", e);
                 return self;
             }
         };
@@ -517,7 +531,7 @@ impl ChatImage {
         let img = match image::load_from_memory(&raw) {
             Ok(img) => img,
             Err(e) => {
-                crate::log!("[Image] image decode failed, skipping compression: {}", e);
+                crate::log_legacy!("[Image] image decode failed, skipping compression: {}", e);
                 return self;
             }
         };
@@ -543,7 +557,7 @@ impl ChatImage {
         // Encode as JPEG — always, even if already JPEG (re-encoding normalizes quality)
         let mut jpeg_buf = std::io::Cursor::new(Vec::new());
         if let Err(e) = img.write_to(&mut jpeg_buf, image::ImageFormat::Jpeg) {
-            crate::log!("[Image] JPEG encoding failed: {}", e);
+            crate::log_legacy!("[Image] JPEG encoding failed: {}", e);
             return self;
         }
 
@@ -564,7 +578,7 @@ impl ChatImage {
             scale *= 0.7;
         }
 
-        crate::log!(
+        crate::log_legacy!(
             "[Image] {}x{} ({} KB) → {}x{} ({} KB)",
             orig_w,
             orig_h,
@@ -626,7 +640,7 @@ pub struct AppCaptureRequest {
     pub dom: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
     /// Mandatory. Semantic mode of the actor that authored this message —
@@ -692,6 +706,10 @@ pub struct ChatRequest {
     pub input_chain: Option<String>,
     #[serde(default)]
     pub input_seq: Option<i64>,
+    /// Compose epoch captured with the device's send intent. An accepted
+    /// retry retains this value; it is never refreshed from today's draft.
+    #[serde(default)]
+    pub compose_epoch: Option<i64>,
     /// `true` when `thread_id` names a thread that is EXPECTED not to exist yet,
     /// because this request is the one creating it.
     ///
@@ -772,9 +790,9 @@ pub struct ChatRequest {
     /// `mode=human` send cannot carry it and gets a 400.
     #[serde(default)]
     pub integrated: bool,
-    /// *Person mentions*, by operator id (ADR 0649). A message mentioning only
-    /// people pauses the agent and starts no turn. A gateway with fewer than
-    /// two people refuses a non-empty list.
+    /// *User mentions*, by user id (ADR 0649). A message mentioning only
+    /// users pauses the agent and starts no turn. A gateway with fewer than
+    /// two users refuses a non-empty list.
     #[serde(default)]
     pub mentions: Vec<String>,
     /// The *agent mention*: the message wakes the thread's agent, and resumes
@@ -783,8 +801,8 @@ pub struct ChatRequest {
     pub agent_mentioned: bool,
 }
 
-/// Body of `POST /api/v1/chat/cancel` and the default (Stop) mode of
-/// `POST /api/v1/claude-code/stop`. `canceled = true` when the call canceled
+/// Body of the default (Stop) mode of `POST /api/v1/claude-code/stop`.
+/// `canceled = true` when the call canceled
 /// live work, settled a stuck `running` projection, or cancel-stamped a pending
 /// question — i.e. a status-changing event is on its way over SSE. `false` when
 /// the server had nothing to cancel: the client's optimistic "canceling" state
@@ -793,6 +811,17 @@ pub struct ChatRequest {
 #[derive(Serialize)]
 pub struct CancelResponse {
     pub canceled: bool,
+}
+
+/// Chat Stop persists unread-input take-backs before canceling the live turn.
+/// `canceled` describes the live cancellation only; an input taken back with
+/// no live turn still needs an immediate client re-sync. Returned content lets
+/// another device restore inputs absent from its local timeline.
+#[derive(Serialize)]
+pub struct ChatCancelResponse {
+    pub canceled: bool,
+    #[serde(flatten)]
+    pub take_back: crate::engine::consumption_claim::TakeBackReport,
 }
 
 #[derive(Serialize)]
@@ -1445,7 +1474,7 @@ async fn request_logger(req: axum::extract::Request, next: Next) -> Response {
     let status = response.status().as_u16();
     let elapsed = start.elapsed();
 
-    log!("[API] {} {} → {} ({:.0?})", method, path, status, elapsed);
+    log_legacy!("[API] {} {} → {} ({:.0?})", method, path, status, elapsed);
 
     response
 }
@@ -1516,6 +1545,9 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
     }
 }
 
+/// The largest request body any `/api/v1` route buffers.
+pub(crate) const API_BODY_LIMIT: usize = 100 * 1024 * 1024;
+
 // Top-level wiring helper that takes every engine subsystem the router needs;
 // reducing it would force the call site to thread the same set into a holder.
 #[allow(clippy::too_many_arguments)]
@@ -1570,6 +1602,7 @@ pub fn create_router(
         pending_oauth_flows: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         reveal_tokens: secret_reveal::RevealTokens::new(),
         call_tickets: voice_ticket::CallTickets::new(),
+        door_router: owner_door::DoorRouter::default(),
     };
 
     // Serve static files from the data/ tree. One mount covers every
@@ -1603,12 +1636,14 @@ pub fn create_router(
         .merge(chatgpt_plan::router())
         .merge(intelligence_ladder::router())
         .merge(model_prices::router())
+        .merge(spend_cap_holds::router())
         .merge(side_questions::router())
-        .merge(owner_approval::router())
+        .merge(permission_requests::router())
+        .merge(permissions::router())
         .merge(threads::router())
         .merge(changes::router())
         .merge(main_check::router())
-        .merge(follow_main::router())
+        .merge(gateway_signals::router())
         .merge(notifications::router())
         .merge(artifacts::router())
         .merge(settings::router())
@@ -1650,11 +1685,16 @@ pub fn create_router(
         .merge(plugins::router())
         .merge(plugin_media::router())
         .merge(webhooks::router())
-        .merge(thread_people::router())
-        .merge(people_messages::router())
+        .merge(thread_users::router())
+        .merge(user_only_messages::router())
         .merge(config_changes::router())
-        .merge(operators::router())
+        .merge(users::router())
+        .merge(workspace_calls::router())
+        .merge(diagnostic_bundles::router())
         .merge(workspace_label::router())
+        .merge(workspace_list::router())
+        .merge(workspace_broker::router())
+        .merge(host_log_transfer::router())
         .merge(workspace_prompt_footprint::router())
         .merge(handshake_scripts::router())
         .merge(proxy::router())
@@ -1664,7 +1704,7 @@ pub fn create_router(
         // "Failed to buffer the request body". `Router::layer` only covers
         // routes registered before the call, so this is applied after every
         // domain merge to guarantee it reaches all routes.
-        .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(API_BODY_LIMIT))
         // Compress JSON responses (br/gzip per Accept-Encoding). The thread
         // events snapshot (`GET /threads/:id/events`) ships the full event
         // history uncompressed today — a heavy coding-agent thread is multiple
@@ -1676,6 +1716,13 @@ pub fn create_router(
         // `compression_predicate` extends it to leave media alone, which is what
         // keeps `Accept-Ranges` on a data-file response.
         .layer(CompressionLayer::new().compress_when(compression_predicate()))
+        // Park an unattested caller's knock on an owner-only door until the
+        // owner allows it once. Inside the identity gate below, so a caller
+        // with no identity at all is refused first. See `api::owner_door`.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            owner_door::park_unattested_acts,
+        ))
         // Refuse a mutating request carrying no identity (401). Layered here
         // for the same reason the workspace check below is: a write nobody can
         // be attributed to is a hazard on every mutating endpoint, and a
@@ -1717,7 +1764,15 @@ pub fn create_router(
             state.clone(),
             target_workspace::enforce_target_workspace,
         ))
-        .with_state(state);
+        // Read a gateway stamp's age before any body arrives
+        // (`api::gateway_stamp::note_arrival`).
+        .layer(axum::middleware::from_fn(gateway_stamp::note_arrival))
+        .layer(axum::middleware::from_fn_with_state(
+            lucidos_diagnostic_log::fault::Inbox::new(&state.workspace_path),
+            internal_faults::observe,
+        ))
+        .with_state(state.clone());
+    state.door_router.set(api_routes.clone());
 
     // Refuse a browser request that came from another origin (403), in front of
     // everything. An engine binds loopback, so its remaining browser-shaped
@@ -1731,7 +1786,7 @@ pub fn create_router(
     // its own copy of the check for that case, since a credentialed route must
     // refuse even then. See `api::browser_origin`.
     let api_routes = if permissive_cors_enabled() {
-        crate::log!("[API] permissive CORS is on, so the same-origin gate is off with it");
+        crate::log_legacy!("[API] permissive CORS is on, so the same-origin gate is off with it");
         api_routes
     } else {
         api_routes.layer(axum::middleware::from_fn(browser_origin::enforce))

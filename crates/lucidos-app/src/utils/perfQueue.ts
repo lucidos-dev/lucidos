@@ -4,7 +4,7 @@
  *  request for many samples instead of one POST per sample — which the engine
  *  appends to its log as `[Client/perf] …` lines. Greppable, no DB / no
  *  events-table rows (the bloat we deliberately avoid). Under the gateway that
- *  log is `~/.lucidos/gateway/gateway.log`: see `docs/client-logs.md`.
+ *  log is `gateway.log` in the gateway data dir: see `docs/client-logs.md`.
  *
  *  Strictly fire-and-forget: a flush failure, an unreachable engine, or a
  *  teardown mid-flight must never throw into or block the app — telemetry is a
@@ -25,7 +25,7 @@
  *  `storage` event fires only for OTHER documents. Prefer the toggle. */
 
 // Straight from `basePath` rather than through the `api/client` barrel. This
-// module is on the boot path (`utils/perfProbe` takes it at startup) and needs
+// module is on the boot path (`utils/mainThreadStall` takes it at startup) and needs
 // one constant, which `api/client/_core.ts` only re-exports from here anyway.
 // Same reasoning as `utils/clientLog.ts`, which stays a leaf for it.
 import { API } from './basePath';
@@ -209,7 +209,7 @@ export function flushPerfQueue(keepalive = false): void {
   if (buffer.length === 0) return;
   const batch = buffer;
   buffer = [];
-  const samples = batch.map((s) => ({ category: 'perf', message: s.message, data: s.data }));
+  const samples = batch.map((s) => ({ category: 'perf', code: s.message, message: s.message, data: s.data }));
   try {
     fetch(`${API}/internal/client-logs`, {
       method: 'POST',

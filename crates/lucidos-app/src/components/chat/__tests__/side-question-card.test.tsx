@@ -103,9 +103,9 @@ it('says Thinking only after a delay while pending, shimmering like the live ste
 });
 
 it('shows a failure as an alert', () => {
-  show([{ ...asked, id: 'a', question: 'q', status: 'failed', error: 'Side questions are not available in Codex threads.' }]);
+  show([{ ...asked, id: 'a', question: 'q', status: 'failed', error: 'Update Codex to use ephemeral side-question forks.' }]);
   const alert = host.querySelector('[role="alert"]')!;
-  expect(alert.textContent).toBe('Side questions are not available in Codex threads.');
+  expect(alert.textContent).toBe('Update Codex to use ephemeral side-question forks.');
 });
 
 it('offers Retry on a failure only, and turns the card back to Thinking in place', () => {

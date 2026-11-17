@@ -1,3 +1,4 @@
+import { LucidosGlyph } from '../shared/LucidosMark';
 import type { ComponentChildren, RefObject } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
@@ -13,7 +14,7 @@ import { ThreadFilterCover } from './ThreadFilterCover';
 import { LeavingViewSnapshot, type LeavingDrawing } from './LeavingViewDrawing';
 import { focusPane, showThreadList } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
-import { handleArchiveAll } from '../../store/actions/archive-all';
+import { archiveAllPhase, handleArchiveAll } from '../../store/actions/archive-all';
 import { landingGroupFor, openListedThread, openOngoingThread } from '../../store/actions/event-navigation';
 import { preferencesSettled } from '../../store/actions/preferences';
 import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
@@ -1417,10 +1418,13 @@ function DrawerSectionTitle({ navKey, title, Icon, count, hasRunning, collapsed,
 /** Archive all (ADR 0349), on the Current header under Folders. Its click is
  *  its own: it never also toggles the header underneath it. */
 function ArchiveAllButton() {
+    const phase = archiveAllPhase.value;
+    const label = { idle: 'Archive all', checking: 'Checking…', confirming: 'Awaiting confirmation…', archiving: 'Archiving…' }[phase];
     return (
         <button type="button" class="drawer-archive-all"
+                disabled={phase !== 'idle'} aria-busy={phase === 'checking' || phase === 'archiving'}
                 onClick={(e) => { e.stopPropagation(); void handleArchiveAll(); }}>
-            Archive all
+            {label}
         </button>
     );
 }
@@ -1438,7 +1442,7 @@ const AGENT_GLYPHS: Record<AgentGlyph, () => VNode> = {
     claude: () => <ClaudeIcon />,
     codex: () => <CodexIcon />,
     trigger: () => <CategoryIcon category="triggers" />,
-    lucidos: () => <LucidosMarkIcon />,
+    lucidos: () => <><LucidosMarkIcon /><LucidosGlyph /></>,
 };
 
 /** A coding-agent thread that ran on several backends draws one mark each. */
@@ -2026,7 +2030,8 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
      *  Folders tree sets it, where the row is not already the thread's place. */
     offerShowInFolders?: boolean;
     /** What a tap on the row does. Blocked and Review land on what needs the
-     *  user (`openOngoingThread`); every other list opens the thread as it was. */
+     *  user unless the saved place has reached it (`openOngoingThread`); every
+     *  other list opens the thread as it was. */
     onOpen?: (threadId: string) => void;
 }) {
     // Signal reads stay here so each row's subscription set is narrow. The row
@@ -2193,6 +2198,8 @@ function OngoingList() {
         if (filter !== ongoingFilterChoice.value) setOngoingFilterChoice('all');
     }, [filter]);
     const rowIds = rows.map(n => n.thread.meta.id);
+    // Empty messages roll with the list rather than appearing over departing rows.
+    const emptyId = hydrated && rows.length === 0 ? `ongoing-empty-${selected}` : null;
     const landing = landingGroupFor('ongoing', selected);
     const openRow = landing ? (id: string) => openOngoingThread(id, landing) : focusThread;
 
@@ -2203,7 +2210,7 @@ function OngoingList() {
     const navKey = `${selected}:${rowIds.join(',')}`;
     usePublishedNavNodes(() => navList, navKey);
 
-    useFlipTransitions(containerRef, [{ name: 'ongoing', ids: [ONGOING_TILES_FLIP_ID, ...rowIds] }], 'ongoing', [selected, filter]);
+    useFlipTransitions(containerRef, [{ name: 'ongoing', ids: [ONGOING_TILES_FLIP_ID, ...rowIds, ...(emptyId ? [emptyId] : [])] }], 'ongoing', [selected, filter]);
 
     return (
         <div ref={containerRef} class="thread-drawer-rows ongoing-grouping">
@@ -2222,7 +2229,7 @@ function OngoingList() {
                     offerShowInFolders
                     onOpen={openRow}
                 />)}
-            {hydrated && rows.length === 0 && <div class="empty-state">{ONGOING_GROUP_META[selected].empty}</div>}
+            {emptyId && <div key={emptyId} class="empty-state" data-flip-id={emptyId}>{ONGOING_GROUP_META[selected].empty}</div>}
         </div>
     );
 }

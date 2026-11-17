@@ -92,9 +92,21 @@ fn pins() -> Vec<Pin> {
         },
         Pin {
             file: "crates/lucidos-app/e2e/db-helpers.ts",
-            before: "join(homedir(), '.lucidos', '".into(),
-            after: "')",
+            before: "const entry = '".into(),
+            after: "';",
             value: SHARED_PG_PASSWORD_FILE.into(),
+        },
+        Pin {
+            file: "crates/lucidos-app/e2e/db-helpers.ts",
+            before: "join(homedir(), '".into(),
+            after: "')",
+            value: lucidos_home::HOME_DIR_NAME.into(),
+        },
+        Pin {
+            file: "crates/lucidos-app/e2e/db-helpers.ts",
+            before: "join(home, '".into(),
+            after: "', entry)",
+            value: lucidos_home::private::DIR_NAME.into(),
         },
         Pin {
             file: "README.md",

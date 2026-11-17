@@ -1,12 +1,14 @@
 /** Route whatever's in `window.location.hash` to the right handler, then strip
  *  the consumed state so a refresh doesn't re-fire.
  *
- *  Three channels coexist in the hash:
+ *  Four channels coexist in the hash:
  *  - Bare `#notifications` (cross-workspace landing channel, see
  *    `utils/workspaceLanding.ts`) → the notifications view. Matched FIRST,
  *    because `notification` is a prefix of it.
  *  - Bare `#thread=<uuid>` (cross-workspace landing channel — see
  *    `openThreadInWorkspace`) → focusThreadOrBootstrap.
+ *  - Bare `#app=<id>[&fragment=…]` (a remote workspace's app popout, see
+ *    `appHash.ts`) → openAppById, then pseudo-fullscreen.
  *  - `#notification=…&thread=…&event=…&tap=…` (Safari's declarative-push
  *    navigate target, the SW client.navigate after a push tap, or a
  *    hand-typed deep link) → dispatchDeepLink.
@@ -27,7 +29,9 @@
  *  its hash is still in the URL. */
 import { focusThreadOrBootstrapResult } from './threads';
 import { switchMenuItem } from './menu';
-import { THREAD_HASH_RE } from './cross-workspace';
+import { THREAD_HASH_RE } from './threadHash';
+import { parseAppLandingHash } from './appHash';
+import { openAppById } from './apps';
 import {
   parseDeepLinkFromUrl,
   hasDeepLinkParams,
@@ -35,7 +39,8 @@ import {
 } from './notification-deeplink';
 import { dispatchDeepLink } from './in-app-notification-toast';
 import { postClientLog } from '../../utils/liveness';
-import { showToast } from '../store';
+import { appPseudoFullscreen, showToast, wipPreviewThreadId } from '../store';
+import { replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 
 /** Backoff between landing attempts, in ms. One attempt runs before the first
@@ -133,6 +138,28 @@ export function handleHashLocation(): void {
     // switch cannot lose a race with a lazy-starting engine.
     switchMenuItem('notifications');
     stripConsumedHash();
+    return;
+  }
+  const appLanding = parseAppLandingHash(window.location.hash);
+  if (appLanding) {
+    postClientLog('deeplink', 'route_app_hash', { app: appLanding.appId });
+    // Consumed before the open, so a resume mid-load cannot open it twice.
+    // `openAppById` retries a cache miss and toasts its own failures.
+    stripConsumedHash();
+    void openAppById(appLanding.appId, 'a popout link', appLanding.fragment)
+      .then(opened => {
+        if (!opened) return;
+        // The tab seeds its history from the opener, which may have been
+        // previewing a WIP of this app. The popout shows the live app (ADR 0726).
+        if (wipPreviewThreadId.value !== null) {
+          wipPreviewThreadId.value = null;
+          replaceNavState();
+        }
+        appPseudoFullscreen.value = true;
+      })
+      .catch(err => {
+        showToast(`Failed to open app "${appLanding.appId}": ${errorDetail(err)}`, 'error');
+      });
     return;
   }
   const hashMatch = THREAD_HASH_RE.exec(window.location.hash);

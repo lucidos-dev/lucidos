@@ -1,3 +1,5 @@
+import { setAppUpdateProgressHandler } from './appUpdateProgressEvents';
+export { startAppUpdateProgress, stopAppUpdateProgress } from './appUpdateProgressEvents';
 import { showToast, removeToast, clientOfferedRelease, latestTauriAppNotes, appUpdateCheckError, appUpdateCheckInFlight, appUpdateProgress, lucidosRelease, relayedUpdate, releaseCheck, settingsScrollTarget } from '../store';
 import { isNewerVersion } from '../../utils/version';
 import type { ToastAction } from '../types';
@@ -13,8 +15,6 @@ import { requestUpdateRelay, requestUpdateCheck } from '../../api/client/control
 import {
   checkAppUpdate,
   installAppUpdateAndRestart,
-  listen,
-  APP_UPDATE_PROGRESS_EVENT,
   type AppUpdateOffer,
   type AppUpdateProgress,
 } from '../../utils/tauri';
@@ -50,15 +50,7 @@ const RELAY_DID_NOT_RUN =
   'The desktop app did not run the update. Make sure Lucidos is open on that Mac, then try again.';
 
 let installing = false;
-/** Unsubscribe for the progress event, or `null` when not subscribed. */
-let unlistenProgress: (() => void) | null = null;
-/** Guards the async gap in {@link startAppUpdateProgress} so remounting
- *  (reload, workspace switch, restart-reconnect) can't register a second
- *  listener while the first `listen` call is still in flight. */
-let subscribing = false;
-/** The version this window has already toasted about, so a repeat refresh does
- *  not raise a second offer for the same release. The same dedupe the plugin
- *  marketplace scan keeps in `plugin-update-notice.json`, one layer up. */
+/** The release this window has already offered, to avoid duplicate toasts. */
 let lastOfferedVersion: string | null = null;
 /** The user-initiated check in flight, or `null`. Holding the PROMISE is what
  *  makes a second caller join the first rather than race it: a bare boolean
@@ -184,42 +176,6 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
   // the narration. Now that the narration is a dialog, the offer would sit
   // behind it, still inviting a click on an update already running.
   removeToast(UPDATE_TOAST_KEY);
-}
-
-/** Subscribe to the Rust updater's progress stream. Idempotent across remounts;
- *  Tauri-only. Carries no timer: the CHECK lives in the gateway (ADR 0108) and
- *  this is only the narration for an install the user started.
- *
- *  Best-effort (frontend.md carve-out): this runs at startup without user intent,
- *  and a failed subscription costs the narration, not the update — the install
- *  action's own error toast and System > Overview still report outcomes. It
- *  leaves itself unsubscribed on failure, so the next mount retries. */
-export function startAppUpdateProgress(): void {
-  if (!isTauri()) return;
-  void subscribeToAppUpdateProgress();
-}
-
-async function subscribeToAppUpdateProgress(): Promise<void> {
-  if (unlistenProgress || subscribing) return;
-  subscribing = true;
-  try {
-    unlistenProgress = await listen<AppUpdateProgress>(
-      APP_UPDATE_PROGRESS_EVENT,
-      (e) => { handleAppUpdateProgress(e.payload); },
-    );
-  } catch (e) {
-    console.warn('[app-update] progress subscription failed; retried on next mount', e);
-  } finally {
-    subscribing = false;
-  }
-}
-
-/** Drop the progress subscription (startup cleanup). */
-export function stopAppUpdateProgress(): void {
-  if (unlistenProgress) {
-    unlistenProgress();
-    unlistenProgress = null;
-  }
 }
 
 /** Ask the GATEWAY whether a newer Lucidos is published, and record the answer.
@@ -632,3 +588,5 @@ function handleRelayNews(news: RelayNews): void {
     showToast(RELAY_DID_NOT_RUN, 'error', { key: UPDATE_TOAST_KEY });
   }
 }
+
+setAppUpdateProgressHandler(handleAppUpdateProgress);

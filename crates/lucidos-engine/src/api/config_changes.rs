@@ -38,8 +38,15 @@ async fn undo(
     };
     if let config_change::ConfigUndo::WriteTrigger { trigger_id, .. } = &undo {
         let current = state.scheduler.lock().await.get_trigger_config(trigger_id);
-        super::triggers::refuse_unowned_grant(&headers, undo.needs_the_owner(current.as_ref()))
-            .map_err(|e| ApiError::new(StatusCode::FORBIDDEN, e))?;
+        let name = current
+            .as_ref()
+            .map_or(trigger_id.as_str(), |c| c.name.as_str());
+        super::triggers::refuse_unowned_grant(
+            &headers,
+            name,
+            undo.needs_the_owner(current.as_ref()),
+        )
+        .map_err(|e| ApiError::new(StatusCode::FORBIDDEN, e))?;
     }
     let applied = config_change::apply_undo(&state.engine.undo_targets(), event_id, undo, actor)
         .await

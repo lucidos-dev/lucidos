@@ -45,6 +45,7 @@ function RungLabel({ shown }: { shown: ShownRung }) {
       {shown.intelligence && <span class="rung-intelligence">{shown.intelligence}</span>}
       <span class="rung-name">{shown.name}</span>
       {shown.effort && <span class="rung-effort">{` · ${shown.effort}`}</span>}
+      {shown.nextTurn && <span class="rung-next-turn" aria-hidden="true">*</span>}
     </span>
   );
 }
@@ -52,12 +53,14 @@ function RungLabel({ shown }: { shown: ShownRung }) {
 /** The pair in full, which the label may cut short with an ellipsis. */
 function pairName(shown: ShownRung | null): string {
   if (!shown) return 'Model and effort';
+  if (shown.nextTurn) return `Running: ${shown.name}${shown.effort ? ` · ${shown.effort}` : ''}. Next turn: ${shown.nextTurn}`;
   return shown.effort ? `${shown.name} · ${shown.effort}` : shown.name;
 }
 
 /** The accessible name for the part that opens the list. */
 function openLabel(shown: ShownRung | null): string {
   if (!shown) return 'Choose model and effort';
+  if (shown.nextTurn) return `${pairName(shown)}. Choose another`;
   const rung = shown.position ? `, rung ${shown.position.at} of ${shown.position.of}` : '';
   return shown.effort
     ? `Model and effort: ${shown.name}, ${shown.effort}${rung}. Choose another`

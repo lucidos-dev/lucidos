@@ -222,7 +222,7 @@ impl crate::engine::LucidosEngine {
         let mut pending = read_pending_wake(&self.pool, thread_id, keep_warm_waits(live.clone()))
             .await
             .unwrap_or_else(|e| {
-                crate::log!("[ExpectedWake] Pending work of {thread_id} unreadable: {e}");
+                crate::log_legacy!("[ExpectedWake] Pending work of {thread_id} unreadable: {e}");
                 None
             })?;
         let durations = self.keep_alive_durations.current();

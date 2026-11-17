@@ -17,6 +17,9 @@ so it adds no row to the receipts.
 
 ## Checks
 
+- Check database-write recipes against `system-knowhow/best-practices` § The workspace database.
+  Apply `system-knowhow/workspace-audit/scripts`' table-policy check to fenced code examples too.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Per `docs/taxonomy.md` (frontmatter shape) and `system-knowhow/best-practices.md` (file placement):
@@ -32,3 +35,8 @@ Per `docs/taxonomy.md` (frontmatter shape) and `system-knowhow/best-practices.md
 - **Orphaned files under `data/knowhow/`**: a file no consumer names is potentially dead. Its id appears in NO trigger's stale `run.knowhow` (see the `triggers` section), NO intent's `knowhow:` frontmatter (see the `intents` section), and NO app `manifest.json`/`config/*.json`. The usual cause is a trigger that lost `run.knowhow` when the preload was retired, with the content never moved into its intent. Recommend one fix: (a) inline the procedure into a trigger's intent, (b) move the file into `data/triggers/<slug>/knowhow/` if trigger-specific, or (c) delete it. Severity: **stale** (review). Reference: `system-knowhow/triggers.md`.
 
 Knowhow bodies also carry pre-proxy API patterns. Run the `cross-cutting` section's credential check over the fenced code blocks here too. Knowhow is where a leak *spreads*: it tells the next session how to call the API, so the finding returns after the code is clean.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

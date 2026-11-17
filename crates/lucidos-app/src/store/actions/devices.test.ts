@@ -689,6 +689,16 @@ describe('turnDeviceName', () => {
     expect(mod.turnDeviceName('phone-1')).toBe('');
   });
 
+  it('keeps an unknown claimed device unnamed while resolving known claims', async () => {
+    const { mod } = await load();
+    mod.devices.value = { status: 'loaded', data: [] };
+    expect(mod.turnDeviceName('typed-id', { knownOnly: true })).toBe('');
+    mod.devices.value = {
+      status: 'loaded', data: [{ ...makeDevice('phone-1', true), name: 'My phone' }],
+    };
+    expect(mod.turnDeviceName('phone-1', { knownOnly: true })).toBe('My phone');
+  });
+
   it('gives a device neither list holds its short-id name', async () => {
     const { mod } = await load();
     mod.devices.value = { status: 'loaded', data: [] };

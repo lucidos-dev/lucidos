@@ -25,12 +25,13 @@
  */
 
 import { useSignal } from '@preact/signals';
-import type { WorkspaceStatus } from '../../api/client/control';
 import { peerWorkspaces, remotePeerWorkspaces } from '../../store/actions/app-badge';
 import { switchMenuItem } from '../../store/actions/menu';
 import { showToast, unreadCount, visibleWorkspaceName } from '../../store/store';
 import { REMOTE_GATEWAY, WORKSPACE_ID } from '../../utils/basePath';
-import { remoteWorkspaceRoute, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
+import { notifyRows, type NotifyRow, type NotifyRowsInput } from '../../utils/notificationRows';
+export { notifyRows } from '../../utils/notificationRows';
+export type { NotifyRow } from '../../utils/notificationRows';
 import { errorDetail } from '../../utils/errorDetail';
 import {
   alternateOpenMode,
@@ -40,7 +41,6 @@ import {
   openWorkspaceIn,
   type WorkspaceOpenMode,
 } from '../../utils/workspaceWindow';
-import { workspaceState, type WorkspaceState } from '../../utils/workspaceState';
 import { BellIcon } from '../shared/icons';
 import { workspaceActionRow } from './WorkspaceActionRow';
 import { GlyphBadge } from '../shared/GlyphBadge';
@@ -51,37 +51,9 @@ import { countLabel } from './unreadCountLabel';
  *  its rows leading with a status dot instead. */
 const NOTIFY_ACTION_INDENT = 'brand-menu-ws-action-under-icon';
 
-/** One row's worth of the group, resolved from the two count sources. */
-export interface NotifyRow {
-  /** Registry slug, or `null` for this workspace on a non-gateway page. */
-  id: string | null;
-  name: string;
-  count: number;
-  /** True for the workspace this page serves, which routes in-app. */
-  isSelf: boolean;
-  /** How the gateway reports that workspace's engine. Carried because opening
-   *  one is `alternateOpenMode`'s and `middleClickActivates`' decision, and
-   *  both ask the state. This workspace's own row is `healthy` by
-   *  construction: this page is running inside it. */
-  state: WorkspaceState;
-}
-
 /** What the group needs to draw itself. Threaded whole rather than unpacked
  *  into positional arguments, matching `SwitcherListProps` next door. */
-export interface NotificationsGroupProps {
-  /** Every workspace the gateway serves, from the shared cache in
-   *  `store/actions/app-badge.ts`. Empty outside a gateway-served page. */
-  peers: WorkspaceStatus[];
-  /** Every paired remote gateway's workspaces, from the same cache. A gateway
-   *  that did not answer the newest ask contributes no row. */
-  remotePeers: readonly RemoteGatewayView[];
-  /** This workspace's LIVE unread count, never its polled row. See
-   *  {@link notifyRows}. */
-  ownUnread: number;
-  /** This workspace's slug, or `null` on a legacy no-gateway page. */
-  ownId: string | null;
-  /** What to call this workspace. Falls back when `/health` has not answered. */
-  ownName: string | null;
+export interface NotificationsGroupProps extends NotifyRowsInput {
   /** This workspace's row was activated, which is an in-app view switch. */
   onOpenOwn: () => void;
   /** A peer row was activated. The event decides the mode, so a cmd-click or a
@@ -95,56 +67,6 @@ export interface NotificationsGroupProps {
   onContext: (id: string | null) => void;
   /** The unfolded action row was pressed, in the mode it offered. */
   onAlternate: (row: NotifyRow, mode: WorkspaceOpenMode) => void;
-}
-
-/** What this workspace's row is called before its name has resolved. */
-const OWN_FALLBACK_NAME = 'This workspace';
-
-/** The rows to draw, in order: this workspace first, then the peers as the
- *  gateway listed them, then the remote gateways' workspaces named
- *  `<name> @<gateway>` as the switcher names them.
- *
- *  Two count sources, deliberately. This workspace's comes from the caller's
- *  LIVE `unreadCount`, so an optimistic mark-read empties the row on the same
- *  tick. Every other workspace's comes from the polled listing, the only view
- *  we have of an engine this page holds no connection to.
- *
- *  Our own row is dropped from `peers` for the same reason. That row is stale
- *  for a second or two after a mark-read. Two rows for one workspace
- *  disagreeing is worse than one slightly stale row.
- *
- *  A workspace with nothing unread is not a row. A stopped one reports no count
- *  at all and is therefore never a row either, which is the same
- *  running-workspaces-only rule the icon badge follows. */
-export function notifyRows({ peers, remotePeers, ownUnread, ownId, ownName }: NotificationsGroupProps): NotifyRow[] {
-  const rows: NotifyRow[] = [];
-  if (ownUnread > 0) {
-    rows.push({
-      id: ownId,
-      name: ownName ?? OWN_FALLBACK_NAME,
-      count: ownUnread,
-      isSelf: true,
-      state: 'healthy',
-    });
-  }
-  for (const w of peers) {
-    if (w.id === ownId) continue;
-    const count = w.unread_count ?? 0;
-    if (count > 0) {
-      rows.push({ id: w.id, name: w.name, count, isSelf: false, state: workspaceState(w) });
-    }
-  }
-  for (const view of remotePeers) {
-    if (view.unreachable !== null) continue;
-    for (const w of view.workspaces) {
-      const route = remoteWorkspaceRoute(view, w);
-      const count = w.unread_count ?? 0;
-      if (route !== ownId && count > 0) {
-        rows.push({ id: route, name: `${w.name} @${view.gateway}`, count, isSelf: false, state: workspaceState(w) });
-      }
-    }
-  }
-  return rows;
 }
 
 /** The alternate a right-click offers on `row`, or `null` for a row with none.

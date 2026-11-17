@@ -70,7 +70,7 @@ impl Fixture {
 
     /// The dev gateway's machine-global data dir.
     fn dev_gateway(&self) {
-        self.dir(".lucidos/gateway");
+        self.dir(".lucidos/private/gateway");
     }
 
     /// A checkout, identified by the marker the whole tree resolves it from.
@@ -144,7 +144,7 @@ fn all_three_vehicles_are_enumerated_together() {
 fn a_reserved_directory_is_never_read_as_an_instance() {
     let fx = Fixture::new();
     // The dev gateway's own dir, and a stray marker inside the shared runtime.
-    fx.file(".lucidos/gateway/port", "5251\n");
+    fx.file(".lucidos/private/gateway/port", "5251\n");
     fx.file(".lucidos/runtime/port", "5252\n");
     fx.file(".lucidos/logs/port", "5252\n");
 
@@ -282,7 +282,7 @@ fn a_checkout_is_located_from_the_running_binary() {
     let repo = fx.checkout("lucidos", "1.2.3");
     let running = RunningProcess {
         exe: Some(repo.join(".launch/debug/plain/lucidos-gateway")),
-        data_dir: Some(fx.home.join(".lucidos/gateway")),
+        data_dir: Some(fx.home.join(".lucidos/private/gateway")),
     };
 
     let inv = scan(&fx.roots(), &running);

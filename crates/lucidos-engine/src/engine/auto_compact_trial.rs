@@ -146,7 +146,7 @@ async fn first_trial_arm(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<AutoCom
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[AutoCompactTrial] first arm of {}: {}", thread_id, e);
+        crate::log_legacy!("[AutoCompactTrial] first arm of {}: {}", thread_id, e);
         None
     });
     match arm.as_deref() {
@@ -185,7 +185,7 @@ pub async fn resolve(
     let root = match super::thread_family::family_root(pool, thread_id).await {
         Ok(root) => root,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[AutoCompactTrial] could not read the family root of {}, so the spawn sits out the trial: {}",
                 thread_id,
                 e

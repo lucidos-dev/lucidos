@@ -7,7 +7,7 @@ import type { RestartGroup } from '../store';
 import { applyChange as apiApply, discardChange as apiDiscard, setAsideChange as apiSetAside, bringBackChange as apiBringBack, applyAllChanges as apiApplyAll, cancelApplyAllChanges as apiCancelApplyAll, discardAllChanges as apiDiscardAll, revertChange as apiRevert, fetchChanges as apiFetchChanges, getChangeById as apiGetChangeById, armStandingApply as apiArmStandingApply, disarmStandingApply as apiDisarmStandingApply, restartEngine, ApiError, isTransportError } from '../../api/client';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
-import { isNewerVersion } from '../../utils/version';
+import { isNewerBuildId } from '../../utils/version';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { reconcileApplyProgress } from './applyProgress';
 import { setLandingLaneFromServer } from './landingLane';
@@ -265,7 +265,7 @@ export async function confirmAndRestartEngine(): Promise<void> {
 function isEngineOutdated(): boolean {
   const ev = engineVersion.value;
   const lev = latestEngineVersion.value;
-  return !!(ev && lev && isNewerVersion(lev, ev));
+  return !!(ev && lev && isNewerBuildId(lev, ev));
 }
 
 /** Persist (or clear) the restart-pending state driven by `restartRequired` so

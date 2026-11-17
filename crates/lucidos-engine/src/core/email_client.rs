@@ -129,7 +129,7 @@ impl EmailClient {
         let non_ascii_search = search.filter(|s| !s.is_ascii());
         let imap_search = if let Some(original) = non_ascii_search {
             let sanitized = sanitize_search_query(original);
-            crate::log!(@Email, "Non-ASCII detected in search, sanitized: {:?} → {:?}", original, &sanitized);
+            crate::log_legacy!(@Email, "Non-ASCII detected in search, sanitized: {:?} → {:?}", original, &sanitized);
             sanitized
         } else {
             search.map(|s| s.to_string()).unwrap_or_default()
@@ -144,7 +144,7 @@ impl EmailClient {
             since,
         );
 
-        crate::log!(@Email, "IMAP search: {} in {}", query, folder);
+        crate::log_legacy!(@Email, "IMAP search: {} in {}", query, folder);
 
         let uids = session.uid_search(&query).await?;
         let mut uid_list: Vec<u32> = uids.into_iter().collect();
@@ -256,7 +256,7 @@ impl EmailClient {
             let before = summaries.len();
             summaries.retain(|email| matches_search_filter(email, original_search));
             summaries.truncate(limit as usize);
-            crate::log!(
+            crate::log_legacy!(
                 @Email,
                 "Non-ASCII client-side filter: {} → {} results",
                 before,
@@ -571,7 +571,7 @@ impl EmailClient {
         } else {
             "password"
         };
-        crate::log!(@Email, "Email sent to {} via {} ({})", to, account.smtp_host, auth_method);
+        crate::log_legacy!(@Email, "Email sent to {} via {} ({})", to, account.smtp_host, auth_method);
 
         Ok(message_id)
     }

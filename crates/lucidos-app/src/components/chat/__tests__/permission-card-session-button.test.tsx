@@ -1,13 +1,19 @@
 // @vitest-environment jsdom
 /** A grant button shows only where the engine records a grant.
  *
- *  The chat card derives its own: a command with no readable head, such as a
- *  bare redirect, gets no session button. The coding-agent card renders
- *  exactly the offer the engine stamped on its event (ADR 0571).
+ *  Both cards render exactly the offer the engine stamped on the event
+ *  (ADR 0571). A card from before the stamp offers no grant.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { render } from 'preact';
 import { CommandPermissionBody, PermissionBody } from '../PermissionCard';
+import type { GrantOffer } from '../../../generated/thread-event-wire';
+
+const SECRET_NOTE = "This reads Lucidos's private files. No grant can cover that, so it can only be allowed once.";
+
+function note(): string | null {
+  return host.querySelector('.permission-resolution-note')?.textContent ?? null;
+}
 
 let host: HTMLDivElement;
 
@@ -43,14 +49,48 @@ describe('the command-guard card', () => {
     expect(labels()).toContain('Allow once');
   });
 
-  it('offers it when a head derives', () => {
-    render(card('git status'), host);
-    expect(labels()).toContain('Allow for this thread');
+  it.each(['run_bash', 'run_bash_background', 'run_python'])('offers no unstamped scopes for %s', (toolName) => {
+    render(<CommandPermissionBody event={{
+      request_id: 'old-card', tool_use_id: 'old-tool', tool_name: toolName,
+      command: 'git status', summary: 'Read status', grant_head: 'git',
+    }} />, host);
+    expect(answers()).toEqual(['Deny', 'Allow once']);
+    expect(note()).toBe('This card comes from an older Lucidos, so it can only allow once.');
+  });
+
+  const stamped = (grantOffer: GrantOffer) => (
+    <CommandPermissionBody
+      event={{
+        request_id: 'r-3',
+        tool_use_id: 't-3',
+        tool_name: 'run_bash',
+        command: 'git status',
+        summary: 'git status',
+        grant_offer: grantOffer,
+      }}
+    />
+  );
+
+  it('renders the stamped offer, not its own derivation', () => {
+    render(stamped({ session: 'Bash(git:*)', broad: 'Bash' }), host);
+    expect(answers()).toEqual(['Deny', 'Allow once', 'Allow for this thread', 'Always allow']);
+  });
+
+  it('keeps an empty engine stamp without an older-card note', () => {
+    render(stamped({}), host);
+    expect(answers()).toEqual(['Deny', 'Allow once']);
+    expect(note()).toBeNull();
+  });
+
+  it('offers only Allow once for a secret read, and says why', () => {
+    render(stamped({ withheld: 'secret-read' }), host);
+    expect(answers()).toEqual(['Deny', 'Allow once']);
+    expect(note()).toBe(SECRET_NOTE);
   });
 });
 
 describe('the coding-agent card', () => {
-  const card = (grantOffer?: { broad?: string; narrow?: string; session?: string }) => (
+  const card = (grantOffer?: GrantOffer) => (
     <PermissionBody
       event={{
         request_id: 'r-2',
@@ -86,5 +126,12 @@ describe('the coding-agent card', () => {
   it('offers no grant on a card from before the engine stamped one', () => {
     render(card(undefined), host);
     expect(answers()).toEqual(['Deny', 'Allow once']);
+    expect(note()).toBeNull();
+  });
+
+  it('offers only Allow once for a secret read, and says why', () => {
+    render(card({ withheld: 'secret-read' }), host);
+    expect(answers()).toEqual(['Deny', 'Allow once']);
+    expect(note()).toBe(SECRET_NOTE);
   });
 });

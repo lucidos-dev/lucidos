@@ -125,6 +125,24 @@ describe('oauthClientSubmitError', () => {
   });
 });
 
+describe('a client secret that repeats the client ID', () => {
+  it('is refused on create and on edit, ignoring surrounding whitespace', () => {
+    const repeated = fields({ ...COMPLETE, clientSecret: ' abc ' });
+    for (const editing of [false, true]) {
+      expect(oauthClientSubmitError(repeated, editing)).toMatch(/identical to the client ID/);
+    }
+  });
+
+  it('does not refuse a different or blank secret', () => {
+    expect(oauthClientSubmitError(fields({ ...COMPLETE, clientSecret: 'other' }), false)).toBeNull();
+    expect(oauthClientSubmitError(fields(COMPLETE), false)).toBeNull();
+  });
+
+  it('is what a repair for the engine client_secret entry explains', () => {
+    expect(describeMissingFields(['client_secret'])).toMatch(/identical to the client ID/);
+  });
+});
+
 describe('describeMissingFields', () => {
   it('says nothing when the form is not a repair', () => {
     expect(describeMissingFields(undefined)).toBeNull();

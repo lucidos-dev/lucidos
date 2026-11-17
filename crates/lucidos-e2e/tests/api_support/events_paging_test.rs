@@ -204,9 +204,14 @@ async fn a_page_carries_the_pair_stamped_behind_it() {
 
     let body = snapshot(thread_id, &[("limit", "4".into())]).await;
     let stamps = body["pairStamps"].as_array().expect("pairStamps on a page");
-    assert_eq!(stamps.len(), 1, "one stamp covers model and effort");
+    assert_eq!(
+        stamps.len(),
+        2,
+        "the newest applied stamp, plus one that covers model and effort"
+    );
     assert_eq!(stamps[0]["model"], "model-old");
     assert_eq!(stamps[0]["reasoning_effort"], "high");
+    assert_eq!(stamps[1]["model"], "", "the newest message names no model");
 
     let unpaged = snapshot(thread_id, &[]).await;
     assert!(unpaged.get("pairStamps").is_none(), "unpaged sends none");

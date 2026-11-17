@@ -244,6 +244,7 @@ async fn empty_coding_agent_prompt_sent_does_not_flip_status_to_running() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -309,6 +310,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
@@ -343,6 +345,7 @@ async fn cc_follow_up_after_exit_resumes_via_db() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -443,6 +446,7 @@ async fn cc_session_id_survives_engine_restart() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s1".into(),
             branch: "claude-code/test".into(),
@@ -475,6 +479,7 @@ async fn cc_session_id_survives_engine_restart() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })

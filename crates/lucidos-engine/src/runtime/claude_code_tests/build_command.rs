@@ -11,7 +11,7 @@ fn collect_envs(
 }
 
 /// The command alone, for tests that only read its flags and env.
-fn session_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process::Command {
+fn session_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> SandboxedCommand {
     build_command(args, cli_dir)
         .expect("the command builds")
         .cmd
@@ -36,6 +36,7 @@ fn test_spawn_args<'a>(
         spawning_event_id: None,
         repo_name: None,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -44,6 +45,7 @@ fn test_spawn_args<'a>(
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     }
 }
 
@@ -67,6 +69,7 @@ fn test_spawn_args_with_event<'a>(
         spawning_event_id,
         repo_name: None,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -75,6 +78,7 @@ fn test_spawn_args_with_event<'a>(
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     }
 }
 
@@ -98,6 +102,7 @@ fn test_spawn_args_with_repo<'a>(
         spawning_event_id: None,
         repo_name,
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &[],
         account_pin: None,
         binary_override: None,
@@ -106,6 +111,7 @@ fn test_spawn_args_with_repo<'a>(
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     }
 }
 
@@ -134,6 +140,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         spawning_event_id: None,
         repo_name: Some("engine-repo"),
         interactive: false,
+        build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
         user_env_vars: &user_env,
         account_pin: None,
         binary_override: None,
@@ -142,6 +149,7 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
         auto_compact: None,
         keep_alive: false,
         agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
     };
     let cmd = session_command(&args, None);
     let env = collect_envs(&cmd);
@@ -948,6 +956,7 @@ fn build_command_carries_the_agent_compile_env() {
 fn format_user_input_text_only() {
     let uuid = uuid::Uuid::new_v4();
     let input = AgentInput {
+        defer_on_steer_failure: false,
         text: "hello".into(),
         images: vec![],
         uuid,
@@ -965,6 +974,7 @@ fn format_user_input_text_only() {
 #[test]
 fn format_user_input_with_images_uses_blocks() {
     let input = AgentInput {
+        defer_on_steer_failure: false,
         text: "describe".into(),
         images: vec![crate::api::ChatImage {
             base64: "deadbeef".into(),
@@ -1341,6 +1351,32 @@ fn a_session_gets_no_vertex_base_url_from_the_engine() {
     assert_eq!(vertex_base_url(&session_command(&args, None)), None);
 }
 
+/// Claude Code picks its own backend from its login and settings, per install.
+/// The engine never stamps a backend selector onto a fresh or resumed session.
+#[test]
+fn a_session_gets_no_backend_selector_from_the_engine() {
+    let p = std::path::Path::new("/tmp");
+    let fresh = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    let mut resumed = test_spawn_args(p, p, uuid::Uuid::new_v4());
+    resumed.resume_session_id = Some("sess-1");
+    for args in [&fresh, &resumed] {
+        let envs = collect_envs(&session_command(args, None));
+        for selector in [
+            "CLAUDE_CODE_USE_VERTEX",
+            "ANTHROPIC_VERTEX_PROJECT_ID",
+            "CLOUD_ML_REGION",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "ANTHROPIC_BASE_URL",
+        ] {
+            assert_eq!(
+                envs.get(std::ffi::OsStr::new(selector)),
+                None,
+                "the engine set {selector} on a Claude Code session"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_workspace_vertex_url_reaches_the_session_untouched() {
     let p = std::path::Path::new("/tmp");
@@ -1604,6 +1640,109 @@ struct StartupWorkspace {
     config: tempfile::TempDir,
     claude: tempfile::TempDir,
     env: Vec<(String, String)>,
+}
+
+/// Exercise the production spawn, including the configured wrapper and the
+/// pinned account on resume. A host-side auth probe cannot satisfy this stub.
+#[cfg(unix)]
+#[tokio::test]
+async fn billing_initialize_uses_the_session_wrapper_and_pinned_environment() {
+    // Spawn resolves the Lucidos CLI and may write CLI skills under HOME.
+    // Keep both independent of the developer's installed binaries/home.
+    const CHILD: &str = "LUCIDOS_TEST_BILLING_WRAPPER_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let cli = home.path().join("lucidos");
+        std::fs::write(&cli, "#!/bin/sh\ntrue\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::claude_code::build_command_tests::billing_initialize_uses_the_session_wrapper_and_pinned_environment", "--nocapture"])
+                .env(CHILD, "1")
+                .env("HOME", home.path())
+                .env("LUCIDOS_CLI_BIN", cli)
+                .kill_on_drop(true)
+                .output(),
+        ).await.unwrap().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut ws = StartupWorkspace::new();
+    let bin = ws.bin();
+    ws.env.push((
+        "BILLING_TEST_CWD".into(),
+        ws.worktree.path().to_string_lossy().into_owned(),
+    ));
+    ws.env.push((
+        "BILLING_TEST_PIN".into(),
+        ws.config.path().to_string_lossy().into_owned(),
+    ));
+    ws.env[0].1 = "/unused/user-config".into();
+    std::fs::write(&bin, r##"#!/bin/sh
+case "$*" in
+*--version*) echo '7.7.7 (Claude Code)' ;;
+*)
+[ "$(pwd -P)" = "$(cd "$BILLING_TEST_CWD" && pwd -P)" ] || exit 21
+[ "$CLAUDE_CONFIG_DIR" = "$BILLING_TEST_PIN" ] || exit 22
+IFS= read -r initialize
+case "$initialize" in
+  *'"subtype":"initialize"'*'"type":"control_request"'*|*'"type":"control_request"'*'"subtype":"initialize"'*) ;;
+  *) exit 23 ;;
+esac
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"lucidos-billing-initialize","response":{"account":{"apiProvider":"firstParty","apiKeySource":"none","tokenSource":"claude-login","email":"fixture@example.com","accessToken":"fixture-secret"}}}}'
+IFS= read -r status
+case "$status" in *'"subtype":"get_status"'*) ;; *) exit 24 ;; esac
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"lucidos-billing-status","response":{"sections":[{"title":"Session","rows":[{"label":"Version","value":"7.7.7"},{"label":"Session ID","value":"fixture-session"},{"label":"cwd","value":"/tmp/fixture"}]}]}}}'
+IFS= read -r prompt
+printf '%s\n' '{"type":"assistant","message":{"id":"fixture-call","model":"claude-sonnet-5","content":[],"usage":{"input_tokens":2,"output_tokens":4}}}'
+;;
+esac
+"##).unwrap();
+    let pin = AccountPin::ExplicitConfigDir {
+        dir: ws.config.path().to_string_lossy().into_owned(),
+    };
+    let mut args = ws.args(&bin);
+    args.account_pin = Some(&pin);
+    args.resume_session_id = Some("fixture-session");
+    let cancel = CancellationToken::new();
+    let mut agent = ClaudeCodeRuntime.spawn(args, cancel.clone()).await.unwrap();
+    agent
+        .input_tx
+        .send(AgentInput {
+            defer_on_steer_failure: false,
+            text: "ping".into(),
+            images: vec![],
+            uuid: uuid::Uuid::new_v4(),
+        })
+        .unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let mut billing = None;
+        while let Some(event) = agent.events_rx.recv().await {
+            match event {
+                AgentEvent::BillingObserved { attribution } => billing = Some(attribution),
+                AgentEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => {
+                    assert_eq!((input_tokens, output_tokens), (2, 4));
+                    return billing.expect("same-process evidence precedes usage");
+                }
+                _ => {}
+            }
+        }
+        panic!("wrapper ended before usage");
+    })
+    .await;
+    cancel.cancel();
+    assert_eq!(result.unwrap().provider_id(), "anthropic-subscription");
 }
 
 #[cfg(unix)]

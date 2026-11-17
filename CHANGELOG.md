@@ -1,8 +1,66 @@
 # Changelog
 
+## v0.59.0 — 2026-11-16
+
+### Added
+
+- An OS sandbox for agents. Every command an agent starts runs in a Seatbelt (macOS) or Landlock (Linux) sandbox. It hides your secrets and keeps Lucidos state read-only. The owner can turn it off for a workspace, and a banner shows while it is not in force.
+- A main check. A workspace can check `main` after each landing, on Linux and macOS. A red check gets one repair, and a newer green check closes it. A setting says if this workspace runs the check, another host runs it, or nobody does.
+- Harden takes minutes, not an hour, when a main check covers the workspace. The round runs a fast set, and the main check runs the rest after landing.
+- At plan approval, the card always offers to build the plan in a fresh session. It also offers the other coding-agent backend when that backend's models are available.
+- Press Up and Down in the composer to recall the prompts you sent.
+- Archive completed sub-threads from a parent thread's menu in one tap.
+- Settings has its own People page beside Devices. You can manage the users and devices of a paired remote gateway from its workspace.
+- Agents can create, stop, start, rename, delete and restore workspaces with `lucidos workspaces`. You approve each call, except for a workspace the agent made itself.
+- Agents read a cleaned engine log with `lucidos diagnostic-log`. In the macOS sandbox, `lucidos ps` replaces `ps`.
+- An agent can send the host's raw logs to one SSH destination after you allow it once. The card names the files and the destination, and warns that raw logs may hold secrets.
+- Agents can save a draft for you without opening it. An agent sends a saved draft only on your word.
+- A checkpoint and pause holds every automatic step in a thread until you allow it.
+- When Claude Code runs another model than the one you picked, the thread shows it as a step. The picker then stops offering that model.
+- Claude Fable 5.2 in Claude Code and on its intelligence ladder.
+- Agent marks can show each backend's brand colour, and a waiting thread shows a clock.
+- The backup banner says when a backup is overdue.
+
+### Changed
+
+- One permission model. Every card that offered only Allow once is now a permission request with its own options. A batch answers tool cards and owner approvals with one confirm, and voice reads every button.
+- A caller that Lucidos cannot verify gets a once-only owner card for an owner-only act. If that card cannot reach you, the coding-agent start fails and says why. It does not wait forever.
+- When you allow an unverified start, the thread is adopted, so its later starts do not ask again. Don't allow gives one refusal, not several.
+- A device session for a workspace that an agent made can carry Always allow, for that device and that exact lifetime.
+- A model pick that you make during a turn applies when the turn ends. The picker marks the pending pick with an asterisk.
+- The context ceiling hands off at the next safe point, also in the middle of a long turn. Sessions that ran past 500k tokens without a handoff now hand off.
+- After a handoff, the successor session starts on its own, also when the ceiling cut a turn short.
+- Codex takes a follow-up in the middle of a turn and keeps the running work, when its app server supports it.
+- Codex runs inside the Lucidos sandbox with its own sandbox off, so it asks before every command and file change, as Claude Code does. Coding-agent auto-answer can settle those cards.
+- The follow toggle sits to the left of the down chevron while the chevron shows.
+- A video player that has not played yet shows a still poster and loads no video until you play, scrub or go full screen.
+- Provider errors are typed. A turn that the provider blocked gets its own failure card with a way forward, and the parent thread learns why. Lucidos never resumes the blocked session.
+- A coding agent's background task can run for up to 4 hours.
+- A parent thread waits for every unfinished child that will wake it, at any depth.
+- A new install keeps its secrets and control files in one private folder, `~/.lucidos/private`, which the sandbox hides. An existing install keeps its files where they are.
+- When you reopen a thread, it returns to the same line, not only to the same turn.
+- Lucidos can run its packaged app as a disposable service with fresh storage, so a smoke test never touches your workspaces.
+
+### Fixed
+
+- A queued message no longer gets stuck or sends twice. A message is either taken back or used, never both.
+- Stop no longer hangs. After you press Stop, automatic wakes wait until you send a message, press Continue or answer a card.
+- Stop gives back messages that had not started yet. Their text returns to the composer, and it survives a reload.
+- Home no longer stays at "Requesting" before a turn starts.
+- On iPhone, a notification tap opens its thread while local storage still loads.
+- The desktop app no longer reloads a window again and again after macOS covers and pauses it.
+- Dropbox Connect no longer asks for `openid`, and the sign-in page reports the real result.
+- A refused backup start shows the engine's reason, and the backup reminder hides once a provider is set.
+- Timed toasts always show a close button, and focus returns to where it was when a toast closes.
+- In a voice call, the rest of a spoken sentence reaches the turn that took its start.
+- A closed lane thread does not hand off and does not replay an old handoff.
+- Token Cost records the billing provider for keep-alive pings and web searches.
+- Scripts in the agent sandbox reach the workspace database again, so Token Cost and other psql scripts work on macOS. The bundled database accepts only password logins.
 ## v0.58.0 — 2026-11-11
 
 ### Added
+
+- Codex threads take side questions from an ephemeral copy of their saved context, beside any running turn. Older Codex CLIs show update instructions.
 
 - Sign in with ChatGPT. The ChatGPT plan is its own provider: sign in under Settings > Providers or with `lucidos chatgpt-plan`, and chat on your plan's models. Apps and scripts never spend it.
 - Mermaid diagrams render inline in chat and previews, with a toggle to the source.

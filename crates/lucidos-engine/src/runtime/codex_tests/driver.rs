@@ -61,6 +61,8 @@ fn stub_driver_prompted(
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: Vec::new(),
     };
@@ -104,10 +106,20 @@ fn stub_driver_prompted(
 const EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 async fn next_event(agent: &mut RunningAgent) -> AgentEvent {
-    tokio::time::timeout(EVENT_TIMEOUT, agent.events_rx.recv())
-        .await
-        .expect("an event before the liveness ceiling")
-        .expect("events channel open")
+    recv(&mut agent.events_rx).await
+}
+
+async fn recv(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> AgentEvent {
+    tokio::time::timeout(EVENT_TIMEOUT, async {
+        loop {
+            let event = rx.recv().await.expect("events channel open");
+            if !matches!(event, AgentEvent::BillingObserved { .. }) {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("an event before the liveness ceiling")
 }
 
 fn logged_invocations(args_log: &Path) -> Vec<String> {
@@ -129,6 +141,7 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -203,6 +216,7 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "first".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -215,6 +229,7 @@ async fn follow_up_turn_resumes_with_session_id_from_first_turn() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "second".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -262,6 +277,7 @@ async fn a_resumed_session_runs_the_engine_continuation_as_an_input() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: continuation.into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -304,6 +320,7 @@ async fn a_huge_first_turn_prompt_travels_on_stdin_not_argv() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -341,6 +358,7 @@ async fn child_death_without_terminal_synthesizes_failed_result() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -379,6 +397,7 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -451,6 +470,8 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: Vec::new(),
     };
@@ -471,17 +492,12 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
 
     input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
         })
         .unwrap();
-    async fn recv(rx: &mut mpsc::UnboundedReceiver<AgentEvent>) -> AgentEvent {
-        tokio::time::timeout(EVENT_TIMEOUT, rx.recv())
-            .await
-            .expect("an event before the liveness ceiling")
-            .expect("channel open")
-    }
     assert!(matches!(
         recv(&mut events_rx).await,
         AgentEvent::InputRead { .. }
@@ -500,6 +516,7 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     // interrupt. CC's stdin queue behaves the same way after Esc.
     input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "queued".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -564,6 +581,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -583,6 +601,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "later".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -606,6 +625,7 @@ async fn a_line_split_around_a_queued_input_still_arrives_whole() {
 
 fn input(text: &str) -> AgentInput {
     AgentInput {
+        defer_on_steer_failure: false,
         text: text.into(),
         images: vec![],
         uuid: uuid::Uuid::new_v4(),
@@ -683,6 +703,7 @@ async fn a_turn_that_never_starts_rejects_its_input() {
     s.agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: ping,
@@ -704,6 +725,8 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
         model: None,
         reasoning_effort: None,
         sandbox_writable_roots: Vec::new(),
+        sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+        login_shell: true,
         env_removed: Vec::new(),
         env: Vec::new(),
     };
@@ -733,6 +756,7 @@ async fn a_turn_that_cannot_spawn_rejects_its_input() {
     agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "ping".into(),
             images: vec![],
             uuid: ping,

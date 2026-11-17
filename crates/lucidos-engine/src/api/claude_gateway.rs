@@ -50,9 +50,12 @@ async fn sign_in(
 ) -> Result<Json<SignInState>, ApiError> {
     let actor = super::actor::require_user_actor(&headers, &state.pool, None).await?;
     if let Some(url) = request.url {
-        super::settings::refuse_agent_human_only_preference(
+        super::settings::require_owner_for_human_only_preference(
             &headers,
             prefs::CLAUDE_GATEWAY_URL.key(),
+            // The sign-in answers with a URL to open, which a replay would
+            // hand to nobody.
+            super::owner_door::OnUnattested::Refuse,
         )?;
         // The shared preference write, so its check and the sign-out of an
         // old gateway apply exactly as they do to a Settings save.

@@ -62,6 +62,7 @@ pub(crate) const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "marketplaces",
     "access",
     "devices",
+    "users",
     "system",
     // The Overview page: connection state, versions and maintenance. `system`
     // above is the submenu listing the sub-pages. So that one answers "open

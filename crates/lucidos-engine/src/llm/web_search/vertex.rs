@@ -54,6 +54,7 @@ impl WebSearchProvider for VertexGroundingSearch {
             text,
             usage,
             model: GROUNDING_MODEL.to_string(),
+            provider: Some(crate::runtime::billing_provider::BillingProvider::Vertex),
         })
     }
 

@@ -255,6 +255,14 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
         obj.insert("integrated".into(), true.into());
     }
 
+    // A thread's subprocess spawns into another workspace through its own
+    // engine, which vouches for the thread to the target via the gateway.
+    let through_own_engine = matches!(relation, CliRelation::Top)
+        && crate::http::has_origin_token()
+        && caller_workspace
+            .as_deref()
+            .is_some_and(|caller| caller != target_basename);
+
     match relation {
         CliRelation::Child => {
             if let Some(t) = caller_thread_id {
@@ -286,30 +294,51 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     } else {
         &ports_proto
     };
-    let url = format!("{}://localhost:{}/api/v1/chat/stream", scheme, api_port);
     let client = crate::http::client()?;
-    let start = std::time::Instant::now();
-    let resp = client
-        .post(&url)
-        // This is the ONE subcommand that deliberately talks to a workspace
-        // other than its own, so it asserts the TARGET rather than letting the
-        // `$LUCIDOS_WORKSPACE` default through (which would name the caller and
-        // earn a 409 from the receiving engine). A per-request header wins over
-        // a default of the same name.
-        .header(crate::http::HEADER_TARGET_WORKSPACE, &target_basename)
-        .json(&body)
-        .send_with_connect_retry()
-        // A scheme this had to guess is the likeliest reason for a transport
-        // failure here, so the message names the file that failed to say.
-        .map_err(|e| {
-            let mut msg = crate::http::format_request_error("POST", &url, &e, start.elapsed());
-            if proto_assumed && !args.insecure_http {
-                msg.push_str(&crate::workspace::assumed_proto_note(&target_ports));
+    let through_gateway = if through_own_engine {
+        post_through_own_engine(&client, &target_basename, &body)?
+    } else {
+        GatewaySpawn::Direct(None)
+    };
+    let through_gateway = match through_gateway {
+        GatewaySpawn::Answer(status, text) => Some((status, text)),
+        GatewaySpawn::Direct(reason) => {
+            if through_own_engine {
+                eprintln!(
+                    "{}",
+                    unverified_spawn_note(&target_basename, reason.as_deref().unwrap_or_default())
+                );
             }
-            msg
-        })?;
-    let status = resp.status();
-    let text = resp.text().unwrap_or_default();
+            None
+        }
+    };
+    let (status, text) = match through_gateway {
+        Some(answer) => answer,
+        None => {
+            let url = format!("{}://localhost:{}/api/v1/chat/stream", scheme, api_port);
+            let start = std::time::Instant::now();
+            let resp = client
+                .post(&url)
+                // This post goes to another workspace's engine, so it asserts
+                // the TARGET. The `$LUCIDOS_WORKSPACE` default would name the
+                // caller and earn a 409 there. A per-request header wins.
+                .header(crate::http::HEADER_TARGET_WORKSPACE, &target_basename)
+                .json(&body)
+                .send_with_connect_retry()
+                // A scheme this had to guess is the likeliest reason for a
+                // transport failure here, so the message names the file.
+                .map_err(|e| {
+                    let mut msg =
+                        crate::http::format_request_error("POST", &url, &e, start.elapsed());
+                    if proto_assumed && !args.insecure_http {
+                        msg.push_str(&crate::workspace::assumed_proto_note(&target_ports));
+                    }
+                    msg
+                })?;
+            let status = resp.status();
+            (status, resp.text().unwrap_or_default())
+        }
+    };
     if !status.is_success() {
         let off_ladder = serde_json::from_str::<serde_json::Value>(&text)
             .is_ok_and(|body| body["reason"] == crate::intelligence_ladder::OFF_LADDER_REASON);
@@ -334,6 +363,80 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let label = link_label(args.title.as_deref(), &args.message);
     println!("[{}](thread:{}/{})", label, target_basename, thread_id);
     Ok(())
+}
+
+enum GatewaySpawn {
+    Answer(reqwest::StatusCode, String),
+    Direct(Option<String>),
+}
+
+/// POST the spawn to this workspace's own engine, which signs it for the
+/// gateway (`/api/v1/workspace-calls`). Keeps the reason when no gateway carries the
+/// call: the caller then posts to the target directly, landing unattested.
+fn post_through_own_engine(
+    client: &reqwest::blocking::Client,
+    target: &str,
+    body: &serde_json::Value,
+) -> Result<GatewaySpawn, BoxError> {
+    let Some(path) = lucidos_gateway_stamp::workspace_call_path(target) else {
+        return Ok(GatewaySpawn::Direct(None));
+    };
+    let url = format!(
+        "{}/api/v1{path}",
+        crate::workspace::resolve_from_env()?.base_url()
+    );
+    let start = std::time::Instant::now();
+    // No target assertion here: this request is for our own engine, which the
+    // client's default header names.
+    let resp = client
+        .post(&url)
+        .json(body)
+        .send_with_connect_retry()
+        .map_err(|e| crate::http::format_request_error("POST", &url, &e, start.elapsed()))?;
+    let status = resp.status();
+    let text = resp.text().unwrap_or_default();
+    if hands_the_call_back(status, &text) {
+        let answer: serde_json::Value = serde_json::from_str(&text)?;
+        Ok(GatewaySpawn::Direct(Some(
+            answer["reason"].as_str().unwrap_or_default().to_string(),
+        )))
+    } else {
+        Ok(GatewaySpawn::Answer(status, text))
+    }
+}
+
+/// What the caller hears when no gateway vouches for its spawn. The target
+/// cannot verify it, so the thread waits for the target owner's Allow.
+fn unverified_spawn_note(target: &str, reason: &str) -> String {
+    let cause = if reason == lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY {
+        String::from(
+            "The target workspace is on another gateway this one is not paired with. \
+                 In the target's Lucidos, open Settings → Access → Pair a gateway. \
+                 Then add it as a remote gateway here.",
+        )
+    } else if reason == lucidos_gateway_stamp::REASON_NO_GATEWAY {
+        "This engine runs without a gateway.".to_string()
+    } else {
+        "This call goes directly to the target, without a gateway.".to_string()
+    };
+    format!(
+        "lucidos spawn-thread: {cause} So \"{target}\" cannot verify \
+         this workspace. The thread waits for its owner to tap Allow, and starts then. \
+         Nothing went wrong, so do not send it again."
+    )
+}
+
+/// Did our engine say no gateway carries this call, so we post directly?
+fn hands_the_call_back(status: reqwest::StatusCode, text: &str) -> bool {
+    status == reqwest::StatusCode::CONFLICT
+        && serde_json::from_str::<serde_json::Value>(text).is_ok_and(|answer| {
+            [
+                lucidos_gateway_stamp::REASON_NO_GATEWAY,
+                lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY,
+            ]
+            .iter()
+            .any(|reason| answer["reason"] == *reason)
+        })
 }
 
 /// Refuse an `--integrated` spawn the CLI can already tell is unfit. The
@@ -525,23 +628,36 @@ pub(crate) fn resolve_target(name_or_path: &str) -> Result<PathBuf, BoxError> {
             .into()
     })?;
     let candidate = root.join(name_or_path);
-    if !candidate.join(".lucidos/ports").is_file() {
-        return Err(format!(
-            "Target workspace '{}' not found at {} (no .lucidos/ports).",
-            name_or_path,
-            candidate.display()
-        )
-        .into());
+    if candidate.join(".lucidos/ports").is_file() {
+        return Ok(candidate);
     }
-    Ok(candidate)
+    // A workspace outside the root still resolves by name, through the
+    // gateway's listing of this machine's workspaces.
+    let missing = format!(
+        "Target workspace '{}' not found at {} (no .lucidos/ports)",
+        name_or_path,
+        candidate.display()
+    );
+    let rows = crate::workspace::resolve_from_env()
+        .and_then(|ws| crate::workspaces::fetch(&ws))
+        .map_err(|e| format!("{missing}, and the workspace list failed: {e}"))?;
+    crate::workspaces::find(&rows, name_or_path)
+        .map(|row| row.path.clone())
+        .ok_or_else(|| {
+            format!(
+                "{missing}, and this machine's workspace list does not name it. \
+                 Run `lucidos workspaces list` to see the names."
+            )
+            .into()
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         check_actor_mode, check_effort_fits_model, check_integrated_spawn, effort_rows,
-        inline_images, link_label, models_offering, require_input, workspaces_root, CC_MENU,
-        CODEX_MENU, EFFORT_LEVELS, NOTHING_TO_SEND,
+        inline_images, link_label, models_offering, require_input, unverified_spawn_note,
+        workspaces_root, CC_MENU, CODEX_MENU, EFFORT_LEVELS, NOTHING_TO_SEND,
     };
     use crate::CliCodingAgent;
     use crate::CliMode;
@@ -843,5 +959,34 @@ mod tests {
         let missing = PathBuf::from("/nonexistent/shot.png");
         let err = inline_images(&[missing]).unwrap_err().to_string();
         assert!(err.contains("--image /nonexistent/shot.png"), "{err}");
+    }
+
+    /// An unverified spawn waits for the target's owner. The caller hears
+    /// that, and nothing tells it to send the spawn again.
+    #[test]
+    fn an_unverified_spawn_says_it_waits_for_the_owner() {
+        let note = unverified_spawn_note("dev", lucidos_gateway_stamp::REASON_NO_GATEWAY);
+        assert!(note.contains("\"dev\" cannot verify"), "{note}");
+        assert!(note.contains("waits for its owner to tap Allow,"), "{note}");
+        assert!(!note.contains("Allow once"), "{note}");
+        assert!(note.contains("runs without a gateway"), "{note}");
+        let unpaired = unverified_spawn_note(
+            "dev",
+            lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY,
+        );
+        assert!(
+            unpaired.contains("Settings → Access → Pair a gateway"),
+            "{unpaired}"
+        );
+        assert!(unpaired.contains("remote gateway here"), "{unpaired}");
+        let direct = unverified_spawn_note("my studio", "");
+        assert!(direct.contains("directly to the target"), "{direct}");
+        assert!(
+            direct.contains("waits for its owner to tap Allow,"),
+            "{direct}"
+        );
+        assert!(direct.contains("do not send it again"), "{direct}");
+        assert!(note.contains("do not send it again"), "{note}");
+        assert!(!note.to_lowercase().contains("failed"), "{note}");
     }
 }

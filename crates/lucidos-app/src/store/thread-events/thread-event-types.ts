@@ -36,6 +36,7 @@ export type {
   RetryOf,
   RetrySkipReason,
   SessionEndReason,
+  SpawnVerdict,
   SubThreadPendingChange,
   ThreadDirection,
   ThreadEvent,
@@ -49,9 +50,13 @@ import {
   AUTO_RECOVERY_AFTER_HANG_REASON,
   AUTO_RESUME_AFTER_API_ERROR_REASON,
   AUTO_RESUME_AFTER_SWITCH_REASON,
+  BUILD_REQUESTED_REASON,
   EFFORT_RESTART_REASON,
   ENGINE_RESTART_INTERRUPT_REASON,
+  HANDOFF_REQUESTED_REASON,
   HARDEN_REQUESTED_REASON,
+  PLAN_REQUESTED_REASON,
+  REPORTS_REQUESTED_REASON,
   USER_CLICKED_CONTINUE_REASON,
 } from '@lucidos/engine-constants';
 export { THREAD_EVENT_TYPE_NAMES } from '../../generated/thread-event-wire';
@@ -132,6 +137,18 @@ export const LUCIDOS_AGENT_LABEL = 'Lucidos Agent';
  *  "You". */
 export const API_CALLER_LABEL = 'API caller';
 
+/** A caller's recorded claims are display hints, never a checked identity. */
+export function unattestedCallerLabel(
+  origin: Extract<MessageOrigin, { kind: 'unattested_caller' }>,
+  deviceName?: string,
+): string {
+  if (origin.claimed_workspace) return `Workspace "${origin.claimed_workspace}"`;
+  if (origin.claimed_device_id) return deviceName
+    ? `A program that named your device "${deviceName}"`
+    : 'A program that named a device';
+  return origin.claimed_local_token ? 'A program on this computer' : 'An unknown caller';
+}
+
 /** Derive the ActorMode from a MessageOrigin. Mirrors the Rust
  *  `MessageOrigin::mode()` impl: device is intrinsic Human, engine and system
  *  are intrinsic Engine, the others read from the carried `mode` field
@@ -140,7 +157,9 @@ export function originMode(origin: MessageOrigin | undefined): ActorMode {
   if (!origin) return 'engine'; // unknown origin → engine acted on its own
   switch (origin.kind) {
     case 'device':      return 'human';
+    case 'saved_draft': return 'human';
     case 'api':         return origin.mode ?? 'human';
+    case 'unattested_caller': return origin.mode ?? 'human';
     case 'workspace':   return origin.mode ?? 'human';
     case 'thread_link': return origin.mode ?? 'agent';
     // A guest collapses to plain agent mode on purpose, so `actorInitiator`
@@ -277,18 +296,15 @@ export function isUserStoppedWait(event: { type: string; cause?: string }): bool
  *  children. A `ChildThreadDetached` on a parent (ADR 0278): one of its
  *  children moved to top level. A `ChildReportFiled`: a child's report its
  *  child said needs no action now. And a `CacheKeepAliveStatusChanged`, the
- *  record of one keep-alive run (ADR 0540). A *people-only message* and an
- *  agent pause or resume (ADR 0649). None wakes the agent, so no response
- *  follows. */
+ *  record of one keep-alive run (ADR 0540). A *user-only message* (ADR 0649).
+ *  None wakes the agent, so no response follows. */
 export function isTurnlessBoundary(event: { type: string; cause?: string }): boolean {
   return isUserStoppedWait(event)
     || event.type === 'ChildThreadStopped'
     || event.type === 'ChildThreadDetached'
     || event.type === 'ChildReportFiled'
     || event.type === 'CacheKeepAliveStatusChanged'
-    || event.type === 'PeopleMessagePosted'
-    || event.type === 'AgentPaused'
-    || event.type === 'AgentResumed';
+    || event.type === 'UserOnlyMessagePosted';
 }
 
 /** The wait's `reason` as a bare subject, for a label that already said "wait".
@@ -366,6 +382,7 @@ const REDIRECT_CANCEL: Record<CancelCause, boolean> = {
   user_action: false,
   superseded_by_followup: true,
   effort_restart: true,
+  refused: false,
   unknown: false,
 };
 
@@ -398,6 +415,15 @@ export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = AUTO_RESUME_AFTER_SW
 /** ContinuationStarted.reason emitted when the user pressed **Harden** on the
  *  Not ready strip, and the thread resumed to run `/harden`. */
 export const CONTINUATION_HARDEN_REQUESTED_REASON = HARDEN_REQUESTED_REASON;
+
+/** ContinuationStarted.reasons emitted when the owner let one automatic step
+ *  run on a thread whose automation is paused: the plan nudge, building an
+ *  approved plan, the context-ceiling handoff, or a wake to read waiting
+ *  reports. */
+export const CONTINUATION_PLAN_REQUESTED_REASON = PLAN_REQUESTED_REASON;
+export const CONTINUATION_BUILD_REQUESTED_REASON = BUILD_REQUESTED_REASON;
+export const CONTINUATION_HANDOFF_REQUESTED_REASON = HANDOFF_REQUESTED_REASON;
+export const CONTINUATION_REPORTS_REQUESTED_REASON = REPORTS_REQUESTED_REASON;
 
 /** ContinuationStarted.reason emitted when the user picked a new reasoning
  *  effort on a Claude Code thread. Claude Code takes effort only at spawn, so
@@ -444,6 +470,10 @@ export function continuationStartedSummary(
     return 'Resumed after the model connection dropped';
   }
   if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'Hardening the work';
+  if (reason === CONTINUATION_PLAN_REQUESTED_REASON) return 'Returning to the plan';
+  if (reason === CONTINUATION_BUILD_REQUESTED_REASON) return 'Building the approved plan';
+  if (reason === CONTINUATION_HANDOFF_REQUESTED_REASON) return 'Handing off the session';
+  if (reason === CONTINUATION_REPORTS_REQUESTED_REASON) return 'Reading the waiting reports';
   if (reason === CONTINUATION_EFFORT_RESTART_REASON) return 'Restarted at the new reasoning effort';
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
 }
@@ -457,6 +487,10 @@ export function continuationCause(
   if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Stopped responding';
   if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) return 'Connection dropped';
   if (reason === CONTINUATION_HARDEN_REQUESTED_REASON) return 'You asked to harden';
+  if (reason === CONTINUATION_PLAN_REQUESTED_REASON) return 'You allowed the plan nudge';
+  if (reason === CONTINUATION_BUILD_REQUESTED_REASON) return 'You allowed the build';
+  if (reason === CONTINUATION_HANDOFF_REQUESTED_REASON) return 'You allowed the handoff';
+  if (reason === CONTINUATION_REPORTS_REQUESTED_REASON) return 'You woke it for reports';
   if (reason === CONTINUATION_EFFORT_RESTART_REASON) return 'You changed effort';
   return originMode(actor) === 'human' ? 'You continued' : 'After restart';
 }

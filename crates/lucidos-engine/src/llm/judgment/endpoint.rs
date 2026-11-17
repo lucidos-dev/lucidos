@@ -255,7 +255,7 @@ async fn openrouter_api_key(pool: &PgPool) -> Option<String> {
             .map(|secret| (c.auth_type, secret)),
         Ok(None) => None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Judgment] Could not read the '{}' credential: {}",
                 service,
                 e
@@ -303,7 +303,7 @@ async fn stored_credential(
         }
         Ok(None) => None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Judgment] Could not read the '{}' credential: {}",
                 service,
                 e

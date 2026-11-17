@@ -17,11 +17,8 @@
 //! is not something a display label gets to widen.
 //!
 //! So the direct-port page asks its own engine, which IS same-origin with it,
-//! and the engine asks the co-located gateway over loopback, a call carrying no
-//! browser fetch metadata, which `control_authz` allows. Same hop as
-//! [`crate::boot_report`] and `api::history::restart_via_gateway`, same posture:
-//! scheme via [`crate::net_config::peer_scheme_order`], the self-signed dev cert
-//! accepted, no ambient proxy, a short timeout.
+//! and the engine asks the co-located gateway over loopback
+//! ([`super::gateway_control`]), under a short timeout.
 //!
 //! Two properties this route is responsible for:
 //!
@@ -104,7 +101,7 @@ async fn fetch_label_within(
     match tokio::time::timeout(deadline, ask_gateway(gateway_port, id, our_port)).await {
         Ok(label) => label,
         Err(_) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[WorkspaceLabel] gateway on :{} did not answer within {:?}; using the engine name",
                 gateway_port,
                 deadline
@@ -116,53 +113,15 @@ async fn fetch_label_within(
 
 /// The hop itself, unbounded: [`fetch_label_within`] owns the deadline.
 async fn ask_gateway(gateway_port: &str, id: &str, our_port: &str) -> Option<String> {
-    // Every give-up path in here says so. The route answers 200 with a null
-    // label whatever happens, and the page only warns when the request itself
-    // throws, so a line here is the ONLY place a broken hop is visible at all.
-    let client = match crate::gateway_auth::client_builder().build() {
-        Ok(client) => client,
-        Err(e) => {
-            crate::log!(
-                "[WorkspaceLabel] could not build the gateway client ({}); using the engine name",
-                e
-            );
-            return None;
+    match super::gateway_control::fetch_control(gateway_port, "/workspaces").await {
+        Ok(body) => label_for(&body, id, our_port),
+        Err(why) => {
+            // The route answers 200 with a null label whatever happens. This
+            // line is the only place a broken hop shows at all.
+            crate::log_legacy!("[WorkspaceLabel] {}; using the engine name", why);
+            None
         }
-    };
-    // Resolved scheme first, the other protocol second, so a dev/packaged
-    // mismatch still connects (the class that broke `restart_via_gateway`).
-    for scheme in crate::net_config::peer_scheme_order() {
-        let url = format!("{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces");
-        let Ok(resp) = client.get(&url).send().await else {
-            continue; // unreachable on this scheme, so try the other protocol
-        };
-        if !resp.status().is_success() {
-            // The gateway answered and refused; the other scheme won't differ.
-            crate::log!(
-                "[WorkspaceLabel] gateway control listing returned {}; using the engine name",
-                resp.status()
-            );
-            return None;
-        }
-        let body = match resp.text().await {
-            Ok(body) => body,
-            Err(e) => {
-                crate::log!(
-                    "[WorkspaceLabel] gateway control listing body was unreadable ({}); \
-                     using the engine name",
-                    e
-                );
-                return None;
-            }
-        };
-        return label_for(&body, id, our_port);
     }
-    // Neither protocol connected.
-    crate::log!(
-        "[WorkspaceLabel] gateway on :{} unreachable; using the engine name",
-        gateway_port
-    );
-    None
 }
 
 /// Pull OUR OWN display name out of a control listing. `None` for a malformed
@@ -198,7 +157,7 @@ fn label_for(listing: &str, workspace_id: &str, our_port: &str) -> Option<String
         // The most diagnostic of the give-up paths, and the shape of the bug
         // this route exists to fix: we reached A gateway, and it has never heard
         // of us. Usually means we are pointed at the wrong one.
-        crate::log!(
+        crate::log_legacy!(
             "[WorkspaceLabel] gateway does not list '{}'; using the engine name",
             workspace_id
         );
@@ -212,7 +171,7 @@ fn label_for(listing: &str, workspace_id: &str, our_port: &str) -> Option<String
         _ => return None,
     };
     if row_port != our_port {
-        crate::log!(
+        crate::log_legacy!(
             "[WorkspaceLabel] '{}' is on :{} but this engine serves :{}; \
              not our row, using the engine name",
             workspace_id,
@@ -229,6 +188,7 @@ fn label_for(listing: &str, workspace_id: &str, our_port: &str) -> Option<String
 
 #[cfg(test)]
 mod tests {
+    use super::super::gateway_control::test_support::stand_in_gateway;
     use super::*;
     use axum::http::StatusCode;
 
@@ -264,30 +224,6 @@ mod tests {
         for body in ["", "not json", "{}", r#"{"workspaces":"nope"}"#] {
             assert_eq!(label_for(body, "dev", "5173"), None, "body: {body:?}");
         }
-    }
-
-    /// Serve `body` at the control-listing path on a loopback port, over plain
-    /// HTTP, and hand back the port. Stands in for the gateway.
-    ///
-    /// Plain HTTP on purpose. `peer_scheme_order()` puts `https` first whenever
-    /// this process has TLS certs configured, so a run in that environment has
-    /// to fall through to the second protocol to reach this stub at all. That
-    /// makes the fallback loop load-bearing for the test rather than incidental,
-    /// which is the arm that broke `restart_via_gateway` when someone hardcoded
-    /// a scheme.
-    async fn stand_in_gateway(body: &'static str, status: StatusCode) -> u16 {
-        let app = Router::<()>::new().route(
-            "/~/api/v1/control/workspaces",
-            get(move || async move { (status, body) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind loopback");
-        let port = listener.local_addr().expect("local addr").port();
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-        port
     }
 
     #[tokio::test]

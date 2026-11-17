@@ -131,11 +131,8 @@ impl RoutingProvider {
     /// Snap a reasoning effort onto the closest tier the route's backend
     /// actually supports.
     ///
-    /// **This is the chokepoint**, and it is here rather than in each provider
-    /// because this is the only layer that knows the [`ProviderKind`]: the
-    /// OpenAI, OpenRouter and local backends are all the same
-    /// [`OpenAiProvider`] struct with a different base URL, so a rule inside it
-    /// can only see the model id and cannot tell whose vocabulary applies. It
+    /// **This is the chokepoint** for effort clamping. The registry route
+    /// supplies both the backend and wire model before a call is sent. It
     /// covers every producer of an effort at once, the chat picker, a trigger's
     /// pinned effort, the `preferences` tool, the HTTP API, and a per-thread
     /// value remembered from a model the thread no longer runs on.
@@ -157,7 +154,7 @@ impl RoutingProvider {
             // Not one of our tiers at all, so there is nothing to snap it onto.
             // Send no effort and let the provider default apply, rather than
             // guessing a tier a typo would then be billed for.
-            crate::log!(
+            crate::log_legacy!(
                 "[Routing] dropping unrecognised reasoning effort '{}' for '{}'; provider default applies",
                 effort,
                 model
@@ -165,7 +162,7 @@ impl RoutingProvider {
             return None;
         };
         if clamped != effort {
-            crate::log!(
+            crate::log_legacy!(
                 "[Routing] reasoning effort '{}' is unavailable on '{}'; using closest supported '{}'",
                 effort,
                 model,
@@ -200,7 +197,7 @@ impl RoutingProvider {
             .map(|blocks| replace_image_blocks(blocks, note))
             .sum();
         if withheld > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[Routing] '{model}' does not read images; withheld {withheld} base64 bytes of images"
             );
         }
@@ -274,12 +271,12 @@ impl RoutingProvider {
         match &resolved.generation {
             Generation::Named => {}
             Generation::Successor => {
-                crate::log!("[Routing] '{named}' is retired; sending its successor '{model}'")
+                crate::log_legacy!("[Routing] '{named}' is retired; sending its successor '{model}'")
             }
-            Generation::Predecessor => crate::log!(
+            Generation::Predecessor => crate::log_legacy!(
                 "[Routing] nothing from '{named}' on is reachable; sending the earlier '{model}'"
             ),
-            Generation::Held { successor } => crate::log!(
+            Generation::Held { successor } => crate::log_legacy!(
                 "[Routing] '{named}' is retired, but '{successor}' is not reachable; keeping '{named}'"
             ),
         }
@@ -296,6 +293,7 @@ impl RoutingProvider {
         call: crate::llm::metered::CallToken,
     ) -> Result<LlmResponse, BoxError> {
         let Resolved { model, route, .. } = resolved;
+        crate::llm::metered::check_provider(route.provider).await?;
         // `route_for` already refused an unconfigured backend, so the miss here
         // is unreachable. It resolves through the same `backend`, and saying
         // what to configure beats an `expect` if the two ever part company.
@@ -353,6 +351,13 @@ fn unconfigured_message(kind: ProviderKind) -> &'static str {
 
 #[async_trait]
 impl LlmProvider for RoutingProvider {
+    fn resolved_provider_kind(
+        &self,
+        selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Some(self.resolve(selection)?.route.provider))
+    }
+
     async fn chat(
         &self,
         messages: Vec<Message>,
@@ -400,7 +405,7 @@ impl LlmProvider for RoutingProvider {
                 if next.model == first.model {
                     return Err(err);
                 }
-                crate::log!(
+                crate::log_legacy!(
                     "[Routing] {} does not serve '{}'; retrying once on '{}'",
                     first.route.provider.as_str(),
                     first.model,
@@ -434,7 +439,7 @@ impl LlmProvider for RoutingProvider {
         }
         if let Some(served) = response.served_model.as_deref() {
             if !served_as_sent(&route.wire_id, served) {
-                crate::log!(
+                crate::log_legacy!(
                     "[Routing] WARNING: sent '{}' to {}, but '{served}' served it",
                     route.wire_id,
                     route.provider.as_str()
@@ -779,6 +784,7 @@ mod tests {
             }
         });
         let local = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             String::new(),
             "local-model".to_string(),
             &format!("http://{addr}/v1"),
@@ -843,6 +849,7 @@ mod tests {
             }
         });
         let provider = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             "k".to_string(),
             "unused".to_string(),
             &format!("http://{addr}/v1"),
@@ -1027,6 +1034,7 @@ mod tests {
             }
         });
         let openai = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             "k".to_string(),
             "unused".to_string(),
             &format!("http://{addr}/v1"),
@@ -1401,6 +1409,7 @@ mod tests {
             RoutingBackends {
                 openrouter: Some(
                     OpenAiProvider::new_with_base_url(
+                        crate::llm::ProviderKind::OpenAi,
                         "k".to_string(),
                         "x".to_string(),
                         crate::llm::OPENROUTER_BASE_URL,
@@ -1448,6 +1457,7 @@ mod tests {
     #[test]
     fn the_effort_sent_is_the_routed_one() {
         let local = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             String::new(),
             "local-model".to_string(),
             "http://127.0.0.1:9/v1",
@@ -1578,6 +1588,7 @@ pub(crate) mod lineage_stub {
             }
         });
         let provider = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
             String::new(),
             "unused".to_string(),
             &format!("http://{addr}/v1"),

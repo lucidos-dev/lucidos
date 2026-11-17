@@ -397,7 +397,7 @@
       "frames": false,
       "default": {
         "dark": "#fb923c",
-        "light": "#ea7c2a"
+        "light": "#cb621a"
       }
     },
     {
@@ -441,7 +441,7 @@
       "group": "marks",
       "kind": "color",
       "label": "Claude mark",
-      "description": "The Claude logo on the chat's actor chips and in navigation history. Follows --initiator-coding-agent by default.",
+      "description": "The Claude logo on chat actor chips, in navigation history and in drawer rows with agent brand colours On. Follows --initiator-coding-agent by default.",
       "frames": false,
       "default": {
         "dark": "var(--initiator-coding-agent)",
@@ -453,7 +453,7 @@
       "group": "marks",
       "kind": "color",
       "label": "Codex mark",
-      "description": "The Codex logo's fill. Follows the primary text colour by default, so it reads white on a dark theme.",
+      "description": "The Codex logo on chat actor chips, in navigation history and in drawer rows with agent brand colours On. Follows the primary text colour by default.",
       "frames": false,
       "default": {
         "dark": "var(--text-primary)",
@@ -1055,8 +1055,8 @@
       "description": "The font for code, paths and tool output.",
       "frames": true,
       "default": {
-        "dark": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
-        "light": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace"
+        "dark": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace",
+        "light": "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace"
       }
     }
   ]

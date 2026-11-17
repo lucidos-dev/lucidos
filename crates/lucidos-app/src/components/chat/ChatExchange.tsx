@@ -1,3 +1,6 @@
+import { turnDeviceName } from '../../store/actions/devices';
+import { spendCapResetLabel } from '../../utils/spendCap';
+import { providerLabel } from '../../store/modelProviders';
 import { Fragment, type ComponentChildren } from 'preact';
 import { InlineWidget } from '../widgets/InlineWidget';
 import { ReplyHtml } from '../widgets/useWidgetEmbedSlots';
@@ -8,7 +11,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ReadMarker, StoredEvent, ThreadEvent, MessageOrigin, ResolvedPermission, TypedAnswer } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeChangeId, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY, triggerRunInterruption } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_LABEL, API_CALLER_LABEL, unattestedCallerLabel, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, drawsInitiatorPanel, isResumeTurn, exchangeUserMessage, isUserBubbleEvent, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, messageReadTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, drawnResponseEvents, exchangeStatus, exchangeError, exchangeChangeId, exchangeStarterId, dividerBodyIsSuppressed, opensAwaitingAnswer, hasRenderableResponseContent, isEmptyContinuedExchange, questionDividerResolution, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, isLivePartialRow, isLiveReplyRow, isLiveUtteranceRow, isSpeechOnlyTurn, turnBodyFolded, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isTurnlessBoundary, isUnsentExchange, agentMessageSender, waitReentryReason, RESPONSE_CANCELED_SUMMARY, triggerRunInterruption } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, expandExchange, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { discardUnsentMessage, editQueuedMessage, removeQueuedMessage, retryUnsentMessage } from '../../store/actions/chat';
@@ -17,7 +20,9 @@ import { unsentMessages } from '../../store/unsentMessages';
 import { withScrollAnchor } from './CreateThreadView';
 import { QuestionBody } from './QuestionCard';
 import { agentExitCopy } from './agentExitCopy';
-import { teammateName } from '../../store/actions/operators';
+import { providerBlockCopy, providerCodeLine } from './providerBlockCopy';
+import { ProviderBlockActions } from './ProviderBlockActions';
+import { teammateName } from '../../store/actions/gatewayUsers';
 import { originPopoverHasContent, resolveOrigin } from './messageOrigin';
 import { pendingAnswers, unsentPicks } from '../../store/pendingDecisions';
 import { CommandPermissionBody, McpPermissionBody, PermissionBody, engineResolutionNote, pendingVerdicts } from './PermissionCard';
@@ -36,13 +41,9 @@ import { NO_SIDE_QUESTIONS, SideQuestionGroup, placeInBody } from './SideQuestio
 import type { SideQuestion } from '../../store/sideQuestions';
 import { ChangeEventRow, CheckpointCard, ContinueButton, RestartRow, FreshSessionRow, HandoffSessionRow, EventDeliveryBody, EventWaitRow, FileList, HeldMessageRow, GeneratedImage, InitiatorPanel, InlineStep, LivePartialBody, SubAgentStepGroup, LiveUtteranceBody, MarkdownBlock, ResponsePanel, ResumeCard, SpokenChip, SpokenReply, TriggerFiredBody, TriggerInterruptionNotice, UserMessageBody, changeAccent, describeExecutor, boundaryCard, turnControls } from './chat-exchange-parts';
 import type { BoundaryTurn } from './chat-exchange-parts';
-import { EditIcon, TrashIcon, PowerIcon, PersonIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
+import { EditIcon, TrashIcon, PowerIcon, UserIcon, ApiPlugIcon, TriggerFiredIcon, WarningIcon, ContinuedIcon } from '../shared/icons';
 import { useOnScreenInTranscript } from '../../hooks/useOnScreenInTranscript';
 import { engineReasonHeadline } from '../../utils/engineEventExplainers';
-import { lazyComponent } from '../../utils/lazyComponent';
-
-// Only a team thread records a pause, so the first frame skips it.
-const AgentPauseRow = lazyComponent(() => import('./AgentPauseRow').then((m) => m.AgentPauseRow));
 
 // Stable refs so the `loadedOr` fallback does not yield a fresh [] each render.
 // Without these, every dependent useMemo invalidates on every render while
@@ -213,6 +214,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   const error = exchangeError(exchange);
   const interruption = triggerRunInterruption(exchange);
   const agentExitCard = error?.agentExit && agentExitCopy(error.agentExit, sessionCodingAgent);
+  const providerBlockCard = error?.providerError && providerBlockCopy(error.providerError);
+  const providerCode = error?.providerError && providerCodeLine(error.providerError);
   const unsentEventId = unsentMessageOf(exchange);
   // A live turn's output can land between the bubble and this card, so the
   // card names the message Retry would send.
@@ -449,7 +452,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
   // changes, the caller's own bubbles being chromeless already.
   const isSpeechOnly = isSpeechOnlyTurn(exchange);
   // A teammate's bubble names its sender and aligns left. Reading
-  // `teammateName` subscribes this turn to `operators`.
+  // `teammateName` subscribes this turn to `gatewayUsers`.
   const senderOrigin = isUserMessageBubble ? resolveOrigin(exchange) : undefined;
   const teammate = senderOrigin?.kind === 'device' ? teammateName(senderOrigin.device_id) : null;
   const isChromeless = isUserMessageBubble || isChangePanel || isSpeechOnly || initiator.chromeless === true;
@@ -793,7 +796,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
         // `data-change-id`. Inline steps are NOT stamped, since the "Show
         // steps" toggle can hide them and an id there resolves only sometimes.
         <div class="exchange-error" data-event-id={error.eventId || undefined}>
-          <strong>{unsentEventId ? 'Not sent' : agentExitCard?.heading ?? 'The reply failed'}</strong>
+          <strong>{unsentEventId ? 'Not sent' : error.spendCap ? 'Spend cap reached' : providerBlockCard?.heading ?? agentExitCard?.heading ?? 'The reply failed'}</strong>
           {unsentText && <blockquote class="exchange-error-quote">{unsentText}</blockquote>}
           {unsentEventId
             ? (
@@ -809,6 +812,17 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
                 </div>
               </>
             )
+            : error.spendCap
+              ? <><p>{providerLabel(error.spendCap.provider)}. {spendCapResetLabel(error.spendCap.resets_at)} You can try again after raising the cap.</p><blockquote class="exchange-error-quote">{error.spendCap.message}</blockquote>{agentExitCard && <p class="exchange-error-reason">{agentExitCard.reason}</p>}{agentExitCard && isLast && <div class="exchange-error-actions"><ContinueButton threadId={threadId} label="Try again" /></div>}</>
+            : providerBlockCard
+              ? (
+                <>
+                  <p class="exchange-error-output">{error.message}</p>
+                  {error.providerError?.detail && <blockquote class="exchange-error-quote">{error.providerError.detail}</blockquote>}
+                  <p class="exchange-error-reason">{providerBlockCard.reason}</p>
+                  {isLast && <ProviderBlockActions threadId={threadId} sessionCodingAgent={sessionCodingAgent} />}
+                </>
+              )
             : agentExitCard
               ? (
                 <>
@@ -824,6 +838,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, readMar
               : (
                 <>
                   <p>{error.message}</p>
+                  {providerCode && <p class="exchange-error-reason">{providerCode}</p>}
                   <p>Send a message to try again.</p>
                 </>
               )}
@@ -1095,6 +1110,9 @@ function initiatorSummary(exchange: Exchange): string {
     case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
     case 'MessageReceived': {
       if (ev.origin?.kind === 'api') return 'API message';
+      if (ev.origin?.kind === 'unattested_caller') return ev.origin.claimed_workspace
+        ? `Message from workspace "${ev.origin.claimed_workspace}", by its own account`
+        : `Message from ${unattestedCallerLabel(ev.origin, ev.origin.claimed_device_id ? turnDeviceName(ev.origin.claimed_device_id, { knownOnly: true }) : undefined).replace(/^A /, 'a ').replace(/^An /, 'an ')}`;
       if (modeToInitiator(ev.mode) !== 'system') return '';
       // An engine-seeded thread names what it is about, as the popover does.
       const headline = ev.origin?.kind === 'engine' ? engineReasonHeadline(ev.origin.reason) : null;
@@ -1142,10 +1160,10 @@ function actorVariant(actor: Parameters<typeof actorInitiator>[0]): InitiatorVar
  *    is what tells it apart from the agent.
  *  - **System**, the host killing the process.
  *  - **API caller**, an external HTTP caller that did not self-identify.
+ *  - An unsigned caller names its claims in plain words, with no icon.
  *
  *  "You" is reserved for `kind: device`, a browser session bound to a known
- *  device row. Any other human-mode origin renders as "API caller", so an
- *  unauthenticated POST can never impersonate the user in the timeline. The
+ *  device row. An unsigned device claim never renders as "You". The
  *  popover still discloses the origin kind, user-agent and workspace name.
  *
  *  Lives in the view layer rather than the store, because EVERY actor icon is a
@@ -1157,7 +1175,8 @@ export function actorInitiator(actor: MessageOrigin | undefined): { icon: Compon
   // The host system killed the process (engine shutdown, OS signal, crash), so
   // the power symbol rather than the Lucidos mark the deliberate engine wears.
   if (actor?.kind === 'system') return { icon: <PowerIcon />, label: SYSTEM_LABEL };
-  if (actor?.kind === 'device') return { icon: <PersonIcon />, label: 'You' };
+  if (actor?.kind === 'device') return { icon: <UserIcon />, label: 'You' };
+  if (actor?.kind === 'unattested_caller') return { icon: null, label: unattestedCallerLabel(actor, actor.claimed_device_id ? turnDeviceName(actor.claimed_device_id, { knownOnly: true }) : undefined) };
   switch (originMode(actor)) {
     case 'human':  return { icon: <ApiPlugIcon />, label: API_CALLER_LABEL };
     case 'agent':  return { icon: <LucidosGlyph />, label: LUCIDOS_AGENT_LABEL };
@@ -1170,7 +1189,7 @@ export function actorInitiator(actor: MessageOrigin | undefined): { icon: Compon
  *  every arm where the device-owner is the initiator (MessageReceived from a
  *  device, divider-starter ActionRequired events, …). */
 function youInitiator(rest: Partial<InitiatorDescriptor> = {}): InitiatorDescriptor {
-  return { variant: 'user', icon: <PersonIcon />, label: 'You', ...rest };
+  return { variant: 'user', icon: <UserIcon />, label: 'You', ...rest };
 }
 
 /** Build a `'system'`-variant descriptor with the engine chip (Lucidos mark +
@@ -1463,7 +1482,11 @@ export function describeInitiator(
       const details = userMessageHtml || userImageHashes.length > 0
         ? <UserMessageBody html={userMessageHtml} imageHashes={userImageHashes} />
         : undefined;
-      if (ev.origin?.kind === 'api' || modeToInitiator(ev.mode) === 'system') {
+      if (
+        ev.origin?.kind === 'api'
+        || ev.origin?.kind === 'unattested_caller'
+        || modeToInitiator(ev.mode) === 'system'
+      ) {
         return { variant: actorVariant(ev.origin), summary, details, ...actorInitiator(ev.origin) };
       }
       // A spoken message says so. The composer stays live during a call (ADR
@@ -1674,6 +1697,7 @@ export function describeInitiator(
               command: ev.command,
               summary: ev.summary,
               grant_head: ev.grant_head,
+              grant_offer: ev.grant_offer,
             }}
             resolved={resolved}
             terminated={responseTerminated}
@@ -1709,21 +1733,12 @@ export function describeInitiator(
     }
     // A message kept between people (ADR 0649). It reads like any typed
     // message: the bubble, and the sender's name when it is a teammate's.
-    case 'PeopleMessagePosted':
+    case 'UserOnlyMessagePosted':
       return youInitiator({
         details: userMessageHtml || userImageHashes.length > 0
           ? <UserMessageBody html={userMessageHtml} imageHashes={userImageHashes} />
           : undefined,
       });
-    case 'AgentPaused':
-    case 'AgentResumed':
-      return {
-        variant: 'system',
-        icon: null,
-        label: '',
-        chromeless: true,
-        details: <AgentPauseRow paused={ev.type === 'AgentPaused'} cause={ev.cause} actor={ev.actor} />,
-      };
     case 'McpConsentRequested':
       // Iconless action label (ResponseCanceled style). No answer is ever
       // recorded, so its chip opens no popover. No body component: nothing

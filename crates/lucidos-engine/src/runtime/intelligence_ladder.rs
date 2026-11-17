@@ -303,7 +303,7 @@ impl ChatOffer {
     pub async fn load(pool: &PgPool, routes: ModelRoutes) -> Self {
         let labels = crate::core::ModelStore::list(pool)
             .await
-            .inspect_err(|e| log!("[IntelligenceLadder] reading model labels failed: {e}"))
+            .inspect_err(|e| log_legacy!("[IntelligenceLadder] reading model labels failed: {e}"))
             .unwrap_or_default()
             .into_iter()
             .map(|m| (m.id, m.label))
@@ -625,12 +625,12 @@ pub async fn default_implementer(pool: &PgPool, agent: CodingAgent) -> Option<De
 /// `stored`, kept only as far as `agent` offers it.
 fn offered_default(agent: CodingAgent, stored: DefaultImplementer) -> Option<DefaultImplementer> {
     if let Err(e) = super::validate_coding_agent_model(agent, Some(&stored.model)) {
-        log!("[IntelligenceLadder] ignoring the default implementer: {e}");
+        log_legacy!("[IntelligenceLadder] ignoring the default implementer: {e}");
         return None;
     }
     let effort = stored.effort.filter(|effort| {
         super::validate_coding_agent_effort(agent, Some(&stored.model), Some(effort))
-            .inspect_err(|e| log!("[IntelligenceLadder] ignoring the default effort: {e}"))
+            .inspect_err(|e| log_legacy!("[IntelligenceLadder] ignoring the default effort: {e}"))
             .is_ok()
     });
     Some(DefaultImplementer {
@@ -1060,7 +1060,7 @@ pub(crate) async fn measure_long_prompt_share(pool: &PgPool) -> Option<f64> {
     .bind(LONG_PROMPT_WINDOW_DAYS)
     .fetch_one(pool)
     .await
-    .inspect_err(|e| log!("[IntelligenceLadder] measuring the long-prompt share failed: {e}"))
+    .inspect_err(|e| log_legacy!("[IntelligenceLadder] measuring the long-prompt share failed: {e}"))
     .ok()
     .flatten()
 }
@@ -1126,7 +1126,6 @@ pub async fn load(
     routes: &ModelRoutes,
     surface: LadderSurface,
 ) -> IntelligenceLadder {
-    let override_value = surface.override_pref().read(pool).await;
     let default_intelligence_rung = match surface.coding_agent() {
         Some(agent) => default_coding_intelligence_rung(pool, agent).await,
         None => default_chat_intelligence_rung(pool, &routes.registry).await,
@@ -1134,6 +1133,21 @@ pub async fn load(
     let reference = match &default_intelligence_rung {
         Some(pair) => Some(pair.clone()),
         None => default_coding_intelligence_rung(pool, CodingAgent::ClaudeCode).await,
+    };
+    load_with_reference(pool, routes, surface, reference).await
+}
+
+/// Load a surface against a caller-selected reference, including an absent one.
+pub async fn load_with_reference(
+    pool: &PgPool,
+    routes: &ModelRoutes,
+    surface: LadderSurface,
+    reference: Option<IntelligenceRung>,
+) -> IntelligenceLadder {
+    let override_value = surface.override_pref().read(pool).await;
+    let default_intelligence_rung = match surface.coding_agent() {
+        Some(agent) => default_coding_intelligence_rung(pool, agent).await,
+        None => default_chat_intelligence_rung(pool, &routes.registry).await,
     };
     match surface.coding_agent() {
         Some(agent) => assemble(
@@ -1153,6 +1167,35 @@ pub async fn load(
             None,
         ),
     }
+}
+
+/// Other installed backends, with the spawn's binary probe supplied by the caller.
+pub(crate) fn other_coding_agents(
+    current: CodingAgent,
+    installed: impl Fn(CodingAgent) -> bool,
+) -> Vec<CodingAgent> {
+    [CodingAgent::ClaudeCode, CodingAgent::Codex]
+        .into_iter()
+        .filter(|a| *a != current && installed(*a))
+        .collect()
+}
+
+/// Other installed backends measured against the current ladder's reference.
+pub async fn other_backend_ladders(
+    pool: &PgPool,
+    routes: &ModelRoutes,
+    current: &IntelligenceLadder,
+) -> Vec<IntelligenceLadder> {
+    let Some(agent) = current.coding_agent else {
+        return Vec::new();
+    };
+    let installed = crate::runtime::installed_coding_agents(pool).await;
+    let mut ladders = Vec::new();
+    for other in other_coding_agents(agent, |a| installed.contains(&a)) {
+        ladders
+            .push(load_with_reference(pool, routes, other.into(), current.reference.clone()).await);
+    }
+    ladders
 }
 
 /// The reason slug an off-ladder refusal carries, for a client to tell it

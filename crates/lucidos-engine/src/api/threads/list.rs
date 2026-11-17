@@ -57,7 +57,7 @@ async fn load_family_threads<'a>(
         .fetch_family_extension(&ids, MAX_FAMILY_THREADS)
         .await
         .map_err(|e| {
-            log!("[API] Failed to fetch family extension: {}", e);
+            log_legacy!("[API] Failed to fetch family extension: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch family extension: {}", e),
@@ -71,7 +71,7 @@ async fn home_thread_summary(
     pool: &sqlx::PgPool,
 ) -> Result<Option<ThreadSummary>, (StatusCode, String)> {
     let internal = |e: String| {
-        log!("[API] Failed to fetch the home thread: {}", e);
+        log_legacy!("[API] Failed to fetch the home thread: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to fetch the home thread: {e}"),
@@ -132,35 +132,35 @@ pub(in crate::api) async fn list_threads(
     );
 
     let saved = saved_result.map_err(|e| {
-        log!("[API] Failed to get saved threads: {}", e);
+        log_legacy!("[API] Failed to get saved threads: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get saved threads: {}", e),
         )
     })?;
     let recent = recent_result.map_err(|e| {
-        log!("[API] Failed to get recent threads: {}", e);
+        log_legacy!("[API] Failed to get recent threads: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get recent threads: {}", e),
         )
     })?;
     let active_threads = active_result.map_err(|e| {
-        log!("[API] Failed to get active thread info: {}", e);
+        log_legacy!("[API] Failed to get active thread info: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get active thread info: {}", e),
         )
     })?;
     let composing = composing_result.map_err(|e| {
-        log!("[API] Failed to get composing threads: {}", e);
+        log_legacy!("[API] Failed to get composing threads: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get composing threads: {}", e),
         )
     })?;
     let archive_count = archive_count_result.map_err(|e| {
-        log!("[API] Failed to count archived threads: {}", e);
+        log_legacy!("[API] Failed to count archived threads: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to count archived threads: {}", e),
@@ -183,7 +183,7 @@ pub(in crate::api) async fn list_threads(
                 .get_threads_by_ids(std::slice::from_ref(focused_id))
                 .await
                 .map_err(|e| {
-                    log!("[API] Failed to fetch focused thread {}: {}", focused_id, e);
+                    log_legacy!("[API] Failed to fetch focused thread {}: {}", focused_id, e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Failed to fetch focused thread: {}", e),
@@ -229,7 +229,7 @@ pub(in crate::api) async fn list_threads(
         response["focused_thread"] = match serde_json::to_value(&ft) {
             Ok(v) => v,
             Err(e) => {
-                log!("[API] Failed to serialize focused thread: {}", e);
+                log_legacy!("[API] Failed to serialize focused thread: {}", e);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to serialize focused thread: {}", e),
@@ -398,7 +398,7 @@ fn parse_source_filter(raw: &Option<String>) -> Option<Vec<String>> {
 
 /// GET /api/v1/threads/list — script/trigger/LLM-tool surface. Returns a flat
 /// newest-first list of `ThreadSummary` rows from the projection, each with
-/// its reader fields (draft preview and thread link).
+/// its reader fields (draft preview and thread link) and its liveness.
 ///
 /// Distinct from `GET /api/v1/threads`, which is the UI-shaped fetch (returns
 /// a grouped saved / archive / active / composing / family payload).
@@ -424,13 +424,14 @@ pub(in crate::api) async fn list_thread_summaries(
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to list thread summaries: {}", e);
+            log_legacy!("[API] Failed to list thread summaries: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to list thread summaries: {}", e),
             )
         })?;
     attach_reader_fields(&mut summaries, &state.engine.workspace_name());
+    crate::engine::thread_liveness::attach(state.engine.pool(), &mut summaries).await;
     Ok(Json(summaries))
 }
 
@@ -456,7 +457,7 @@ pub(in crate::api) async fn list_drafts(
     let store = state.engine.event_store();
     let workspace = state.engine.workspace_name();
     let internal = |e: Box<dyn std::error::Error + Send + Sync>| {
-        log!("[API] Failed to read drafts: {}", e);
+        log_legacy!("[API] Failed to read drafts: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to read drafts: {}", e),
@@ -499,7 +500,7 @@ pub(in crate::api) async fn list_held_messages(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let held = state.engine.list_held_messages(limit).await.map_err(|e| {
-        log!("[API] Failed to list held messages: {}", e);
+        log_legacy!("[API] Failed to list held messages: {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to list held messages: {}", e),
@@ -527,7 +528,7 @@ pub(in crate::api) async fn get_thread_summary(
         .get_threads_by_ids(std::slice::from_ref(&thread_id))
         .await
         .map_err(|e| {
-            log!("[API] Failed to fetch thread {}: {}", thread_id, e);
+            log_legacy!("[API] Failed to fetch thread {}: {}", thread_id, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to fetch thread: {}", e),
@@ -568,7 +569,7 @@ pub(in crate::api) async fn count_thread_summaries(
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to count thread summaries: {}", e);
+            log_legacy!("[API] Failed to count thread summaries: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to count thread summaries: {}", e),
@@ -615,7 +616,7 @@ pub(in crate::api) async fn get_archived_count(
         )
         .await
         .map_err(|e| {
-            log!("[API] Failed to count archived threads: {}", e);
+            log_legacy!("[API] Failed to count archived threads: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to count archived threads: {}", e),
@@ -685,7 +686,7 @@ pub(in crate::api) async fn get_older_threads(
         )
         .await
         .map_err(|e| {
-            log!("[API] Failed to get older threads: {}", e);
+            log_legacy!("[API] Failed to get older threads: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get older threads: {}", e),
@@ -720,7 +721,7 @@ pub(in crate::api) async fn get_filter_facets(
         .get_filter_facets(&state.app_manager)
         .await
         .map_err(|e| {
-            log!("[API] Failed to get filter facets: {}", e);
+            log_legacy!("[API] Failed to get filter facets: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get filter facets: {}", e),

@@ -79,6 +79,7 @@ function settle(): Promise<void> {
 }
 
 function resetAll(): void {
+  localStorage.clear();
   toasts.value = [];
   threadMap.value = new Map();
   focusedThreadId.value = null;
@@ -543,8 +544,8 @@ describe('eventHasTarget', () => {
   });
 });
 
-/** A tap in the Blocked view lands on what waits for the user, not on
- *  the saved reading position. */
+/** A tap in the Blocked view lands on what waits for the user unless
+ *  the saved reading position has reached its turn. */
 describe('openOngoingThread from Blocked', () => {
   beforeEach(resetAll);
 
@@ -561,6 +562,33 @@ describe('openOngoingThread from Blocked', () => {
       eventsLoaded: true,
     } as unknown as ThreadState;
   }
+
+  it.each(['live-edge', 'anchor:-20:q-1', 'line:-20:-100:q-1:1~ffffffff', 'row:-20:q-1'])(
+    'restores a reached Blocked target for %s', saved => {
+      threadMap.value = new Map([['waiting', waitingThread()]]);
+      localStorage.setItem('lucidos-scroll-thread-waiting', saved);
+      openOngoingThread('waiting', 'blocked');
+      expect(focusThread).toHaveBeenCalledWith('waiting');
+      expect(landOnEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['start-1', 'unknown'])('lands for an unreached row: %s', rowEventId => {
+    threadMap.value = new Map([['waiting', waitingThread()]]);
+    localStorage.setItem('lucidos-scroll-thread-waiting', `row:-20:${rowEventId}`);
+    openOngoingThread('waiting', 'blocked');
+    expect(landOnEvent).toHaveBeenCalledWith('waiting', 'q-1');
+  });
+
+  it('restores a saved failure-step row in the target turn', () => {
+    const waiting = waitingThread();
+    const failed: ThreadState = { ...waiting, meta: { ...waiting.meta, status: 'failed' } };
+    failed.events.set(2, { type: 'ResponseFailed', error: 'failed', _eventId: 'failure' } as never);
+    threadMap.value = new Map([['waiting', failed]]);
+    localStorage.setItem('lucidos-scroll-thread-waiting', 'row:-20:failure');
+    openOngoingThread('waiting', 'blocked');
+    expect(landOnEvent).not.toHaveBeenCalled();
+  });
 
   it('lands on the open question at once when the events are loaded', () => {
     threadMap.value = new Map([['waiting', waitingThread()]]);
@@ -727,12 +755,13 @@ describe('openListedThread', () => {
   });
 });
 
-/** A tap in the Review view lands on the reply to read. It lands at once, so
- *  the saved reading position is never painted first. */
+/** A tap in the Review view preserves a reached saved place; otherwise it
+ *  lands on the reply to read before painting the saved position. */
 describe('openOngoingThread from Review', () => {
   beforeEach(resetAll);
 
-  it('lands on the newest turn of a thread that asked to be read', () => {
+  it.each([null, 'row:-20:reply-2', 'row:-20:reply-1', 'row:-20:unknown'])(
+    'opens Review with saved position %s', saved => {
     const events = new Map<number, unknown>([
       [1, { type: 'MessageReceived', content: 'first', _eventId: 'start-1', created: '2026-08-06T10:00:00Z' }],
       [2, { type: 'ResponseGenerated', text: 'one', _eventId: 'reply-1', created: '2026-08-06T10:00:01Z' }],
@@ -747,10 +776,12 @@ describe('openOngoingThread from Review', () => {
       eventsLoaded: true,
     } as unknown as ThreadState]]);
 
+    if (saved) localStorage.setItem('lucidos-scroll-thread-asked', saved);
     openOngoingThread('asked', 'review');
 
     expect(focusThread).toHaveBeenCalledWith('asked');
-    expect(landOnEvent).toHaveBeenCalledWith('asked', 'start-2');
+    if (saved === 'row:-20:reply-2') expect(landOnEvent).not.toHaveBeenCalled();
+    else expect(landOnEvent).toHaveBeenCalledWith('asked', 'start-2');
   });
 });
 

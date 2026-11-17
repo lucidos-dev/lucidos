@@ -52,6 +52,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::runtime::agent_sandbox::{Sandbox, SandboxedCommand};
+
 /// Candidate `bash` locations, in resolution order. Covers macOS (`/bin/bash`,
 /// always present) and both merged-`/usr` and split-`/usr` Linux layouts. A
 /// system with none of these falls back to `/bin/sh` without `pipefail`.
@@ -84,7 +86,7 @@ impl CommandShell {
                 };
             }
         }
-        log!(
+        log_legacy!(
             "[Shell] no bash found in {:?} — falling back to {} WITHOUT pipefail. \
              A failing stage of a pipeline (e.g. `cmd | tee log`) will be masked \
              by the last stage's exit status.",
@@ -112,30 +114,34 @@ impl CommandShell {
     /// The interpreter with its options applied and no target yet. Both spawn
     /// helpers start here so the `pipefail` flag can only ever be applied in
     /// one place.
-    fn base(&self) -> tokio::process::Command {
-        let mut cmd = tokio::process::Command::new(&self.program);
+    fn base(&self, sandbox: &Sandbox) -> std::io::Result<SandboxedCommand> {
+        let mut cmd = sandbox.command(&self.program)?;
         if self.pipefail {
             cmd.args(["-o", "pipefail"]);
         }
-        cmd
+        Ok(cmd)
     }
 
     /// `<shell> [-o pipefail] -c <command>` — the spawn used by `run_bash`,
     /// `run_bash_background`, and (via a generated `python <script>` string)
     /// `run_python_background`.
-    pub fn command(&self, command: &str) -> tokio::process::Command {
-        let mut cmd = self.base();
+    pub fn command(&self, sandbox: &Sandbox, command: &str) -> std::io::Result<SandboxedCommand> {
+        let mut cmd = self.base(sandbox)?;
         cmd.arg("-c").arg(command);
-        cmd
+        Ok(cmd)
     }
 
     /// `<shell> [-o pipefail] <script>` — the spawn used for scheduled/trigger
     /// script files. Same masking applies to a pipeline inside the script, so
     /// it gets the same guarantee.
-    pub fn script(&self, script_path: &Path) -> tokio::process::Command {
-        let mut cmd = self.base();
+    pub fn script(
+        &self,
+        sandbox: &Sandbox,
+        script_path: &Path,
+    ) -> std::io::Result<SandboxedCommand> {
+        let mut cmd = self.base(sandbox)?;
         cmd.arg(script_path);
-        cmd
+        Ok(cmd)
     }
 }
 
@@ -429,7 +435,11 @@ mod tests {
             return;
         }
         let out = command_shell()
-            .command("sh -c 'echo lints; exit 101' 2>&1 | tee /dev/null | cat")
+            .command(
+                &Sandbox::unsandboxed(),
+                "sh -c 'echo lints; exit 101' 2>&1 | tee /dev/null | cat",
+            )
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");
@@ -451,7 +461,11 @@ mod tests {
             return;
         }
         let out = command_shell()
-            .command("sh -c 'exit 42' | sh -c 'exit 7' | cat")
+            .command(
+                &Sandbox::unsandboxed(),
+                "sh -c 'exit 42' | sh -c 'exit 7' | cat",
+            )
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");
@@ -465,7 +479,8 @@ mod tests {
     #[tokio::test]
     async fn command_still_reports_plain_exit_codes() {
         let out = command_shell()
-            .command("echo hi; exit 3")
+            .command(&Sandbox::unsandboxed(), "echo hi; exit 3")
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");
@@ -481,7 +496,8 @@ mod tests {
         std::fs::write(&script, "sh -c 'exit 101' | tee /dev/null\n").unwrap();
 
         let out = command_shell()
-            .script(&script)
+            .script(&Sandbox::unsandboxed(), &script)
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");
@@ -538,7 +554,8 @@ mod tests {
             return;
         }
         let out = command_shell()
-            .command("yes | head -1 >/dev/null")
+            .command(&Sandbox::unsandboxed(), "yes | head -1 >/dev/null")
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");
@@ -651,7 +668,8 @@ mod tests {
     #[tokio::test]
     async fn from_status_classifies_a_real_signal_death() {
         let out = command_shell()
-            .command("kill -SEGV $$")
+            .command(&Sandbox::unsandboxed(), "kill -SEGV $$")
+            .expect("unsandboxed command")
             .output()
             .await
             .expect("spawn");

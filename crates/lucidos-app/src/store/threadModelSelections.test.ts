@@ -5,6 +5,7 @@
  *  docs/plans/2026-07-03-per-thread-model-memory.md. */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  chatTurnSelection,
   lastThreadModel,
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
@@ -213,5 +214,37 @@ describe('a paged thread reads its pair from the server stamps', () => {
     );
     expect(resolveActiveThreadModel('t-1')).toBe('picked-model');
     expect(resolveActiveThreadReasoningEffort('t-1', 'picked-model')).toBe('low');
+  });
+});
+
+describe('pending chat rung picks', () => {
+  it('ignores injected live stamps and reconstructs the same pair from a paged snapshot', () => {
+    const applied = { type: 'ChatTurnSettingsResolved', model: 'live', reasoning_effort: 'low', request_event_id: 'turn' };
+    const pick = { type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high' };
+    seedThread('pending', [[1, applied as never], [2, pick as never],
+      [3, { type: 'MessageReceived', model: 'live', request_event_id: 'turn' } as never]]);
+    expect(resolveActiveThreadModel('pending')).toBe('next');
+    expect(chatTurnSelection('pending').live?.model).toBe('live');
+    expect(chatTurnSelection('pending').pending?.model).toBe('next');
+    seedThread('pending', [], [
+      { sequence: 1, event_type: 'ChatTurnSettingsResolved', request_event_id: 'turn', model: 'live', reasoning_effort: 'low', provider: '' },
+      { sequence: 2, event_type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high', provider: '' },
+    ]);
+    expect(resolveActiveThreadModel('pending')).toBe('next');
+    expect(chatTurnSelection('pending').live?.model).toBe('live');
+    expect(chatTurnSelection('pending').pending?.model).toBe('next');
+    seedThread('pending', [[4, { ...pick, type: 'ChatTurnSettingsResolved', request_event_id: 'next-turn' } as never]], threadMap.value.get('pending')!.pairStamps);
+    expect(chatTurnSelection('pending').pending).toBeUndefined();
+    expect(chatTurnSelection('pending').live?.model).toBe('next');
+  });
+
+  it('reads a re-pick of the running pair as no pending pick', () => {
+    seedThread('repick', [
+      [1, { type: 'ChatTurnSettingsResolved', model: 'live', reasoning_effort: 'low', request_event_id: 'turn' } as never],
+      [2, { type: 'ChatSettingsChanged', model: 'next', reasoning_effort: 'high' } as never],
+      [3, { type: 'ChatSettingsChanged', model: 'live', reasoning_effort: 'low', provider: '' } as never],
+    ]);
+    expect(chatTurnSelection('repick').live?.model).toBe('live');
+    expect(chatTurnSelection('repick').pending).toBeUndefined();
   });
 });

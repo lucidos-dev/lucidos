@@ -1013,7 +1013,7 @@ fn the_idle_arm_proposes_before_it_idles() {
 /// **A clean idle covers its polled tasks before anything reads its waits.**
 /// An idle agent polls nothing, so the turn end arms one wait over every
 /// running task. It must come first. The live wait holds the idle proposal
-/// (ADR 0395) and keeps a waiting child unfinished (ADR 0254). It also feeds
+/// (ADR 0395) and keeps a child holding it unfinished (ADR 0254). It also feeds
 /// the turn-end gate's wake decision. It runs only at a clean end, so a user
 /// Stop is never overridden.
 #[test]
@@ -1087,27 +1087,12 @@ fn the_idle_arm_decides_before_it_idles_and_re_enters_after() {
     );
 }
 
-/// The ceiling re-entry's turn is the engine's (ADR 0629, I12). The flag the
-/// input arm sets for it reaches `turn_ended_cleanly`, so its end forces no
-/// read or wake decision. Only an ordinary clean turn end reads the ceiling,
-/// after the idle it counts as a turn (I1, I11). The send comes before the
-/// idle exit decides whether to keep the subprocess.
+/// The actual read boundary classifies a ceiling re-entry; forwarding does not.
 #[test]
 fn the_ceiling_reentry_is_an_engine_turn_read_after_the_idle() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
-
-    let input_arm = RUN_SRC
-        .find("Some(mut user_input) = msg_rx.recv()")
-        .expect("run.rs must still forward input in its own arm");
-    let flag = input_arm
-        + RUN_SRC[input_arm..]
-            .find("ceiling_reentry_forwarded = true;")
-            .expect("the input arm must mark a forwarded ceiling re-entry");
-    let kind_check = RUN_SRC[input_arm..flag]
-        .rfind("if user_input.kind == crate::engine::AgentInputKind::CeilingReentry {")
-        .expect("only the ceiling re-entry sets the flag");
-    assert!(RUN_SRC[input_arm + kind_check..flag].lines().count() <= 2);
-
+    assert!(RUN_SRC.contains("ceiling_delivery.observe(&ev, new_turn_after_terminal);"));
+    assert!(!RUN_SRC.contains("std::mem::take(&mut ceiling_reentry_forwarded)"));
     let classify = RUN_SRC
         .find("let (terminal_kind, emit_idle) = classify_result(")
         .expect("run.rs must still classify the Result before acting on it");
@@ -1116,23 +1101,20 @@ fn the_ceiling_reentry_is_an_engine_turn_read_after_the_idle() {
         arm.find(needle)
             .unwrap_or_else(|| panic!("the Result arm must still contain {needle}"))
     };
-    let taken = find("let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);");
+    let taken = find("let ceiling_read = ceiling_delivery.turn_ended();");
     let clean = find("turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn)");
     let idle_emit = find("self.emit_coding_agent_idled(");
-    const ORDINARY_END: &str = "let ceiling = if ended_cleanly && emit_idle {";
+    const ORDINARY_END: &str = "let ceiling = if ceiling_end == CeilingTurnEnd::Reenter && emit_idle && !keep_alive_turn && !is_resolution_session {";
     let gated = find(ORDINARY_END);
     let read = find("crate::engine::context_ceiling::ceiling_crossing(self.pool(), thread_id, inputs.owed() > 0)");
     let send = find("context_ceiling::record_ceiling_reentry(");
-    let head = find("requeue_at_head(&msg_tx, msg_rx, reentry);");
+    let head = find("ceiling_reentry_forwarded = forward_ceiling_input(");
     let idle_exit = find("match idle_action(");
     assert!(
         taken < clean,
-        "the turn consumes the flag it was forwarded under"
+        "the turn consumes only its own read classification"
     );
-    assert!(
-        idle_emit < gated,
-        "the ceiling counts the idle just recorded"
-    );
+    assert!(idle_emit < gated, "the re-entry follows the idle");
     assert!(
         arm[gated + ORDINARY_END.len()..read].trim().is_empty(),
         "the reading is the clean-end gate's first statement"
@@ -1150,11 +1132,11 @@ fn the_reentry_turn_holds_input_and_ends_in_a_handoff() {
 
     assert!(
         RUN_SRC.contains(
-            "Some(mut user_input) = msg_rx.recv(), if !handed_off && !ceiling_reentry_forwarded => {"
+            "Some(mut user_input) = msg_rx.recv(), if input_gate.receives() && !ceiling_reentry_forwarded => {"
         ),
         "the input arm closes while the re-entry turn runs"
     );
-    assert!(RUN_SRC.contains("s.in_ceiling_reentry = ceiling_reentry_forwarded;"));
+    assert!(RUN_SRC.contains("s.in_ceiling_reentry = true;"));
 
     let classify = RUN_SRC
         .find("let (terminal_kind, emit_idle) = classify_result(")
@@ -1165,8 +1147,10 @@ fn the_reentry_turn_holds_input_and_ends_in_a_handoff() {
             .unwrap_or_else(|| panic!("the Result arm must still contain {needle}"))
     };
     let terminal = find("event: terminal_event,");
-    let taken = find("let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);");
-    let settle = find("if ceiling_turn {\n");
+    let taken = find("let ceiling_read = ceiling_delivery.turn_ended();");
+    let settle = find(
+        "if !is_shutdown && (ceiling_read.is_some() || ceiling_end == CeilingTurnEnd::Brief) {\n",
+    );
     let pending = find("handoff_pending: crate::engine::successor::handoff_pending(");
     let idle_emit = find("self.emit_coding_agent_idled(");
     assert!(
@@ -1382,4 +1366,32 @@ fn a_resolution_session_ends_only_when_no_follow_up_is_owed() {
         decision < end,
         "the session may end only after the owed-input check said nothing is coming"
     );
+}
+
+#[test]
+fn context_ceiling_steer_preserves_turn_state_and_stop_withdraws_first() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    let forward = RUN_SRC
+        .split("fn forward_ceiling_input(")
+        .nth(1)
+        .unwrap()
+        .split("/// The coding-agent driver")
+        .next()
+        .unwrap();
+    assert!(forward.contains("defer_on_steer_failure: true"));
+    assert!(!forward.contains("reset_per_turn_flags"));
+    let stop = RUN_SRC
+        .split("_ = interrupt.notified()")
+        .nth(1)
+        .unwrap()
+        .split("_ = stop.notified()")
+        .next()
+        .unwrap();
+    assert!(
+        stop.find("withdraw_ceiling_before_stop(").unwrap()
+            < stop.find("ControlRequest::Interrupt").unwrap()
+    );
+    assert!(stop.contains("interruption_cause.is_none() && !shutdown_interrupt"));
+    assert!(RUN_SRC.contains("held_ceiling_inputs.push(user_input);"));
+    assert!(RUN_SRC.contains("for held in held_ceiling_inputs.into_iter().rev()"));
 }

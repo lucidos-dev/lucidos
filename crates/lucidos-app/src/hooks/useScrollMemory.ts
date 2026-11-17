@@ -1,3 +1,5 @@
+import { ANCHOR_PREFIX, ROW_PREFIX, LINE_PREFIX, LIVE_EDGE_VALUE, readSavedScroll, type SavedScroll } from '../store/savedScroll';
+export { LIVE_EDGE_VALUE, parseSavedScroll, readSavedScroll, type SavedScroll } from '../store/savedScroll';
 import { useEffect, useRef } from 'preact/hooks';
 import type { RefObject } from 'preact';
 
@@ -15,7 +17,7 @@ import {
   applyFollowSeed,
   type FollowResumeFrom,
 } from '../components/chat/scrollState';
-import { ANCHOR_ATTR, anchorRow, anchorTargetTop, anchorTurn, anchorTurnIsClamped, readRowAnchor, readScrollAnchor, rowTargetTop, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
+import { ANCHOR_ATTR, anchorRow, anchorTargetTop, anchorTurn, anchorTurnIsClamped, blockRelTop, lineBlockOf, lineTargetTop, readLineAnchor, readLineBlock, readRowAnchor, readScrollAnchor, rowTargetTop, type LineAnchor, type LineBlock, type RowAnchor, type ScrollAnchor } from '../components/chat/scrollAnchor';
 import { onPageHide, onPageWake } from '../utils/pageVisit';
 import { postClientLog } from '../utils/clientLog';
 import { watchUserAction } from '../utils/userAction';
@@ -33,49 +35,22 @@ export function isFullyRestorable(saved: number, scrollHeight: number, clientHei
   return max >= saved;
 }
 
-/** The stored form of a reading position that is the LIVE EDGE rather than a
- *  pixel offset: the reader had a standing follow armed in this thread, and was
- *  ON the edge, when they left it. Deliberately not a number, and deliberately
- *  not a second key beside the offset: a thread opens in exactly one place, so
- *  the two answers share one slot and cannot disagree. */
-export const LIVE_EDGE_VALUE = 'live-edge';
+/** The forms that name content, which only an anchoring container records. */
+type ContentPlace = Extract<SavedScroll, { kind: 'anchor' | 'row' | 'line' }>;
 
-/** A marker older builds wrote in front of a place, for a standing follow held
- *  away from the live edge. The follow has no such state any more (ADR 0064),
- *  so it is never written. A stored one is read as the bare place it marks,
- *  with no follow. */
-const FOLLOWING_PREFIX = 'following:';
+function namesContent(record: SavedScroll | null): record is ContentPlace {
+  return record?.kind === 'anchor' || record?.kind === 'row' || record?.kind === 'line';
+}
 
-/** The stored form of a reading position that names a TURN:
- *  `anchor:<relTop>:<eventId>`. Why a turn and not a pixel offset, and every
- *  alternative weighed: ADR 0152, docs/adr/.
- *
- *  `relTop` leads, so an id carrying a colon survives the round trip: the parse
- *  splits on the FIRST one. It is EXACT rather than a fallback to "somewhere
- *  near", `relTop` being the pixel offset the anchored turn's top sat at. */
-const ANCHOR_PREFIX = 'anchor:';
+/** The turn a line record falls back to once its path will not resolve. */
+function turnOfLine(record: LineAnchor): SavedScroll {
+  return { kind: 'anchor', eventId: record.eventId, relTop: record.turnRelTop };
+}
 
-/** The stored form of a reading position that names a step ROW:
- *  `row:<relTop>:<rowEventId>`. Laid out like `ANCHOR_PREFIX` and for the same
- *  reasons. The finer of the two, and the one written wherever the turn at the
- *  line has a step row at or above it (`readRowAnchor`). */
-const ROW_PREFIX = 'row:';
-
-/** Where a thread opens. A TURN the reader was parked on (`ANCHOR_PREFIX`), the
- *  live edge they asked to ride (`LIVE_EDGE_VALUE`), or a bare pixel offset.
- *  `null` for no saved position at all, which `resetOnEmpty` turns into the top.
- *
- *  The offset is what every container that is NOT the transcript records, none
- *  of them being windowed. It is also what a transcript position written by an
- *  older build still reads as.
- *
- *  `live-edge` is the one form that holds a standing follow. A place never
- *  does, so a follow parked away from the edge cannot be recorded. */
-export type SavedScroll =
-  | { kind: 'offset'; top: number }
-  | { kind: 'live-edge' }
-  | ({ kind: 'anchor' } & ScrollAnchor)
-  | ({ kind: 'row' } & RowAnchor);
+/** The stored form of a line anchor, the one writer of `LINE_PREFIX`. */
+function formatLineAnchor(anchor: LineAnchor): string {
+  return `${LINE_PREFIX}${anchor.relTop}:${anchor.turnRelTop}:${anchor.eventId}:${anchor.path.join('.')}~${anchor.kinds}`;
+}
 
 /** The stored form of an anchor, the one writer of `ANCHOR_PREFIX`. */
 function formatScrollAnchor(anchor: ScrollAnchor): string {
@@ -85,66 +60,6 @@ function formatScrollAnchor(anchor: ScrollAnchor): string {
 /** The stored form of a row anchor, the one writer of `ROW_PREFIX`. */
 function formatRowAnchor(anchor: RowAnchor): string {
   return `${ROW_PREFIX}${Math.round(anchor.relTop)}:${anchor.rowEventId}`;
-}
-
-/** Parse a localStorage scroll value. Returns null on missing, invalid or
- *  negative input.
- *
- *  Tolerates a trailing `:<revision>` stamp that older stored positions carry.
- *  `parseFloat` reads the offset out and ignores the rest, so a browser holding
- *  one keeps its position. An `anchor:` value is read first, so that tolerance
- *  never sees one.
- *
- *  A build predating either sentinel reads it as junk and answers null, so a
- *  downgrade opens the thread at the top rather than somewhere wrong. No
- *  migration either way: all that is at stake is where one thread opens once. */
-export function parseSavedScroll(raw: string | null): SavedScroll | null {
-  if (raw === null || raw === '') return null;
-  if (raw === LIVE_EDGE_VALUE) return { kind: 'live-edge' };
-  // An older build's marker comes off, and what is left is parsed exactly as
-  // an unmarked value is. A marked `live-edge` was never written, and reads as
-  // the edge.
-  if (raw.startsWith(FOLLOWING_PREFIX)) return parseSavedScroll(raw.slice(FOLLOWING_PREFIX.length));
-  if (raw.startsWith(ANCHOR_PREFIX)) {
-    const parsed = parseIdAt(raw.slice(ANCHOR_PREFIX.length));
-    return parsed && { kind: 'anchor', eventId: parsed.id, relTop: parsed.relTop };
-  }
-  if (raw.startsWith(ROW_PREFIX)) {
-    const parsed = parseIdAt(raw.slice(ROW_PREFIX.length));
-    return parsed && { kind: 'row', rowEventId: parsed.id, relTop: parsed.relTop };
-  }
-  const n = Number.parseFloat(raw);
-  if (!Number.isFinite(n) || n < 0) return null;
-  return { kind: 'offset', top: Math.floor(n) };
-}
-
-/** `<relTop>:<eventId>`, split on the FIRST colon so an id may carry one.
- *
- *  `relTop` is matched whole rather than handed to `parseInt`, which reads
- *  `12abc` as 12. A malformed value is one we did not write, and guessing at it
- *  would put the reader somewhere nobody asked for. It is signed: the ordinary
- *  anchor sits at or above the viewport top. */
-function parseIdAt(rest: string): { id: string; relTop: number } | null {
-  const sep = rest.indexOf(':');
-  if (sep < 1) return null;
-  const relTop = rest.slice(0, sep);
-  const id = rest.slice(sep + 1);
-  if (!/^-?\d+$/.test(relTop) || id === '') return null;
-  return { id, relTop: Number(relTop) };
-}
-
-/** What is RECORDED under `key`, or null for nothing legible.
- *
- *  Storage can THROW rather than answer null, in a browser with it blocked, so
- *  every read in the app goes through this. Exported because ThreadView asks
- *  the same question of the same keys. It has to render the anchored turn
- *  before this hook can put the reader on it. */
-export function readSavedScroll(key: string): SavedScroll | null {
-  try {
-    return parseSavedScroll(localStorage.getItem(key));
-  } catch {
-    return null;
-  }
 }
 
 const SAVE_DEBOUNCE_MS = 150;
@@ -361,7 +276,7 @@ export function attachScrollMemory(
     // then no saved position: not a bottom nobody asked for, and not a turn
     // whose id means nothing among these children.
     if (value?.kind === 'live-edge' && !followsLiveEdge) return null;
-    if ((value?.kind === 'anchor' || value?.kind === 'row') && !anchorsToContent) return null;
+    if (namesContent(value) && !anchorsToContent) return null;
     return value;
   };
 
@@ -454,11 +369,13 @@ export function attachScrollMemory(
    *  (docs/adr/).
    *
    *  A turn drawn with its head CLAMPED is not resolved yet. Its rows are still
-   *  arriving, and landing on it would settle the restore and stop the walk. */
+   *  arriving, and landing on it would settle the restore and stop the walk. A
+   *  line's path waits the same way (`lineBlockOf`). */
   const offsetFor = (record: SavedScroll): number | null => {
     const top = record.kind === 'anchor'
       ? (anchorTurnIsClamped(el, record) ? null : anchorTargetTop(el, record))
       : record.kind === 'row' ? rowTargetTop(el, record)
+      : record.kind === 'line' ? lineTargetTop(el, record)
       : record.kind === 'offset' ? record.top
       : null;
     if (top === null) return null;
@@ -467,16 +384,43 @@ export function attachScrollMemory(
     return Math.max(0, el.scrollHeight - el.clientHeight);
   };
 
+  /** The record to place from and where, or null to keep waiting. A line whose
+   *  path does not resolve places its turn as soon as the turn can be placed.
+   *  A rendered turn's blocks are already drawn, so waiting longer only shows
+   *  the reader the wrong place. */
+  const placementFor = (record: SavedScroll): { record: SavedScroll; top: number } | null => {
+    const top = offsetFor(record);
+    if (top !== null) return { record, top };
+    return record.kind === 'line' ? placementFor(turnOfLine(record)) : null;
+  };
+
   /** Put the reader at `top`, which `offsetFor` resolved from `record`, and
-   *  hold the turn or row the record names while the transcript settles. Turns
-   *  above it keep drawing after the write, and no browser anchoring carries
-   *  the reader with them. An offset names nothing to hold. */
+   *  hold the reader's LINE while the transcript settles. Content above it
+   *  keeps drawing after the write, and no browser anchoring carries the
+   *  reader with it. The line is the block at the viewport top after the
+   *  write. Every record form holds it, so an older turn or row record keeps
+   *  the paragraph too. The record's own block, row or turn gates the hold:
+   *  an offset names nothing, so it holds nothing. */
   const placeFromRecord = (record: SavedScroll, top: number) => {
     markNavigationScroll(el, top);
     const target = record.kind === 'anchor' ? anchorTurn(el, record)
       : record.kind === 'row' ? anchorRow(el, record)
+      : record.kind === 'line' ? lineBlockOf(el, record)
       : null;
-    if (target) holdRestoredPlace(el, target);
+    if (!target) return;
+    const line = readLineBlock(el);
+    holdRestoredPlace(el, line?.block ?? target, reportSettledDrift(record, line), line?.turn);
+  };
+
+  /** Say how far the reader's line moved between the restore and the
+   *  transcript settling, for the transcript alone. The line is the block at
+   *  the viewport top right after the restore. A non-zero drift is content
+   *  that moved under the reader after they came back. One number, no content. */
+  const reportSettledDrift = (record: SavedScroll, line: LineBlock | null) => () => {
+    if (!anchorsToContent || !line || (isCurrent && !isCurrent())) return;
+    const now = blockRelTop(el, line.block);
+    if (now === null) return;
+    postClientLog('scroll', 'restore', { outcome: 'settled', form: record.kind, drift: Math.round(now - line.relTop) });
   };
 
   /** Put the reader where the record's PLACE says.
@@ -506,12 +450,12 @@ export function attachScrollMemory(
    *  armed. */
   const tryRestore = (final = false) => {
     if (!restoring || saved === null || saved.kind === 'live-edge') return;
-    const top = offsetFor(saved);
-    if (top === null) {
+    const placement = placementFor(saved);
+    if (placement === null) {
       if (!final) keepWaitingForAnchor();
       return;
     }
-    placeFromRecord(saved, top);
+    placeFromRecord(placement.record, placement.top);
     reportRestore(el.scrollTop < el.scrollHeight - el.clientHeight - 1 ? 'landed' : 'landed-at-bottom');
     stopRestore();
   };
@@ -534,7 +478,7 @@ export function attachScrollMemory(
   const ceilingReached = () => Date.now() - restoreStartedAt >= ANCHOR_RESTORE_CEILING_MS;
 
   const keepWaitingForAnchor = () => {
-    if ((saved?.kind !== 'anchor' && saved?.kind !== 'row') || deadlineTimer === null) return;
+    if (!namesContent(saved) || deadlineTimer === null) return;
     if (el.scrollHeight === lastHeight) return;
     lastHeight = el.scrollHeight;
     if (ceilingReached()) return;
@@ -692,11 +636,11 @@ export function attachScrollMemory(
         // `EVENT_RESOLVE_DEADLINE_MS` plus its slack. The first is two orders of
         // magnitude shorter, so the arm is committed by the time this reads.
         const recorded = readSaved();
-        const rescueTop = recorded === null ? null : offsetFor(recorded);
+        const rescue = recorded === null ? null : placementFor(recorded);
         if (recorded?.kind === 'live-edge') {
           resumeFollowingBottom(el);
-        } else if (recorded !== null && rescueTop !== null) {
-          placeFromRecord(recorded, rescueTop);
+        } else if (rescue !== null) {
+          placeFromRecord(rescue.record, rescue.top);
         } else if (resetOnEmpty) {
           // Either there was no position, or there is one the content cannot
           // hold. Both open the thread where a thread with no position opens, at
@@ -730,12 +674,15 @@ export function attachScrollMemory(
   /** WHERE the reader is parked, in the form this container can record. Null
    *  for nothing worth recording, which only an anchoring container can answer.
    *
-   *  The ANCHOR leads, on a container that can name its children. The offset is
+   *  The ANCHOR leads, on a container that can name its children: the line
+   *  block, then the step row, then the turn, finest first. The offset is
    *  its fallback rather than a second choice of policy: an empty transcript
    *  has no turn to name, and the number is still the honest answer for a
    *  container that is not windowed. */
   const currentPlace = (): string | null => {
     if (anchorsToContent) {
+      const line = readLineAnchor(el);
+      if (line) return formatLineAnchor(line);
       const row = readRowAnchor(el);
       if (row) return formatRowAnchor(row);
       const anchor = readScrollAnchor(el);

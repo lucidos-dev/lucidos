@@ -9,7 +9,7 @@
 //! Usage: cargo run -p lucidos-engine --bin populate_memory [workspace_path]
 
 use chrono::{Duration, Utc};
-use lucidos_engine::log;
+use lucidos_engine::log_legacy;
 use lucidos_engine::memory::{EmbeddingProvider, FastEmbedProvider, MemorySource, PgVectorIndex};
 use lucidos_engine::scheduler::NotificationStore;
 use serde::{Deserialize, Serialize};
@@ -3527,8 +3527,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("./test-workspace"));
 
-    log!("[Populate] === History Population Tool (with backdated timestamps) ===\n");
-    log!("[Populate] Workspace: {}\n", workspace_path.display());
+    log_legacy!("[Populate] === History Population Tool (with backdated timestamps) ===\n");
+    log_legacy!("[Populate] Workspace: {}\n", workspace_path.display());
 
     // Create workspace structure
     std::fs::create_dir_all(workspace_path.join("data"))?;
@@ -3536,7 +3536,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Connect to PostgreSQL (use DATABASE_URL env var)
     let database_url = lucidos_engine::core::database_url();
-    log!(
+    log_legacy!(
         "[Populate] Connecting to PostgreSQL at {}",
         lucidos_engine::core::redact_postgres_secrets(&database_url)
     );
@@ -3549,15 +3549,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // The migrations own every table, as they do for the engine.
     sqlx::migrate!().run(&pool).await?;
-    log!("[Populate] Schema migrated");
+    log_legacy!("[Populate] Schema migrated");
 
     // Initialize embedder and memory index. Share the engine's per-user model
     // cache rather than fetching a private copy next to the working directory.
-    log!("[Populate] Initializing embedder (first run downloads the model)...");
+    log_legacy!("[Populate] Initializing embedder (first run downloads the model)...");
     lucidos_engine::memory::apply_default_cache_dir(&workspace_path);
     let embedder = FastEmbedProvider::new()?;
 
-    log!("[Populate] Creating memory index...");
+    log_legacy!("[Populate] Creating memory index...");
     let memory_index = PgVectorIndex::new(pool.clone()).await?;
 
     let working_days: i64 = 730; // Full 2 years
@@ -3568,7 +3568,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let base_date = Utc::now() - Duration::days(730);
 
     let total_events = planned_event_total(working_days, conversations_per_day, artifacts_per_day);
-    log!(
+    log_legacy!(
         "\n[Populate] Populating {} events ({} days of history)...\n",
         total_events,
         working_days
@@ -3745,7 +3745,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         if day % 100 == 0 {
             let pct = (day as f64 / working_days as f64) * 100.0;
-            log!(
+            log_legacy!(
                 "[Populate]   Day {}/{} ({:.0}%) - {} events, {} artifacts, {} notifications...",
                 day,
                 working_days,
@@ -3758,7 +3758,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     // Mark older notifications as read (keep last 10 as unread)
-    log!("\n[Populate] Marking older notifications as read (keeping 10 unread)...");
+    log_legacy!("\n[Populate] Marking older notifications as read (keeping 10 unread)...");
     sqlx::query(
         r#"
         UPDATE notifications
@@ -3774,7 +3774,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await?;
 
     // Create personal tracking files (always present)
-    log!("[Populate] Creating personal tracking files...");
+    log_legacy!("[Populate] Creating personal tracking files...");
     std::fs::write(
         artifacts_path.join("todo.md"),
         "# Todo\n\n- [ ] Review API migration PR\n- [ ] Call dentist\n- [ ] Finish quarterly report\n- [x] Order new laptop charger\n- [ ] Update project documentation\n- [ ] Schedule team retrospective\n",
@@ -3798,28 +3798,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .fetch_all(&pool)
         .await?;
 
-    log!("\n[Populate] === Done ===");
-    log!("[Populate]   PostgreSQL events: {}", db_events[0].0);
-    log!(
+    log_legacy!("\n[Populate] === Done ===");
+    log_legacy!("[Populate]   PostgreSQL events: {}", db_events[0].0);
+    log_legacy!(
         "[Populate]   PostgreSQL notifications: {}",
         db_notifications[0].0
     );
     // Propagated, not defaulted. A failed count printed as `0` reads as
     // "indexing wrote nothing" right after it wrote thousands of entries.
-    log!(
+    log_legacy!(
         "[Populate]   Memory index entries: {}",
         memory_index.len().await?
     );
-    log!("[Populate]   Artifact files created: {}", artifact_count);
-    log!("[Populate]   Time: {:.1}s", elapsed.as_secs_f64());
-    log!("[Populate]   Workspace: {}", workspace_path.display());
-    log!("\n[Populate] To test, run:");
-    log!(
+    log_legacy!("[Populate]   Artifact files created: {}", artifact_count);
+    log_legacy!("[Populate]   Time: {:.1}s", elapsed.as_secs_f64());
+    log_legacy!("[Populate]   Workspace: {}", workspace_path.display());
+    log_legacy!("\n[Populate] To test, run:");
+    log_legacy!(
         "[Populate]   LUCIDOS_WORKSPACE={} cargo run -p lucidos-engine",
         workspace_path.display()
     );
-    log!("\n[Populate] Then open http://localhost:3000 in your browser.");
-    log!("[Populate] Click the bell icon to see notifications!");
+    log_legacy!("\n[Populate] Then open http://localhost:3000 in your browser.");
+    log_legacy!("[Populate] Click the bell icon to see notifications!");
 
     Ok(())
 }

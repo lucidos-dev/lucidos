@@ -28,6 +28,7 @@ import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { PairGatewaySection, RemoteGatewaysSection } from './GatewayPairingSections';
 import { PairDeviceSection } from './PairDeviceSection';
+import { PairingRequestsSection } from './PairingRequestsSection';
 import { ExternalAddressSection } from './ExternalAddressSection';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import type { PairTarget } from './PairDeviceSection';
@@ -1236,6 +1237,10 @@ export function MobileAccessPage() {
   // them is TRUE, and conflating those is what this page used to do.
   return (
     <>
+      {/* Above everything, and only while a pairing waits for this device's
+          Allow: the notification that brought the reader here points at it. */}
+      <PairingRequestsSection available={gatewayIsOurOrigin} />
+
       {/* First, because pairing is what most people come here to do, and the
           code already carries the best address. */}
       <PairDeviceSection canMint={gatewayIsOurOrigin} target={pairTarget()} />

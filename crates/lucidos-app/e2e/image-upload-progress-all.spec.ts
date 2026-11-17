@@ -41,7 +41,7 @@ test.describe('Image upload progress in the composer', () => {
     const held = new Promise<void>((resolve) => { release = resolve; });
     await page.route(BLOB_ROUTE, async (route: Route) => {
       await held;
-      await route.continue();
+      await route.fallback();
     });
     await navigateToApp(page);
     const message = uniqueMessage('upload-queued');
@@ -66,7 +66,7 @@ test.describe('Image upload progress in the composer', () => {
   test('a failed upload keeps the draft and the image, refuses Send, and Retry lands it', async ({ page }) => {
     let refuse = true;
     await page.route(BLOB_ROUTE, async (route: Route) => {
-      if (!refuse) return route.continue();
+      if (!refuse) return route.fallback();
       await route.fulfill({
         status: 500,
         contentType: 'application/json',

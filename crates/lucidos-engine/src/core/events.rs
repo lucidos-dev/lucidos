@@ -222,7 +222,7 @@ pub fn walk_thread_images<E: HasEventPayload>(
             let (base64, mime_type) = match image_ref {
                 ImageRef::BlobHash(hash) => {
                     crate::core::blobs::read_blob_as_base64(workspace, hash).unwrap_or_else(|| {
-                        crate::log!(
+                        crate::log_legacy!(
                         "[walk_thread_images] Blob {} missing or unreadable, yielding empty entry",
                         hash
                     );

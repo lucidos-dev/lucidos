@@ -8,24 +8,6 @@
  */
 import type { KnownOAuthProvider, OAuthAccountInfo } from '../../store/types';
 
-/** What a bare sign-in asks for. Every connection wants to know whose account it
- *  is, whatever else it is for. */
-export const SIGN_IN_SCOPES = 'openid email profile';
-
-/** The scope set a Connect press should request.
- *
- *  `purpose` is what the connection is FOR, handed over by whoever deep-linked
- *  here (Backup passes its upload scopes). Folding it in is the difference
- *  between one consent screen and two: without it, a user arriving from Backup
- *  completed the provider's consent screen, came back, and faced *Grant access*.
- *
- *  The sign-in scopes stay in either way, so the account still reports whose it
- *  is. Deduplicated, because a purpose may legitimately name one of them. */
-export function connectScopes(purpose?: string | null): string {
-  const wanted = [...SIGN_IN_SCOPES.split(/\s+/), ...(purpose ?? '').split(/\s+/)];
-  return [...new Set(wanted.filter(Boolean))].join(' ');
-}
-
 /** The scope set *Reconnect* should request for an existing account.
  *
  *  The desired set, NOT the granted one. Passing `account.scopes` is what made
@@ -48,7 +30,7 @@ export function reconnectScopes(account: OAuthAccountInfo): string {
  *  The OIDC and meta scopes, which name no resource. Microsoft omits all four
  *  when the token is issued for a RESOURCE such as `outlook.office.com`: that
  *  response lists the resource's own scopes and nothing else. GitHub knows
- *  none of them, and every Connect asks for three (`SIGN_IN_SCOPES`). */
+ *  none of them, and a generic Connect asks for three of them. */
 const META_SCOPES = new Set(['offline_access', 'openid', 'profile', 'email']);
 
 /** The scopes an account was asked for but did not get.

@@ -17,6 +17,7 @@ const CC_ONLY_EVENTS: &[&str] = &[
     "ContinuationRequested",
     "MissingHardeningDetected",
     "CodingAgentSettingsChanged",
+    "CodingAgentBillingObserved",
     "UserQuestionAsked",
     "UserQuestionAnswered",
 ];
@@ -67,14 +68,14 @@ pub(crate) fn render_fixture() -> String {
                                     )
                                     .iter()
                                     .map(|a| match a {
-                                        Action::DiscardDraft => "discard_draft",
-                                        Action::Discard => "discard",
-                                        Action::Apply => "apply",
-                                        Action::SetAside => "set_aside",
-                                        Action::ApplyWhenSettled => "apply_when_settled",
-                                        Action::Archive => "archive",
-                                        Action::Save => "save",
-                                        Action::Unsave => "unsave",
+                                        ThreadAction::DiscardDraft => "discard_draft",
+                                        ThreadAction::Discard => "discard",
+                                        ThreadAction::Apply => "apply",
+                                        ThreadAction::SetAside => "set_aside",
+                                        ThreadAction::ApplyWhenSettled => "apply_when_settled",
+                                        ThreadAction::Archive => "archive",
+                                        ThreadAction::Save => "save",
+                                        ThreadAction::Unsave => "unsave",
                                     })
                                     .collect();
                                     cases.push(format!(
@@ -231,7 +232,7 @@ pub(crate) fn render_ts() -> String {
         status_literals.join(", ")
     ));
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
-    out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n\n");
+    out.push_str("export type ThreadAction = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';\n\n");
 
     // LEGAL_SECTIONS
     out.push_str(
@@ -306,8 +307,8 @@ pub(crate) fn render_ts() -> String {
     out.push_str("  hasLiveEventWaits: boolean,\n");
     out.push_str("  hasUnsentDraft: boolean,\n");
     out.push_str("  isSaved: boolean,\n");
-    out.push_str("): Action[] {\n");
-    out.push_str("  const actions: Action[] = [];\n");
+    out.push_str("): ThreadAction[] {\n");
+    out.push_str("  const actions: ThreadAction[] = [];\n");
     out.push_str("  const live = status === 'running' || status === 'waiting_for_user_answer';\n");
     out.push_str(
         "  const codingAgentPending = hasPendingChanges && threadType === 'claude_code';\n",

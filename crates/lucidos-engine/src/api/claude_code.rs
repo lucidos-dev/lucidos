@@ -27,15 +27,13 @@ impl StopQuery {
 /// Which clause-4 verb this route is, for the authority gate. One route, three
 /// verbs: the query params pick which button was pressed, and the caller reads
 /// a refusal naming the one it tried.
-fn stop_verb(
-    reason: crate::engine::claude_code::StopReason,
-) -> super::thread_reach::ThreadReachVerb {
-    use super::thread_reach::ThreadReachVerb;
+fn stop_verb(reason: crate::engine::claude_code::StopReason) -> crate::engine::permission::Action {
     use crate::engine::claude_code::StopReason;
+    use crate::engine::permission::Action;
     match reason {
-        StopReason::Apply => ThreadReachVerb::Apply,
-        StopReason::Discard => ThreadReachVerb::Discard,
-        _ => ThreadReachVerb::Cancel,
+        StopReason::Apply => Action::Apply,
+        StopReason::Discard => Action::Discard,
+        _ => Action::Cancel,
     }
 }
 
@@ -130,7 +128,7 @@ pub(super) async fn claude_code_stop(
                 canceled: question_resolved,
             })),
             Err(e) => {
-                crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
+                crate::log_legacy!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
                 Err(StatusCode::NOT_FOUND.into())
             }
         },
@@ -142,7 +140,7 @@ pub(super) async fn claude_code_stop(
                 if let Some(refused) = claim_refusal_error(&e.to_string()) {
                     return Err(refused);
                 }
-                crate::log!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
+                crate::log_legacy!("[API] claude_code_stop ({:?}) failed: {}", reason, e);
                 Err(StatusCode::NOT_FOUND.into())
             }
         },
@@ -200,7 +198,7 @@ pub(super) async fn claude_code_apply_now(
         &state.engine.event_bus,
         &headers,
         Some(thread_id),
-        super::thread_reach::ThreadReachVerb::Apply,
+        crate::engine::permission::Action::Apply,
     )
     .await?;
     let actor = super::actor::user_actor(&headers, None);
@@ -213,7 +211,7 @@ pub(super) async fn claude_code_apply_now(
         }))),
         Err(e) => {
             let msg = e.to_string();
-            crate::log!("[API] apply_now failed for {}: {}", thread_id, msg);
+            crate::log_legacy!("[API] apply_now failed for {}: {}", thread_id, msg);
             Err(apply_now_error(&msg))
         }
     }
@@ -343,7 +341,7 @@ pub(super) async fn claude_code_control(
         &state.engine.event_bus,
         &headers,
         Some(thread_id),
-        super::thread_reach::ThreadReachVerb::Control,
+        crate::engine::permission::Action::Control,
     )
     .await
     .map_err(|e| ApiError::new(e.status_code(), e.to_string()))?;
@@ -488,7 +486,7 @@ pub(super) async fn claude_code_discard(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        super::thread_reach::ThreadReachVerb::Discard,
+        crate::engine::permission::Action::Discard,
     )
     .await?;
     let actor = super::actor::user_actor(&headers, None);
@@ -514,7 +512,7 @@ pub(super) async fn claude_code_interrupt(
         &state.engine.event_bus,
         &headers,
         thread_id,
-        super::thread_reach::ThreadReachVerb::Cancel,
+        crate::engine::permission::Action::Cancel,
     )
     .await?;
     let actor = super::actor::user_actor(&headers, None);
@@ -531,7 +529,7 @@ pub(super) async fn claude_code_interrupt(
     {
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
-            crate::log!("[API] interrupt_agent failed: {}", e);
+            crate::log_legacy!("[API] interrupt_agent failed: {}", e);
             Err(StatusCode::NOT_FOUND.into())
         }
     }

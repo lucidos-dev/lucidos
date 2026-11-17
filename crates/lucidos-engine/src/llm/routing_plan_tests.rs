@@ -81,6 +81,7 @@ async fn counting_openai() -> (OpenAiProvider, Arc<AtomicUsize>) {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let provider = OpenAiProvider::new_with_base_url(
+        crate::llm::ProviderKind::OpenAi,
         "sk-platform".into(),
         SOL.into(),
         &format!("http://{addr}/v1"),

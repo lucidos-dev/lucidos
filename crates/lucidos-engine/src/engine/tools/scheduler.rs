@@ -1,5 +1,5 @@
 use super::super::LucidosEngine;
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::event_bus::SystemEvent;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
 use crate::triggers::{
@@ -923,13 +923,16 @@ impl LucidosEngine {
                 let n = to_change.len();
                 for (group_id, order) in to_change {
                     let payload = serde_json::json!({ "group_id": group_id, "order": order });
-                    self.event_bus
-                        .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
+                    crate::engine::trigger_group_writes::emit_and_apply_group_event(
+                        &self.trigger_groups,
+                        &self.event_bus,
+                        SystemEvent::TriggerGroupReordered {
                             group_id,
                             payload,
                             actor: actor.clone(),
-                        }))
-                        .await?;
+                        },
+                    )
+                    .await?;
                 }
                 Ok(format!(
                     "[ACTION COMPLETED] Reordered {} trigger group(s).",
@@ -968,13 +971,16 @@ impl LucidosEngine {
                     ));
                 }
                 let payload = serde_json::json!({ "group_id": group_id });
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerGroupDeleted {
+                crate::engine::trigger_group_writes::emit_and_apply_group_event(
+                    &self.trigger_groups,
+                    &self.event_bus,
+                    SystemEvent::TriggerGroupDeleted {
                         group_id: group_id.clone(),
                         payload,
                         actor,
-                    }))
-                    .await?;
+                    },
+                )
+                .await?;
                 Ok(format!(
                     "[ACTION COMPLETED] Deleted trigger group '{}' (ID: {}).",
                     group_name, group_id
@@ -1209,7 +1215,7 @@ pub(crate) fn cron_tz_or_utc(name: &str, context: &str) -> chrono_tz::Tz {
     match name.parse() {
         Ok(tz) => tz,
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Invalid timezone '{}' for {}, validating cron in UTC",
                 name,
                 context

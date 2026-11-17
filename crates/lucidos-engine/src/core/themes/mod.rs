@@ -63,7 +63,7 @@ const BUILT_IN_THEMES: &[(&str, &str)] = &[
 
 /// Caps the apply sites in `packages/lucidos-sdk/src/appearance.ts` check
 /// again. They read these from the generated `theme-parts.ts`.
-const MAX_VALUE_LENGTH: usize = 120;
+const MAX_VALUE_LENGTH: usize = 256;
 /// The most tokens a resolved map may hold, and where every apply site stops.
 pub const MAX_RESOLVED_TOKENS: usize = 200;
 const MAX_ID_LENGTH: usize = 64;
@@ -1131,14 +1131,14 @@ fn usable_fonts(
             .map(|font| font.kind)
             .or(workspace.map(|font| font.kind))
         else {
-            crate::log!(
+            crate::log_legacy!(
                 "[Themes] `fonts.{}`: '{id}' is not installed, so it is skipped",
                 slot.name()
             );
             continue;
         };
         if !slot.fits(kind) {
-            crate::log!("[Themes] {}, so it is skipped", slot.unfit(id));
+            crate::log_legacy!("[Themes] {}, so it is skipped", slot.unfit(id));
             continue;
         }
         if let Some(font) = workspace.filter(|font| !entries.contains(font)) {
@@ -1277,7 +1277,7 @@ pub fn list(data_dir: &Path) -> Vec<Theme> {
         match get_with(data_dir, &id, &mut installed) {
             Ok(Some(theme)) => themes.push(theme),
             Ok(None) => {}
-            Err(e) => crate::log!("[Themes] skipping themes/{id}.json: {e}"),
+            Err(e) => crate::log_legacy!("[Themes] skipping themes/{id}.json: {e}"),
         }
     }
     themes

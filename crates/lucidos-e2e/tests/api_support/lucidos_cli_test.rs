@@ -739,8 +739,12 @@ async fn a_cli_emit_cannot_forge_its_actor() {
 
     let actor = stored_actor(&summary).await;
     assert_eq!(
-        actor["kind"], "api",
+        actor["kind"], "unattested_caller",
         "the CLI's own identity, not the payload's: {actor}"
+    );
+    assert_eq!(
+        actor["claimed_local_token"], true,
+        "the CLI claims the machine-local token and no device: {actor}"
     );
 }
 

@@ -1,11 +1,11 @@
 import { useRef } from 'preact/hooks';
 import type { CodingAgent } from '../../api/types';
 import { repositories, appsList, enginePackaged, settingsScrollTarget } from '../../store/store';
-import { resolvePerson, resolveScope, resolveCodingAgent } from '../../store/composeSelections';
-import { mentionablePeople } from '../../store/actions/people';
+import { resolveUser, resolveScope, resolveCodingAgent } from '../../store/composeSelections';
+import { mentionableUsers } from '../../store/actions/users';
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
-import { applyDestination, updateComposeSelection, type ComposeMode } from '../../store/actions/compose';
+import { applyDestination, selectComposeCodingAgent, type ComposeMode } from '../../store/actions/compose';
 import { openSettingsSubview } from '../../store/actions/menu';
 import {
   destinationFromState,
@@ -30,7 +30,7 @@ type DestinationSelectionDeps = {
 };
 
 type CodingAgentSelectionDeps = {
-  patchSelection: typeof updateComposeSelection;
+  selectAgent: typeof selectComposeCodingAgent;
   focusPrompt: () => void;
 };
 
@@ -63,17 +63,11 @@ export function handleComposeCodingAgentSelection(
   threadId: string | null,
   value: string,
   deps: CodingAgentSelectionDeps = {
-    patchSelection: updateComposeSelection,
+    selectAgent: selectComposeCodingAgent,
     focusPrompt: focusPromptNow,
   },
 ): void {
-  // Per-draft when a draft is focused (persisted via the debounced compose PUT);
-  // PENDING when none exists yet (`updateComposeSelection(null, …)` routes to the
-  // pending slot, transferred onto the draft at creation). NEVER the account
-  // default — editing a draft (or the fresh compose view) must not write
-  // `coding_agent_default` or leak to other drafts. `coding_agent_default` is a
-  // fixed seed (from the pref, default Claude Code) — no UI to change it.
-  deps.patchSelection(threadId, { codingAgent: value as CodingAgent });
+  void deps.selectAgent(threadId, value as CodingAgent);
   deps.focusPrompt();
 }
 
@@ -127,8 +121,8 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const lastDestRef = useRef<ComposeDestination>({ kind: 'lucidos-agent' });
   // Per-draft target: resolve THIS draft's scope override (falls back to the
   // global default), so switching one draft's target never changes another's.
-  const people = mentionablePeople.value;
-  let dest = destinationFromState(toggleMode, resolveScope(threadId), resolvePerson(threadId));
+  const users = mentionableUsers.value;
+  let dest = destinationFromState(toggleMode, resolveScope(threadId), resolveUser(threadId));
   if (fading) dest = lastDestRef.current;
   else lastDestRef.current = dest;
 
@@ -142,7 +136,7 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
     listsPending,
     reposError: reposLoadable.status === 'failed' ? reposLoadable.error : null,
     appsError: appsLoadable.status === 'failed' ? appsLoadable.error : null,
-    people,
+    users,
   });
 
   const codingScope = dest.kind === 'coding' ? dest.scope : null;
@@ -150,13 +144,13 @@ export function ComposeDestinationRow({ threadId, toggleMode, fading }: {
   const scopeRepoId = codingScope?.kind === 'external' ? codingScope.repoId : null;
   const appName = scopeAppId ? apps.find(a => a.id === scopeAppId)?.name : undefined;
   const repoName = scopeRepoId ? repos.find(r => r.id === scopeRepoId)?.name : undefined;
-  const personName = dest.kind === 'person' ? people.find(p => p.id === dest.personId)?.name : undefined;
+  const userName = dest.kind === 'user' ? users.find(p => p.id === dest.userId)?.name : undefined;
 
   const value = destinationToOptionValue(dest);
 
   return (
     <>
-      <div class="compose-destination-caption">{destinationCaption(dest, { appName, repoName, personName })}</div>
+      <div class="compose-destination-caption">{destinationCaption(dest, { appName, repoName, userName })}</div>
       <div class="compose-destination-row">
         <Dropdown
           options={options}

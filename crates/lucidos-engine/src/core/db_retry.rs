@@ -53,7 +53,7 @@ where
     loop {
         match read().await {
             Err(e) if attempt < READ_ATTEMPTS && is_transient(&e) => {
-                log!(
+                log_legacy!(
                     "[DbRetry] {} failed on attempt {}/{}, retrying in {}ms: {}",
                     what,
                     attempt,

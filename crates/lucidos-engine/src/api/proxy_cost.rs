@@ -134,7 +134,7 @@ pub(crate) async fn record_model_call(
     let bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            crate::log!("[Proxy] Could not read a model reply: {}", e);
+            crate::log_legacy!("[Proxy] Could not read a model reply: {}", e);
             return (
                 StatusCode::BAD_GATEWAY,
                 format!("could not read the reply: {e}"),

@@ -235,17 +235,21 @@ async fn check_key_access(
     rule: RefererRule,
 ) -> Result<MessageOrigin, ApiError> {
     if !reveal_request_allowed(headers, rule) {
-        log!("[Backup] refused a backup-key read from an app document");
+        log_legacy!("[Backup] refused a backup-key read from an app document");
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
-    crate::api::actor::refuse_agent_caller(headers, KEY_AGENT_REFUSAL)?;
+    crate::api::actor::require_attested_owner(
+        headers,
+        KEY_AGENT_REFUSAL,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )?;
     let actor = crate::api::actor::require_user_actor(headers, &state.pool, None).await?;
     if !state
         .reveal_tokens
         .redeem(token.unwrap_or_default(), RevealSubject::BackupKey)
     {
-        log!("[Backup] refused a backup-key read: no live reveal token");
+        log_legacy!("[Backup] refused a backup-key read: no live reveal token");
         let (status, message) = token_required(KEY_MINT_ROUTE);
         return Err(ApiError::new(status, message));
     }
@@ -280,11 +284,15 @@ pub(super) async fn mint_backup_key_reveal_token(
     headers: HeaderMap,
 ) -> Result<Json<RevealTokenResponse>, ApiError> {
     if !reveal_request_allowed(&headers, WRITE_REFERER_RULE) {
-        log!("[Backup] refused a backup-key reveal-token mint from an app document");
+        log_legacy!("[Backup] refused a backup-key reveal-token mint from an app document");
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
-    crate::api::actor::refuse_agent_caller(&headers, KEY_AGENT_REFUSAL)?;
+    crate::api::actor::require_attested_owner(
+        &headers,
+        KEY_AGENT_REFUSAL,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )?;
     let token = state
         .reveal_tokens
         .mint(RevealSubject::BackupKey)
@@ -331,12 +339,18 @@ async fn check_recipient_access(
     headers: &HeaderMap,
 ) -> Result<MessageOrigin, ApiError> {
     if !reveal_request_allowed(headers, WRITE_REFERER_RULE) {
-        log!("[Backup] refused a backup recipient change from an app document");
+        log_legacy!("[Backup] refused a backup recipient change from an app document");
         let (status, message) = forbidden(KEY_SUBJECT_LABEL);
         return Err(ApiError::new(status, message));
     }
-    crate::api::actor::require_owner_device_for(headers, &state.pool, None, RECIPIENT_OWNER_ONLY)
-        .await
+    crate::api::actor::require_owner_device_for(
+        headers,
+        &state.pool,
+        None,
+        RECIPIENT_OWNER_ONLY,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .await
 }
 
 /// What an agent or the engine's own token is told by the routes above.
@@ -468,6 +482,25 @@ async fn require_sealing_key(state: &AppState) -> Result<backup::crypto::Sealing
         })
 }
 
+/// Refuses a backup to a provider whose account is missing or a scope short.
+/// Every caller (Settings, the app-shell banner, an agent) meets the same 409,
+/// instead of a 202 whose run fails later with a generic `BackupFailed`.
+async fn require_ready_provider(provider_id: &str, pool: &PgPool) -> Result<(), ApiError> {
+    let meta = backup::provider_meta(provider_id)
+        .ok_or_else(|| ApiError::bad_request(format!("Unknown backup provider: {provider_id}")))?;
+    let readiness = backup::provider_readiness(pool, &meta)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if readiness.ready() {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::CONFLICT,
+        format!("{} is not ready: grant access first", meta.name),
+    )
+    .with_reason("provider-not-ready"))
+}
+
 /// Queues a backup and returns 202 immediately; terminal state arrives via
 /// the `BackupCompleted` / `BackupFailed` SSE events. The backup pipeline can
 /// run for many minutes, so a synchronous handler would race the frontend's
@@ -489,6 +522,7 @@ pub async fn create_backup(
     // Validate sync — guard drops on early return so the flag is released.
     let provider = resolve_provider(&req.provider, &state.pool)?;
     let key = require_sealing_key(&state).await?;
+    require_ready_provider(&req.provider, &state.pool).await?;
 
     let engine = state.engine.clone();
     let pool = state.pool.clone();
@@ -634,10 +668,18 @@ pub struct LastSuccessfulBackupResponse {
     /// True when there is no successful backup at all, or the newest one is
     /// older than `backup::BACKUP_STALE_AFTER_SECONDS`.
     pub stale: bool,
-    /// True when a destination AND an active schedule are both set. It is what
+    /// True when a destination is set, whatever the schedule. It is what
     /// separates a workspace whose backups are set up but have never produced an
     /// archive from one where nobody set them up.
     pub configured: bool,
+    /// True when there is no successful backup at all, or the newest one is
+    /// older than `backup::BACKUP_OVERDUE_AFTER_SECONDS`. The app-shell banner
+    /// reads it.
+    pub overdue: bool,
+    /// When the newest successful backup turns overdue, or null when there is
+    /// none. A tab that stays open compares it with its own clock, so the
+    /// banner appears without a re-read.
+    pub overdue_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pure assembly of the response, so the staleness arithmetic is unit-testable
@@ -647,11 +689,13 @@ fn build_last_successful(
     configured: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> LastSuccessfulBackupResponse {
-    let stale = at.is_none_or(|t| (now - t).num_seconds() > backup::BACKUP_STALE_AFTER_SECONDS);
+    let older_than = |limit: i64| at.is_none_or(|t| (now - t).num_seconds() > limit);
     LastSuccessfulBackupResponse {
         at,
-        stale,
+        stale: older_than(backup::BACKUP_STALE_AFTER_SECONDS),
         configured,
+        overdue: older_than(backup::BACKUP_OVERDUE_AFTER_SECONDS),
+        overdue_at: at.map(|t| t + chrono::Duration::seconds(backup::BACKUP_OVERDUE_AFTER_SECONDS)),
     }
 }
 
@@ -715,8 +759,7 @@ pub async fn get_schedule(
 /// in the registry. An install configured for Dropbox rendered every control on
 /// the page against Google Drive. Only the provider half of that collapse was
 /// wrong; keeping the other half is what holds this in step with
-/// `reload_backup_schedule` and with the frontend's `backupIsActive`, which
-/// also requires both.
+/// `reload_backup_schedule`.
 fn schedule_response(cron: Option<String>, provider: Option<String>) -> ScheduleResponse {
     let provider = provider.filter(|p| !p.is_empty());
     // The same predicate the picker's row reads, so the two surfaces cannot
@@ -1096,6 +1139,41 @@ mod tests {
         assert!(old.stale, "past the shared threshold");
     }
 
+    /// `overdue` sits on its own 7-day line. `stale` keeps the 24h line, so a
+    /// manual-only workspace that is two days old is stale but not yet overdue.
+    #[test]
+    fn overdue_has_its_own_threshold_apart_from_stale() {
+        let now = Utc::now();
+        let cases = [
+            (Duration::hours(23), false, false),
+            (Duration::hours(25), true, false),
+            (Duration::days(6), true, false),
+            (Duration::days(8), true, true),
+        ];
+        for (age, stale, overdue) in cases {
+            let s = build_last_successful(Some(now - age), true, now);
+            assert_eq!(s.stale, stale, "stale at {age}");
+            assert_eq!(s.overdue, overdue, "overdue at {age}");
+        }
+    }
+
+    /// `overdue_at` lands exactly on the line `overdue` flips at, so a client
+    /// clock crossing it agrees with a fresh read.
+    #[test]
+    fn overdue_at_is_where_overdue_flips() {
+        let now = Utc::now();
+        let at = now - Duration::days(2);
+        let s = build_last_successful(Some(at), true, now);
+        let due = s.overdue_at.expect("a backup has an overdue instant");
+        assert_eq!(
+            due,
+            at + Duration::seconds(backup::BACKUP_OVERDUE_AFTER_SECONDS)
+        );
+        assert!(!build_last_successful(Some(at), true, due).overdue);
+        assert!(build_last_successful(Some(at), true, due + Duration::seconds(1)).overdue);
+        assert!(build_last_successful(None, true, now).overdue_at.is_none());
+    }
+
     /// Never backed up is the worst kind of stale, and it is NOT the same fact
     /// as "nobody set backups up". The picker says a different sentence for
     /// each, so both fields travel.
@@ -1105,6 +1183,7 @@ mod tests {
         for configured in [true, false] {
             let s = build_last_successful(None, configured, now);
             assert!(s.stale, "no backup at all is stale");
+            assert!(s.overdue, "no backup at all is overdue");
             assert_eq!(s.configured, configured);
             let v = serde_json::to_value(&s).unwrap();
             assert_eq!(v["at"], serde_json::Value::Null);
@@ -1253,8 +1332,7 @@ mod tests {
     /// The decoupling runs ONE WAY. A cron with no destination is not a
     /// schedule that runs: `reload_backup_schedule` removes the job when the
     /// provider is unset, so reporting the cron would show the Backup page
-    /// "Daily (03:00)" for a workspace where nothing is registered, and would
-    /// contradict the reminder banner's `backupIsActive`, which requires both.
+    /// "Daily (03:00)" for a workspace where nothing is registered.
     #[test]
     fn a_cron_with_no_destination_is_not_an_active_schedule() {
         for provider in [None, Some(String::new())] {

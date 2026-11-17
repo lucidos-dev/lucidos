@@ -41,6 +41,7 @@ async fn answer(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
         bus,
         thread_id,
         ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer: AnswerKind::FreeText {

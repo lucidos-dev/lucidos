@@ -10,6 +10,9 @@ use std::collections::HashSet;
 /// shape as the Codex side's `TurnTracker` / `AppServerTracker`.
 #[derive(Debug, Default)]
 pub struct CcStreamState {
+    /// Allowlisted account/endpoint evidence only, never raw control replies.
+    billing_account: Option<crate::runtime::billing_provider::BillingAttribution>,
+    billing_default_endpoint: bool,
     /// Assistant message ids a `Usage` event has already been emitted for in
     /// the turn now in flight. See the dedup comment in the `"assistant"` arm
     /// of [`parse_line`], and [`CcStreamState::end_turn`] for the lifetime.
@@ -366,6 +369,7 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                         slash_commands,
                         skills,
                         agent_version,
+                        can_steer: true,
                     }]
                 } else {
                     Vec::new()
@@ -557,7 +561,9 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             if is_input_replay(&val) {
                 match replayed_input_uuid(&val) {
                     Some(input) => events.push(AgentEvent::InputRead { input }),
-                    None => log!("[ClaudeCode] a replay named no input uuid; it reads nothing"),
+                    None => {
+                        log_legacy!("[ClaudeCode] a replay named no input uuid; it reads nothing")
+                    }
                 }
                 return events;
             }
@@ -671,6 +677,8 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
                 text,
                 duration_ms: duration,
                 error,
+                provider_error: None,
+                turn_end: None,
             });
             events
         }
@@ -777,12 +785,37 @@ pub fn parse_line(state: &mut CcStreamState, line: &str) -> Vec<AgentEvent> {
             events.push(AgentEvent::StreamActivity);
             events
         }
-        // control_response is CC's reply to a control_request (e.g. interrupt).
-        // We don't need to act on it — the interrupt itself triggers a Result event.
-        "control_response" => Vec::new(),
+        "control_response" => {
+            let response = &val["response"];
+            let request_id = response["request_id"].as_str();
+            if request_id == Some(BILLING_INITIALIZE_REQUEST_ID) {
+                state.billing_account = Some(if response["subtype"].as_str() == Some("success") {
+                    crate::runtime::billing_provider::BillingAttribution::claude_initialize(
+                        &response["response"],
+                    )
+                } else {
+                    crate::runtime::billing_provider::BillingAttribution::default()
+                });
+            } else if request_id == Some(BILLING_STATUS_REQUEST_ID) {
+                state.billing_default_endpoint = response["subtype"].as_str() == Some("success")
+                    && crate::runtime::billing_provider::BillingAttribution::claude_default_endpoint(&response["response"]);
+            } else {
+                // Interrupt replies are acknowledged by the Result they cause;
+                // withdraw replies are routed before this parser.
+                return Vec::new();
+            }
+            state
+                .billing_account
+                .clone()
+                .map(|account| AgentEvent::BillingObserved {
+                    attribution: account.claude_endpoint_checked(state.billing_default_endpoint),
+                })
+                .into_iter()
+                .collect()
+        }
         other => {
             if !other.is_empty() {
-                log!("[ClaudeCode] Unrecognized event type: {}", other);
+                log_legacy!("[ClaudeCode] Unrecognized event type: {}", other);
             }
             Vec::new()
         }

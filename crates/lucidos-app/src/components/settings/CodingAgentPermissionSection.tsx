@@ -1,3 +1,4 @@
+import { PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE } from '@lucidos/preference-catalog';
 import {
   CC_PERMISSION_MODES,
   currentCodingAgentPermissionMode,
@@ -6,7 +7,7 @@ import {
 } from '../../store/actions/preferences';
 import { Dropdown, type DropdownOption } from '../shared/Dropdown';
 import { Explainer } from '../shared/Explainer';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 
 const PERMISSION_MODE_COPY: Record<CcPermissionMode, { label: string; description: string }> = {
   'accept-edits': {
@@ -19,7 +20,7 @@ const PERMISSION_MODE_COPY: Record<CcPermissionMode, { label: string; descriptio
   },
 };
 
-const DEFAULT_PERMISSION_MODE = PREFERENCE_CATALOG.coding_agent_claude_permission_mode.fallback;
+const DEFAULT_PERMISSION_MODE = PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE.fallback;
 
 /** The picker's options, in the order a user should weigh them: the safe
  *  default first. Each carries its one-line trade-off as a second row, so the

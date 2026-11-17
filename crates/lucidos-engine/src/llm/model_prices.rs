@@ -332,7 +332,7 @@ static OVERRIDE_WORKSPACE: OnceLock<PathBuf> = OnceLock::new();
 /// Merge `workspace`'s override into every price the engine reads from now on.
 pub fn read_overrides_from(workspace: PathBuf) {
     if OVERRIDE_WORKSPACE.set(workspace).is_err() {
-        crate::log!("[ModelPrices] override workspace already set; keeping the first");
+        crate::log_legacy!("[ModelPrices] override workspace already set; keeping the first");
     }
 }
 
@@ -372,7 +372,7 @@ pub fn price_table_for(workspace: &Path) -> Arc<PriceTable> {
     });
     let table = Arc::new(merge(shipped_file(), overlay));
     if let Some(error) = &table.override_state.error {
-        crate::log!("[ModelPrices] ignoring {}: {error}", path.display());
+        crate::log_legacy!("[ModelPrices] ignoring {}: {error}", path.display());
     }
     loaded.insert(
         path,

@@ -30,6 +30,8 @@ report. Each section carries its own scan, checks and fixes.
 
 Load a section with `load_knowhow` and its id, as for any knowhow.
 
+Thread-progress assessments in the audit need current liveness, rather than earlier replies. The cross-cutting section checks this rule.
+
 ## When to run this
 
 User says "audit the workspace", "check for drift", "what's stale", "is everything still using the right pattern", "scan my apps/triggers", "is my prompt getting big". Or after a major SDK / CLI / system prompt change, where existing content might silently use the old shape.
@@ -78,6 +80,9 @@ This covers *every* mutation: no `rmdir`/`rm`, no writing a `.gitignore`, no
 mid-sweep, put the fix in the report instead. Fixes follow § Remediation below.
 
 ## Sources of truth: load these first
+
+The chat system prompt routes exact-data lookups to file tools.
+An unattended trigger artifact remains readable even when excluded from workspace memory; audit recipes must preserve that explicit read.
 
 The audit does **not** restate the rules. Each check names the file that owns
 its rule; load it for the canonical wording.

@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
-import { readScrollAnchor, readRowAnchor, rowTargetTop, anchorTargetTop, anchorTurnIsClamped, HEAD_CLAMPED_ATTR } from '../scrollAnchor';
+import { readScrollAnchor, readRowAnchor, rowTargetTop, anchorTargetTop, anchorTurnIsClamped, HEAD_CLAMPED_ATTR, lineBlockOf, readLineAnchor } from '../scrollAnchor';
 import { mockTranscript } from './scroll-test-helpers';
 
 // WHERE THE READER IS, said as content. The pair has to be exact and it has to
@@ -196,5 +196,26 @@ describe('a position saved on a turn drawn with its head clamped', () => {
     const el = parkedInClampedTurn();
     el.setRowsHidden('t0', 35);
     expect(rowTargetTop(el, { rowEventId: 't0-r32', relTop: 0 })).toBeNull();
+  });
+});
+
+describe('a line anchor resolves only to the kind of element it recorded', () => {
+  const IDS = ['t0', 't1', 't2', 't3'];
+
+  it('resolves its path while the turn is drawn as it was', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
+    el.scrollTop = 1320;                   // block 2 of t2 at the line
+    const anchor = readLineAnchor(el)!;
+    expect(anchor.path).toEqual([2]);
+    expect(lineBlockOf(el, anchor)).not.toBeNull();
+  });
+
+  it('answers null once a row drawn ahead of the block takes its index', () => {
+    const el = mockTranscript({ ids: IDS, turnHeight: 400, blocks: { t2: [20, 100, 1000, 200] } });
+    el.scrollTop = 1320;
+    const anchor = readLineAnchor(el)!;
+    // A keep-alive row arrives ahead of the reply, at the reply's index.
+    el.insertBlock('t2', 2, 40, 'keep-alive-under-card');
+    expect(lineBlockOf(el, anchor)).toBeNull();
   });
 });

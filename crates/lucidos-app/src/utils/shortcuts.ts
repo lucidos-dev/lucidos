@@ -9,6 +9,7 @@ export type ShortcutId =
   | 'closeThread'
   | 'searchEverywhere'
   | 'searchFiles'
+  | 'searchApps'
   | 'openSettings'
   | 'showShortcuts'
   | 'openNotifications'
@@ -96,6 +97,7 @@ export const SHORTCUT_DEFS: readonly ShortcutDef[] = [
   { id: 'newThread', label: 'New thread', category: 'Navigation', defaultBinding: B(true, true, false, 'o'), mnemonic: 'ChatGPT\'s new chat chord' },
   { id: 'closeThread', label: 'Close thread (cascade)', category: 'Navigation', defaultBinding: B(true, true, false, 'w'), mnemonic: 'W, as in close window' },
   { id: 'searchEverywhere', label: 'Search everywhere', category: 'Navigation', defaultBinding: B(true, false, false, 'k'), mnemonic: 'The search chord in Slack, Linear and Notion' },
+  { id: 'searchApps', label: 'Search apps or plugins (current list)', category: 'Navigation', defaultBinding: B(true, false, true, 'Enter'), mnemonic: 'Alt for Apps, Enter to open search' },
   { id: 'searchFiles', label: 'Search files', category: 'Navigation', defaultBinding: B(true, false, false, 'p'), mnemonic: 'Quick open in VS Code and Zed' },
   { id: 'openSettings', label: 'Open settings', category: 'Navigation', defaultBinding: B(true, false, false, ','), mnemonic: 'Settings in every Mac app' },
   { id: 'showShortcuts', label: 'Show keyboard shortcuts', category: 'Navigation', defaultBinding: B(true, false, false, '/'), mnemonic: 'The shortcut list in ChatGPT and Slack' },

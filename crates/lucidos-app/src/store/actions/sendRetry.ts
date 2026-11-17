@@ -1,7 +1,8 @@
-import { isTransientFetchError } from '../../api/client';
+import { ApiError, isTransientFetchError } from '../../api/client';
 import { postClientLog } from '../../utils/clientLog';
 import { errorDetail } from '../../utils/errorDetail';
 import { onPageWake } from '../../utils/pageVisit';
+import type { UnsentMessage } from '../unsentMessages';
 
 /** The waits before each quiet retry of a send. A dropped connection fails in
  *  under a second, so all three fit in about 13 s. */
@@ -44,10 +45,12 @@ export function sendFailureOf(result: { attempts: number; error: unknown }): Sen
   return { attempts: result.attempts, reason: errorDetail(result.error) };
 }
 
-/** The details a Not sent notice opens to. */
-export function sendFailureDetail(failure: SendFailure): string {
-  const tries = failure.attempts === 1 ? 'try' : 'tries';
-  return `Lucidos did not answer after ${failure.attempts} ${tries}. Last error: ${failure.reason}.`;
+/** Only an explicit ordering refusal permits Retry to form a fresh intent. */
+export function inputRefusalOf(error: unknown): UnsentMessage['refusal'] {
+  if (!(error instanceof ApiError) || error.httpCode !== 409 || typeof error.body !== 'object' || error.body === null || !('reason' in error.body)) return undefined;
+  const reason = error.body.reason;
+  if (reason !== 'overtaken' && reason !== 'compose_snapshot_stale' && reason !== 'compose_fence_required') return undefined;
+  return { reason, message: error.reason };
 }
 
 /** Run a send, retrying failures that say nothing about the request, on

@@ -8,6 +8,738 @@ use crate::test_support::{setup_test_db, teardown_test_db};
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Seed durable queue state only. Owner authorization is exercised by the
+/// acceptance tests; this fixture isolates recovery and manager admission.
+async fn persisted_saved_draft(f: &Fixture, admitted: bool, recorded: bool) -> (Uuid, Uuid) {
+    use crate::core::draft_submission::{DraftSubmissionAuthority, DraftSubmissionReceipt};
+    use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta};
+    let thread = Uuid::new_v4();
+    emit_message_received(&f.bus, thread).await;
+    let (revision,epoch): (i64,i64) = sqlx::query_as(
+        "UPDATE thread_summaries SET compose_text='saved work',status='idle' WHERE thread_id=$1 RETURNING summary_version,compose_epoch",
+    ).bind(thread).fetch_one(&f.pool).await.unwrap();
+    let receipt = DraftSubmissionReceipt {
+        thread_id: thread,
+        revision,
+        epoch,
+        retry_key: Uuid::new_v4(),
+        event_id: Uuid::new_v4(),
+        queue_entry_id: Uuid::new_v4(),
+    };
+    let message = Uuid::new_v4();
+    let origin = MessageOrigin::SavedDraft {
+        submission_event_id: receipt.event_id,
+        submitted_by_thread_id: Uuid::new_v4(),
+    };
+    let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+        "type":"agent-chat","message":"saved work","thread_id":thread,"event_id":message,
+        "mode":"human","origin":origin,
+    }))
+    .unwrap();
+    f.bus
+        .emit_system_once(
+            receipt.event_id,
+            SystemEvent::DraftSubmissionAccepted {
+                receipt: receipt.clone(),
+                snapshot: crate::core::store::ComposeReport {
+                    summary_version: revision,
+                    compose_epoch: epoch,
+                    restorations: vec![],
+                    text: "saved work".into(),
+                    image_hashes: vec![],
+                    mode: None,
+                    selection: None,
+                },
+                request: Box::new(request),
+                authority: DraftSubmissionAuthority::StandingInstruction {
+                    instruction_event_id: Uuid::new_v4(),
+                },
+                actor: None,
+            },
+        )
+        .await
+        .unwrap();
+    if recorded {
+        f.bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event: ThreadEvent::MessageReceived {
+                    provider: None,
+                    voice_session_id: None,
+                    wake_mode: None,
+                    text: "saved work".into(),
+                    user_image_hashes: vec![],
+                    device_id: None,
+                    image_description: None,
+                    parent_thread_id: None,
+                    spawning_event_id: None,
+                    mode: ActorMode::Human,
+                    model: None,
+                    reasoning_effort: None,
+                    origin: Some(origin),
+                },
+                meta: EventMeta {
+                    event_id: Some(message),
+                    channel: Some(EventChannel::Chat),
+                    ..EventMeta::NONE
+                },
+            })
+            .await
+            .unwrap();
+    }
+    if admitted {
+        f.bus
+            .emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+                entry_id: receipt.queue_entry_id,
+                thread_id: Some(thread),
+                actor: None,
+            }))
+            .await
+            .unwrap();
+    }
+    (receipt.queue_entry_id, thread)
+}
+
+#[tokio::test]
+async fn routing_an_input_wakes_its_queued_successor_without_another_event() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta};
+
+    let f = fixture(5).await;
+    let thread = Uuid::new_v4();
+    emit_message_received(&f.bus, thread).await;
+    let mut entries = Vec::new();
+    for text in ["first", "second"] {
+        let message = Uuid::new_v4();
+        let actor = MessageOrigin::Device {
+            device_id: "test-device".into(),
+        };
+        let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+            "type": "agent-chat", "thread_id": thread, "event_id": message,
+            "message": text, "mode": "human", "origin": actor,
+        }))
+        .unwrap();
+        let intent = OrdinarySubmissionIntent::new(thread, message, &request).unwrap();
+        let accepted = f
+            .bus
+            .accept_ordinary_submission(request, actor, &f.bus.input_order, None, None, intent)
+            .await
+            .unwrap();
+        entries.push((accepted.receipt.entry_id, message));
+    }
+    let (queue, executor) = gated_queue(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        5,
+        Arc::default(),
+    );
+    queue.start_draining();
+    let (first, message) = entries[0];
+    let second = entries[1].0;
+    wait_for_executed(&executor, vec![first]).await;
+    // Let the initial timer and acceptance drains settle before routing A.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(executor.executed_ids(), vec![first]);
+    assert!(f.bus.accepted_input_has_predecessor(second));
+    drop(f.bus.take_accepted_input_turn(first).unwrap());
+    assert!(
+        f.bus.accepted_input_has_predecessor(second),
+        "recording still blocks B"
+    );
+    f.bus
+        .emit(BusEvent::Thread {
+            thread_id: thread,
+            event: ThreadEvent::MessageReceived {
+                provider: None,
+                voice_session_id: None,
+                wake_mode: None,
+                text: "first".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                event_id: Some(message),
+                channel: Some(EventChannel::Chat),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    // No explicit drain, completion, acceptance or other event after routing.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_for_executed(&executor, vec![first, second]),
+    )
+    .await
+    .expect("routing A must wake B without waiting for the 60s timer");
+    executor.gate.add_permits(2);
+    wait_until(|| async { queue.state.lock().await.user_reservations.is_empty() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn saved_draft_image_failure_records_message_and_anchored_terminal_atomically() {
+    let f = fixture(4).await;
+    let (entry_id, thread) = persisted_saved_draft(&f, true, false).await;
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT request FROM thread_queue WHERE id=$1")
+        .bind(entry_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    let mut request: ThreadQueueRequest = serde_json::from_value(raw).unwrap();
+    let ThreadQueueRequest::AgentChat {
+        image_hashes,
+        event_id,
+        ..
+    } = &mut request
+    else {
+        panic!("expected saved chat");
+    };
+    *image_hashes = vec!["a".repeat(64), "b".repeat(64), "a".repeat(64)];
+    let message_id = Uuid::parse_str(event_id.as_deref().unwrap()).unwrap();
+    let events =
+        super::saved_drafts::image_failure_events(&request, "image missing".into()).unwrap();
+    let result = f
+        .bus
+        .emit_atomically_as_trigger(thread, events, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].event_id, message_id);
+    let (payload, anchor): (serde_json::Value, Option<Uuid>) = sqlx::query_as(
+        "SELECT payload,(payload->>'request_event_id')::uuid FROM events WHERE id=$1",
+    )
+    .bind(result[1].event_id)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap();
+    assert_eq!(anchor, Some(message_id));
+    assert!(payload.to_string().contains("image missing"));
+    let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE id=$1")
+        .bind(message_id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+    assert_eq!(payload["text"], "saved work");
+    assert_eq!(
+        payload["user_image_hashes"],
+        serde_json::json!(["a".repeat(64), "b".repeat(64), "a".repeat(64)])
+    );
+    assert_eq!(payload["origin"]["kind"], "saved_draft");
+    assert!(f
+        .queue
+        .queued_chat_message_recorded(&request)
+        .await
+        .unwrap()
+        .unwrap());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn accepted_saved_draft_is_adopted_once_by_concurrent_drains() {
+    let f = fixture(5).await;
+    let (entry, _) = persisted_saved_draft(&f, false, false).await;
+    tokio::join!(f.queue.drain(), f.queue.drain());
+    wait_for_executed(&f.executor, vec![entry]).await;
+    assert_eq!(
+        row_status(&f.pool, entry).await.as_deref(),
+        Some("admitted")
+    );
+    f.executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry).await.is_none() }).await;
+    f.queue.drain().await;
+    assert_eq!(f.executor.executed_ids(), vec![entry]);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recover_ordinary_chat_uses_message_identity_on_existing_threads() {
+    for recorded in [false, true] {
+        let f = fixture(5).await;
+        let thread = Uuid::new_v4();
+        emit_message_received(&f.bus, thread).await;
+        let message_id = if recorded {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM events WHERE aggregate_id=$1 AND event_type='MessageReceived'",
+            )
+            .bind(thread.to_string())
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+        } else {
+            Uuid::new_v4()
+        };
+        let entry_id = Uuid::new_v4();
+        let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+            "type":"agent-chat", "message":"ordinary follow-up", "thread_id":thread,
+            "event_id":message_id, "mode":"human",
+        }))
+        .unwrap();
+        f.bus
+            .emit(BusEvent::System(SystemEvent::ThreadQueued {
+                entry_id,
+                kind: request.kind(),
+                trigger_id: None,
+                trigger_name: None,
+                thread_id: Some(thread),
+                summary: "ordinary follow-up".into(),
+                request: serde_json::to_value(request).unwrap(),
+                requeued: false,
+                actor: None,
+            }))
+            .await
+            .unwrap();
+        f.bus
+            .emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+                entry_id,
+                thread_id: Some(thread),
+                actor: None,
+            }))
+            .await
+            .unwrap();
+        let (queue, executor) = restarted_queue(&f, 5);
+        queue.recover_persisted_entries().await;
+        if recorded {
+            assert_eq!(row_status(&f.pool, entry_id).await, None);
+            assert!(executor.executed_ids().is_empty());
+        } else {
+            assert_eq!(
+                row_status(&f.pool, entry_id).await.as_deref(),
+                Some("queued")
+            );
+            queue.drain().await;
+            wait_for_executed(&executor, vec![entry_id]).await;
+            executor.release_one();
+            wait_until(|| async { row_status(&f.pool, entry_id).await.is_none() }).await;
+        }
+        f.pool.close().await;
+        teardown_test_db(&f.db).await;
+    }
+}
+
+#[tokio::test]
+async fn changed_ordinary_projection_is_retained_without_dispatch_live_and_after_restart() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    for restart in [false, true] {
+        let f = fixture(1).await;
+        let thread = Uuid::new_v4();
+        emit_message_received(&f.bus, thread).await;
+        let id = Uuid::new_v4();
+        let actor = MessageOrigin::Device {
+            device_id: "test-device".into(),
+        };
+        let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+            "type":"agent-chat", "thread_id":thread, "event_id":id,
+            "message":"immutable accepted content", "mode":"human", "origin":actor,
+        }))
+        .unwrap();
+        let intent = OrdinarySubmissionIntent::new(thread, id, &request).unwrap();
+        let accepted = f
+            .bus
+            .accept_ordinary_submission(request, actor, &f.bus.input_order, None, None, intent)
+            .await
+            .unwrap();
+        let entry = accepted.receipt.entry_id;
+        sqlx::query("UPDATE thread_queue SET request=jsonb_set(request,'{message}','\"changed projection\"'::jsonb) WHERE id=$1")
+            .bind(entry).execute(&f.pool).await.unwrap();
+        let bus = if restart {
+            EventBus::new(f.pool.clone()).0
+        } else {
+            f.bus.clone()
+        };
+        let (queue, executor) = gated_queue(
+            &f.pool,
+            &bus,
+            &f.trigger_configs,
+            f.workspace.path(),
+            1,
+            Arc::default(),
+        );
+        if restart {
+            queue.begin_boot_recovery();
+            queue.recover_persisted_entries().await;
+        }
+        queue.drain().await;
+        assert!(executor.executed_ids().is_empty());
+        assert_eq!(row_status(&f.pool, entry).await.as_deref(), Some("queued"));
+        let notices: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type='NotificationCreated' AND payload->'data'->>'thread_id'=$1")
+            .bind(thread.to_string()).fetch_one(&f.pool).await.unwrap();
+        assert_eq!(
+            notices, 1,
+            "invalid durable work is retained with a visible recovery notice"
+        );
+        f.pool.close().await;
+        teardown_test_db(&f.db).await;
+    }
+}
+
+#[tokio::test]
+async fn live_ordinary_acceptance_reconciles_without_restart_or_background_capacity() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    let f = fixture(1).await;
+    let thread = Uuid::new_v4();
+    emit_message_received(&f.bus, thread).await;
+    let id = Uuid::new_v4();
+    let actor = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+        "type":"agent-chat", "thread_id":thread, "event_id":id,
+        "message":"ordinary follow-up", "mode":"human", "origin":actor,
+    }))
+    .unwrap();
+    let intent = OrdinarySubmissionIntent::new(thread, id, &request).unwrap();
+    let accepted = f
+        .bus
+        .accept_ordinary_submission(request, actor, &f.bus.input_order, None, None, intent)
+        .await
+        .unwrap();
+    let entry = accepted.receipt.entry_id;
+    f.queue.state.lock().await.policy.max_concurrent_sub_thread = 0;
+    // Deliberately omit any dispatch wake: periodic reconciliation owns it.
+    f.queue.drain().await;
+    wait_for_executed(&f.executor, vec![entry]).await;
+    assert!(f.queue.state.lock().await.active.is_empty());
+    assert_eq!(f.queue.state.lock().await.user_reservations.len(), 1);
+    let view = f.queue.snapshot().await.unwrap();
+    let rows: Vec<_> = view
+        .entries
+        .iter()
+        .filter(|row| row.thread_id == Some(thread))
+        .collect();
+    assert_eq!(
+        rows.iter().filter(|row| row.id == entry).count(),
+        1,
+        "durable membership and its user gate render once"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "the existing running turn remains visible beside its unrecorded follow-up"
+    );
+    assert!(rows.iter().all(|row| row.kind == "user-chat"));
+    f.queue.drain().await;
+    assert_eq!(f.executor.executed_ids(), vec![entry]);
+    f.executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry).await.is_none() }).await;
+    wait_until(|| async { f.queue.state.lock().await.user_reservations.is_empty() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recovered_ordinary_input_uses_user_gate_without_background_reservation() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    let f = fixture(1).await;
+    let thread = Uuid::new_v4();
+    emit_message_received(&f.bus, thread).await;
+    let id = Uuid::new_v4();
+    let actor = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+        "type":"agent-chat", "thread_id":thread, "event_id":id,
+        "message":"ordinary follow-up", "mode":"human", "origin":actor,
+    }))
+    .unwrap();
+    let intent = OrdinarySubmissionIntent::new(thread, id, &request).unwrap();
+    let accepted = f
+        .bus
+        .accept_ordinary_submission(request, actor, &f.bus.input_order, None, None, intent)
+        .await
+        .unwrap();
+    let entry = accepted.receipt.entry_id;
+    drop(accepted);
+    let bus = EventBus::new(f.pool.clone()).0;
+    let (queue, executor) = gated_queue(
+        &f.pool,
+        &bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        1,
+        Arc::default(),
+    );
+    queue.state.lock().await.policy.max_concurrent_sub_thread = 0;
+    queue.begin_boot_recovery();
+    queue.recover_persisted_entries().await;
+    queue.drain().await;
+    wait_for_executed(&executor, vec![entry]).await;
+    {
+        let state = queue.state.lock().await;
+        assert!(
+            state.active.is_empty(),
+            "durable membership is not a background reservation"
+        );
+        assert_eq!(state.user_reservations.len(), 1);
+    }
+    queue.recover_persisted_entries().await;
+    queue.drain().await;
+    assert_eq!(
+        executor.executed_ids(),
+        vec![entry],
+        "recovery cannot double-dispatch"
+    );
+    // A completion-write failure cannot discard the durable membership or
+    // authorize the same manager to dispatch the unconfirmed input again.
+    sqlx::raw_sql("CREATE FUNCTION refuse_user_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic completion failure'; END $$; CREATE TRIGGER refuse_user_completion BEFORE DELETE ON thread_queue FOR EACH ROW EXECUTE FUNCTION refuse_user_completion();")
+        .execute(&f.pool).await.unwrap();
+    executor.release_one();
+    wait_until(|| async { queue.state.lock().await.user_reservations.is_empty() }).await;
+    assert_eq!(
+        row_status(&f.pool, entry).await.as_deref(),
+        Some("admitted")
+    );
+    queue.recover_persisted_entries().await;
+    queue.drain().await;
+    assert_eq!(executor.executed_ids(), vec![entry]);
+    sqlx::raw_sql("DROP TRIGGER refuse_user_completion ON thread_queue; DROP FUNCTION refuse_user_completion();")
+        .execute(&f.pool).await.unwrap();
+    // A fresh process reconstructs the same accepted input and executes once.
+    let fresh_bus = EventBus::new(f.pool.clone()).0;
+    let (fresh, fresh_executor) = gated_queue(
+        &f.pool,
+        &fresh_bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        1,
+        Arc::default(),
+    );
+    fresh.begin_boot_recovery();
+    fresh.recover_persisted_entries().await;
+    fresh.drain().await;
+    wait_for_executed(&fresh_executor, vec![entry]).await;
+    fresh_executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry).await.is_none() }).await;
+    wait_until(|| async { fresh.state.lock().await.user_reservations.is_empty() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recovery_rebuilds_saved_and_ordinary_recording_order_before_capacity_admission() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    let f = fixture(5).await;
+    let (saved_entry, thread) = persisted_saved_draft(&f, false, false).await;
+    let id = Uuid::new_v4();
+    let actor = MessageOrigin::Device {
+        device_id: "test-device".into(),
+    };
+    let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+        "type":"agent-chat", "thread_id":thread, "event_id":id,
+        "message":"ordinary follow-up", "mode":"human", "origin":actor,
+    }))
+    .unwrap();
+    let intent = OrdinarySubmissionIntent::new(thread, id, &request).unwrap();
+    let epoch: i64 =
+        sqlx::query_scalar("SELECT compose_epoch FROM thread_summaries WHERE thread_id=$1")
+            .bind(thread)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        f.bus
+            .accept_ordinary_submission(
+                request.clone(),
+                actor.clone(),
+                &f.bus.input_order,
+                None,
+                None,
+                intent.clone(),
+            )
+            .await
+            .err()
+            .unwrap()
+            .to_string(),
+        "compose_fence_required"
+    );
+    let accepted = f
+        .bus
+        .accept_ordinary_submission(
+            request,
+            actor,
+            &f.bus.input_order,
+            None,
+            Some(epoch),
+            intent,
+        )
+        .await
+        .unwrap();
+    let ordinary_entry = accepted.receipt.entry_id;
+    drop(accepted);
+    // A fresh bus, not merely a manager, discards all old runtime order.
+    let bus = EventBus::new(f.pool.clone()).0;
+    let (queue, _executor) = gated_queue(
+        &f.pool,
+        &bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        5,
+        Arc::default(),
+    );
+    queue.begin_boot_recovery();
+    queue.recover_persisted_entries().await;
+    assert!(!bus.accepted_input_has_predecessor(saved_entry));
+    assert!(bus.accepted_input_has_predecessor(ordinary_entry));
+    {
+        let mut state = queue.state.lock().await;
+        let mut admitted = Vec::new();
+        let mut dropped = Vec::new();
+        queue.drain_background_into(
+            &mut state,
+            &HashMap::new(),
+            usize::MAX,
+            &mut admitted,
+            &mut dropped,
+        );
+        assert_eq!(
+            admitted.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            vec![saved_entry]
+        );
+        assert!(dropped.is_empty());
+        assert_eq!(
+            state.active.len(),
+            1,
+            "waiting successor reserves no capacity"
+        );
+    }
+    let saved = bus.take_accepted_input_turn(saved_entry).unwrap();
+    let mut ordinary = bus.take_accepted_input_turn(ordinary_entry).unwrap();
+    assert!(ordinary.has_input_ahead());
+    drop(saved);
+    assert!(
+        ordinary.has_input_ahead(),
+        "unrecorded failure retains the barrier"
+    );
+    // Durable cancellation is an explicit terminal decision for this input.
+    bus.emit(BusEvent::System(SystemEvent::ThreadQueueDropped {
+        entry_id: saved_entry,
+        reason: "synthetic cancellation".into(),
+        actor: None,
+    }))
+    .await
+    .unwrap();
+    ordinary.wait_for_predecessor().await;
+    assert!(!ordinary.has_input_ahead());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recover_saved_draft_requeues_unrecorded_message_on_existing_thread() {
+    let f = fixture(5).await;
+    let (entry, _) = persisted_saved_draft(&f, true, false).await;
+    let (queue, executor) = restarted_queue(&f, 5);
+    queue.recover_persisted_entries().await;
+    assert_eq!(row_status(&f.pool, entry).await.as_deref(), Some("queued"));
+    queue.drain().await;
+    wait_for_executed(&executor, vec![entry]).await;
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry).await.is_none() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn recover_saved_draft_hands_recorded_message_to_thread_recovery() {
+    for admitted in [false, true] {
+        let f = fixture(5).await;
+        let (entry, _) = persisted_saved_draft(&f, admitted, true).await;
+        let (queue, executor) = restarted_queue(&f, 5);
+        queue.recover_persisted_entries().await;
+        assert_eq!(row_status(&f.pool, entry).await, None);
+        assert!(executor.executed_ids().is_empty());
+        f.pool.close().await;
+        teardown_test_db(&f.db).await;
+    }
+}
+
+#[tokio::test]
+async fn boot_recovery_after_an_early_saved_draft_load_queues_it_once() {
+    let f = fixture(5).await;
+    let (entry, _) = persisted_saved_draft(&f, false, false).await;
+    let (queue, _executor) = restarted_queue(&f, 5);
+    queue.load_accepted_inputs().await.unwrap();
+    queue.recover_persisted_entries().await;
+    let copies = queue
+        .state
+        .lock()
+        .await
+        .queued
+        .iter()
+        .filter(|queued| queued.id == entry)
+        .count();
+    assert_eq!(copies, 1);
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn malformed_saved_request_does_not_block_later_accepted_work() {
+    let f = fixture(5).await;
+    let (invalid, thread) = persisted_saved_draft(&f, false, false).await;
+    sqlx::query("UPDATE thread_queue SET request='{}'::jsonb WHERE id=$1")
+        .bind(invalid)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    let (mismatch, mismatch_thread) = persisted_saved_draft(&f, true, false).await;
+    sqlx::query("UPDATE thread_queue SET request=jsonb_set(request, '{message}', '\"changed text\"'::jsonb) WHERE id=$1")
+        .bind(mismatch).execute(&f.pool).await.unwrap();
+    let (valid, _) = persisted_saved_draft(&f, false, false).await;
+    let (queue, executor) = restarted_queue(&f, 5);
+    queue.recover_persisted_entries().await;
+    queue.drain().await;
+    wait_for_executed(&executor, vec![valid]).await;
+    assert_eq!(
+        row_status(&f.pool, invalid).await.as_deref(),
+        Some("queued")
+    );
+    assert_eq!(
+        row_status(&f.pool, mismatch).await.as_deref(),
+        Some("admitted")
+    );
+    queue.drain().await;
+    let notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type='NotificationCreated' AND payload->'data'->>'thread_id'=$1",
+    ).bind(thread.to_string()).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(
+        notices, 1,
+        "malformed work must produce one durable recovery notice"
+    );
+    let mismatch_notices: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type='NotificationCreated' AND payload->'data'->>'thread_id'=$1",
+    ).bind(mismatch_thread.to_string()).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(mismatch_notices, 1);
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, valid).await.is_none() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn saved_draft_with_recorded_message_is_not_readmitted_by_reconciliation() {
+    let f = fixture(5).await;
+    let (entry, _) = persisted_saved_draft(&f, false, true).await;
+    f.queue.drain().await;
+    assert_eq!(row_status(&f.pool, entry).await, None);
+    assert!(f.executor.executed_ids().is_empty());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 /// Executor whose `execute` parks until the test releases a permit —
 /// `release_one()` lets exactly one execution finish, so tests control slot
 /// lifetimes deterministically.
@@ -41,7 +773,10 @@ impl ThreadQueueExecutor for GatedExecutor {
         self.prepared.fetch_add(1, Ordering::SeqCst);
     }
 
-    async fn execute(&self, entry: ExecutableEntry) {
+    async fn execute(
+        &self,
+        entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.executed.lock().unwrap().push(entry.id);
         let permit = self
             .gate
@@ -49,6 +784,7 @@ impl ThreadQueueExecutor for GatedExecutor {
             .await
             .expect("gate semaphore closed mid-test");
         permit.forget();
+        Ok(())
     }
 }
 
@@ -105,7 +841,10 @@ impl ThreadQueueExecutor for DepthProbeExecutor {
             .push(crate::scheduler::user_tasks::current_event_trigger_depth());
     }
 
-    async fn execute(&self, _entry: ExecutableEntry) {
+    async fn execute(
+        &self,
+        _entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let depth = crate::scheduler::user_tasks::current_event_trigger_depth();
         self.executed.lock().unwrap().push(depth);
         let _ = self.entered.send(depth);
@@ -115,6 +854,7 @@ impl ThreadQueueExecutor for DepthProbeExecutor {
             .await
             .expect("gate semaphore closed mid-test");
         permit.forget();
+        Ok(())
     }
 }
 
@@ -1612,6 +2352,7 @@ fn cc_idled() -> crate::engine::thread_events::ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -1626,6 +2367,8 @@ fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     }
 }
 
@@ -1633,6 +2376,7 @@ fn user_question_asked() -> crate::engine::thread_events::ThreadEvent {
 /// goes back to `running` and counts again.
 fn user_question_answered() -> crate::engine::thread_events::ThreadEvent {
     crate::engine::thread_events::ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu-1".to_string(),
         quiet: false,
         answer: crate::engine::thread_events::AnswerKind::FreeText {
@@ -1727,7 +2471,9 @@ async fn a_user_thread_that_leaves_running_stops_counting() {
         response_generated(),
         crate::engine::thread_events::ThreadEvent::ResponseFailed {
             error: "boom".to_string(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         user_question_asked(),
     ] {
@@ -2056,7 +2802,9 @@ fn moves_user_occupancy_selects_status_transitions() {
     assert!(moves_user_occupancy(&response_generated()));
     assert!(moves_user_occupancy(&ThreadEvent::ResponseFailed {
         error: "x".into(),
+        spend_cap: None,
         agent_exit: None,
+        provider_error: None,
     }));
     assert!(moves_user_occupancy(&ThreadEvent::ContinuationRequested {
         reason: String::new()
@@ -2600,14 +3348,388 @@ async fn a_fire_stalled_past_the_wait_threshold_reports_a_delay_once() {
 // Keep-awake: an admitted entry holds the computer awake until its work ends.
 // ---------------------------------------------------------------------------
 
+/// A failed completion write must retain the reservation and its waiter.
+#[tokio::test]
+async fn drop_write_failure_retains_queued_work_and_its_completion_waiter() {
+    let f = fixture(1).await;
+    let running = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None)
+        .await;
+    let waiting = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None)
+        .await;
+    assert!(!waiting.admitted);
+    sqlx::raw_sql("CREATE FUNCTION refuse_drop() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic drop failure'; END $$; CREATE TRIGGER refuse_drop BEFORE DELETE ON thread_queue FOR EACH ROW EXECUTE FUNCTION refuse_drop();")
+        .execute(&f.pool).await.unwrap();
+    assert!(f
+        .queue
+        .drop_entry(waiting.entry_id, "synthetic cancellation", None)
+        .await
+        .is_err());
+    assert_eq!(
+        row_status(&f.pool, waiting.entry_id).await.as_deref(),
+        Some("queued")
+    );
+    assert!(f
+        .queue
+        .state
+        .lock()
+        .await
+        .queued
+        .iter()
+        .any(|entry| entry.id == waiting.entry_id));
+    let mut completion = waiting.completion;
+    assert!(matches!(
+        completion.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    sqlx::raw_sql("DROP TRIGGER refuse_drop ON thread_queue; DROP FUNCTION refuse_drop();")
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    f.queue
+        .drop_entry(waiting.entry_id, "synthetic cancellation", None)
+        .await
+        .unwrap();
+    completion.await.unwrap();
+    wait_for_executed(&f.executor, vec![running.entry_id]).await;
+    f.executor.release_one();
+    running.completion.await.unwrap();
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn completion_write_failure_keeps_background_slot_and_waiter_until_confirmed() {
+    let f = fixture(1).await;
+    let entry = f
+        .queue
+        .submit(sub_thread_request(Uuid::new_v4()), None)
+        .await;
+    wait_for_executed(&f.executor, vec![entry.entry_id]).await;
+    sqlx::raw_sql("CREATE FUNCTION refuse_completion() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'synthetic completion failure'; END $$; CREATE TRIGGER refuse_completion BEFORE DELETE ON thread_queue FOR EACH ROW EXECUTE FUNCTION refuse_completion();")
+        .execute(&f.pool).await.unwrap();
+    f.executor.release_one();
+    assert!(awake_hold_released(entry.entry_id).await);
+    assert_eq!(
+        row_status(&f.pool, entry.entry_id).await.as_deref(),
+        Some("admitted")
+    );
+    assert!(f
+        .queue
+        .state
+        .lock()
+        .await
+        .active
+        .contains_key(&entry.entry_id));
+    let mut completion = entry.completion;
+    assert!(matches!(
+        completion.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    sqlx::raw_sql(
+        "DROP TRIGGER refuse_completion ON thread_queue; DROP FUNCTION refuse_completion();",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    f.queue.complete(entry.entry_id).await;
+    completion.await.unwrap();
+    assert!(row_status(&f.pool, entry.entry_id).await.is_none());
+    assert!(f.queue.state.lock().await.active.is_empty());
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 /// Executor whose work panics.
 struct PanickingExecutor;
 
+struct FailedWriteExecutor;
+
+#[async_trait]
+impl ThreadQueueExecutor for FailedWriteExecutor {
+    async fn execute(
+        &self,
+        _entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("synthetic terminal write failure".into())
+    }
+}
+
+#[tokio::test]
+async fn failed_chat_releases_capacity_only_after_its_durable_outcome() {
+    use crate::engine::thread_events::{EventChannel, EventMeta};
+    for (recorded, terminated, panicked) in [
+        (true, true, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, true),
+        (true, false, true),
+        (false, true, true),
+    ] {
+        let f = fixture(1).await;
+        let thread = Uuid::new_v4();
+        emit_message_received(&f.bus, thread).await;
+        let message_id = if recorded {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM events WHERE thread_id=$1 AND event_type='MessageReceived'",
+            )
+            .bind(thread)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap()
+        } else {
+            Uuid::new_v4()
+        };
+        if terminated {
+            f.bus
+                .emit(BusEvent::Thread {
+                    thread_id: thread,
+                    event: ThreadEvent::ResponseFailed {
+                        error: "provider failed".into(),
+                        agent_exit: None,
+                        provider_error: None,
+                        spend_cap: None,
+                    },
+                    meta: EventMeta {
+                        request_event_id: Some(message_id),
+                        channel: Some(EventChannel::Chat),
+                        ..EventMeta::NONE
+                    },
+                })
+                .await
+                .unwrap();
+        }
+        sqlx::query("UPDATE thread_summaries SET status='idle' WHERE thread_id=$1")
+            .bind(thread)
+            .execute(&f.pool)
+            .await
+            .unwrap();
+        let executor: Arc<dyn ThreadQueueExecutor> = if panicked {
+            Arc::new(PanickingExecutor)
+        } else {
+            Arc::new(FailedWriteExecutor)
+        };
+        let queue = queue_with_executor(
+            &f.pool,
+            &f.bus,
+            &f.trigger_configs,
+            f.workspace.path(),
+            1,
+            executor,
+            Arc::default(),
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "type":"agent-chat", "message":"ordinary input", "mode":"human",
+            "thread_id":thread, "event_id":message_id,
+            "origin":{"kind":"device", "device_id":"synthetic-device"},
+        }))
+        .unwrap();
+        let entry = queue.submit(request, None).await;
+        assert!(awake_hold_released(entry.entry_id).await);
+        if recorded && terminated {
+            assert_eq!(row_status(&f.pool, entry.entry_id).await, None);
+            assert!(!queue
+                .state
+                .lock()
+                .await
+                .active
+                .contains_key(&entry.entry_id));
+            let next = queue.submit(sub_thread_request(Uuid::new_v4()), None).await;
+            assert!(
+                next.admitted,
+                "settled failure stranded the only capacity slot"
+            );
+        } else {
+            assert_eq!(
+                row_status(&f.pool, entry.entry_id).await.as_deref(),
+                Some("admitted")
+            );
+            assert!(queue
+                .state
+                .lock()
+                .await
+                .active
+                .contains_key(&entry.entry_id));
+        }
+        f.pool.close().await;
+        teardown_test_db(&f.db).await;
+    }
+}
+
+#[tokio::test]
+async fn executor_write_failure_retains_durable_work_without_completing_it() {
+    let f = fixture(4).await;
+    let queue = queue_with_executor(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        4,
+        Arc::new(FailedWriteExecutor),
+        Arc::default(),
+    );
+    let entry = queue.submit(sub_thread_request(Uuid::new_v4()), None).await;
+    assert!(entry.admitted);
+    assert!(
+        awake_hold_released(entry.entry_id).await,
+        "executor joiner did not finish"
+    );
+    assert_eq!(
+        row_status(&f.pool, entry.entry_id).await.as_deref(),
+        Some("admitted")
+    );
+    let completions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE event_type='ThreadQueueCompleted' AND payload->'data'->>'entry_id'=$1",
+    ).bind(entry.entry_id.to_string()).fetch_one(&f.pool).await.unwrap();
+    assert_eq!(completions, 0);
+    let mut completion = entry.completion;
+    assert!(
+        matches!(
+            completion.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "failed work resolved as completed"
+    );
+    let (recovered, executor) = restarted_queue(&f, 4);
+    recovered.recover_persisted_entries().await;
+    assert_eq!(
+        row_status(&f.pool, entry.entry_id).await.as_deref(),
+        Some("queued")
+    );
+    recovered.drain().await;
+    wait_for_executed(&executor, vec![entry.entry_id]).await;
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry.entry_id).await.is_none() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+struct ParkedStartExecutor;
+
+#[async_trait]
+impl ThreadQueueExecutor for ParkedStartExecutor {
+    async fn execute(
+        &self,
+        _entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err(Box::new(
+            crate::engine::agent_session::spawn_gate::StartAwaitsOwner,
+        ))
+    }
+}
+
+#[tokio::test]
+async fn start_parked_on_the_owner_card_completes_without_a_recovery_notice() {
+    let f = fixture(1).await;
+    let queue = queue_with_executor(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        1,
+        Arc::new(ParkedStartExecutor),
+        Arc::default(),
+    );
+    let entry = queue.submit(sub_thread_request(Uuid::new_v4()), None).await;
+    assert!(awake_hold_released(entry.entry_id).await);
+    assert_eq!(row_status(&f.pool, entry.entry_id).await, None);
+    let next = queue.submit(sub_thread_request(Uuid::new_v4()), None).await;
+    assert!(next.admitted, "a parked start held the only capacity slot");
+    let notices: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type='NotificationCreated'")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(notices, 0, "a parked start is waiting, not failed");
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 #[async_trait]
 impl ThreadQueueExecutor for PanickingExecutor {
-    async fn execute(&self, _entry: ExecutableEntry) {
+    async fn execute(
+        &self,
+        _entry: ExecutableEntry,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         panic!("the work failed");
     }
+}
+
+#[tokio::test]
+async fn ordinary_chat_panic_retains_unrecorded_followup_for_restart() {
+    let f = fixture(4).await;
+    let thread = Uuid::new_v4();
+    emit_message_received(&f.bus, thread).await;
+    let queue = queue_with_executor(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        4,
+        Arc::new(PanickingExecutor),
+        Arc::default(),
+    );
+    let request = serde_json::from_value(serde_json::json!({
+        "type":"agent-chat", "message":"ordinary follow-up", "mode":"human",
+        "thread_id":thread, "event_id":Uuid::new_v4(),
+        "origin": {"kind":"device", "device_id":"synthetic-device"},
+    }))
+    .unwrap();
+    let entry = queue.submit(request, None).await;
+    assert!(entry.admitted);
+    assert!(awake_hold_released(entry.entry_id).await);
+    assert_eq!(
+        row_status(&f.pool, entry.entry_id).await.as_deref(),
+        Some("admitted")
+    );
+    let (recovered, executor) = restarted_queue(&f, 4);
+    recovered.recover_persisted_entries().await;
+    assert_eq!(
+        row_status(&f.pool, entry.entry_id).await.as_deref(),
+        Some("queued")
+    );
+    recovered.drain().await;
+    wait_for_executed(&executor, vec![entry.entry_id]).await;
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry.entry_id).await.is_none() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
+#[tokio::test]
+async fn saved_draft_panic_before_message_recording_retains_work_for_restart() {
+    let f = fixture(4).await;
+    let (entry_id, _) = persisted_saved_draft(&f, false, false).await;
+    let queue = queue_with_executor(
+        &f.pool,
+        &f.bus,
+        &f.trigger_configs,
+        f.workspace.path(),
+        4,
+        Arc::new(PanickingExecutor),
+        Arc::default(),
+    );
+    queue.drain().await;
+    assert!(awake_hold_released(entry_id).await);
+    assert_eq!(
+        row_status(&f.pool, entry_id).await.as_deref(),
+        Some("admitted")
+    );
+    let (recovered, executor) = restarted_queue(&f, 4);
+    recovered.recover_persisted_entries().await;
+    assert_eq!(
+        row_status(&f.pool, entry_id).await.as_deref(),
+        Some("queued")
+    );
+    recovered.drain().await;
+    wait_for_executed(&executor, vec![entry_id]).await;
+    executor.release_one();
+    wait_until(|| async { row_status(&f.pool, entry_id).await.is_none() }).await;
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
 }
 
 /// Waits for an entry's joiner to drop its keep-awake hold.

@@ -31,6 +31,7 @@
  *  - no badge inherits the tracking that leans it left;
  *  - the rules cover every badge that carries a number or a sign;
  *  - the pill height and the baseline's offset are whole pixels;
+ *  - an icon badge's spinner and hourglass keep clear of its circle;
  *  - each badge is one layer, and its width is a whole pixel;
  *  - each badge's text renders through GlyphBadge, whose ink span moves by paint only;
  *  - badges.css is imported LAST, which lets it win their `display` and box;
@@ -47,12 +48,61 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
-import { clientSourcePaths, cssRules, rulesTargeting, selectorList, styleSheetPaths } from './css-rule-helpers';
+import { UI_SCALE_MAX, UI_SCALE_MIN, UI_SCALE_STEP } from '@lucidos/appearance';
+import { clientSourcePaths, cssRules, decl, rulesTargeting, selectorList, styleSheetPaths } from './css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 const stylesDir: string = resolve(here, '..');
 const badgesCss: string = readFileSync(resolve(stylesDir, 'badges.css'), 'utf-8');
+const headerMarkCss: string = readFileSync(resolve(stylesDir, 'header-mark.css'), 'utf-8');
+const iconsTsx: string = readFileSync(
+  resolve(stylesDir, '..', 'components', 'shared', 'icons.tsx'), 'utf-8');
 const mainTsx: string = readFileSync(resolve(stylesDir, '..', 'main.tsx'), 'utf-8');
+
+const iconRules = cssRules(badgesCss)
+  .filter(r => r.selector === '.badge.badge-icon');
+
+/** The least room between an icon's ink and the circle, as a share of the box.
+ *  The 1px inset left under 0.05 at 100% and below zero at 137.5%. */
+const MIN_CLEARANCE_SHARE = 0.075;
+
+/** How far an icon's ink reaches from its centre, as a share of its size.
+ *  Read from the SVG: every vertex plus half the stroke. An arc never reaches
+ *  past its endpoints here, because both icons' arcs centre on the viewBox. */
+function inkReach(component: string): number {
+  const svg = iconsTsx.match(new RegExp(`export function ${component}\\(\\)[\\s\\S]*?</svg>`))?.[0] ?? '';
+  const view = Number(svg.match(/viewBox="0 0 (\d+) \d+"/)?.[1]);
+  const stroke = Number(svg.match(/stroke-width="([\d.]+)"/)?.[1]);
+  const points: Array<[number, number]> = [];
+  for (const [, list] of svg.matchAll(/points="([^"]+)"/g)) {
+    const n = list.trim().split(/[\s,]+/).map(Number);
+    for (let i = 0; i < n.length; i += 2) points.push([n[i], n[i + 1]]);
+  }
+  for (const [, d] of svg.matchAll(/ d="([^"]+)"/g)) {
+    let x = 0, y = 0;
+    for (const [, cmd, args] of d.matchAll(/([MLHVAmlhva])([^MLHVAmlhva]*)/g)) {
+      const n = args.trim().split(/[\s,]+|(?=-)/).filter(Boolean).map(Number);
+      const step = { M: 2, L: 2, H: 1, V: 1, A: 7 }[cmd.toUpperCase() as 'M'];
+      for (let i = 0; i < n.length; i += step) {
+        const rel = cmd === cmd.toLowerCase();
+        const c = cmd.toUpperCase();
+        if (c === 'H') x = (rel ? x : 0) + n[i];
+        else if (c === 'V') y = (rel ? y : 0) + n[i];
+        else { x = (rel ? x : 0) + n[i + step - 2]; y = (rel ? y : 0) + n[i + step - 1]; }
+        points.push([x, y]);
+      }
+    }
+  }
+  expect(points.length, `${component} has no vertices to read`).toBeGreaterThan(0);
+  const half = view / 2;
+  return Math.max(...points.map(([px, py]) => Math.hypot(px - half, py - half) + stroke / 2)) / view;
+}
+
+/** Every icon the brand badge can draw, by the component BrandBadge renders. */
+const BADGE_ICON_REACH: Record<string, number> = {
+  HourglassIcon: inkReach('HourglassIcon'),
+  ReloadIcon: inkReach('ReloadIcon'),
+};
 
 /** Every badge whose content is a number, a sign or a status word, so every
  *  badge that has a glyph to centre. A badge drawing only a dot is deliberately
@@ -73,10 +123,10 @@ const GLYPH_BADGES = [
  *  band to centre, and each keeps the size its own rule states. */
 const GLYPHLESS = ['brand-badge-dot', 'system-attention-badge-corner'];
 
-/** `.badge` minus the dots, at the specificity of `.badge` alone: `:where()`
+/** `.badge` minus dots and icon boxes, at the specificity of `.badge` alone: `:where()`
  *  weighs nothing, so the `:not()` around it weighs nothing either. */
 const SHARED_SELECTORS = GLYPH_BADGES.map(c => c === 'badge'
-  ? `.badge:not(:where(${GLYPHLESS.map(g => `.${g}`).join(', ')}))`
+  ? `.badge:not(:where(${[...GLYPHLESS, 'badge-icon'].map(g => `.${g}`).join(', ')}))`
   : `.${c}`);
 
 /** Every property the shared rule decides, and so every one a heavier rule
@@ -127,45 +177,69 @@ describe('one rule centres the glyph in every badge that has one', () => {
     expect(selectorList(tracking!.selector)).toEqual(GLYPH_BADGES.map(c => `.${c}`));
   });
 
-  it('leaves the badge on flex centring while it draws an icon', () => {
-    // While work runs, the brand badge holds a spinning glyph instead of the
-    // "!", and while it waits, a still hourglass. Neither has a cap band. A
-    // line box trimmed to one parks the icon off centre, and so does the
-    // padding that lifts a baseline.
-    const icon = cssRules(badgesCss)
-      .find(r => r.selector === '.badge:has(.brand-badge-spinner, .brand-badge-queued)');
-    expect(icon?.props.get('display')).toBe('flex');
-    expect(icon?.props.get('align-items')).toBe('center');
-    expect(icon?.props.get('text-box-trim')).toBe('none');
-    // All four sides: inline padding is room for a count's digits, and it drew
-    // a one-icon badge as a pill beside the round "!".
-    expect(icon?.props.get('padding')).toBe('0');
+  it('gives icons a square independent of text metrics, even without trim support', () => {
+    const icon = iconRules.find(r => r.atRules === '');
+    expect(icon?.props.get('display')).toBe('grid');
+    expect(icon?.props.get('place-items')).toBe('center');
+    expect(icon?.props.get('--badge-icon-box')).toBe('var(--badge-height)');
+    expect(icon?.props.get('padding')).toBe('var(--badge-icon-inset)');
+    for (const side of ['width', 'height']) {
+      expect(icon?.props.get(side)).toBe('var(--badge-icon-box)');
+    }
+    expect(iconRules.some(r => /cap|baseline|--badge-box/.test([...r.props.values()].join(' ')))).toBe(false);
   });
 
-  it('insets the icon by a whole pixel on each side', () => {
-    // Flex centring halves the spare room, and a half pixel snaps either way:
-    // at 100% a 9px icon in the 12px box sat a pixel low. The icon is the box
-    // minus an even, whole-pixel inset, derived from both sizes.
-    const svg = cssRules(badgesCss)
-      .find(r => r.selector === '.badge :is(.brand-badge-spinner, .brand-badge-queued) svg');
-    expect(svg?.atRules, 'it reads --badge-box, which only the trim rule declares')
-      .toBe('@supports (text-box-trim: trim-both)');
-    const size = svg?.props.get('--badge-icon-snapped') ?? '';
-    expect(size).toMatch(/^calc\(var\(--badge-box\)\s+- 2 \* round\(down, /);
-    expect(size).toContain('var(--badge-icon-size)');
-    expect(size).toContain(', 1px))');
-    for (const side of ['width', 'height']) {
-      expect(svg?.props.get(side)).toBe('var(--badge-icon-snapped)');
+  it('snaps the box and symmetric insets independently of text trim', () => {
+    const icon = iconRules.find(r => r.atRules === '@supports (width: round(down, 1rem, 1px))');
+    expect(icon?.props.get('--badge-icon-box')).toBe('round(down, var(--badge-height), 1px)');
+    expect(icon?.props.get('--badge-icon-inset'))
+      .toBe('round(down, var(--badge-icon-box) * var(--badge-icon-inset-share), 1px)');
+  });
+
+  it('keeps every icon clear of the circle at every ui-scale', () => {
+    // A square icon in a circle loses its room at the corners. With a 1px
+    // inset the hourglass touched the rim at every scale, and at 137.5% it
+    // crossed it. This replays the snapped inset over every box the scale
+    // range draws, against how far each icon's ink reaches from its centre.
+    const share = Number(iconRules.find(r => r.atRules === '')?.props.get('--badge-icon-inset-share'));
+    expect(share).toBeGreaterThan(0);
+    const badgeRem = parseFloat(decl(headerMarkCss, '--header-mark-count-size') ?? '');
+    expect(badgeRem).toBeGreaterThan(0);
+    for (const [icon, reach] of Object.entries(BADGE_ICON_REACH)) {
+      for (let scale = UI_SCALE_MIN; scale <= UI_SCALE_MAX; scale += UI_SCALE_STEP) {
+        const box = Math.floor(badgeRem * 16 * scale / 100);
+        const inset = Math.floor(box * share);
+        const size = box - 2 * inset;
+        const clearance = box / 2 - reach * size;
+        expect(inset, `${icon} at ${scale}%: a whole-pixel inset`).toBeGreaterThanOrEqual(1);
+        expect(clearance / box, `${icon} at ${scale}% in a ${box}px box: ${clearance.toFixed(2)}px clear`)
+          .toBeGreaterThanOrEqual(MIN_CLEARANCE_SHARE);
+      }
     }
   });
 
-  it('names every icon the brand badge can draw in that exemption', () => {
-    // An icon wrapper BrandBadge renders but the exemption omits rides high.
+  it('sizes the icon in badges.css alone, so no host overrides its room', () => {
+    // The brand badge used to state its own icon size. A second size anywhere
+    // takes the room back from the rule above.
+    for (const path of styleSheetPaths(stylesDir)) {
+      if (path.endsWith('/badges.css')) continue;
+      const css: string = readFileSync(path, 'utf-8');
+      const iconHosts = cssRules(css).filter(r => /\.brand-badge-(spinner|queued)\b/.test(r.selector));
+      for (const rule of iconHosts) {
+        expect(rule.props.has('width') || rule.props.has('height'), `${path}: ${rule.selector}`).toBe(false);
+      }
+      expect(css, path).not.toContain('--badge-icon-');
+    }
+  });
+
+  it('checks clearance for every icon the brand badge can draw', () => {
+    // New icons must join the clearance check.
     const badgeTsx: string = readFileSync(
       resolve(stylesDir, '..', 'components', 'layout', 'BrandBadge.tsx'), 'utf-8');
-    const wrappers = [...badgeTsx.matchAll(/class="(brand-badge-[a-z]+)"><[A-Z]\w*Icon \/>/g)]
-      .map(m => m[1]);
-    expect(wrappers.sort()).toEqual(['brand-badge-queued', 'brand-badge-spinner']);
+    const drawn = [...badgeTsx.matchAll(/class="(brand-badge-[a-z]+)"><([A-Z]\w*Icon) \/>/g)];
+    expect(drawn.map(m => m[1]).sort()).toEqual(['brand-badge-queued', 'brand-badge-spinner']);
+    // And the clearance check measures each of them.
+    expect(drawn.map(m => m[2]).sort()).toEqual(Object.keys(BADGE_ICON_REACH).sort());
   });
 });
 
@@ -324,7 +398,7 @@ describe('the ink, not the advance, sits in the middle', () => {
       const source: string = readFileSync(path, 'utf-8');
       for (const tag of source.matchAll(/<([a-z]+)\b[^>]*?\bclass=(?:"([^"]*)"|\{`([^`]*)`\})/g)) {
         const classes: string[] = (tag[2] ?? tag[3]).replace(/\$\{[^}]*\}/g, ' ').split(/\s+/);
-        if (classes.some(c => measured.includes(c)) && !classes.some(c => GLYPHLESS.includes(c))) {
+        if (classes.some(c => measured.includes(c)) && !classes.some(c => [...GLYPHLESS, 'badge-icon'].includes(c))) {
           offenders.push(`${path.split('/src/')[1]}: <${tag[1]} class="${tag[2] ?? tag[3]}">`);
         }
       }

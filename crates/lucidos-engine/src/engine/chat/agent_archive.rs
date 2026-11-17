@@ -137,7 +137,7 @@ pub(crate) async fn record_archive_request(
         meta: EventMeta::with_actor(Some(agent_thread_actor(thread_id))),
     })
     .await?;
-    crate::log!(
+    crate::log_legacy!(
         "[AgentArchive] {} asked to be archived when it settles",
         thread_id
     );

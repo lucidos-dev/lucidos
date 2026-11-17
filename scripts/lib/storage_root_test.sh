@@ -12,6 +12,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=storage_root.sh
 source "$SCRIPT_DIR/storage_root.sh"
+# A run under the e2e harness inherits the override. Each case sets its own.
+unset LUCIDOS_PRIVATE_DIR
 
 PASS=0
 FAIL=0
@@ -80,8 +82,38 @@ assert_eq "an existing open workspace" "$(mode_of "$fake_home/workspaces/myws")"
 resolve_in_fake_home fresh
 assert_eq "a new workspace" "$(mode_of "$fake_home/workspaces/fresh")" "700"
 
-echo "workspace.sh: the dev gateway's data dir defaults under the Lucidos home"
-assert_eq "the default" "$(gateway_data_dir_in_fake_home)" "$fake_home/.lucidos/gateway"
+echo "workspace.sh: the dev gateway's data dir defaults under the private subtree"
+assert_eq "the default" "$(gateway_data_dir_in_fake_home)" "$fake_home/.lucidos/private/gateway"
+
+echo "storage_root: a private entry stays where an older release put it"
+fake_home="$SCRATCH/entry-home"
+mkdir -p "$fake_home/.lucidos"
+entry() { HOME="$fake_home" lucidos_private_entry "$1"; }
+assert_eq "a fresh home uses the subtree" "$(entry local-token)" \
+    "$fake_home/.lucidos/private/local-token"
+echo old > "$fake_home/.lucidos/local-token"
+assert_eq "an older copy stays put" "$(entry local-token)" "$fake_home/.lucidos/local-token"
+assert_eq "an older home creates beside it" "$(entry network.toml)" \
+    "$fake_home/.lucidos/network.toml"
+mkdir -p "$fake_home/.lucidos/private"
+echo new > "$fake_home/.lucidos/private/run"
+assert_eq "a copy already in the subtree stays there" "$(entry run)" \
+    "$fake_home/.lucidos/private/run"
+assert_eq "a new name always uses the subtree" "$(entry socket-token)" \
+    "$fake_home/.lucidos/private/socket-token"
+
+echo "storage_root: LUCIDOS_PRIVATE_DIR takes every entry, older ones included"
+moved="$SCRATCH/e2e-private"
+moved_entry() { HOME="$fake_home" LUCIDOS_PRIVATE_DIR="$moved" lucidos_private_entry "$1"; }
+assert_eq "an older entry moves too" "$(moved_entry local-token)" "$moved/local-token"
+assert_eq "a subtree entry moves too" "$(moved_entry run)" "$moved/run"
+assert_eq "the dir is the override" \
+    "$(HOME="$fake_home" LUCIDOS_PRIVATE_DIR="$moved" lucidos_private_dir)" "$moved"
+assert_eq "the gateway data dir follows it" \
+    "$(unset LUCIDOS_GATEWAY_DATA; HOME="$fake_home" LUCIDOS_PRIVATE_DIR="$moved" gateway_data_dir)" "$moved/gateway"
+assert_eq "an empty override moves nothing" \
+    "$(HOME="$fake_home" LUCIDOS_PRIVATE_DIR="" lucidos_private_entry local-token)" \
+    "$fake_home/.lucidos/local-token"
 
 echo
 echo "storage_root_test: $PASS passed, $FAIL failed"

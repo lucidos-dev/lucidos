@@ -12,7 +12,7 @@
  * - a tap on a chevron's own button lands on the chevron.
  */
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, navigateToApp, ensureMobileView } from './helpers';
+import { assertHealthy, navigateToApp, ensureMobileView, watchPreferenceReads } from './helpers';
 
 const PORTRAIT = { width: 393, height: 852 };
 const LANDSCAPE = { width: 852, height: 393 };
@@ -130,12 +130,11 @@ test.describe('The mobile header icons take a near miss', () => {
   });
 
   test('every icon hit box is the full target tall, upright and in landscape', async ({ page }) => {
+    const preferencesSettled = watchPreferenceReads(page);
     await navigateToApp(page);
-    // The app's own preference load writes the ui-scale. Wait for it, so the
+    // Every preference read writes the ui-scale. Wait for all of them, so the
     // scale set here is the last write rather than one that gets undone.
-    await page.waitForFunction(
-      () => localStorage.getItem('lucidos-ui-scale') !== null, undefined, { timeout: 10_000 },
-    );
+    await preferencesSettled();
 
     for (const view of ['threads', 'thread', 'content'] as const) {
       for (const orientation of ['portrait', 'landscape'] as const) {

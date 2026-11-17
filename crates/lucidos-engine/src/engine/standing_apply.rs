@@ -269,6 +269,7 @@ fn withheld(reason: UnproposedReason) -> &'static str {
         UnproposedReason::PlanAwaitingApproval => {
             "The work is not ready: its implementation plan awaits approval."
         }
+        UnproposedReason::PlanOnlyCode => "The plan was approved for later, but the branch also changes code.",
         UnproposedReason::OutsideBound => {
             "The work is not ready: it reaches past the files its security fix named."
         }
@@ -585,7 +586,7 @@ async fn read_settle_facts(
         Ok(Some(row)) => row,
         Ok(None) => return FactsProbe::ThreadGone,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] thread lookup for {} failed: {}",
                 arm.thread_id,
                 e
@@ -602,7 +603,7 @@ async fn read_settle_facts(
         match crate::engine::agent_recovery::thread_parked_on_question(pool, arm.thread_id).await {
             Ok(parked) => parked,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[StandingApply] question lookup for {} failed: {}",
                     arm.thread_id,
                     e
@@ -669,7 +670,7 @@ pub(crate) async fn read_turn_settle(
     let terminal_is_newest = match newest {
         Ok(event_type) => event_type.is_some_and(|t| t != "CodingAgentIdled"),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] turn closer lookup for {} failed: {}",
                 thread_id,
                 e
@@ -723,7 +724,7 @@ async fn read_armed_change(pool: &sqlx::PgPool, arm: &StandingApply) -> Option<A
         Ok(None) if arm.change_id.is_none() => Some(ArmedChange::Unproposed),
         Ok(row) => Some(classify_bound_change(row)),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[StandingApply] change lookup for {} failed: {}",
                 arm.thread_id,
                 e
@@ -904,7 +905,7 @@ impl LucidosEngine {
                 "[StandingApply] StandingApplyArmed",
             )
             .await;
-        log!(
+        log_legacy!(
             "[StandingApply] armed thread {} (change {:?}, batch {:?})",
             arm.thread_id,
             arm.change_id,
@@ -957,7 +958,7 @@ impl LucidosEngine {
         let rows = match read_sweep_candidates(self.pool()).await {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[StandingApply] sweep lookup failed: {}", e);
+                log_legacy!("[StandingApply] sweep lookup failed: {}", e);
                 return 0;
             }
         };
@@ -974,7 +975,7 @@ impl LucidosEngine {
             };
             match self.arm_standing_apply(arm).await {
                 Ok(()) => armed += 1,
-                Err(e) => log!("[StandingApply] sweep arm for {} failed: {}", thread_id, e),
+                Err(e) => log_legacy!("[StandingApply] sweep arm for {} failed: {}", thread_id, e),
             }
         }
         armed
@@ -1050,7 +1051,7 @@ impl LucidosEngine {
                 Some(loaded.arm)
             }
             Err(e) => {
-                log!("[StandingApply] delete for {} failed: {}", thread_id, e);
+                log_legacy!("[StandingApply] delete for {} failed: {}", thread_id, e);
                 None
             }
         }
@@ -1066,7 +1067,7 @@ impl LucidosEngine {
         reason: &str,
         actor: Option<MessageOrigin>,
     ) {
-        log!(
+        log_legacy!(
             "[StandingApply] dropped thread {} ({})",
             arm.thread_id,
             reason
@@ -1093,7 +1094,7 @@ impl LucidosEngine {
         let loaded = match load_arm(self.pool(), thread_id).await {
             Ok(arm) => arm,
             Err(e) => {
-                log!("[StandingApply] load for {} failed: {}", thread_id, e);
+                log_legacy!("[StandingApply] load for {} failed: {}", thread_id, e);
                 return;
             }
         };
@@ -1113,7 +1114,7 @@ impl LucidosEngine {
                 return;
             }
             Err(error) => {
-                log!("[StandingApply] restore boundary unavailable: {}", error);
+                log_legacy!("[StandingApply] restore boundary unavailable: {}", error);
                 return;
             }
         }
@@ -1142,7 +1143,7 @@ impl LucidosEngine {
             match settle_restored_arm(self.pool(), &self.event_bus, loaded).await {
                 Ok(true) => self.standing_applies.remove(loaded.arm.thread_id),
                 Ok(false) => {}
-                Err(error) => log!("[StandingApply] restore settlement failed: {}", error),
+                Err(error) => log_legacy!("[StandingApply] restore settlement failed: {}", error),
             }
             return;
         }
@@ -1164,7 +1165,7 @@ impl LucidosEngine {
         let Some(arm) = self.consume_generation(loaded.arm.thread_id, taken) else {
             return; // a re-arm or another resolution won the race
         };
-        log!(
+        log_legacy!(
             "[StandingApply] thread {} settled, applying change {}",
             arm.thread_id,
             change_id
@@ -1173,7 +1174,7 @@ impl LucidosEngine {
         let actor = arm.actor.clone();
         tokio::spawn(async move {
             if let Err(e) = engine.apply_change(change_id, actor).await {
-                log!(
+                log_legacy!(
                     "[StandingApply] apply_change({change_id}) returned Err: {e}. \
                      The apply path emits ChangeApplyFailed, which reports to the owner",
                 );
@@ -1191,7 +1192,7 @@ impl LucidosEngine {
         let mut rx = self.event_bus.subscribe();
         let engine = self.clone();
         tokio::spawn(async move {
-            log!("[StandingApply] resolver started");
+            log_legacy!("[StandingApply] resolver started");
             loop {
                 match rx.recv().await {
                     Ok(emitted) => {
@@ -1203,7 +1204,7 @@ impl LucidosEngine {
                         // The skipped batch may hold the settle an arm was
                         // waiting for, so re-resolve them all rather than
                         // stranding the owner's instruction.
-                        log!(
+                        log_legacy!(
                             "[StandingApply] subscriber lagged by {} events, re-resolving",
                             n
                         );
@@ -1212,7 +1213,7 @@ impl LucidosEngine {
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        log!("[StandingApply] EventBus closed, resolver stopping");
+                        log_legacy!("[StandingApply] EventBus closed, resolver stopping");
                         break;
                     }
                 }
@@ -1239,14 +1240,14 @@ impl LucidosEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[StandingApply] recovery query failed: {}", e);
+                log_legacy!("[StandingApply] recovery query failed: {}", e);
                 return;
             }
         };
         if rows.is_empty() {
             return;
         }
-        log!("[StandingApply] recovering {} armed thread(s)", rows.len());
+        log_legacy!("[StandingApply] recovering {} armed thread(s)", rows.len());
         let ids: HashSet<Uuid> = rows.iter().map(|(id,)| *id).collect();
         self.standing_applies.replace(ids.clone());
         for thread_id in ids {
@@ -1406,6 +1407,7 @@ mod db_tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }
     }
 
@@ -2550,6 +2552,7 @@ mod tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         });
         let permission_card = on_thread(ThreadEvent::CodingAgentPermissionRequest {
             request_id: "req-1".into(),

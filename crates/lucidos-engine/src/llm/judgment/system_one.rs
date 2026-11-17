@@ -105,7 +105,7 @@ pub(crate) fn parse_response(
             Ok(parsed) => {
                 answers.insert(id.clone(), parsed);
             }
-            Err(e) => log!("[Judgment] Dropping unreadable answer {}: {}", id, e),
+            Err(e) => log_legacy!("[Judgment] Dropping unreadable answer {}: {}", id, e),
         }
     }
 
@@ -147,12 +147,9 @@ impl JudgmentProvider for SystemOneProvider {
         if !status.is_success() {
             // The body describes the offending field on a 422 and is safe to
             // surface. The key is in the header, never here.
-            return Err(format!(
-                "System One endpoint returned {}: {}",
-                status.as_u16(),
-                text.trim()
-            )
-            .into());
+            return Err(
+                crate::llm::ProviderError::from_http("System One", status.as_u16(), &text).into(),
+            );
         }
         let mut judgment = parse_response(&text)?;
         judgment.request_chars = request_chars;

@@ -106,7 +106,7 @@ pub fn resolve_anthropic_auth(
                 }
             }
             other => {
-                log!(
+                log_legacy!(
                     "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer), ignoring it and falling back to ANTHROPIC_API_KEY",
                     other
                 );
@@ -186,6 +186,13 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    fn resolved_provider_kind(
+        &self,
+        _selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(Some(self.endpoint.provider_kind()))
+    }
+
     fn default_model(&self) -> &str {
         &self.model
     }

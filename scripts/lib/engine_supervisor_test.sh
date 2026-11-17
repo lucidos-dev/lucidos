@@ -331,6 +331,43 @@ EOF
     wait_for_exit "$sup_pid" 3
 }
 
+# ── Test 8: every spawn reads SUPERVISED_STDIN ──────────────────────────
+# A starter's stamp key arrives on stdin. A respawn must get it again, or it
+# boots keyless and every device reads as unattested.
+test_every_spawn_reads_supervised_stdin() {
+    echo "test: each spawn, respawns included, reads SUPERVISED_STDIN"
+    local tdir="$SANDBOX/t8"
+    mkdir -p "$tdir"
+    local logfile="$tdir/log"
+    local seen="$tdir/seen"
+    printf 'the-key\nsecond-line\n' > "$tdir/stdin"
+
+    local mock="$tdir/mock"
+    cat > "$mock" <<EOF
+#!/bin/bash
+read -r line
+echo "\$line" >> "$seen"
+[ "\$(wc -l < "$seen")" -ge 2 ] && exit 0
+exit 137
+EOF
+    chmod +x "$mock"
+
+    ( SUPERVISED_STDIN="$tdir/stdin" run_supervised "$tdir" "$logfile" "$mock" ) &
+    local sup_pid=$!
+    CLEANUP_PIDS+=("$sup_pid")
+
+    if ! wait_for_exit "$sup_pid" 10; then
+        fail "supervisor did not stop after the second spawn"
+        kill -KILL "$sup_pid" 2>/dev/null || true
+        return
+    fi
+    if [ "$(cat "$seen" 2>/dev/null)" = "$(printf 'the-key\nthe-key')" ]; then
+        pass "both spawns read the first line of SUPERVISED_STDIN"
+    else
+        fail "spawns read: $(cat "$seen" 2>/dev/null)"
+    fi
+}
+
 test_supervisor_writes_no_pidfile
 test_clean_exit_zero_stops_loop
 test_clean_exit_130_stops_loop
@@ -338,6 +375,7 @@ test_clean_exit_usr1_stops_loop
 test_unexpected_exit_137_restarts
 test_sigterm_to_supervisor_signals_engine_then_exits
 test_respawn_sidecar_written_on_unexpected_death
+test_every_spawn_reads_supervised_stdin
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

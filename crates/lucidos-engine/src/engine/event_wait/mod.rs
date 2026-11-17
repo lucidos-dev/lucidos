@@ -299,7 +299,7 @@ pub async fn rebuild_live_waits(
                 waits.insert(wait).await;
                 loaded += 1;
             }
-            None => crate::log!(
+            None => crate::log_legacy!(
                 "[EventWait] Skipped malformed EventWaitStarted payload on thread {} (seq {})",
                 thread_id,
                 sequence,
@@ -325,7 +325,7 @@ pub(crate) async fn settle_restored_waits(
         .await?;
     for (thread_id, payload, sequence, created) in rows {
         let Some(wait) = live_wait_from_payload(thread_id, &payload, sequence, created) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Skipped malformed archived EventWaitStarted on thread {} (seq {})",
                 thread_id,
                 sequence,
@@ -544,7 +544,7 @@ pub async fn arming_lookback_matches(
         if pages == ARMING_LOOKBACK_MAX_PAGES {
             // Not silent: a budget nobody can see reads as "the window was
             // empty", which is the wrong conclusion to hand a debugger.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Arming lookback hit its {ARMING_LOOKBACK_MAX_PAGES}-page budget \
                  for {types:?}; reporting the {} match(es) found so far",
                 found.len(),
@@ -981,7 +981,7 @@ pub async fn lost_wait_reentries(
             let thread_id = thread_str
                 .parse::<Uuid>()
                 .inspect_err(|_| {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Skipping lost re-entry on malformed thread id {:?}",
                         thread_str
                     )
@@ -1029,7 +1029,7 @@ pub async fn wait_delivery_names_any(
     {
         Ok(delivered) => delivered,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Delivery probe failed for thread {}: {}. Answering no, \
                  so the caller wakes the thread",
                 thread_id,

@@ -27,6 +27,7 @@ use crate::core::prefs;
 use crate::core::IntentStore;
 use crate::engine::summary_tree::module::MemoryModule;
 use crate::triggers::TriggerConfig;
+use lucidos_update_channel::is_upgrade;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -133,14 +134,14 @@ impl NoticeFacts {
         exposure: GuardExposure,
     ) -> Self {
         let memory_module = MemoryModule::stored(pool).await.unwrap_or_else(|e| {
-            log!("[ReleaseNotices] Failed to read the memory module: {}", e);
+            log_legacy!("[ReleaseNotices] Failed to read the memory module: {}", e);
             Some(MemoryModule::Classic)
         });
         let ungranted = ungranted_trigger_ids(trigger_configs);
         let has_ungranted_coding_agent_trigger = any_started_a_coding_agent(pool, &ungranted)
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[ReleaseNotices] Failed to read trigger coding agents: {}",
                     e
                 );
@@ -167,7 +168,7 @@ async fn command_guard_never_set(pool: &PgPool) -> bool {
         .await
         .map(|row| row.is_none())
         .unwrap_or_else(|e| {
-            log!("[ReleaseNotices] Failed to read the command guard: {}", e);
+            log_legacy!("[ReleaseNotices] Failed to read the command guard: {}", e);
             true
         })
 }
@@ -286,7 +287,10 @@ pub fn parse(src: &str) -> Result<Vec<ReleaseNotice>, String> {
             )
         })?;
         // Non-decreasing rather than increasing: one release may carry several.
-        if previous.as_ref().is_some_and(|p| since < *p) {
+        if previous
+            .as_ref()
+            .is_some_and(|p| is_upgrade(&since.to_string(), &p.to_string()))
+        {
             return Err(format!(
                 "{at} is older than the notice above it; append, never reorder"
             ));
@@ -315,7 +319,7 @@ pub fn all() -> &'static [ReleaseNotice] {
     NOTICES.get_or_init(|| match parse(RELEASE_NOTICES_TOML) {
         Ok(notices) => notices,
         Err(e) => {
-            crate::log!("[ReleaseNotices] release-notices.toml is not usable: {e}");
+            crate::log_legacy!("[ReleaseNotices] release-notices.toml is not usable: {e}");
             Vec::new()
         }
     })
@@ -333,10 +337,11 @@ pub fn running_release() -> Result<Version, String> {
 
 /// The release an engine on `release`, built `dirty`, reports for this purpose.
 ///
-/// A release-dirty build counts as the NEXT PATCH. Such a build is past the
+/// A release-dirty stable build counts as the NEXT PATCH. Such a build is past the
 /// published snapshot by definition, so a notice written for the release it is
 /// becoming already applies to it. That is the only way an author reads their
-/// own notice on screen, since no engine reports an unreleased version.
+/// own notice on screen. A pre-release keeps its precedence, even when dirty,
+/// so it never exposes a notice for its future stable release.
 ///
 /// It stays off for everyone else. `build.rs` sets the flag false whenever git
 /// is unavailable, so a shipped install never takes this arm. And a notice
@@ -345,7 +350,7 @@ pub fn running_release() -> Result<Version, String> {
 pub(crate) fn reported_release(release: &str, dirty: bool) -> Result<Version, String> {
     let mut version =
         Version::parse(release).map_err(|e| format!("{release} is not semver: {e}"))?;
-    if dirty {
+    if dirty && version.pre.is_empty() {
         version.patch += 1;
     }
     Ok(version)
@@ -353,7 +358,8 @@ pub(crate) fn reported_release(release: &str, dirty: bool) -> Result<Version, St
 
 /// Has the release an engine reports as `running` reached `notice`?
 fn applies_to(notice: &ReleaseNotice, running: &Version) -> bool {
-    Version::parse(&notice.since).is_ok_and(|since| since <= *running)
+    Version::parse(&notice.since)
+        .is_ok_and(|since| !is_upgrade(&running.to_string(), &since.to_string()))
 }
 
 /// Is `notice` meant for this workspace: reached by the release, and its
@@ -526,7 +532,7 @@ pub async fn stored_cursor(pool: &PgPool) -> Option<String> {
 pub async fn seed_cursor_at_startup(pool: &PgPool, notices: &[ReleaseNotice]) {
     match running_release() {
         Ok(running) => place_workspace(pool, notices, &running).await,
-        Err(e) => crate::log!("[ReleaseNotices] {e}, so no notice can be placed"),
+        Err(e) => crate::log_legacy!("[ReleaseNotices] {e}, so no notice can be placed"),
     }
 }
 
@@ -564,7 +570,7 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
                 // Placing on a guess would either stamp a real workspace silent
                 // or open a modal over a first run. Skip, and let the next boot
                 // ask again.
-                crate::log!(
+                crate::log_legacy!(
                     "[ReleaseNotices] could not tell whether the workspace has threads: {e}"
                 );
                 return;
@@ -577,8 +583,8 @@ async fn place_workspace(pool: &PgPool, notices: &[ReleaseNotice], running: &Ver
         return;
     };
     match PreferenceStore::set_silent(pool, prefs::RELEASE_NOTICE_CURSOR.key(), &stamp).await {
-        Ok(()) => crate::log!("[ReleaseNotices] stamped a fresh workspace at {stamp}"),
-        Err(e) => crate::log!("[ReleaseNotices] could not stamp the workspace: {e}"),
+        Ok(()) => crate::log_legacy!("[ReleaseNotices] stamped a fresh workspace at {stamp}"),
+        Err(e) => crate::log_legacy!("[ReleaseNotices] could not stamp the workspace: {e}"),
     }
 }
 
@@ -649,6 +655,25 @@ mod tests {
     fn a_release_that_is_not_semver_is_an_error_either_way() {
         assert!(reported_release("0.38", false).is_err());
         assert!(reported_release("0.38", true).is_err());
+    }
+
+    #[test]
+    fn prereleases_do_not_expose_their_future_stable_notices_even_when_dirty() {
+        let notices = vec![notice("previous", "9.1.0"), notice("future", "9.2.0")];
+        for dirty in [false, true] {
+            let running = reported_release("9.2.0-nightly.20261116.1", dirty).unwrap();
+            let shown = view(&notices, &running, &CLASSIC, None);
+            assert_eq!(ids(&shown), ["previous"]);
+            assert_eq!(
+                fresh_workspace_stamp(&notices, &running),
+                Some("previous".to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn notice_eligibility_ignores_build_metadata() {
+        assert!(applies_to(&notice("a", "1.0.0+z"), &v("1.0.0+a")));
     }
 
     /// The stamp and the surfaces read one release, so a fresh workspace is
@@ -1162,99 +1187,6 @@ mod tests {
         parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
     }
 
-    fn knowhow_source(id: &str) -> String {
-        let path = format!(
-            "{}/../../system-knowhow/{id}.md",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("system-knowhow/{id}.md must exist: {e}"))
-    }
-
-    /// A knowhow file's frontmatter `description`, lowercased. That line is what
-    /// the engine splices into the routing list, so it is the half a prompt has
-    /// to meet.
-    fn knowhow_description(id: &str) -> String {
-        knowhow_source(id)
-            .lines()
-            .find_map(|l| l.strip_prefix("description:"))
-            .unwrap_or_else(|| panic!("system-knowhow/{id}.md needs a frontmatter description"))
-            .to_lowercase()
-    }
-
-    /// An action SENDS its sentence as an ordinary message, so the knowhow meant
-    /// to answer it has to route on the words that sentence uses.
-    ///
-    /// Nothing else holds the two together. Reword either side alone and the
-    /// button still works, still starts a thread, and quietly gets a general
-    /// answer instead of the recipe. Same shape as
-    /// `setup_interview_route_matches_the_frontend_seeded_prompt`, which pins
-    /// the welcome button against its own knowhow.
-    #[test]
-    fn every_action_prompt_routes_to_the_knowhow_meant_to_answer_it() {
-        // Notice id, the knowhow that must answer it, and the words both sides
-        // have to keep. A word here is one the description ROUTES on.
-        let routes: [(&str, &str, &[&str]); 2] = [
-            (
-                "run-a-workspace-audit",
-                "workspace-audit",
-                &["audit", "workspace", "drift"],
-            ),
-            ("two-dashboards", "workspace-audit", &["apps", "check"]),
-        ];
-        let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
-        for (id, knowhow, words) in routes {
-            let notice = notices
-                .iter()
-                .find(|n| n.id == id)
-                .unwrap_or_else(|| panic!("{id} must still be in release-notices.toml"));
-            let prompt = notice
-                .action_prompt
-                .as_ref()
-                .unwrap_or_else(|| panic!("{id} must carry the action this pins"))
-                .to_lowercase();
-            let description = knowhow_description(knowhow);
-            for word in words {
-                assert!(
-                    prompt.contains(word),
-                    "{id}'s prompt drops the routing word {word:?}"
-                );
-                assert!(
-                    description.contains(word),
-                    "system-knowhow/{knowhow}.md's description drops {word:?}, so {id} may not reach it"
-                );
-            }
-        }
-    }
-
-    /// A targeted run picks its check by the name the prompt uses. Rename the
-    /// check alone and the button falls back to a guess, or the full pass.
-    #[test]
-    fn a_targeted_action_names_a_check_its_audit_section_owns() {
-        let targeted = [
-            ("two-dashboards", "workspace-audit/apps", "dashboard rename"),
-            (
-                "triggers-need-the-coding-agent-grant",
-                "workspace-audit/triggers",
-                "coding-agent grant",
-            ),
-        ];
-        let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
-        for (id, section, check) in targeted {
-            let prompt = notices
-                .iter()
-                .find(|n| n.id == id)
-                .and_then(|n| n.action_prompt.as_ref())
-                .unwrap_or_else(|| panic!("{id} must carry the action this pins"))
-                .to_lowercase();
-            assert!(prompt.contains(check), "{id}'s prompt drops {check:?}");
-            assert!(
-                knowhow_source(section).to_lowercase().contains(check),
-                "system-knowhow/{section}.md no longer names {check:?}, so {id} cannot pick it"
-            );
-        }
-    }
-
     /// A notice authored for the release being prepared must not reach the dev
     /// workspaces running the release before it.
     #[test]
@@ -1751,5 +1683,102 @@ mod tests {
         let refused = resolve(&pool, &three(), &v("3.0.0"), &CLASSIC, "a").await;
         assert!(refused.is_err(), "an unreadable cursor must not be written");
         teardown_test_db(&db_name).await;
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        fn knowhow_source(id: &str) -> String {
+            let path = format!(
+                "{}/../../system-knowhow/{id}.md",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("system-knowhow/{id}.md must exist: {e}"))
+        }
+
+        /// A knowhow file's frontmatter `description`, lowercased. That line is what
+        /// the engine splices into the routing list, so it is the half a prompt has
+        /// to meet.
+        fn knowhow_description(id: &str) -> String {
+            knowhow_source(id)
+                .lines()
+                .find_map(|l| l.strip_prefix("description:"))
+                .unwrap_or_else(|| panic!("system-knowhow/{id}.md needs a frontmatter description"))
+                .to_lowercase()
+        }
+
+        /// An action SENDS its sentence as an ordinary message, so the knowhow meant
+        /// to answer it has to route on the words that sentence uses.
+        ///
+        /// Nothing else holds the two together. Reword either side alone and the
+        /// button still works, still starts a thread, and quietly gets a general
+        /// answer instead of the recipe. Same shape as
+        /// `setup_interview_route_matches_the_frontend_seeded_prompt`, which pins
+        /// the welcome button against its own knowhow.
+        #[test]
+        fn every_action_prompt_routes_to_the_knowhow_meant_to_answer_it() {
+            // Notice id, the knowhow that must answer it, and the words both sides
+            // have to keep. A word here is one the description ROUTES on.
+            let routes: [(&str, &str, &[&str]); 2] = [
+                (
+                    "run-a-workspace-audit",
+                    "workspace-audit",
+                    &["audit", "workspace", "drift"],
+                ),
+                ("two-dashboards", "workspace-audit", &["apps", "check"]),
+            ];
+            let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
+            for (id, knowhow, words) in routes {
+                let notice = notices
+                    .iter()
+                    .find(|n| n.id == id)
+                    .unwrap_or_else(|| panic!("{id} must still be in release-notices.toml"));
+                let prompt = notice
+                    .action_prompt
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{id} must carry the action this pins"))
+                    .to_lowercase();
+                let description = knowhow_description(knowhow);
+                for word in words {
+                    assert!(
+                        prompt.contains(word),
+                        "{id}'s prompt drops the routing word {word:?}"
+                    );
+                    assert!(
+                        description.contains(word),
+                        "system-knowhow/{knowhow}.md's description drops {word:?}, so {id} may not reach it"
+                    );
+                }
+            }
+        }
+
+        /// A targeted run picks its check by the name the prompt uses. Rename the
+        /// check alone and the button falls back to a guess, or the full pass.
+        #[test]
+        fn a_targeted_action_names_a_check_its_audit_section_owns() {
+            let targeted = [
+                ("two-dashboards", "workspace-audit/apps", "dashboard rename"),
+                (
+                    "triggers-need-the-coding-agent-grant",
+                    "workspace-audit/triggers",
+                    "coding-agent grant",
+                ),
+            ];
+            let notices = parse(RELEASE_NOTICES_TOML).expect("release-notices.toml must validate");
+            for (id, section, check) in targeted {
+                let prompt = notices
+                    .iter()
+                    .find(|n| n.id == id)
+                    .and_then(|n| n.action_prompt.as_ref())
+                    .unwrap_or_else(|| panic!("{id} must carry the action this pins"))
+                    .to_lowercase();
+                assert!(prompt.contains(check), "{id}'s prompt drops {check:?}");
+                assert!(
+                    knowhow_source(section).to_lowercase().contains(check),
+                    "system-knowhow/{section}.md no longer names {check:?}, so {id} cannot pick it"
+                );
+            }
+        }
     }
 }

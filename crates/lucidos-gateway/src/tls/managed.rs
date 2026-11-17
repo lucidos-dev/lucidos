@@ -345,7 +345,7 @@ async fn serve_copy(store: &CertStore, dir: &Path, name: &str) {
     let state = TlsState::tailnet(name, &cert, store.operator().is_some());
     match store.install(name, cert, key).await {
         Ok(()) => store.record(state),
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[Gateway] the kept certificate in {} did not load: {e}",
             dir.display()
         ),
@@ -369,7 +369,7 @@ async fn install(store: &CertStore, dir: &Path, name: &str, pair: CertPair) -> b
             "The certificate serves, but its copy in {} failed: {e}",
             dir.display()
         );
-        crate::log!("[Gateway] HTTPS certificate: {error}");
+        crate::log_legacy!("[Gateway] HTTPS certificate: {error}");
         state.error = Some(error);
     }
     store.record(state);
@@ -378,7 +378,7 @@ async fn install(store: &CertStore, dir: &Path, name: &str, pair: CertPair) -> b
 
 /// Record `reason`. A certificate still serving keeps its state beside it.
 fn fail(store: &CertStore, reason: String) {
-    crate::log!("[Gateway] HTTPS certificate: {reason}");
+    crate::log_legacy!("[Gateway] HTTPS certificate: {reason}");
     let state = if store.current().is_some() {
         TlsState {
             error: Some(reason),

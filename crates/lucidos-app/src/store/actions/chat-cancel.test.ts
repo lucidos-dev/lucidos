@@ -112,21 +112,12 @@ describe('cancelCurrentExchange outcome', () => {
     expect(await cancelCurrentExchange()).toBe('noop');
   });
 
-  it("returns 'failed' when both retries fail", async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockRejectedValueOnce(new TypeError('Load failed'));
+  it("returns 'failed' on a transport error without replaying a content-bearing Stop", async () => {
+    mockFetch.mockRejectedValueOnce(new TypeError('Load failed'));
     expect(await cancelCurrentExchange()).toBe('failed');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  it("returns 'canceled' when the retry succeeds (the iOS PWA case)", async () => {
-    mockFetch
-      .mockRejectedValueOnce(new TypeError('Load failed'))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ canceled: true }), { status: 200 }));
-    expect(await cancelCurrentExchange()).toBe('canceled');
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-  });
 });
 
 describe('handleCancelExchange optimistic flag lifecycle', () => {

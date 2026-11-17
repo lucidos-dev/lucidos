@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   showToast: vi.fn(),
 }));
 
-vi.mock('./navigation-request', () => ({ handleNavigationRequest: mocks.handleNavigationRequest }));
+vi.mock('./navigation-dispatch', () => ({ handleNavigationRequest: mocks.handleNavigationRequest }));
 vi.mock('./repositoriesLoader', () => ({ refreshRepositories: mocks.refreshRepositories }));
 vi.mock('../store', async () => {
   const actual = await vi.importActual<typeof import('../store')>('../store');

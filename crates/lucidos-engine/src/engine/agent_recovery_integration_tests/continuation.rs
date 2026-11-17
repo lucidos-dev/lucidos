@@ -87,6 +87,7 @@ async fn synthetic_idled_with_engine_restart_interrupt_does_not_dispatch() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: cc_meta,
     })
@@ -240,6 +241,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -291,6 +293,8 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -304,6 +308,7 @@ async fn seed_typed_answer(bus: &EventBus, thread_id: Uuid, question: &str, type
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer: AnswerKind::FreeText {
@@ -549,10 +554,12 @@ async fn a_start_failure_leaves_its_message_owed_to_the_next_continue() {
         event: ThreadEvent::ResponseFailed {
             error: "Couldn't load settings from Cloud gateway https://claude-gateway.example.com."
                 .into(),
+            spend_cap: None,
             agent_exit: Some(CodingAgentExit {
                 stage: CodingAgentExitStage::Startup,
                 code: Some(1),
             }),
+            provider_error: None,
         },
         meta: EventMeta {
             request_event_id: Some(received.event_id),
@@ -775,6 +782,8 @@ async fn a_message_the_user_took_back_is_not_replayed() {
         thread_id,
         ThreadEvent::QueuedMessageRemoved {
             removed_message_id: removed,
+            restore_to_compose: false,
+            compose: None,
         },
     )
     .await;

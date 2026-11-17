@@ -7,16 +7,22 @@
 //! The decisions live in `engine::thread_triage::archive_all`. Here they meet
 //! the cascade: every archive is `archive_family`, leaving pinned members open.
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{
+    extract::{Query, State},
+    http::HeaderMap,
+    Json,
+};
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::error::ApiError;
+use crate::api::owner_door::{OnUnattested, OwnerAct};
 use crate::api::AppState;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::thread_triage::archive_all::{
-    preflight, refusal_kept_slug, still_safe, ArchiveAllPreflight, KeptThread,
+    completed_preflight, preflight, refusal_kept_slug, refuse_completed, still_safe,
+    ArchiveAllPreflight, KeptThread,
 };
 use crate::engine::thread_triage::facts::{load, TriageScope};
 
@@ -29,6 +35,8 @@ pub(crate) const MAX_IDS: usize = 2_000;
 #[derive(Debug, Deserialize)]
 pub(in crate::api) struct ThreadIdsRequest {
     thread_ids: Vec<Uuid>,
+    #[serde(default)]
+    parent_thread_id: Option<Uuid>,
     /// Unarchive only: bring each thread's sub-threads back too, as the thread
     /// menu's Move to Current does. Undo leaves it off and names every id.
     #[serde(default)]
@@ -49,17 +57,33 @@ impl ThreadIdsRequest {
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(in crate::api) struct ArchiveScope {
+    parent_thread_id: Option<Uuid>,
+}
+
 /// GET /api/v1/threads/archive-all-preflight: what Archive all would put away
 /// from Current, and what stays, counted by reason.
 pub(in crate::api) async fn archive_all_preflight(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(scope): Query<ArchiveScope>,
 ) -> Result<Json<ArchiveAllPreflight>, ApiError> {
-    crate::api::actor::require_owner_device(&headers, &state.pool).await?;
-    let rows = load(&state.pool, TriageScope::Inbox { except: None })
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
-    Ok(Json(preflight(&rows)))
+    crate::api::actor::require_owner_device(&headers, &state.pool, OnUnattested::Refuse).await?;
+    let rows = load(
+        &state.pool,
+        scope.parent_thread_id.map_or(
+            TriageScope::Inbox { except: None },
+            TriageScope::Descendants,
+        ),
+    )
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(if scope.parent_thread_id.is_some() {
+        completed_preflight(&rows)
+    } else {
+        preflight(&rows)
+    }))
 }
 
 /// POST /api/v1/threads/archive-all `{thread_ids}`: archive the confirmed
@@ -71,8 +95,18 @@ pub(in crate::api) async fn archive_all(
     headers: HeaderMap,
     Json(request): Json<ThreadIdsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = crate::api::actor::require_owner_device(&headers, &state.pool).await?;
+    let act = format!("archive {} threads", request.thread_ids.len());
+    let actor = crate::api::actor::require_owner_device(
+        &headers,
+        &state.pool,
+        OnUnattested::Ask(OwnerAct::new(act)),
+    )
+    .await?;
+    let parent = request.parent_thread_id;
     let confirmed = request.ids()?;
+    if let Some(parent) = parent {
+        return archive_completed(&state, parent, &confirmed, actor).await;
+    }
     let rows = load(&state.pool, TriageScope::Ids(&confirmed))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -105,6 +139,54 @@ pub(in crate::api) async fn archive_all(
     ))
 }
 
+/// Execute the counted ceiling. Fresh scope rejects forged or detached ids;
+/// the archive path checks again while holding its family locks.
+async fn archive_completed(
+    state: &AppState,
+    parent: Uuid,
+    confirmed: &[Uuid],
+    actor: MessageOrigin,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let rows = load(&state.pool, TriageScope::Descendants(parent))
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let mut archived = Vec::new();
+    let mut kept = Vec::new();
+    for id in confirmed {
+        if archived.contains(id) {
+            continue;
+        }
+        let row = rows.iter().find(|r| r.facts.thread_id == *id);
+        let result = match refuse_completed(row) {
+            Some(reason) => Err((reason, "not_completed")),
+            None => super::archive::archive_completed_family(
+                &state.engine,
+                *id,
+                actor.clone(),
+                parent,
+                confirmed,
+            )
+            .await
+            .map_err(|r| (rejection_text(&r), refusal_kept_slug(&r.1))),
+        };
+        match result {
+            Ok(outcome) => archived.extend(outcome.archived),
+            Err((reason, slug)) => kept.push(KeptThread {
+                thread_id: *id,
+                reason,
+                slug,
+                thread_count: 1,
+            }),
+        }
+    }
+    archived.sort_unstable();
+    archived.dedup();
+    kept.retain(|k| !archived.contains(&k.thread_id));
+    Ok(Json(
+        serde_json::json!({"archived": archived, "kept": kept}),
+    ))
+}
+
 /// POST /api/v1/threads/unarchive `{thread_ids, with_sub_threads?}`: move
 /// archived threads back to the inbox. Answers `{unarchived: [...]}`.
 pub(in crate::api) async fn unarchive(
@@ -112,7 +194,13 @@ pub(in crate::api) async fn unarchive(
     headers: HeaderMap,
     Json(request): Json<ThreadIdsRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = crate::api::actor::require_owner_device(&headers, &state.pool).await?;
+    let act = format!("bring back {} archived threads", request.thread_ids.len());
+    let actor = crate::api::actor::require_owner_device(
+        &headers,
+        &state.pool,
+        OnUnattested::Ask(OwnerAct::new(act)),
+    )
+    .await?;
     let scope = if request.with_sub_threads {
         UnarchiveScope::WithSubThreads
     } else {

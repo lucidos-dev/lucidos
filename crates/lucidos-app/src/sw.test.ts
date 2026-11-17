@@ -125,11 +125,11 @@ describe('Service Worker fetch handler', () => {
     cacheStore = sw.cacheStore;
   });
 
-  it('GET to /api/v1/foo: calls respondWith (needed for iOS empty-response fix)', () => {
+  it('GET to /api/v1/foo: bypasses the worker', () => {
     mockFetch.mockResolvedValue(new Response('ok'));
     const event = makeEvent('https://example.com/api/v1/threads/abc/events');
     handlers.fetch(event);
-    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    expect(event.respondWith).not.toHaveBeenCalled();
   });
 
   it('POST to /api/v1/foo: does NOT call respondWith (browser handles natively, avoids iOS body-clone bug)', () => {
@@ -189,14 +189,11 @@ describe('Service Worker fetch handler', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
-  // Exempting the probe must not exempt its neighbours: everything else under
-  // /api/v1/ keeps the retry, which does earn its keep on an ordinary read
-  // inside a 10s budget.
-  it('GET to a path merely starting with health: still calls respondWith', () => {
+  it('GET to a path merely starting with health: bypasses the worker', () => {
     mockFetch.mockResolvedValue(new Response('ok'));
     const event = makeEvent('https://example.com/api/v1/health-history');
     handlers.fetch(event);
-    expect(event.respondWith).toHaveBeenCalledTimes(1);
+    expect(event.respondWith).not.toHaveBeenCalled();
   });
 
   it('cross-origin GET: does NOT call respondWith', () => {
@@ -321,7 +318,7 @@ describe('Service Worker fetch handler', () => {
     mockFetch
       .mockRejectedValueOnce(new TypeError('Load failed'))
       .mockResolvedValueOnce(new Response('ok'));
-    const event = makeEvent('https://example.com/api/v1/threads/abc/events');
+    const event = makeEvent('https://example.com/api/v1/health?sw-fetch-probe=1');
     handlers.fetch(event);
     expect(event.respondWith).toHaveBeenCalledTimes(1);
     const response = await event.respondWith.mock.calls[0][0];
@@ -333,7 +330,7 @@ describe('Service Worker fetch handler', () => {
     mockFetch
       .mockRejectedValueOnce(new TypeError('Load failed'))
       .mockRejectedValueOnce(new TypeError('Load failed'));
-    const event = makeEvent('https://example.com/api/v1/threads/abc/events');
+    const event = makeEvent('https://example.com/api/v1/health?sw-fetch-probe=1');
     handlers.fetch(event);
     await expect(event.respondWith.mock.calls[0][0]).rejects.toThrow('Load failed');
     expect(mockFetch).toHaveBeenCalledTimes(2);
@@ -382,12 +379,11 @@ describe('Service Worker fetch handler', () => {
     expect(mockCache.put).not.toHaveBeenCalled();
   });
 
-  it('GET /api/v1/threads/abc/events: still uses fetchWithRetry path (NOT Cache API)', async () => {
-    mockFetch.mockResolvedValue(new Response('ok'));
+  it('GET /api/v1/threads/abc/events bypasses worker fetch and cache', () => {
     const event = makeEvent('https://example.com/api/v1/threads/abc/events');
     handlers.fetch(event);
-    await event.respondWith.mock.calls[0][0];
-    expect(mockCache.put).not.toHaveBeenCalled();
+    expect(event.respondWith).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
     expect(mockCache.match).not.toHaveBeenCalled();
   });
 });
@@ -454,6 +450,7 @@ describe('Service Worker fetch handler — immutable /assets bundle caching', ()
       expect.objectContaining({ headers: expect.objectContaining({ 'x-lucidos-restore-generation': 'unknown' }) }));
     expect(clientLogBodies(sw)).toEqual([{
       category: 'sw',
+      code: 'asset_failed',
       message: 'asset_failed',
       data: { path: '/assets/missing-000000.js', status: 404, type: 'default', contentType: 'text/plain;charset=UTF-8' },
     }]);
@@ -883,7 +880,7 @@ describe('Service Worker push handler — normal show-notification path', () => 
     const actions = [{ action: 'unwatch', title: 'Unwatch' }];
     const event = makePushEvent({
       web_push: 8030,
-      notification: { title: 'Sam', body: 'Kim, can you look?', tag: 'people-tid-1', actions },
+      notification: { title: 'Sam', body: 'Kim, can you look?', tag: 'user-tid-1', actions },
     });
     handlers.push(event);
     await Promise.all(event.waiting);
@@ -904,7 +901,7 @@ describe('Service Worker message handler — liveness ping', () => {
   it('responds to lucidos:ping with lucidos:pong on event.source', () => {
     const source = { postMessage: vi.fn() };
     handlers.message({ data: { type: 'lucidos:ping' }, source });
-    expect(source.postMessage).toHaveBeenCalledWith({ type: 'lucidos:pong' });
+    expect(source.postMessage).toHaveBeenCalledWith({ type: 'lucidos:pong', instance: expect.any(Number) });
   });
 
   it('responds to lucidos:get-build-id with the placeholder BUILD_ID (un-stamped dev source)', () => {
@@ -1303,7 +1300,7 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
     await Promise.all(ev._waited);
 
     expect(mockFetch).toHaveBeenCalledWith(
-      'https://example.com/api/v1/threads/tid-1/people/unwatch',
+      'https://example.com/api/v1/threads/tid-1/users/unwatch',
       expect.objectContaining({ method: 'POST' }),
     );
     expect(mockFetch).toHaveBeenCalledWith(
@@ -1506,12 +1503,12 @@ describe('Service Worker notificationclick handler — deep-link routing', () =>
 describe('Service Worker base-path awareness (gateway scope)', () => {
   const SCOPE = 'https://example.com/ws/work/';
 
-  it('intercepts /ws/<id>/api/v1 GETs (matched scope-relative)', () => {
+  it('bypasses /ws/<id>/api/v1 GETs', () => {
     const { handlers, mockFetch } = loadSw({ scope: SCOPE });
     mockFetch.mockResolvedValue(new Response('ok'));
     const ev = makeEvent('https://example.com/ws/work/api/v1/threads/list');
     handlers.fetch(ev);
-    expect(ev.respondWith).toHaveBeenCalled();
+    expect(ev.respondWith).not.toHaveBeenCalled();
   });
 
   it('does NOT intercept the scoped SSE stream', () => {
@@ -1558,6 +1555,37 @@ describe('Service Worker base-path awareness (gateway scope)', () => {
     const opts = mockRegistration.showNotification.mock.calls[0][1] as Record<string, string>;
     expect(opts.icon).toBe('/ws/work/favicon.svg');
     expect(opts.navigate).toBe('https://example.com/ws/work/');
+  });
+});
+
+describe('trusted remote push worker', () => {
+  const scope = 'https://example.com/work@peer/';
+
+  it('never warms, intercepts or deletes shared caches', async () => {
+    const {handlers, mockCaches, mockFetch} = loadSw({scope, buildId: 'trusted-a-build'});
+    const waits: Promise<unknown>[] = [];
+    const lifecycle = {waitUntil: (promise: Promise<unknown>) => waits.push(promise)};
+    handlers.install(lifecycle);
+    handlers.activate(lifecycle);
+    await Promise.all(waits);
+    for (const path of ['', 'assets/client.js', 'api/v1/threads', 'data/report.html']) {
+      const event = makeEvent(scope + path, 'GET', 'navigate');
+      handlers.fetch(event);
+      expect(event.respondWith).not.toHaveBeenCalled();
+    }
+    expect(mockCaches.keys).not.toHaveBeenCalled();
+    expect(mockCaches.open).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('keeps notification destinations inside the selected remote shell', async () => {
+    for (const navigate of ['https://other.example/', '/~/api/v1/control/workspaces', '../local/', 'javascript:alert(1)']) {
+      const {handlers, mockRegistration} = loadSw({scope});
+      const waits: Promise<unknown>[] = [];
+      handlers.push({data: {json: () => ({web_push: 8030, notification: {title: 'Remote', navigate}})}, waitUntil: (p: Promise<unknown>) => waits.push(p)});
+      await Promise.all(waits);
+      expect(mockRegistration.showNotification.mock.calls[0][1].navigate).toBe(scope);
+    }
   });
 });
 

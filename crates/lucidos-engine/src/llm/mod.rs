@@ -22,10 +22,12 @@ pub mod openai;
 pub mod prefill;
 pub mod provider;
 pub mod provider_build;
+pub mod provider_error;
 pub mod provider_selection;
 pub mod reasoning;
 pub mod routing;
 pub mod served_model;
+pub mod spend_cap;
 pub(crate) mod stable_prefix;
 pub mod tool_names;
 pub mod tools;
@@ -58,6 +60,7 @@ pub use provider_build::{
     build_active_provider, ProviderBuildContext, ProviderBuildOutcome,
     PROVIDER_CREDENTIAL_SERVICES, PROVIDER_PREFERENCE_KEYS,
 };
+pub use provider_error::{ProviderError, ProviderErrorKind};
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 // `clamp_effort` is deliberately NOT re-exported: it is the wire-side rule and
 // its only caller is `RoutingProvider`, inside this module. Anything outside
@@ -141,6 +144,9 @@ fn contains_status_token(haystack: &str, code: &str) -> bool {
 /// Whether an error is a transient network/infrastructure issue (not a logic or auth error).
 /// Used to suppress noisy duplicate notifications for triggers.
 pub fn is_transient_error(err: &str) -> bool {
+    if spend_cap::is_spend_cap_text(err) {
+        return false;
+    }
     let lower = err.to_lowercase();
     lower.contains("error sending request")
         || lower.contains("connection reset")
@@ -163,6 +169,9 @@ pub fn is_transient_error(err: &str) -> bool {
 /// a rate limit, an overload, or a timeout. A caller that adapts how many
 /// calls it runs at once backs off on one.
 pub fn is_capacity_error(err: &str) -> bool {
+    if spend_cap::is_spend_cap_text(err) {
+        return false;
+    }
     const PHRASES: &[&str] = &[
         "rate limit",
         "rate_limit",
@@ -185,25 +194,33 @@ pub fn is_capacity_error(err: &str) -> bool {
 /// known intermittent validation blips from regional API replicas (rare 400s
 /// that succeed on the next attempt).
 pub fn is_retryable_error(err: &str) -> bool {
+    if spend_cap::is_spend_cap_text(err) {
+        return false;
+    }
     if is_transient_error(err) {
         return true;
     }
     let lower = err.to_lowercase();
-    lower.contains("server_error")
-        || lower.contains("error decoding response body")
+    lower.contains("error decoding response body")
         || lower.contains("stream read error")
         // Vertex regional replica drift on Opus 4.7's `adaptive` thinking type.
         // Same call succeeds on retry; ~1 in 550 on global endpoint.
         || err.contains("Input tag 'adaptive' found")
 }
 
-/// Whether an HTTP response should trigger a retry — combines status-code and
-/// body checks (covers transient 5xx/429/529 plus known 400 validation blips
-/// that succeed on retry) and bounds attempts at `MAX_RETRIES`. A 2xx is never
+/// Whether an HTTP response should trigger a retry. It combines status-code and
+/// body checks and bounds attempts at `MAX_RETRIES`. Retryable: transient
+/// 5xx/429/529, a retryable provider error kind the body names, and known 400
+/// validation blips that succeed on retry. A 2xx is never
 /// retried: its body is the model's billed answer, not an error message.
 pub fn should_retry_http(status: u16, body: &str, attempt: u32) -> bool {
-    !(200..300).contains(&status)
-        && (is_retryable_status(status) || is_retryable_error(body))
+    !spend_cap::is_spend_cap_http(status, body)
+        && !(200..300).contains(&status)
+        && (is_retryable_status(status)
+            || ProviderError::from_http("", status, body)
+                .kind
+                .is_retryable()
+            || is_retryable_error(body))
         && attempt <= MAX_RETRIES
 }
 
@@ -215,7 +232,7 @@ pub fn retry_delay(attempt: u32, base_secs: u64) -> Duration {
 
 /// Log a retry attempt with model context.
 pub fn log_retry(model: &str, reason: &str, attempt: u32, delay: Duration) {
-    log!(
+    log_legacy!(
         "[{}] {} (attempt {}/{}), retrying in {:?}...",
         model,
         reason,
@@ -233,8 +250,12 @@ pub fn log_retry(model: &str, reason: &str, attempt: u32, delay: Duration) {
 /// Anthropic, Vertex Claude) all reached this arm with the same fourteen lines.
 /// One home keeps the base delay and the log wording the same across them. A
 /// change to the backoff can no longer land on three paths out of four.
-pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u32) -> bool {
-    if !is_retryable_error(err) || attempt > MAX_RETRIES {
+pub(crate) async fn retry_after_stream_error(
+    model: &str,
+    err: &(dyn std::error::Error + Send + Sync + 'static),
+    attempt: u32,
+) -> bool {
+    if !error_is_retryable(err) || attempt > MAX_RETRIES {
         return false;
     }
     // Base 2 rather than 1: a stream that died partway costs more to re-run
@@ -245,6 +266,21 @@ pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u3
     true
 }
 
+/// Whether a failed call may be sent again. A [`ProviderError`] decides by its
+/// kind, or by the provider's own message when the kind is unknown. Any other
+/// error (transport, stream read) decides by its text.
+pub(crate) fn error_is_retryable(err: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    match err.downcast_ref::<ProviderError>() {
+        Some(ProviderError {
+            kind: ProviderErrorKind::Unknown(_),
+            message,
+            ..
+        }) => is_retryable_error(message),
+        Some(provider) => provider.kind.is_retryable(),
+        None => is_retryable_error(&err.to_string()),
+    }
+}
+
 /// A stream failure, made final once `on_token` has shown the user something.
 ///
 /// The caller's retry re-sends the whole request, so text already on screen
@@ -252,14 +288,15 @@ pub(crate) async fn retry_after_stream_error(model: &str, err: &str, attempt: u3
 /// chunk timeout and a mid-stream `error` frame. The cause is logged, because
 /// the returned message must carry no retryable wording.
 pub(crate) fn stream_failure(
-    err: String,
+    err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
     rendered_any: bool,
     provider_tag: &str,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    if !rendered_any || !is_retryable_error(&err) {
-        return err.into();
+    let err = err.into();
+    if !rendered_any || !error_is_retryable(&*err) {
+        return err;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[{}] Stream failed after text had streamed, so not retrying: {}",
         provider_tag,
         err
@@ -283,6 +320,19 @@ pub fn with_retry_context(err: impl std::fmt::Display, attempts: u32) -> String 
         format!("{} (after {} attempts)", err, attempts)
     } else {
         err.to_string()
+    }
+}
+
+/// The final error of a retry loop. A [`ProviderError`] keeps its type and
+/// records the attempts, so a caller further up can still branch on its kind.
+/// Any other error gets [`with_retry_context`]'s text.
+pub(crate) fn retry_failure(
+    err: Box<dyn std::error::Error + Send + Sync>,
+    attempts: u32,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    match err.downcast::<ProviderError>() {
+        Ok(provider) => Box::new(provider.with_attempts(attempts)),
+        Err(other) => with_retry_context(other, attempts).into(),
     }
 }
 
@@ -406,7 +456,7 @@ pub(crate) fn clamp_provider_token_count(n: u64, source: &str) -> u32 {
     match u32::try_from(n) {
         Ok(v) => v,
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[{}] Token count {} exceeds u32::MAX; clamping (likely corrupt upstream usage block)",
                 source,
                 n
@@ -484,7 +534,6 @@ mod tests {
         assert!(is_retryable_error(
             "Claude streaming error [overloaded]: overloaded"
         ));
-        assert!(is_retryable_error("server_error"));
         assert!(is_retryable_error("error decoding response body"));
         assert!(is_retryable_error("Stream read error: connection lost"));
     }
@@ -591,15 +640,65 @@ mod tests {
     /// they were going to return anyway.
     #[tokio::test]
     async fn a_stream_error_stops_retrying_when_spent_or_not_transient() {
+        let spent: Box<dyn std::error::Error + Send + Sync> = "connection reset by peer".into();
         assert!(
-            !retry_after_stream_error("test-model", "connection reset by peer", MAX_RETRIES + 1)
-                .await,
+            !retry_after_stream_error("test-model", &*spent, MAX_RETRIES + 1).await,
             "attempts are spent"
         );
+        let auth: Box<dyn std::error::Error + Send + Sync> = "authentication failed".into();
         assert!(
-            !retry_after_stream_error("test-model", "authentication failed", 1).await,
+            !retry_after_stream_error("test-model", &*auth, 1).await,
             "an auth failure is not transient"
         );
+    }
+
+    fn provider_error(kind: ProviderErrorKind) -> Box<dyn std::error::Error + Send + Sync> {
+        Box::new(ProviderError {
+            provider: "Acme".to_string(),
+            kind,
+            code: None,
+            message: "words that name no retry phrase".to_string(),
+            status: None,
+            attempts: 0,
+        })
+    }
+
+    /// A provider error retries by its kind, whatever its text says.
+    #[test]
+    fn a_provider_error_retries_by_its_kind() {
+        assert!(error_is_retryable(&*provider_error(
+            ProviderErrorKind::Internal
+        )));
+        assert!(!error_is_retryable(&*provider_error(
+            ProviderErrorKind::InvalidRequest
+        )));
+        let plain: Box<dyn std::error::Error + Send + Sync> = "connection reset".into();
+        assert!(
+            error_is_retryable(&*plain),
+            "other errors keep the text rule"
+        );
+    }
+
+    /// The final error keeps its type, so a caller can still branch on the kind.
+    #[test]
+    fn a_retry_failure_keeps_a_provider_error_typed() {
+        let failure = retry_failure(provider_error(ProviderErrorKind::Overloaded), 4);
+        let typed = failure.downcast_ref::<ProviderError>().expect("typed");
+        assert_eq!(typed.attempts, 4);
+        assert!(failure.to_string().ends_with("(after 4 attempts)"));
+        let other = retry_failure("connection failed".into(), 3);
+        assert_eq!(other.to_string(), "connection failed (after 3 attempts)");
+    }
+
+    /// ADR 0089: a retryable provider error after rendered text stops the turn.
+    #[test]
+    fn a_provider_error_after_rendered_text_is_cut_off() {
+        let err = stream_failure(provider_error(ProviderErrorKind::Internal), true, "Test");
+        assert!(is_stream_cut_after_text(&err.to_string()));
+        let fresh = stream_failure(provider_error(ProviderErrorKind::Internal), false, "Test");
+        assert!(fresh.is::<ProviderError>());
+        let refused = stream_failure(provider_error(ProviderErrorKind::Permission), true, "Test");
+        assert!(refused.is::<ProviderError>());
     }
 
     #[test]
@@ -753,5 +852,13 @@ mod tests {
             assert!(!should_retry_http(status, body, 1), "status {status}");
         }
         assert!(should_retry_http(400, body, 1));
+    }
+
+    #[test]
+    fn a_body_naming_a_retryable_kind_retries_on_a_client_status() {
+        let overloaded = r#"{"type":"error","error":{"type":"overloaded_error","message":"x"}}"#;
+        assert!(should_retry_http(400, overloaded, 1));
+        let invalid = r#"{"type":"error","error":{"type":"invalid_request_error","message":"x"}}"#;
+        assert!(!should_retry_http(400, invalid, 1));
     }
 }

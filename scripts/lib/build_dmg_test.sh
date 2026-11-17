@@ -7,6 +7,9 @@ set -u
 export GH_TOKEN=offline-test-token
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_darwin build-dmg.sh
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 PASS=0
@@ -404,7 +407,7 @@ echo "test: --adopt-submission picks the real DMG, and refuses to guess between 
 if [ "$REAL_BUILD_PRESENT" = "1" ]; then
     echo "  skip: a real build sits in $BUNDLE_DMG_DIR (adoption would write a handle for it)"
 else
-    # A run killed mid-refresh can leave refresh_dmg_payload's .rw.dmg behind;
+    # A run killed mid-refresh can leave dmg_volume_assemble's .rw.dmg behind;
     # adopting THAT would record a checksum for bytes Apple never scanned.
     rm -f "$NOTARIZE_STATE"
     mkdir -p "$BUNDLE_DMG_DIR"
@@ -466,7 +469,7 @@ done
 echo ""
 echo "test: the notary submit no longer holds a foreground --wait"
 # The whole point: a wait that outlives the process can never complete, because
-# the orchestration layer caps background tasks at 3600s.
+# the orchestration layer caps background tasks (an hour by default, 4 h at most).
 BUILD_DMG="$PROJECT_DIR/scripts/build-dmg.sh"
 if grep -q -- '--no-wait' "$BUILD_DMG"; then
     pass "submit uses --no-wait"
@@ -984,10 +987,10 @@ for f in scripts/lib/updater_payload.sh scripts/lib/updater_payload_test.sh; do
 done
 
 # Ordering is the whole fix: pack AFTER the bundle is signed (or the tarball is
-# the unsigned one again) and BEFORE the DMG payload is refreshed (which is what
+# the unsigned one again) and BEFORE the DMG is assembled (which is what
 # makes the DMG correct and must stay untouched).
 #
-# Compared at the CALL sites, not the definitions. refresh_dmg_payload now lives
+# Compared at the CALL sites, not the definitions. dmg_volume_assemble now lives
 # inside run_dmg_notarize_stage, whose definition sits near the top of the file
 # with the other helpers the resume path needs, so definition order says nothing
 # about execution order any more.
@@ -1020,7 +1023,7 @@ fi
 # Inside that stage, the refresh (which injects the stapled app) must precede the
 # DMG's own signature and submission, or the image is signed around stale bytes.
 DMG_STAGE_FN="$(awk '/^run_dmg_notarize_stage\(\) \{/,/^\}/' "$BUILD_DMG")"
-D_REFRESH="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'refresh_dmg_payload "' | cut -d: -f1 | head -1)"
+D_REFRESH="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'dmg_volume_assemble "' | cut -d: -f1 | head -1)"
 D_SIGN="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'sign_dmg "' | cut -d: -f1 | head -1)"
 D_SUBMIT="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'notarize_submit_and_wait\|notarize_submit_and_persist' | cut -d: -f1 | head -1)"
 if [ -n "$D_REFRESH" ] && [ -n "$D_SIGN" ] && [ -n "$D_SUBMIT" ] \

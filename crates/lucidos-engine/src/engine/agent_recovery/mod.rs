@@ -16,6 +16,7 @@ mod orphaned_branch_work;
 mod recovery;
 #[cfg(test)]
 pub(crate) use recovery::restored_recovery_branches;
+pub(crate) use recovery::unanswered_question_predicate_sql;
 mod undelivered_input;
 
 pub use has_diff::*;
@@ -32,7 +33,7 @@ pub(crate) use undelivered_input::undelivered_input;
 pub(crate) use recovery::{
     ends_question_park, newest_open_question, park_ending_event_types_sql,
     preserve_question_park_at_shutdown, thread_has_unanswered_question, thread_parked_on_question,
-    unanswered_question_exists_sql,
+    unanswered_question_exists_sql, OpenRequest,
 };
 // The last two boot steps that touch thread status, called from `main.rs` once
 // every recovery sweep has run.

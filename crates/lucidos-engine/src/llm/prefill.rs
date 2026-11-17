@@ -287,7 +287,16 @@ pub(crate) async fn send(
         .map(str::to_string);
     call_trace::response_received(status.as_u16(), request_id.as_deref());
     if !status.is_success() {
+        let headers = response.headers().clone();
         let reply = response.text().await?;
+        if let Some(provider) = body.provider {
+            if let Some(cap) =
+                crate::llm::metered::http_spend_cap(provider, status.as_u16(), &headers, &reply)
+                    .await
+            {
+                return Err(cap.into());
+            }
+        }
         if PrefillRefused::is_refusal(status.as_u16()) {
             return Err(Box::new(PrefillRefused::new(format!(
                 "{label} refused the prefill ({status}): {reply}"
@@ -364,6 +373,45 @@ pub(crate) fn cannot_prefill(provider: Option<ProviderKind>) -> BoxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn billing_refusals_from_prefill_preserve_the_provider_and_reset() {
+        for (status, reply) in [
+            (402, "Payment required"),
+            (
+                429,
+                r#"{"error":{"type":"billing_error","message":"spent"}}"#,
+            ),
+        ] {
+            let app = axum::Router::new().fallback(move || async move {
+                (
+                    axum::http::StatusCode::from_u16(status).unwrap(),
+                    [("retry-after", "60")],
+                    reply,
+                )
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let mut body = streamed_body();
+            body.provider = Some(ProviderKind::ClaudeGateway);
+            let before = chrono::Utc::now();
+            let error = send(
+                reqwest::Client::new().post(format!("http://{address}")),
+                &body,
+                "Claude gateway",
+            )
+            .await
+            .unwrap_err();
+            let cap = error
+                .downcast_ref::<crate::llm::spend_cap::SpendCapReached>()
+                .expect("a billing refusal keeps its typed error");
+            assert_eq!(cap.provider, ProviderKind::ClaudeGateway);
+            assert!(cap.resets_at.unwrap() >= before + chrono::Duration::seconds(60));
+            assert!(!error.is::<PrefillRefused>());
+            server.abort();
+        }
+    }
 
     #[test]
     fn a_reply_reads_its_usage_and_never_its_stop_reason_as_failure() {

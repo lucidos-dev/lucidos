@@ -995,10 +995,10 @@ fn side_questions_never_enter_session_history() {
     assert!(!text.contains("what is x?") && !text.contains("x is 3"));
 }
 
-/// A people-only message reads as a user turn in order, with its sender's
+/// A user-only message reads as a user turn in order, with its sender's
 /// device, and leaves the woken turn's request and reply alone (ADR 0649).
 #[test]
-fn a_people_only_message_is_a_user_turn_that_opens_no_request() {
+fn a_user_only_message_is_a_user_turn_that_opens_no_request() {
     let device = |id: &str| json!({"kind": "device", "device_id": id});
     let events = vec![
         make_event(
@@ -1008,12 +1008,12 @@ fn a_people_only_message_is_a_user_turn_that_opens_no_request() {
         ),
         make_event("ResponseGenerated", json!({"text": "Here it is."}), 1),
         make_event(
-            "PeopleMessagePosted",
+            "UserOnlyMessagePosted",
             json!({"text": "looks thin to me", "actor": device("dev-alex")}),
             2,
         ),
         make_event(
-            "PeopleMessagePosted",
+            "UserOnlyMessagePosted",
             json!({"text": "agreed, add risks", "actor": device("dev-sam")}),
             3,
         ),
@@ -1048,7 +1048,7 @@ fn a_people_only_message_is_a_user_turn_that_opens_no_request() {
     );
     assert_eq!(
         msgs[5].request_event_id, msgs[4].event_id,
-        "the reply answers the woken message, not a people-only one"
+        "the reply answers the woken message, not a user-only one"
     );
 }
 
@@ -1063,11 +1063,11 @@ fn only_a_device_origin_names_a_sender() {
     assert_eq!(build_session_messages(&events)[0].sender_device_id, None);
 }
 
-/// A people-only message posted while a reply streams follows that reply,
+/// A user-only message posted while a reply streams follows that reply,
 /// which never saw it. While the turn still runs, its in-progress reply stays
 /// last and keeps the running steps on the message that woke it.
 #[test]
-fn a_people_only_message_during_a_turn_follows_its_reply() {
+fn a_user_only_message_during_a_turn_follows_its_reply() {
     let device = |id: &str| json!({"kind": "device", "device_id": id});
     let asked = make_event(
         "MessageReceived",
@@ -1076,7 +1076,7 @@ fn a_people_only_message_during_a_turn_follows_its_reply() {
     );
     let streamed = make_event("TextStreamed", json!({"text": "Working on"}), 1);
     let aside = make_event(
-        "PeopleMessagePosted",
+        "UserOnlyMessagePosted",
         json!({"text": "keep it short", "actor": device("dev-alex")}),
         2,
     );

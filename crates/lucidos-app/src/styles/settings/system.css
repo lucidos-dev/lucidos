@@ -253,15 +253,8 @@
     flex-wrap: nowrap;
 }
 
-/* Settings → System → Maintenance: the update address. The banner's lead words
-   carry the warning colour, since an override changes where every update comes
-   from and must not read as one more routine notice. */
-.update-address-flag {
-    color: var(--accent-yellow);
-}
-
 /* A free-text field stacks under its label, as base.css does for a bare
-   .settings-text-input. Here the field shares a line with its Save button, so
+   .settings-text-input. The field shares a line with its Save button, so
    the row matches on its own class rather than on the field. */
 .update-address-row {
     flex-direction: column;
@@ -285,4 +278,41 @@
     flex: 1;
     min-width: 0;
     font-family: var(--font-mono);
+}
+
+/* Each segment has separate selection and explanation buttons, never nested. */
+.update-channel-segment {
+    display: inline-flex;
+    align-items: center;
+    padding-right: 0.5rem;
+    border-radius: calc(var(--radius-control) * 0.375);
+}
+.update-channel-segment.active {
+    background: var(--bg-secondary);
+}
+.update-channel-segment .segmented-btn {
+    padding-right: 0;
+}
+.update-channel-fold {
+    display: flex;
+    align-items: center;
+    margin-top: var(--space-sm);
+}
+.update-channel-fold .settings-disclosure-toggle {
+    margin-top: 0;
+}
+.update-channel-fields {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+    width: 100%;
+}
+.update-channel-fields input {
+    flex: 1 1 12rem;
+    min-width: 0;
+}
+.update-channel-url {
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+    font-size: var(--font-size-xs);
 }

@@ -114,7 +114,7 @@ impl Drop for SessionEntryGuard {
             let Some(reaped) = reap_entry(&sessions, thread_id, &msg_tx).await else {
                 return;
             };
-            log!(
+            log_legacy!(
                 "[AgentSession] Session future for thread {} was dropped before completing — \
                  reaped its agent_sessions entry (process_exited={})",
                 thread_id,
@@ -177,7 +177,7 @@ async fn settle_dropped_session(pool: &sqlx::PgPool, event_bus: &EventBus, threa
         Ok(false) => return,
         Ok(true) => {}
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] dropped-session settle probe failed for {}: {} — \
                  skipping the terminal emit rather than risk a duplicate",
                 thread_id,

@@ -57,6 +57,11 @@ impl LucidosEngine {
             )
             .await;
 
+        // Mid-turn it shares the running turn's cache, never a pending pick.
+        let overrides = self
+            .running_turn_overrides(thread_id)
+            .await
+            .map_err(|e| format!("{AGENT} could not read its running model: {e}"))?;
         let router = self.current_provider();
         let configured = router.configured_providers();
         let resolved = super::run::resolve_route_overrides(
@@ -69,7 +74,7 @@ impl LucidosEngine {
             None,
             Some(thread_id),
             None,
-            crate::core::ResolvedModelSelection::default(),
+            overrides,
         )
         .await;
 

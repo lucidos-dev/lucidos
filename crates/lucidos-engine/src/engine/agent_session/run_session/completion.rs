@@ -92,7 +92,7 @@ pub(super) fn reap_own_session_entry(
         return sessions.remove(&thread_id);
     }
     if sessions.contains_key(&thread_id) {
-        log!(
+        log_legacy!(
             "[AgentSession] Teardown for thread {} left a replacement session's entry alone",
             thread_id
         );
@@ -173,7 +173,7 @@ async fn remove_discarded_worktree(
 ) {
     match discarded_worktree_removal(worktree_branch, session_branch) {
         WorktreeRemoval::Keep(reason) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Keeping worktree {}: {}",
                 worktree.display(),
                 reason
@@ -184,7 +184,7 @@ async fn remove_discarded_worktree(
             if let Err(e) =
                 git_ran_ok(&["worktree", "remove", "--force", &wt_path_str], repo_root).await
             {
-                log!(
+                log_legacy!(
                     "[AgentSession] Failed to remove discarded worktree {}: {}",
                     worktree.display(),
                     e
@@ -239,7 +239,7 @@ impl LucidosEngine {
         .await;
         if !auto_resume_after_api_error(terminal, resumes_spent, is_shutdown, is_resolution_session)
         {
-            log!(
+            log_legacy!(
                 "[AgentSession] thread {} ended on a transient upstream API failure with {} of {} auto-resumes spent: not resuming, so its parent hears about the failure now",
                 thread_id,
                 resumes_spent,
@@ -247,7 +247,7 @@ impl LucidosEngine {
             );
             return;
         }
-        log!(
+        log_legacy!(
             "[AgentSession] thread {} ended on a transient upstream API failure ({} of {} auto-resumes already spent): resuming, and withholding its parent's completion card until the real terminal",
             thread_id,
             resumes_spent,
@@ -350,13 +350,13 @@ impl LucidosEngine {
         // message is progress, and this recovery is only for the unattended
         // case where nothing else will move the thread.
         let continuation_persisted = if shutting_down {
-            log!(
+            log_legacy!(
                 "[AgentSession] thread {} would auto-resume after a transient upstream API failure, but the engine is shutting down: telling its parent instead of resuming",
                 thread_id,
             );
             false
         } else if followups_queued {
-            log!(
+            log_legacy!(
                 "[AgentSession] thread {} ended on a transient upstream API failure, but a follow-up is already queued for it: leaving the thread to that message rather than resuming",
                 thread_id,
             );
@@ -365,7 +365,7 @@ impl LucidosEngine {
             // The user asked this session to end, so a resume would contradict
             // them. After a Discard it would also re-adopt a worktree finalize
             // is about to delete.
-            log!(
+            log_legacy!(
                 "[AgentSession] thread {} ended on a transient upstream API failure, but a Stop, Apply, Discard or Archive is pending for it: telling its parent instead of resuming",
                 thread_id,
             );
@@ -478,7 +478,7 @@ impl LucidosEngine {
         // mistaken for an external kill.
         let engine_cancelled = agent_cancel.is_cancelled();
         if safety_net_fired {
-            log!(
+            log_legacy!(
                 "[AgentSession] safety net firing for thread {} — buffered_text_len={}, watchdog_fired={}, killed_by_signal={}, exit_code={:?}, init_seen={}, engine_cancelled={}",
                 thread_id,
                 claude_text_buf.len(),
@@ -520,7 +520,7 @@ impl LucidosEngine {
         match &net_action {
             SafetyNetAction::Nothing | SafetyNetAction::Skip => {}
             SafetyNetAction::EmitFailed { error, agent_exit } => {
-                log!(
+                log_legacy!(
                     "[AgentSession] thread {}: {} exited on its own ({:?}, code {:?}); failing the turn with its words and not retrying",
                     thread_id,
                     coding_agent.display_name(),
@@ -533,7 +533,12 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                 error: error.clone(),
+                                spend_cap: crate::llm::spend_cap::SpendCapNotice::from_agent_text(
+                                    "Coding agent",
+                                    error,
+                                ),
                                 agent_exit: Some(*agent_exit),
+                                provider_error: None,
                             },
                             meta: meta.clone(),
                         },
@@ -599,6 +604,21 @@ impl LucidosEngine {
         };
         let should_discard = matches!(pending_stop, Some(StopReason::Discard));
         let is_resolution_session = conflict.is_some() || lane_duty.is_some();
+        // A hard Stop or failed exit can bypass the Result arm.
+        if !is_shutdown
+            && !matches!(
+                pending_stop,
+                Some(StopReason::Apply | StopReason::Discard | StopReason::Archive)
+            )
+            && (crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await
+                || matches!(last_terminal_kind, Some(TerminalKind::Failed { .. }))
+                || matches!(
+                    net_action,
+                    SafetyNetAction::EmitFailed { .. } | SafetyNetAction::EmitAbortedSafetyNet
+                ))
+        {
+            self.settle_owed_ceiling_handoff(thread_id).await;
+        }
 
         let continuation_requested = self
             .maybe_auto_resume_after_api_error(
@@ -645,7 +665,7 @@ impl LucidosEngine {
             }
             let mut guard = self.agent_sessions.lock().await;
             reap_own_session_entry(&mut guard, thread_id, &external_terminal_emitted);
-            log!(
+            log_legacy!(
                 "[Shutdown] Skipping cleanup for thread {}: session will resume after restart",
                 thread_id
             );
@@ -684,7 +704,7 @@ impl LucidosEngine {
                 pending_stop,
             ) {
                 Some(end) => self.report_lane_thread_end(duty.batch_id, thread_id, end),
-                None => log!(
+                None => log_legacy!(
                     "[AgentSession] Lane batch {} handed off to the continuation of thread {}",
                     duty.batch_id,
                     thread_id
@@ -745,7 +765,7 @@ impl LucidosEngine {
                     // whose spawn re-attaches the duty via
                     // `pending_conflict_change_for_thread` and whose own
                     // completion then applies or aborts for real.
-                    log!(
+                    log_legacy!(
                         "[AgentSession] Conflict resolution for {} handed off to auto-recovery continuation — change {} stays pending, merge state preserved",
                         change.branch_name,
                         change.id
@@ -754,7 +774,7 @@ impl LucidosEngine {
                 ConflictResolutionCleanupAction::Abort { message } => {
                     let apply_actor = self.pending_apply_actors.take(change.id);
                     let _ = git_cmd(&["merge", "--abort"], &cwd).await;
-                    log!(
+                    log_legacy!(
                         "[AgentSession] Conflict resolution not applied for {}: {}",
                         change.branch_name,
                         message
@@ -775,7 +795,7 @@ impl LucidosEngine {
                             git_ran_ok(&["worktree", "remove", "--force", &wt_str], &repo_root)
                                 .await
                         {
-                            log!(
+                            log_legacy!(
                                 "[ConflictResolution] Failed to remove temp merge worktree {}: {}",
                                 wt_str,
                                 e
@@ -784,7 +804,7 @@ impl LucidosEngine {
                         if let Err(e) =
                             git_ran_ok(&["branch", "-D", &branch_name], &repo_root).await
                         {
-                            log!(
+                            log_legacy!(
                                 "[ConflictResolution] Failed to delete temp merge branch {}: {}",
                                 branch_name,
                                 e
@@ -823,7 +843,7 @@ impl LucidosEngine {
                         // here preserves the original git stderr so a stuck
                         // merge can be triaged without re-running.
                         if let Err(e) = git_commit_no_edit(&cwd).await {
-                            log!(
+                            log_legacy!(
                                 "[ConflictResolution] {} (change {}, branch {})",
                                 e,
                                 change.id,
@@ -896,7 +916,7 @@ impl LucidosEngine {
                                     &pre_sha, &post_sha,
                                 )),
                             )
-                            .await;
+                            .await?;
                             self.maybe_emit_app_ui_refresh(
                                 &kind_ctx,
                                 &change.files,
@@ -917,7 +937,7 @@ impl LucidosEngine {
                                 "[ConflictResolution] MergeResolutionCleared",
                             )
                             .await;
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Conflict resolution complete — change {} applied via ff-merge",
                                 change.id
                             );
@@ -929,7 +949,7 @@ impl LucidosEngine {
                                 "[ConflictResolution] MergeResolutionCleared",
                             )
                             .await;
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] ff-merge failed after conflict resolution: {}",
                                 e
                             );
@@ -974,7 +994,7 @@ impl LucidosEngine {
                     .get_open_by_branch(&branch_name)
                     .await
                     .unwrap_or_else(|e| {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] get_open_by_branch({}): {}; skipping discard emit",
                             branch_name,
                             e
@@ -1005,7 +1025,7 @@ impl LucidosEngine {
                 let discard_branch = worktree_current_branch(wt).await;
                 remove_discarded_worktree(wt, &repo_root, &branch_name, discard_branch.as_deref())
                     .await;
-                log!("[AgentSession] Discarding changes (branch {})", branch_name);
+                log_legacy!("[AgentSession] Discarding changes (branch {})", branch_name);
                 // `git_ran_ok`, not `git_cmd`: a non-zero exit is an `Ok` there,
                 // so a refused delete logged nothing. Git refuses while a
                 // worktree still has the branch checked out, which is exactly
@@ -1013,7 +1033,7 @@ impl LucidosEngine {
                 // tree. The branch then keeps its commits, and the next session
                 // end proposes the discarded work again.
                 if let Err(e) = git_ran_ok(&["branch", "-D", &branch_name], &repo_root).await {
-                    log!(
+                    log_legacy!(
                         "[AgentSession] Failed to delete branch {}: {}",
                         branch_name,
                         e
@@ -1031,7 +1051,7 @@ impl LucidosEngine {
                     // not if it ended up on the default branch (main/master) — otherwise
                     // the cleanup path could delete main.
                     if actual != &branch_name && actual != &base {
-                        log!("[AgentSession] Worktree is on branch '{}', tracked branch was '{}' — using actual branch",
+                        log_legacy!("[AgentSession] Worktree is on branch '{}', tracked branch was '{}' — using actual branch",
                             actual, branch_name);
                         actual.as_str()
                     } else {
@@ -1089,7 +1109,7 @@ impl LucidosEngine {
                         {
                             Ok(true) => self.broadcast_changes_updated().await,
                             Ok(false) => {}
-                            Err(e) => log!(
+                            Err(e) => log_legacy!(
                                 "[AgentSession] Could not withdraw the handed-off change of thread {}: {}",
                                 thread_id,
                                 e
@@ -1097,19 +1117,19 @@ impl LucidosEngine {
                         }
                     }
                     SessionEndAction::KeepExternalBranch => {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] External repo branch {} — keeping branch, no change proposed",
                             effective_branch
                         );
                     }
                     SessionEndAction::KeepCanceledBranch => {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] Turn cancelled on branch {} with nothing to propose; keeping branch resumable",
                             effective_branch
                         );
                     }
                     SessionEndAction::CrashedKeepBranch => {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] Safety net fired with commits on {} — keeping branch on disk, NOT proposing change (thread ended in ResponseAborted)",
                             effective_branch
                         );
@@ -1117,7 +1137,7 @@ impl LucidosEngine {
                     action @ (SessionEndAction::Propose | SessionEndAction::WithholdUnfinished) => {
                         let requires_restart = files_require_restart(&changed_files);
 
-                        log!(
+                        log_legacy!(
                             "[AgentSession] Storing change on branch {}{}",
                             effective_branch,
                             if requires_restart {
@@ -1182,6 +1202,7 @@ impl LucidosEngine {
                                                     .get(&thread_id)
                                                     .is_some_and(|s| s.in_ceiling_reentry),
                                             ),
+                                            turn_end: None,
                                         },
                                         meta,
                                         coding_agent,
@@ -1197,7 +1218,7 @@ impl LucidosEngine {
                                 | ProposeOutcome::AwaitingLanding(_),
                             ) => {}
                             Err(e) => {
-                                log!("[AgentSession] Failed to propose change: {}", e);
+                                log_legacy!("[AgentSession] Failed to propose change: {}", e);
                             }
                         }
                     }
@@ -1220,12 +1241,12 @@ impl LucidosEngine {
                         // that legitimately `git branch -D` (the user asked, or it's a
                         // throwaway merge temp branch).
                         if has_commits {
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Branch {} has commits but empty diff vs main — keeping branch (session resumable), not proposing",
                                 effective_branch
                             );
                         } else {
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Branch {} has no proposable diff — keeping branch (session resumable), not proposing",
                                 effective_branch
                             );
@@ -1275,7 +1296,7 @@ impl LucidosEngine {
         ) {
             match self.hold_thread_for_worktree_reset(thread_id).await {
                 Ok(Some(_hold)) => {
-                    log!(
+                    log_legacy!(
                         "[AgentSession] A Discard for thread {} arrived after its cleanup; carrying it out now",
                         thread_id
                     );
@@ -1284,7 +1305,7 @@ impl LucidosEngine {
                         .end_stale_waiting_session(thread_id, true, None)
                         .await
                     {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] Late Discard for thread {} failed: {}",
                             thread_id,
                             e
@@ -1297,11 +1318,11 @@ impl LucidosEngine {
                         .await;
                     proposed_change = false;
                 }
-                Ok(None) => log!(
+                Ok(None) => log_legacy!(
                     "[AgentSession] A late Discard for thread {} found a new run on the thread; leaving its worktree alone",
                     thread_id
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[AgentSession] Could not hold thread {} for its late Discard: {}",
                     thread_id,
                     e

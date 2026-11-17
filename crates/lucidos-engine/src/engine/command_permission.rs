@@ -26,9 +26,9 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::core::grants::{self, GrantFile};
-use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
-use crate::engine::claude_code::AllowScope;
+use crate::core::grants::GrantFile;
+use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionEntry, PermissionState};
+use crate::engine::claude_code::{AllowScope, GrantOffer, OfferWithheld};
 use crate::engine::command_guard::{
     self, CommandSite, GuardDecision, JudgeInput, JudgedClassification, RiskLane,
     SideEffectCategory, StaticVerdict, TrustedHeads,
@@ -36,6 +36,7 @@ use crate::engine::command_guard::{
 use crate::engine::command_judge::JudgeVerdict;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::git_ops::CheckpointEffects;
+use crate::engine::permission::tool_grants::{self, AnsweredBy};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
@@ -206,18 +207,40 @@ pub fn derive_command_allow_pattern(
 /// the coding-agent session lane also uses, so the two cannot drift. Python
 /// takes the coarse `Python` pattern: the python tool has no finer sub-scope.
 /// It covers no secret read, which no grant covers.
+#[cfg(test)]
 pub fn command_is_allowed(
     tool_name: &str,
     command: &str,
     site: CommandSite<'_>,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
+    command_is_allowed_with_paths(
+        tool_name,
+        command,
+        site,
+        &command_guard::SecretPaths::conservative(),
+        allowed,
+    )
+}
+
+fn command_is_allowed_with_paths(
+    tool_name: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
     match tool_name {
-        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
-            command_guard::grant_covers_command("Bash", command, site, &TrustedHeads::NONE, allowed)
-        }
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => command_guard::grant_covers_command_with_paths(
+            "Bash",
+            command,
+            site,
+            &TrustedHeads::NONE,
+            paths,
+            allowed,
+        ),
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => {
-            !command_guard::command_reads_secret(command)
+            !paths.python(command)
                 && command_guard::catastrophic_reason_for_command_at(
                     command,
                     match site {
@@ -233,8 +256,10 @@ pub fn command_is_allowed(
 }
 
 /// Whether a bash or python tool call reads a secret path.
+#[cfg(test)]
 fn tool_call_reads_secret(tool_name: &str, input: &Value) -> bool {
-    command_guard::command_text(tool_name, input).is_some_and(command_guard::command_reads_secret)
+    command_guard::command_text(tool_name, input)
+        .is_some_and(|text| command_guard::tool_text_reads_secret(tool_name, text))
 }
 
 fn bash_narrow_pattern(command: &str) -> Option<String> {
@@ -264,40 +289,72 @@ fn grant_head(tool_name: &str, command: &str, site: CommandSite<'_>) -> Option<S
 }
 
 // ---------------------------------------------------------------------------
-// Persisted allowlist file (`agent-allowed-commands`)
+// Tool grants (`agent-allowed-commands`)
 // ---------------------------------------------------------------------------
 
-/// Record a granted "Always allow" by scope: `Session` into the in-memory
-/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file
-/// ([`GrantFile::AgentCommands`]). No-op for scopes whose pattern doesn't
-/// derive. Mirrors the CC consent endpoint's `record_allow_grant`.
-pub fn record_command_allow_grant(
-    engine: &LucidosEngine,
-    thread_id: Uuid,
+/// The grants a command card offers: each scope's pattern, kept only when
+/// storing it would cover this same command, so no button stores a line that
+/// covers nothing (ADR 0571). A secret read offers none, and says why.
+#[cfg(test)]
+pub fn command_card_offer(tool_name: &str, command: &str, site: CommandSite<'_>) -> GrantOffer {
+    command_card_offer_with_paths(
+        tool_name,
+        command,
+        site,
+        &command_guard::SecretPaths::conservative(),
+    )
+}
+
+fn command_card_offer_with_paths(
     tool_name: &str,
     command: &str,
-    scope: AllowScope,
-) {
-    let site = CommandSite::Workspace(engine.workspace_path());
+    site: CommandSite<'_>,
+    paths: &command_guard::SecretPaths,
+) -> GrantOffer {
+    if paths.tool(tool_name, command) {
+        return GrantOffer::withheld(OfferWithheld::SecretRead);
+    }
     let source = grant_source(tool_name, command, site);
-    let Some(pattern) = derive_command_allow_pattern(tool_name, &source, scope) else {
+    let offered = |scope| {
+        let pattern = derive_command_allow_pattern(tool_name, &source, scope)?;
+        command_is_allowed_with_paths(tool_name, command, site, paths, |p| p == pattern)
+            .then_some(pattern)
+    };
+    let broad = offered(AllowScope::Broad);
+    GrantOffer {
+        narrow: offered(AllowScope::Narrow).filter(|narrow| Some(narrow) != broad.as_ref()),
+        session: offered(AllowScope::Session),
+        broad,
+        withheld: None,
+    }
+}
+
+/// Record a granted "Always allow" by scope as a *tool grant*: the pattern the
+/// card stamped for it, never a fresh derivation (ADR 0571). `Session` is held
+/// by the thread, `Narrow` / `Broad` stand. A scope the card did not offer
+/// records nothing.
+pub async fn record_command_allow_grant(
+    engine: &LucidosEngine,
+    entry: &PermissionEntry,
+    scope: AllowScope,
+    answered_by: AnsweredBy,
+) {
+    let Some(pattern) = entry.grant_offer.pattern(scope).map(str::to_string) else {
         return;
     };
-    match scope {
-        AllowScope::Session => {
-            let mut pending = engine.pending_command_permission.lock().unwrap();
-            pending.allow_session(thread_id, pattern);
-        }
-        AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = grants::append(&engine.grants_dir(), GrantFile::AgentCommands, &pattern)
-            {
-                crate::log!(
-                    "[CommandGuard] Failed to persist allow pattern {:?}: {}",
-                    pattern,
-                    e
-                );
-            }
-        }
+    if let Err(e) = tool_grants::record_card_allow(
+        &engine.event_bus,
+        &engine.grants_dir(),
+        GrantFile::AgentCommands,
+        entry.thread_id,
+        &entry.request_id,
+        pattern.clone(),
+        scope,
+        answered_by,
+    )
+    .await
+    {
+        crate::log_legacy!("[CommandGuard] Failed to record allow pattern {pattern:?}: {e}");
     }
 }
 
@@ -480,7 +537,7 @@ pub async fn resolve_pending_command_permissions_as_superseded(
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] unresolved-permission query failed for {}: {}",
                 thread_id,
                 e
@@ -541,7 +598,7 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!("[Recovery] orphan command permission query failed: {}", e);
+            crate::log_legacy!("[Recovery] orphan command permission query failed: {}", e);
             return;
         }
     };
@@ -550,7 +607,7 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
         return;
     }
 
-    crate::log!(
+    crate::log_legacy!(
         "[Recovery] Auto-resolving {} orphan command permission request(s) (chat turn gone after restart)",
         rows.len()
     );
@@ -561,7 +618,7 @@ pub async fn recover_orphan_command_permission_requests(pool: &sqlx::PgPool, eve
             thread_id,
             request_id,
             false,
-            Some("Chat turn ended before answering — request expired".to_string()),
+            Some(crate::engine::cc_permission::RESTART_CLOSED_REASON.to_string()),
             None,
             EventMeta::NONE,
             "[Recovery] CommandPermissionResolved (orphan)",
@@ -588,7 +645,7 @@ pub async fn resolve_command_permission(
     request_id: String,
     allowed: bool,
     persist_scope: Option<AllowScope>,
-    actor: Option<MessageOrigin>,
+    answered_by: AnsweredBy,
     log_context: &str,
 ) -> bool {
     let entry = {
@@ -606,12 +663,12 @@ pub async fn resolve_command_permission(
     } else {
         Some(DENIAL_REASON.to_string())
     };
-    // A scope on a denial grants nothing: the click said no.
-    let persist_scope = persist_scope.filter(|_| allowed);
+    // A scope on a denial grants nothing: the click said no. Nor does one the
+    // card never offered.
+    let persist_scope =
+        persist_scope.filter(|scope| allowed && entry.grant_offer.pattern(*scope).is_some());
     if let Some(scope) = persist_scope {
-        let command =
-            command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
-        record_command_allow_grant(engine, entry.thread_id, &entry.tool_name, command, scope);
+        record_command_allow_grant(engine, &entry, scope, answered_by.clone()).await;
     }
     emit_command_permission_resolved(
         &engine.event_bus,
@@ -620,7 +677,7 @@ pub async fn resolve_command_permission(
         allowed,
         reason,
         persist_scope,
-        EventMeta::with_actor(actor),
+        EventMeta::with_actor(answered_by.actor),
         log_context,
     )
     .await;
@@ -819,7 +876,7 @@ fn judged(
     outcome: Result<JudgeVerdict, Box<dyn std::error::Error + Send + Sync>>,
 ) -> JudgedClassification {
     let verdict = outcome.unwrap_or_else(|e| {
-        crate::log!("[CommandGuard] judge failed ({}); asking the user", e);
+        crate::log_legacy!("[CommandGuard] judge failed ({}); asking the user", e);
         JudgeVerdict::judge_failed(e.as_ref())
     });
     JudgedClassification {
@@ -901,6 +958,7 @@ impl LucidosEngine {
         tool_use_id: &str,
         meta: &EventMeta,
         cancel_token: &CancellationToken,
+        paths: &command_guard::SecretPaths,
     ) -> GuardDecision {
         // An MCP server setup, or a start of a launch line nobody approved,
         // spawns a process. It is classified, asked and granted as the shell
@@ -928,17 +986,22 @@ impl LucidosEngine {
         };
         // The catastrophic floor is unconditional, including preference-off calls.
         if matches!(
-            command_guard::static_classify(
+            command_guard::static_classify_with_paths(
                 tool_name,
                 input,
-                CommandSite::Workspace(self.workspace_path())
+                CommandSite::Workspace(self.workspace_path()),
+                &TrustedHeads::NONE,
+                paths,
             ),
             StaticVerdict::Settled(RiskLane::Catastrophic)
         ) {
             return GuardDecision::Refuse(command_guard::catastrophic_refusal(tool_name, input));
         }
         // A secret read is gated even with the guard off, since it ships off.
-        if !ctx.enabled && !tool_call_reads_secret(tool_name, input) {
+        if !ctx.enabled
+            && !command_guard::command_text(tool_name, input)
+                .is_some_and(|text| paths.tool(tool_name, text))
+        {
             return GuardDecision::Proceed;
         }
         // `None` → the turn was canceled while the judge was running.
@@ -947,7 +1010,7 @@ impl LucidosEngine {
             summary,
             category,
         }) = self
-            .resolve_command_lane(ctx, tool_name, input, thread_id, cancel_token)
+            .resolve_command_lane(ctx, tool_name, input, thread_id, cancel_token, paths)
             .await
         else {
             return GuardDecision::Refuse(canceled_refusal());
@@ -985,7 +1048,7 @@ impl LucidosEngine {
                 }
             }
             GuardAction::Refuse => {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] Refused catastrophic command from {}",
                     tool_name
                 );
@@ -1000,11 +1063,12 @@ impl LucidosEngine {
                     meta,
                     cancel_token,
                     gated_summary.as_deref(),
+                    paths,
                 )
                 .await
             }
             GuardAction::FailTrigger(cat) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] Trigger blocked — {} not in side-effect grant ({})",
                     cat.reason(),
                     tool_name
@@ -1031,7 +1095,7 @@ impl LucidosEngine {
             )
             .await
             {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] could not record the launch approval for MCP server '{}': {}",
                     launch.server_id,
                     e
@@ -1068,7 +1132,7 @@ impl LucidosEngine {
             crate::engine::git_ops::create_command_checkpoint(self.workspace_path(), &checkpoint_id)
                 .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandGuard] checkpoint failed ({}); running the command without an undo point",
                 e
             );
@@ -1113,18 +1177,18 @@ impl LucidosEngine {
             Err(e) => Err(e),
         };
         if let Err(e) = &effects {
-            crate::log!("[CommandGuard] checkpoint {} post image failed: {}", id, e);
+            crate::log_legacy!("[CommandGuard] checkpoint {} post image failed: {}", id, e);
         }
         match checkpoint_outcome(effects) {
             CheckpointOutcome::Discard(reason) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[CommandGuard] checkpoint {} dropped: {}",
                     id,
                     reason.explain()
                 );
                 crate::engine::git_ops::delete_command_checkpoint_pair(workspace, id).await;
             }
-            CheckpointOutcome::KeepRefsNoCard => crate::log!(
+            CheckpointOutcome::KeepRefsNoCard => crate::log_legacy!(
                 "[CommandGuard] checkpoint {} effects unavailable; refs kept, no card shown",
                 id
             ),
@@ -1228,6 +1292,7 @@ impl LucidosEngine {
     ///
     /// It therefore takes no channel: both channels classify the middle the
     /// same way. Add one back when a routing rule needs it.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_command_lane(
         &self,
         ctx: &mut CommandGuardCtx<'_>,
@@ -1235,9 +1300,16 @@ impl LucidosEngine {
         input: &Value,
         thread_id: Uuid,
         cancel_token: &CancellationToken,
+        paths: &command_guard::SecretPaths,
     ) -> Option<JudgedClassification> {
         let site = CommandSite::Workspace(self.workspace_path());
-        match command_guard::static_classify(tool_name, input, site) {
+        match command_guard::static_classify_with_paths(
+            tool_name,
+            input,
+            site,
+            &TrustedHeads::NONE,
+            paths,
+        ) {
             // Settled lanes are only ever `Safe` / `Catastrophic` — neither
             // carries a side-effect category.
             StaticVerdict::Settled(lane) => Some(JudgedClassification {
@@ -1304,35 +1376,33 @@ impl LucidosEngine {
         meta: &EventMeta,
         cancel_token: &CancellationToken,
         summary_override: Option<&str>,
+        paths: &command_guard::SecretPaths,
     ) -> GuardDecision {
         let command = command_guard::command_text(tool_name, input)
             .unwrap_or_default()
             .to_string();
 
-        // Auto-allow: prior "Allow for this thread" (session) and persisted
-        // "Always allow" (allowlist file) grants are unioned, and EVERY segment
-        // head of the command must be covered (see [`command_is_allowed`]) —
-        // a dangerous trailing segment must not ride into a grant that only
-        // names the harmless leading one.
-        let session_patterns: std::collections::HashSet<String> = {
-            let pending = self.pending_command_permission.lock().unwrap();
-            pending
-                .session_allows
-                .get(&thread_id)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let persisted = grants::patterns(&self.grants_dir(), GrantFile::AgentCommands);
+        // Auto-allow: the thread's own grants and the standing ones are
+        // unioned, and EVERY segment head of the command must be covered (see
+        // [`command_is_allowed`]). A dangerous trailing segment must not ride
+        // into a grant that only names the harmless leading one.
+        let granted = tool_grants::granted_lines(
+            &self.event_bus,
+            &self.grants_dir(),
+            GrantFile::AgentCommands,
+            Some(thread_id),
+        )
+        .await;
         let site = CommandSite::Workspace(self.workspace_path());
-        if command_is_allowed(tool_name, &command, site, |p| {
-            session_patterns.contains(p) || persisted.iter().any(|x| x == p)
-        }) {
+        if command_is_allowed_with_paths(tool_name, &command, site, paths, |p| granted.contains(p))
+        {
             return GuardDecision::Proceed;
         }
 
         // Register (deduping identical concurrent requests) and emit the card.
         let canonical_input = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string());
         let dedup_key: DedupKey = (thread_id, tool_name.to_string(), canonical_input);
+        let offer = command_card_offer_with_paths(tool_name, &command, site, paths);
         let (request_id, mut rx, is_canonical) = {
             let mut pending = self.pending_command_permission.lock().unwrap();
             pending.register_or_attach(
@@ -1340,7 +1410,7 @@ impl LucidosEngine {
                 thread_id,
                 tool_name.to_string(),
                 input.clone(),
-                crate::engine::claude_code::GrantOffer::default(),
+                offer.clone(),
             )
         };
 
@@ -1364,6 +1434,7 @@ impl LucidosEngine {
                             command: command_for_event,
                             summary,
                             grant_head: grant_head(tool_name, &command, site),
+                            grant_offer: Some(offer),
                         },
                         meta: meta.clone(),
                     },
@@ -1409,6 +1480,59 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn executing_policy_stamps_workspace_log_grants_and_preserves_the_floor() {
+        use crate::runtime::agent_sandbox::{policy_from, PolicyInputs, SandboxMode};
+        let policy = policy_from(&PolicyInputs {
+            lucidos_home: None,
+            data_dirs: vec!["/srv/gateway".into()],
+            workspaces: vec![],
+        });
+        for mode in [
+            SandboxMode::Enforced,
+            SandboxMode::Inherited,
+            SandboxMode::OwnerOptedOut,
+            SandboxMode::PermittedOutside,
+        ] {
+            let paths = command_guard::SecretPaths::for_policy(&policy, Some(mode));
+            for tool in [
+                tn::RUN_BASH,
+                tn::RUN_BASH_BACKGROUND,
+                tn::RUN_PYTHON,
+                tn::RUN_PYTHON_BACKGROUND,
+            ] {
+                let bash = matches!(tool, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
+                for (path, open) in [
+                    ("/srv/gateway/workspaces/demo/log", true),
+                    ("/srv/gateway//workspaces/./demo/log", true),
+                    ("/srv/gateway/workspaces/demo/../../config/key", false),
+                    ("/srv/gateway/config/key", false),
+                    (".lucidos/private/local-token", false),
+                ] {
+                    let text = if bash {
+                        format!("grep warning {path}")
+                    } else {
+                        format!("print(open('{path}').read())")
+                    };
+                    let expected = open && mode == SandboxMode::Enforced;
+                    let offer = command_card_offer_with_paths(tool, &text, TEXT_ONLY, &paths);
+                    assert_eq!(
+                        offer.session.is_some(),
+                        expected,
+                        "{mode:?}: {tool}: {text}"
+                    );
+                    assert_eq!(
+                        command_is_allowed_with_paths(tool, &text, TEXT_ONLY, &paths, |_| true),
+                        expected
+                    );
+                    if expected && bash {
+                        assert_eq!(offer.narrow.as_deref(), Some("Bash(grep:*)"));
+                    }
+                }
+            }
+        }
+    }
 
     const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
 
@@ -1591,10 +1715,63 @@ mod tests {
             event,
             ThreadEvent::CommandPermissionRequested {
                 grant_head: None,
+                grant_offer: None,
                 ..
             }
         ));
         assert_eq!(serde_json::to_value(&event).unwrap(), old);
+    }
+
+    /// Each button a command card draws stores a line covering that same
+    /// command. So an Always allow is never followed by the same card (I7).
+    #[test]
+    fn a_command_card_offers_only_grants_that_cover_its_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        let offer = |tool: &str, command: &str| command_card_offer(tool, command, site);
+
+        let git = offer(tn::RUN_BASH, "git status");
+        assert_eq!(git.broad.as_deref(), Some("Bash"));
+        assert_eq!(git.narrow.as_deref(), Some("Bash(git:*)"));
+        assert_eq!(git.session.as_deref(), Some("Bash(git:*)"));
+
+        let chained = offer(tn::RUN_BASH, "git status && make deploy");
+        assert_eq!(chained.broad.as_deref(), Some("Bash"));
+        assert_eq!(chained.narrow, None, "Bash(git:*) does not cover `make`");
+        assert_eq!(chained.session, None);
+
+        let python = offer(tn::RUN_PYTHON, "print(1)");
+        assert_eq!(python.broad.as_deref(), Some("Python"));
+        assert_eq!(python.narrow, None, "Python has one line, the broad one");
+
+        for scope in [AllowScope::Broad, AllowScope::Narrow, AllowScope::Session] {
+            for (tool, command) in [(tn::RUN_BASH, "git status"), (tn::RUN_PYTHON, "print(1)")] {
+                if let Some(line) = offer(tool, command).pattern(scope) {
+                    assert!(command_is_allowed(tool, command, site, |p| p == line));
+                }
+            }
+        }
+    }
+
+    /// No grant covers a secret read, so its card offers Allow once and Deny
+    /// only, and names why.
+    #[test]
+    fn a_secret_read_card_offers_no_grant_and_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let site = CommandSite::Workspace(dir.path());
+        for (tool, command) in [
+            (tn::RUN_BASH, "cat ~/.lucidos/secret-keys/db"),
+            (
+                tn::RUN_PYTHON,
+                "open('/home/u/.lucidos/pg-shared-password')",
+            ),
+        ] {
+            assert_eq!(
+                command_card_offer(tool, command, site),
+                GrantOffer::withheld(OfferWithheld::SecretRead),
+                "{tool}: {command}"
+            );
+        }
     }
 
     /// Nothing runs after the `cd`, so the grant reads the command as written.

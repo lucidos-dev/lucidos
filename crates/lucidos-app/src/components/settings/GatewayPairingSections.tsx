@@ -20,6 +20,7 @@ import {
   removeRemoteGateway,
   updateRemoteGatewayHeaders,
   rotateRemoteGateway,
+  setPairedGatewayMayManage,
   unpairGateway,
   type PairedGateway,
   type RemoteGateway,
@@ -37,6 +38,7 @@ import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
 import { CopyButton, PairCard, expiryLabel, type PairTarget } from './PairDeviceSection';
 import { timeAgo } from './pairedDevices';
 import {
+  AWAITING_OWNER_NOTE,
   EMPTY_REMOTE_GATEWAY_DRAFT,
   HTTPS_ONLY_NOTE,
   TRUST_NOTE,
@@ -178,6 +180,27 @@ export function PairGatewaySection({
     }
   };
 
+  /** Turn the manage grant on or off (ADR 0656). Turning it on says first
+   *  what it hands over. */
+  const setManage = async (gateway: PairedGateway, mayManage: boolean) => {
+    if (mayManage) {
+      const ok = await showConfirm(
+        `Every device paired with ${gateway.label} can then list, revoke and reassign this gateway's `
+          + 'devices, and add, rename and remove its users.\n\n'
+          + 'Pairing codes, gateway pairings and the rest of Settings stay on this gateway.',
+        'Allow',
+        { title: `Let ${gateway.label} manage users and devices?`, variant: 'default' },
+      );
+      if (!ok) return;
+    }
+    try {
+      await setPairedGatewayMayManage(gateway.id, mayManage);
+    } catch (e) {
+      showToast(`Couldn't change what ${gateway.label} may manage: ${errorDetail(e)}`, 'error');
+    }
+    await reload();
+  };
+
   function codeBody() {
     if (minted.status === 'failed') {
       return (
@@ -274,11 +297,32 @@ export function PairGatewaySection({
               <GatewayRow
                 key={gateway.id}
                 title={gateway.label}
-                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · can open this gateway's workspaces`}
+                detail={`Paired ${timeAgo(gateway.paired_at, Date.now())} · ${gateway.last_used_at ? `last used ${timeAgo(gateway.last_used_at, Date.now())}` : 'not used yet'} · ${gateway.may_manage ? "can open this gateway's workspaces and manage its users and devices" : "can open this gateway's workspaces"}`}
                 action={
-                  <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
-                    Unpair
-                  </button>
+                  <>
+                    <label
+                      class="toggle-switch"
+                      data-tooltip={`Let devices on ${gateway.label} manage users and devices`}
+                    >
+                      <input
+                        type="checkbox"
+                        aria-label={`Let devices on ${gateway.label} manage users and devices`}
+                        checked={gateway.may_manage}
+                        onChange={(e) => {
+                          // The switch shows the stored grant, so it moves only
+                          // once the change lands and the list re-reads.
+                          const input = e.currentTarget as HTMLInputElement;
+                          const wanted = input.checked;
+                          input.checked = gateway.may_manage;
+                          void setManage(gateway, wanted);
+                        }}
+                      />
+                      <span class="toggle-slider" />
+                    </label>
+                    <button class="action-btn action-btn-danger" onClick={() => void unpair(gateway)}>
+                      Unpair
+                    </button>
+                  </>
                 }
               />
             )}
@@ -347,6 +391,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
   );
   const [draft, setDraft] = useState<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
   const [pairing, setPairing] = useState(false);
+  const [awaitingOwner, setAwaitingOwner] = useState(false);
   const blocker = remoteGatewayBlocker(draft);
   const edit = (patch: Partial<RemoteGatewayDraft>) => setDraft((d) => ({ ...d, ...patch }));
 
@@ -354,7 +399,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
     if (blocker !== null || pairing) return;
     setPairing(true);
     try {
-      const added = await submitRemoteGateway(draft);
+      const added = await submitRemoteGateway(draft, () => setAwaitingOwner(true));
       setDraft(EMPTY_REMOTE_GATEWAY_DRAFT);
       showToast(`Paired with ${added.name}`, 'success');
       await reload();
@@ -362,6 +407,7 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
       showToast(`Couldn't pair with that gateway: ${errorDetail(e)}`, 'error');
     } finally {
       setPairing(false);
+      setAwaitingOwner(false);
     }
   };
 
@@ -452,22 +498,25 @@ export function RemoteGatewaysSection({ available }: { available: boolean }) {
             />
           </div>
           <div class="settings-row-note" data-role="remote-gateway-trust">{TRUST_NOTE}</div>
-          {field('Address', 'address', 'https://lucidos.example.com')}
-          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
+          {field('Short name', 'name', 'cloud')}
           {field('Gateway pairing secret', 'code', 'lgp_…')}
+          <RemoteHeadersEditor rows={draft.headers ?? []} onChange={headers => edit({ headers })} disabled={pairing} />
           {field(
-            'Short name',
-            'name',
-            'cloud',
+            'Address',
+            'address',
+            'https://lucidos.example.com',
             <button
               class="action-btn action-btn-confirm"
               disabled={blocker !== null || pairing}
               onClick={() => void pair()}
             >
-              {pairing ? 'Pairing…' : 'Pair'}
+              {awaitingOwner ? 'Waiting…' : pairing ? 'Pairing…' : 'Pair'}
             </button>,
           )}
           {blocker?.kind === 'plain-http' && <div class="settings-row-note">{HTTPS_ONLY_NOTE}</div>}
+          <Disclosure open={awaitingOwner}>
+            <div class="settings-row-note" role="status">{AWAITING_OWNER_NOTE}</div>
+          </Disclosure>
         </>
       ) : (
         <div class="settings-section-desc">

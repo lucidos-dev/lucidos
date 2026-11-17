@@ -35,6 +35,8 @@
 
 import { postClientLog } from './liveness';
 import { isWebKit } from './platform';
+import { restoreAdmissionPhase } from './restoreAdmission';
+import { requestsInFlight } from '../api/client/requestsInFlight';
 
 export type ThreadRenderClass =
   | 'genuinely-empty'
@@ -129,5 +131,22 @@ export function reportThreadRenderProbe(probe: ThreadRenderProbe): void {
     animating: probe.animating,
     content_child_count: probe.contentChildCount,
     content_scroll_height: probe.contentScrollHeight,
+  });
+}
+
+/** The probe for a focused thread the store does not hold yet, such as a cold
+ *  notification open still on its skeleton. Restore admission and the shell's
+ *  requests are the two owners that can hold it, so it names both. Counts and
+ *  ages only, never request paths. A temporary measure: see
+ *  docs/temporary-measures.md § The render probe's absent-target report. */
+export function reportAbsentThreadRender(threadId: string): void {
+  if (!isWebKit()) return;
+  const requests = requestsInFlight();
+  postClientLog('render', 'thread_render_probe', {
+    class: 'target-absent',
+    thread_id: threadId,
+    admission_phase: restoreAdmissionPhase(),
+    requests_in_flight: requests.count,
+    oldest_request_ms: requests.oldestMs,
   });
 }

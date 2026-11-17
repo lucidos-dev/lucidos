@@ -14,7 +14,7 @@ type ProbeResult = 'answered' | 'silent' | 'no-evidence';
 
 export interface SwLivenessProbe {
   check: () => Promise<void>;
-  notePong: () => void;
+  notePong: (instance?: unknown) => void;
   stop: () => void;
 }
 
@@ -23,8 +23,10 @@ export function createSwLivenessProbe(deps: {
   ping: () => boolean;
   recover: () => Promise<void>;
   onRecovered: () => void;
+  onState?: (state: number) => void;
 }): SwLivenessProbe {
   let lastPongAt = 0;
+  let workerInstance: number | undefined;
   let lastRecoveryAt = 0;
   let probeInFlight = false;
   let stopped = false;
@@ -34,6 +36,7 @@ export function createSwLivenessProbe(deps: {
     const sentAt = Date.now();
     const away = watchPageAway();
     if (!deps.ping()) return 'no-evidence';
+    deps.onState?.(0);
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     await new Promise<void>((resolve) => {
       pongResolver = () => { if (timeoutHandle !== null) clearTimeout(timeoutHandle); resolve(); };
@@ -70,7 +73,10 @@ export function createSwLivenessProbe(deps: {
 
   return {
     check,
-    notePong() {
+    notePong(instance) {
+      const valid = typeof instance === 'number' && Number.isFinite(instance) && instance >= 0;
+      deps.onState?.(valid && workerInstance !== undefined && workerInstance !== instance ? 2 : 1);
+      if (valid) workerInstance = instance;
       lastPongAt = Date.now();
       pongResolver?.();
     },

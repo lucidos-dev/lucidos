@@ -115,10 +115,26 @@ impl OpenAiImageProvider {
         resp: reqwest::Response,
         call: &str,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
+        let error_headers = resp.headers().clone();
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("OpenAI image {call} failed ({status}): {text}").into());
+            if let Some(cap) = crate::llm::metered::http_spend_cap(
+                crate::llm::ProviderKind::OpenAi,
+                status.as_u16(),
+                &error_headers,
+                &text,
+            )
+            .await
+            {
+                return Err(cap.into());
+            }
+            return Err(crate::llm::ProviderError::from_http(
+                "OpenAI image",
+                status.as_u16(),
+                &text,
+            )
+            .into());
         }
 
         let response: OpenAiImageResponse = resp.json().await?;
@@ -180,6 +196,7 @@ impl ImageProvider for OpenAiImageProvider {
         size: ImageSize,
         _call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::OpenAi).await?;
         let size_str = Self::openai_size(size);
 
         let (call, resp) = if input_images.is_empty() {
@@ -292,6 +309,7 @@ impl ImageProvider for VertexImagenProvider {
         size: ImageSize,
         _call: crate::llm::metered::CallToken,
     ) -> Result<ImageResult, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::Vertex).await?;
         let token = self.get_access_token().await?;
         let aspect_ratio = Self::imagen_aspect_ratio(size);
         let location = self.current_location();
@@ -348,10 +366,23 @@ impl ImageProvider for VertexImagenProvider {
             .send()
             .await?;
 
+        let error_headers = resp.headers().clone();
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
-            return Err(format!("Imagen generation failed ({}): {}", status, text).into());
+            if let Some(cap) = crate::llm::metered::http_spend_cap(
+                crate::llm::ProviderKind::Vertex,
+                status.as_u16(),
+                &error_headers,
+                &text,
+            )
+            .await
+            {
+                return Err(cap.into());
+            }
+            return Err(
+                crate::llm::ProviderError::from_http("Imagen", status.as_u16(), &text).into(),
+            );
         }
 
         let response: serde_json::Value = resp.json().await?;
@@ -403,7 +434,7 @@ pub async fn build_image_provider(
         ) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
-                crate::log!("[Image] Failed to build Vertex Imagen HTTP client: {}", e);
+                crate::log_legacy!("[Image] Failed to build Vertex Imagen HTTP client: {}", e);
                 None
             }
         }
@@ -412,7 +443,7 @@ pub async fn build_image_provider(
         match OpenAiImageProvider::new(key.to_string(), model.to_string()) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Image] Failed to build OpenAI {} HTTP client: {}",
                     model,
                     e
@@ -427,7 +458,7 @@ pub async fn build_image_provider(
         // the OpenAI ids it offers.
         openai if openai.starts_with("gpt-image-") => match openai_api_key {
             Some(key) => {
-                crate::log!("[Image] Using OpenAI {}", model);
+                crate::log_legacy!("[Image] Using OpenAI {}", model);
                 build_openai(key, model)
             }
             None => {
@@ -435,7 +466,7 @@ pub async fn build_image_provider(
                 // `resolve_openai_api_key` (stored credential › OPENAI_API_KEY
                 // › Codex CLI), so naming only the env var sends the user to
                 // fix the wrong thing when they configured it in Settings.
-                crate::log!(
+                crate::log_legacy!(
                     concat!(
                         "[Image] {} selected but no OpenAI key is configured (",
                         providers_settings!(),
@@ -452,24 +483,24 @@ pub async fn build_image_provider(
                 // `vertex_project_id` comes from `VERTEX_PROJECT_ID` › the ADC
                 // file › gcloud config, so pointing only at the env var
                 // misdirects a user who authenticated with ADC.
-                crate::log!(
+                crate::log_legacy!(
                     "[Image] imagen-4 selected but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)"
                 );
                 return None;
             }
-            crate::log!("[Image] Using Vertex AI Imagen 4");
+            crate::log_legacy!("[Image] Using Vertex AI Imagen 4");
             build_imagen()
         }
         _ => {
             if !vertex_project_id.is_empty() {
-                crate::log!("[Image] Auto-selected Vertex AI Imagen 4");
+                crate::log_legacy!("[Image] Auto-selected Vertex AI Imagen 4");
                 build_imagen()
             } else if let Some(key) = openai_api_key {
                 let openai = crate::core::preference_catalog::OPENAI_IMAGE_MODEL;
-                crate::log!("[Image] Auto-selected OpenAI {}", openai);
+                crate::log_legacy!("[Image] Auto-selected OpenAI {}", openai);
                 build_openai(key, openai)
             } else {
-                crate::log!(
+                crate::log_legacy!(
                     "[Image] No image provider available (no Vertex or OpenAI credentials)"
                 );
                 None
@@ -480,6 +511,27 @@ pub async fn build_image_provider(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn image_billing_refusals_name_openai() {
+        let app = axum::Router::new()
+            .fallback(|| async { (axum::http::StatusCode::PAYMENT_REQUIRED, "Payment required") });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = reqwest::get(format!("http://{address}")).await.unwrap();
+        let provider = super::OpenAiImageProvider::new("key".into(), "image-model".into()).unwrap();
+        let error = provider
+            .read_image_response(response, "generation")
+            .await
+            .err()
+            .unwrap();
+        let cap = error
+            .downcast_ref::<crate::llm::spend_cap::SpendCapReached>()
+            .unwrap();
+        assert_eq!(cap.provider, crate::llm::ProviderKind::OpenAi);
+        server.abort();
+    }
+
     use super::*;
 
     #[test]

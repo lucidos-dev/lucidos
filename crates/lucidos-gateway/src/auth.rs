@@ -117,6 +117,18 @@ pub enum Authorization {
 #[derive(Debug, Clone, Copy)]
 pub struct AuthenticatedLocalProcess;
 
+/// The thread-bound credential an engine mints for each agent it spawns. Only
+/// that engine's MAC key can verify it, so the gateway forwards it unread.
+pub const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
+
+/// Stamped by [`crate::auth_api::enforce`] onto an agent's snapshot restore
+/// call from this machine that carries no local token.
+///
+/// It proves only the loopback peer. A sandboxed agent cannot read the local
+/// token, so the source engine's verdict on the origin token is the proof.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentRestoreCaller;
+
 /// The device [`crate::auth_api::enforce`] resolved, stamped onto the request
 /// for the proxy to forward.
 ///
@@ -133,16 +145,34 @@ pub struct AuthenticatedDevice {
 }
 
 impl AuthenticatedDevice {
-    /// The headers that tell the engine who this is. The label is
+    /// The headers that tell the engine who this is, and the gateway stamp that
+    /// proves it to the engine holding `stamp_key`. The label is
     /// percent-encoded, because it is user text and a header value is bytes.
-    pub fn forwarded_headers(&self) -> [(&'static str, String); 2] {
-        [
+    ///
+    /// With no key (an engine adopted keyless) the stamp is left off, and the
+    /// engine reads the device as an unattested caller.
+    pub fn forwarded_headers(
+        &self,
+        workspace_id: &str,
+        stamp_key: Option<&lucidos_gateway_stamp::StampKey>,
+    ) -> Vec<(&'static str, String)> {
+        let mut headers = vec![
             (crate::stack::HEADER_DEVICE_ID, self.id.clone()),
             (
                 crate::stack::HEADER_DEVICE_LABEL,
                 urlencoding::encode(&self.label).into_owned(),
             ),
-        ]
+        ];
+        if let Some(key) = stamp_key {
+            headers.push((
+                lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+                key.sign_now(lucidos_gateway_stamp::Claim::Device {
+                    workspace_id,
+                    device_id: &self.id,
+                }),
+            ));
+        }
+        headers
     }
 }
 
@@ -258,10 +288,10 @@ impl PairedDevices {
 /// loaded it once, then rewrote it whole from private memory, so every write
 /// deleted the other's devices. A device now pairs to a gateway.
 pub fn paired_devices_path(app_data: &Path) -> PathBuf {
-    app_data.join("paired-devices.json")
+    app_data.join(lucidos_home::private::PAIRED_DEVICES)
 }
 
-/// The pre-isolation store at `~/.lucidos/paired-devices.json`, now a seed.
+/// The pre-isolation store, now a seed in the private subtree.
 ///
 /// Moving the path alone would refuse every device paired before the upgrade.
 /// That is the failure `docs/plans/2026-08-19-nobody-is-stranded-by-the-pairing-update.md`
@@ -271,7 +301,7 @@ pub fn paired_devices_path(app_data: &Path) -> PathBuf {
 ///
 /// `None` only when `HOME` is unset.
 pub fn legacy_paired_devices_path() -> Option<PathBuf> {
-    Some(lucidos_home::path()?.join("paired-devices.json"))
+    lucidos_home::private_entry(lucidos_home::private::PAIRED_DEVICES)
 }
 
 /// Lowercase-hex SHA-256 of `value`.
@@ -351,7 +381,7 @@ impl LogThrottle {
 
 /// A fresh device credential: 32 bytes of entropy, lowercase hex.
 pub fn mint_credential() -> std::io::Result<String> {
-    local_token::mint_hex(32)
+    local_token::mint_hex(32).map(crate::diagnostic_log::secret)
 }
 
 /// Render the `Set-Cookie` value that hands a device its credential.
@@ -402,7 +432,7 @@ pub fn request_is_secure(headers: &HeaderMap, connection_is_tls: bool) -> bool {
 /// Read the local token, minting it on first use. A gateway-less engine mints
 /// too, and `lucidos_local_token::ensure` settles which value lands.
 pub fn ensure_local_token() -> std::io::Result<String> {
-    local_token::ensure()
+    local_token::ensure().map(crate::diagnostic_log::secret)
 }
 
 /// Read the hook socket token, minting it on first use.
@@ -413,6 +443,7 @@ pub fn ensure_local_token() -> std::io::Result<String> {
 /// workspace restart.
 pub fn ensure_hook_socket_token() -> std::io::Result<String> {
     local_token::ensure_named(local_token::HOOK_SOCKET_TOKEN_FILE)
+        .map(crate::diagnostic_log::secret)
 }
 
 /// A fresh device id. Not a secret: it names a row in the paired-device store
@@ -569,7 +600,7 @@ fn is_device_cookie_name(name: &str) -> bool {
 /// [`presented_credential_summary`] said zero and `log_device_refusal` stayed
 /// silent. Reproduced against a running gateway: the same two cookies read as 2
 /// over HTTP/1.1 and 1 over HTTP/2.
-fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
+pub(crate) fn cookie_pairs(headers: &HeaderMap) -> impl Iterator<Item = (&str, &str)> {
     headers
         .get_all(axum::http::header::COOKIE)
         .into_iter()

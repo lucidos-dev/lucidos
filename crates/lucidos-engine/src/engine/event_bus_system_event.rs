@@ -18,10 +18,52 @@ use crate::scheduler::notifications::Tap;
 /// sign-in, and its tokens have no shareable name.
 const CHATGPT_PLAN_AGGREGATE_ID: &str = "chatgpt-plan";
 
+/// Who wrote an artifact, resolved before the event is persisted. Workspace
+/// leafhood reads this value rather than mutable thread attendance.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ArtifactWriter {
+    Person,
+    Thread,
+    App { app_id: String },
+    Engine,
+    Trigger { trigger_id: String },
+}
+
+impl ArtifactWriter {
+    pub fn is_workspace_leaf(&self) -> bool {
+        !matches!(self, Self::Trigger { .. })
+    }
+}
+
 /// System events — broadcast to SSE, selectively persisted.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum SystemEvent {
+    /// An internal Lucidos defect, counted once per kind until the next sent
+    /// diagnostic bundle. Contains no message, user text or external failures.
+    InternalFaultRecorded {
+        kind: crate::internal_faults::FaultKind,
+    },
+    /// The owner-approved diagnostic bundle was delivered. This is the durable
+    /// boundary for the internal-fault count; failed sends never reset it.
+    DiagnosticBundleSent {
+        destination: String,
+        report_code: Option<String>,
+        size_bytes: u64,
+        sources: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// One validated bundle arrived in the private Postgres inbox. Persisted
+    /// atomically by EventBus::receive_diagnostic_bundle. Aggregate is
+    /// diagnostic_bundle; aggregate_id is bundle_id. Ingress has no local actor.
+    DiagnosticBundleReceived {
+        bundle_id: Uuid,
+        origin: String,
+        digest: String,
+        size_bytes: u64,
+    },
     NotificationCreated {
         id: String,
         title: String,
@@ -53,11 +95,11 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
         /// The devices this notification is for, when its producer names
-        /// them: a root thread's role change tells one person (ADR 0623).
+        /// them: a root thread's role change tells one user (ADR 0623).
         /// `None` lets the projection work it out from the thread it opens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
-        /// The OS pushes this notification shares a tag with: the people-only
+        /// The OS pushes this notification shares a tag with: the user-only
         /// messages of one thread (ADR 0649). `None` is an ordinary one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         push_group: Option<crate::scheduler::notifications::PushGroup>,
@@ -314,6 +356,19 @@ pub enum SystemEvent {
     ///
     /// Default selection reads these rows to pass over the model. A retired
     /// default moves on by itself, and a stored pick fails visibly (ADR 0403).
+    /// The first billing refusal started one provider's background-call hold.
+    ModelSpendCapReached {
+        provider: String,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+        held_until: chrono::DateTime<chrono::Utc>,
+    },
+    /// A provider hold ended by reset, successful call, or the owner's clear.
+    ModelSpendCapHoldEnded {
+        provider: String,
+        cause: crate::llm::spend_cap::SpendCapHoldEndCause,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     ModelNotServedObserved {
         model: String,
         /// The provider that answered, spelled as `ProviderKind::as_str`.
@@ -357,6 +412,14 @@ pub enum SystemEvent {
         completed: usize,
         total: usize,
     },
+    /// Extraction gave up on one source after retries or its deadline.
+    /// Emitted once per failed indexing operation, before fallback or artifact skipping.
+    MemoryExtractionFailed {
+        source: crate::memory::MemorySource,
+        model: String,
+        /// One of call_failed, unreadable_reply or timed_out.
+        reason: String,
+    },
     /// The user corrected a long-term memory. The only durable record of the
     /// correction: every memory rebuild replays these, so a wrong fact the
     /// extractor finds again in its source events is removed again.
@@ -386,6 +449,8 @@ pub enum SystemEvent {
         /// reads the write later, such as a memory summary, bills that thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<ArtifactWriter>,
     },
     TriggerCreated {
         trigger_id: String,
@@ -695,6 +760,8 @@ pub enum SystemEvent {
         /// reads the write later, such as a memory summary, bills that thread.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<ArtifactWriter>,
     },
     ArtifactUpdated {
         artifact_path: String,
@@ -704,6 +771,8 @@ pub enum SystemEvent {
         /// See `ArtifactCreated`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         writer_thread_id: Option<uuid::Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        writer: Option<ArtifactWriter>,
     },
     ArtifactDeleted {
         artifact_path: String,
@@ -837,16 +906,20 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_id: Option<Uuid>,
         sent_at_ms: i64,
-        /// The reader's devices on a team gateway (ADR 0623): one person's
-        /// read dismisses that person's banners only. Absent means everyone.
+        /// The reader's devices on a team gateway (ADR 0623): one user's
+        /// read dismisses that user's banners only. Absent means everyone.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         audience: Option<Vec<String>>,
     },
-    /// The gateway changed its operators: a person, an email or a device moved
-    /// (ADR 0623). Transient. Every page reloads its own person's devices,
-    /// which decide its Review group on a team gateway. Aggregate `operator`,
+    /// The gateway changed its users: a user, an email or a device moved
+    /// (ADR 0623). Transient. Every page reloads its own user's devices,
+    /// which decide its Review group on a team gateway. Aggregate `user`,
     /// id `all`.
-    OperatorsChanged,
+    UsersChanged,
+    /// A pairing started or stopped waiting for a paired device's Allow. Transient.
+    /// The gateway posts `/api/v1/pairing-requests/changed`, and Settings, Access
+    /// re-reads its list. Aggregate `pairing`, id `all`.
+    PairingRequestsChanged,
     /// A plugin was installed (or updated — overwrite=true reuses this variant).
     /// `manifest` carries the full parsed manifest so future fields are additive.
     /// `files` are paths under `data/` so a future tracked-uninstall can derive
@@ -1370,25 +1443,29 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
-    /// One of the three permission allowlists was rewritten wholesale, through
-    /// its Settings editor.
+    /// One lane's standing tool grants changed: the *permission grants* the
+    /// `permissions` table holds for the workspace, one row per grant file line.
     ///
     /// `patterns` is the resulting set in full, never a delta, on the model of
-    /// `McpServerDisabledToolsChanged`. The point of the event is auditing a
-    /// WIDENED grant after the fact, so the row has to say what the permission
-    /// became. "It changed" answers nothing a month later.
+    /// `McpServerDisabledToolsChanged`. The projection ends every live row the
+    /// set dropped and adds a row for every line it gained, so a replay
+    /// converges. The engine then rewrites the lane's grant file to match.
     ///
-    /// One variant with a typed `grant_file`, not three near-identical ones.
-    /// `GrantFile` is already this codebase's single identity for the three
-    /// lanes. Three variants would be one event written three times, drifting
-    /// apart the way the three handlers just did. A subscriber that wants one
-    /// lane scopes it with a `condition` on `grant_file`.
+    /// `source` says what changed it: a card's Always allow, a Settings edit,
+    /// the one-time import of the file, a reviewed hand edit or a revoke. A row
+    /// it adds records `source` and `granted_in_thread_id`. A unique index lets
+    /// each grant file be imported once.
     ///
-    /// Comments and blank lines are dropped: this records the grants, not the
-    /// file's formatting.
+    /// One variant with a typed `grant_file`, not three near-identical ones. A
+    /// subscriber that wants one lane scopes it with a `condition` on
+    /// `grant_file`.
     PermissionGrantsChanged {
         grant_file: crate::core::GrantFile,
         patterns: Vec<String>,
+        #[serde(default)]
+        source: crate::core::grants::GrantSource,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        granted_in_thread_id: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1545,6 +1622,8 @@ pub enum SystemEvent {
     /// `ComposeReport::broadcast`.
     ThreadComposeChanged {
         id: Uuid,
+        #[serde(default)]
+        restorations: Vec<crate::core::store::ComposeRestoration>,
         text: String,
         /// Content-addressed sha256 hashes of compose-draft image blobs.
         /// Cross-device sync transmits ~80 bytes per attached image instead
@@ -1561,7 +1640,7 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<serde_json::Value>,
         /// The thread's *compose epoch* after this change (`docs/glossary.md`):
-        /// how many times a submission has consumed the thread's compose slot.
+        /// advanced by each submission or Stop restoration.
         /// Carried on every broadcast so a device always holds a value its next
         /// compose PUT can be fenced against, including the device whose own
         /// write is in flight. `#[serde(default)]` reads a pre-epoch payload as
@@ -1676,6 +1755,19 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// The lane batch's catch-up changed its hardened head, so it hardens
+    /// again. Until it lands or fails, or the cap passes, the lane queues
+    /// clean arrivals instead of landing them, so `main` holds still.
+    LaneArrivalsHeld {
+        batch_id: Uuid,
+    },
+    /// The hold on clean arrivals ended. `arrivals` are the changes it held,
+    /// in arrival order, which now land as they would have.
+    LaneArrivalsReleased {
+        batch_id: Uuid,
+        cause: crate::engine::landing_lane::LaneHoldRelease,
+        arrivals: Vec<Uuid>,
+    },
     /// An Apply outside the landing lane moved `main`, but pushing it to
     /// `origin` failed. `main` stays moved locally. `repo` names the
     /// repository's root directory, and `reason` is git's answer (ADR 0589).
@@ -1689,6 +1781,14 @@ pub enum SystemEvent {
     MainFollowRefused {
         repo: String,
         reason: String,
+    },
+    /// Local `main` fast-forwarded from `from_sha` to a newer `origin/main` at
+    /// `to_sha`, because another gateway landed. The main check reads it as a
+    /// landing. `repo` names the repository's root directory (ADR 0694).
+    MainFollowed {
+        repo: String,
+        from_sha: String,
+        to_sha: String,
     },
     /// The *main check* started on GitHub against a stripped copy of
     /// `to_sha`, covering what landed since `from_sha` (ADR 0464).
@@ -1707,10 +1807,12 @@ pub enum SystemEvent {
     },
     /// The main check passed: `main` at its `to_sha` is green. `flaky` names
     /// the tests that failed once and passed a retry. `flaky_fix_thread_id`
-    /// names the *flaky fix thread* this pass opened, absent when one was
-    /// already open or nothing was flaky.
+    /// names the repair its flaky findings went to. `fix_thread_id` names the
+    /// repair this pass reports to: that one, or the red it closes.
     MainCheckPassed {
         check_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix_thread_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1718,8 +1820,8 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         flaky_fix_thread_id: Option<Uuid>,
     },
-    /// The main check failed. Main is red, and `fix_thread_id` names the one
-    /// fix thread it opens. `failures` names each failed test with the head
+    /// The main check failed. Unless superseded by a fix landing, main is red;
+    /// `fix_thread_id` names its repair owner. `failures` names each test with the head
     /// of its error. `tail` is the end of the failing output.
     MainCheckFailed {
         check_id: Uuid,
@@ -1731,6 +1833,17 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
         fix_thread_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        superseded_by_fix: Option<Uuid>,
+    },
+    /// A main repair was admitted. Persisted main_check aggregate, keyed by
+    /// check_id; actor is present only for the owner's Fix now.
+    MainCheckRepairStarted {
+        check_id: Uuid,
+        fix_thread_id: Uuid,
+        started_by: crate::engine::MainRepairStartedBy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
     },
     /// The main check ended with no verdict: GitHub was down, the push was
     /// refused, or the engine restarted mid-run. It starts nothing by itself.
@@ -1740,17 +1853,29 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         run_url: Option<String>,
     },
-    /// The red check closed: its fix landed, or the maintainer closed it.
+    /// A newer `main` at `to_sha` cancelled the running main check before its
+    /// first test job started. It is no verdict, and the next check starts on
+    /// the newer `main` at once (ADR 0694).
+    MainCheckSuperseded {
+        check_id: Uuid,
+        to_sha: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_url: Option<String>,
+    },
+    /// The red check closed: its fix landed, newer main passed, or the owner closed it.
+    /// `fix_thread_id` names the repair that owned it, absent on older rows.
     /// `actor` is set for the maintainer's Close.
     MainCheckRedClosed {
         check_id: Uuid,
         reason: crate::engine::RedCloseReason,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        fix_thread_id: Option<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
     /// Bash supervisor (`scripts/lib/engine_supervisor.sh`) wrapped an
-    /// engine instance that died with a non-graceful exit code (anything
-    /// other than 0 / 130 / 138) and is spawning its replacement. The
+    /// engine instance that died unexpectedly and is spawning its replacement.
+    /// Graceful exits and the platform's SIGINT/SIGUSR1 stops are excluded. The
     /// supervisor writes a sidecar JSON file at
     /// `<workspace>/.lucidos/engine.last-death.json` before respawning;
     /// the next engine reads + emits + deletes the file at startup, so
@@ -1845,6 +1970,34 @@ pub enum SystemEvent {
         service_name: String,
         /// The scope now recorded on the credential.
         base_url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An ordinary composer input was durably accepted, before execution.
+    /// Aggregate `thread`, identity `thread_id`. The immutable request and
+    /// compose acknowledgement survive process loss. Recovery must retain
+    /// user priority. This event is not a MessageReceived.
+    OrdinarySubmissionAccepted {
+        thread_id: Uuid,
+        message_event_id: Uuid,
+        entry_id: Uuid,
+        intent: Box<crate::engine::event_bus::OrdinarySubmissionIntent>,
+        request: Box<crate::engine::thread_queue::ThreadQueueRequest>,
+        compose: Option<crate::core::store::ComposeReport>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A saved draft was durably accepted (ADR 0651). Aggregate `thread`,
+    /// identity `receipt.thread_id`, so deleting the thread removes its saved
+    /// content and cascades its retry receipt. The projection records a permanent
+    /// retry receipt, recoverable queue membership, and consumption of the
+    /// exact draft revision in the same transaction. The snapshot and
+    /// authority evidence are immutable audit data; acceptance is not execution.
+    DraftSubmissionAccepted {
+        receipt: crate::core::draft_submission::DraftSubmissionReceipt,
+        snapshot: crate::core::store::ComposeReport,
+        request: Box<crate::engine::thread_queue::ThreadQueueRequest>,
+        authority: crate::core::draft_submission::DraftSubmissionAuthority,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
@@ -1955,6 +2108,7 @@ impl SystemEvent {
         commit: String,
         source: Option<String>,
         writer_thread_id: Option<uuid::Uuid>,
+        writer: ArtifactWriter,
     ) -> Self {
         if file_exists {
             Self::ArtifactUpdated {
@@ -1962,6 +2116,7 @@ impl SystemEvent {
                 commit,
                 source,
                 writer_thread_id,
+                writer: Some(writer),
             }
         } else {
             Self::ArtifactCreated {
@@ -1969,6 +2124,7 @@ impl SystemEvent {
                 commit,
                 source,
                 writer_thread_id,
+                writer: Some(writer),
             }
         }
     }
@@ -2078,21 +2234,31 @@ impl SystemEvent {
         "LaneBatchStarted",
         "LaneBatchLanded",
         "LaneBatchFailed",
+        "LaneArrivalsHeld",
+        "LaneArrivalsReleased",
         "MainPushFailed",
         "MainFollowRefused",
+        "MainFollowed",
         "MainCheckStarted",
         "MainCheckRunLinked",
         "MainCheckPassed",
         "MainCheckFailed",
+        "MainCheckRepairStarted",
         "MainCheckAbandoned",
+        "MainCheckSuperseded",
         "MainCheckRedClosed",
         "EngineSupervisorRespawned",
+        "InternalFaultRecorded",
+        "DiagnosticBundleSent",
+        "DiagnosticBundleReceived",
         "EmailSent",
         "ProxyModulesReloaded",
         "HandshakeScriptApproved",
         "HandshakeScriptScopeBound",
         "HandshakeScriptInjectsBound",
         "CredentialScopeInferred",
+        "OrdinarySubmissionAccepted",
+        "DraftSubmissionAccepted",
         "ThreadQueued",
         "ThreadQueueAdmitted",
         "ThreadQueueDropped",
@@ -2110,9 +2276,12 @@ impl SystemEvent {
         "BackupKeyRevealed",
         "BackupRecipientSet",
         "ProxyConfigRejected",
+        "ModelSpendCapReached",
+        "ModelSpendCapHoldEnded",
         "ModelNotServedObserved",
         "ThreadsDeleted",
         "MemoryCorrected",
+        "MemoryExtractionFailed",
         "RecommendedCleanupStarted",
         "RecommendedCleanupCompleted",
         "RecommendedCleanupFailed",
@@ -2176,10 +2345,13 @@ impl SystemEvent {
             Self::BackupKeyRevealed { .. } => "BackupKeyRevealed",
             Self::BackupRecipientSet { .. } => "BackupRecipientSet",
             Self::ProxyConfigRejected { .. } => "ProxyConfigRejected",
+            Self::ModelSpendCapReached { .. } => "ModelSpendCapReached",
+            Self::ModelSpendCapHoldEnded { .. } => "ModelSpendCapHoldEnded",
             Self::ModelNotServedObserved { .. } => "ModelNotServedObserved",
             Self::ThreadsDeleted { .. } => "ThreadsDeleted",
             Self::RecoveryProgress { .. } => "RecoveryProgress",
             Self::MemoryCorrected { .. } => "MemoryCorrected",
+            Self::MemoryExtractionFailed { .. } => "MemoryExtractionFailed",
             Self::Toast { .. } => "Toast",
             Self::ArtifactImported { .. } => "ArtifactImported",
             Self::TriggerCreated { .. } => "TriggerCreated",
@@ -2223,7 +2395,8 @@ impl SystemEvent {
             Self::PresenceCheck { .. } => "PresenceCheck",
             Self::NativePushRequested { .. } => "NativePushRequested",
             Self::NativePushDismissRequested { .. } => "NativePushDismissRequested",
-            Self::OperatorsChanged => "OperatorsChanged",
+            Self::UsersChanged => "UsersChanged",
+            Self::PairingRequestsChanged => "PairingRequestsChanged",
             Self::PluginInstalled { .. } => "PluginInstalled",
             Self::PluginLocalChangesMerged { .. } => "PluginLocalChangesMerged",
             Self::PluginUninstalled { .. } => "PluginUninstalled",
@@ -2294,14 +2467,22 @@ impl SystemEvent {
             Self::LaneBatchStarted { .. } => "LaneBatchStarted",
             Self::LaneBatchLanded { .. } => "LaneBatchLanded",
             Self::LaneBatchFailed { .. } => "LaneBatchFailed",
+            Self::LaneArrivalsHeld { .. } => "LaneArrivalsHeld",
+            Self::LaneArrivalsReleased { .. } => "LaneArrivalsReleased",
             Self::MainPushFailed { .. } => "MainPushFailed",
             Self::MainFollowRefused { .. } => "MainFollowRefused",
+            Self::MainFollowed { .. } => "MainFollowed",
             Self::MainCheckStarted { .. } => "MainCheckStarted",
             Self::MainCheckRunLinked { .. } => "MainCheckRunLinked",
             Self::MainCheckPassed { .. } => "MainCheckPassed",
             Self::MainCheckFailed { .. } => "MainCheckFailed",
+            Self::MainCheckRepairStarted { .. } => "MainCheckRepairStarted",
             Self::MainCheckAbandoned { .. } => "MainCheckAbandoned",
+            Self::MainCheckSuperseded { .. } => "MainCheckSuperseded",
             Self::MainCheckRedClosed { .. } => "MainCheckRedClosed",
+            Self::InternalFaultRecorded { .. } => "InternalFaultRecorded",
+            Self::DiagnosticBundleSent { .. } => "DiagnosticBundleSent",
+            Self::DiagnosticBundleReceived { .. } => "DiagnosticBundleReceived",
             Self::EngineSupervisorRespawned { .. } => "EngineSupervisorRespawned",
             Self::EmailSent { .. } => "EmailSent",
             Self::ProxyModulesReloaded { .. } => "ProxyModulesReloaded",
@@ -2309,6 +2490,8 @@ impl SystemEvent {
             Self::HandshakeScriptScopeBound { .. } => "HandshakeScriptScopeBound",
             Self::HandshakeScriptInjectsBound { .. } => "HandshakeScriptInjectsBound",
             Self::CredentialScopeInferred { .. } => "CredentialScopeInferred",
+            Self::OrdinarySubmissionAccepted { .. } => "OrdinarySubmissionAccepted",
+            Self::DraftSubmissionAccepted { .. } => "DraftSubmissionAccepted",
             Self::ThreadQueued { .. } => "ThreadQueued",
             Self::ThreadQueueAdmitted { .. } => "ThreadQueueAdmitted",
             Self::ThreadQueueDropped { .. } => "ThreadQueueDropped",
@@ -2374,10 +2557,13 @@ impl SystemEvent {
         "BackupKeyRevealed",
         "BackupRecipientSet",
         "ProxyConfigRejected",
+        "ModelSpendCapReached",
+        "ModelSpendCapHoldEnded",
         "ModelNotServedObserved",
         "ThreadsDeleted",
         "RecoveryProgress",
         "MemoryCorrected",
+        "MemoryExtractionFailed",
         "Toast",
         "ArtifactImported",
         "TriggerCreated",
@@ -2421,7 +2607,8 @@ impl SystemEvent {
         "PresenceCheck",
         "NativePushRequested",
         "NativePushDismissRequested",
-        "OperatorsChanged",
+        "UsersChanged",
+        "PairingRequestsChanged",
         "PluginInstalled",
         "PluginLocalChangesMerged",
         "PluginUninstalled",
@@ -2490,21 +2677,31 @@ impl SystemEvent {
         "LaneBatchStarted",
         "LaneBatchLanded",
         "LaneBatchFailed",
+        "LaneArrivalsHeld",
+        "LaneArrivalsReleased",
         "MainPushFailed",
         "MainFollowRefused",
+        "MainFollowed",
         "MainCheckStarted",
         "MainCheckRunLinked",
         "MainCheckPassed",
         "MainCheckFailed",
+        "MainCheckRepairStarted",
         "MainCheckAbandoned",
+        "MainCheckSuperseded",
         "MainCheckRedClosed",
         "EngineSupervisorRespawned",
+        "InternalFaultRecorded",
+        "DiagnosticBundleSent",
+        "DiagnosticBundleReceived",
         "EmailSent",
         "ProxyModulesReloaded",
         "HandshakeScriptApproved",
         "HandshakeScriptScopeBound",
         "HandshakeScriptInjectsBound",
         "CredentialScopeInferred",
+        "OrdinarySubmissionAccepted",
+        "DraftSubmissionAccepted",
         "ThreadQueued",
         "ThreadQueueAdmitted",
         "ThreadQueueDropped",
@@ -2524,12 +2721,14 @@ impl SystemEvent {
 
     pub fn aggregate(&self) -> &str {
         match self {
+            Self::DiagnosticBundleReceived { .. } => "diagnostic_bundle",
             Self::NotificationCreated { .. }
             | Self::NotificationRead { .. }
             | Self::NotificationsAllRead { .. }
             | Self::NativePushRequested { .. }
             | Self::NativePushDismissRequested { .. } => "notification",
-            Self::OperatorsChanged => "operator",
+            Self::UsersChanged => "user",
+            Self::PairingRequestsChanged => "pairing",
             Self::PreferencesChanged { .. }
             | Self::LanguageSet { .. }
             | Self::TimezoneSet { .. } => "preference",
@@ -2551,6 +2750,8 @@ impl SystemEvent {
             | Self::BackupKeyRevealed { .. }
             | Self::BackupRecipientSet { .. }
             | Self::ProxyConfigRejected { .. }
+            | Self::ModelSpendCapReached { .. }
+            | Self::ModelSpendCapHoldEnded { .. }
             | Self::ModelNotServedObserved { .. }
             | Self::ThreadsDeleted { .. }
             | Self::RecoveryProgress { .. }
@@ -2601,8 +2802,9 @@ impl SystemEvent {
             // A scan reports on the marketplaces, so it shares their aggregate.
             | Self::PluginCatalogScanStarted {}
             | Self::PluginCatalogScanned { .. } => "plugin_marketplace",
-            Self::ThreadComposeChanged { .. } => "thread",
-            Self::MemoryCorrected { .. }
+            Self::ThreadComposeChanged { .. } | Self::DraftSubmissionAccepted { .. } | Self::OrdinarySubmissionAccepted { .. } => "thread",
+            Self::MemoryExtractionFailed { .. }
+            | Self::MemoryCorrected { .. }
             | Self::TreeBackfillProgressed { .. }
             | Self::TreeBackfillCompleted { .. }
             | Self::TreeBackfillReset { .. }
@@ -2673,16 +2875,20 @@ impl SystemEvent {
             | Self::StandingApplyDropped { .. } => "standing_apply",
             Self::LaneBatchStarted { .. }
             | Self::LaneBatchLanded { .. }
-            | Self::LaneBatchFailed { .. } => "landing_lane",
+            | Self::LaneBatchFailed { .. }
+            | Self::LaneArrivalsHeld { .. }
+            | Self::LaneArrivalsReleased { .. } => "landing_lane",
             Self::MainPushFailed { .. } => "main_push",
-            Self::MainFollowRefused { .. } => "main_follow",
+            Self::MainFollowRefused { .. } | Self::MainFollowed { .. } => "main_follow",
             Self::MainCheckStarted { .. }
             | Self::MainCheckRunLinked { .. }
             | Self::MainCheckPassed { .. }
+            | Self::MainCheckRepairStarted { .. }
             | Self::MainCheckFailed { .. }
             | Self::MainCheckAbandoned { .. }
+            | Self::MainCheckSuperseded { .. }
             | Self::MainCheckRedClosed { .. } => "main_check",
-            Self::EngineSupervisorRespawned { .. }
+            Self::InternalFaultRecorded { .. } | Self::DiagnosticBundleSent { .. } | Self::EngineSupervisorRespawned { .. }
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
             | Self::ServedFrontendAdvanced { .. }
@@ -2706,6 +2912,7 @@ impl SystemEvent {
 
     pub fn aggregate_id(&self) -> String {
         match self {
+            Self::DiagnosticBundleReceived { bundle_id, .. } => bundle_id.to_string(),
             Self::SnapshotProgress { handle, .. }
             | Self::SnapshotRestoreRequested { handle, .. }
             | Self::WorkspaceRestored { handle, .. }
@@ -2759,7 +2966,8 @@ impl SystemEvent {
             } => notification_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "all".to_string()),
-            Self::OperatorsChanged => "all".to_string(),
+            Self::UsersChanged => "all".to_string(),
+            Self::PairingRequestsChanged => "all".to_string(),
             Self::PluginInstalled { id, .. } => id.clone(),
             Self::PluginLocalChangesMerged { id, .. } => id.clone(),
             Self::PluginUninstalled { id, .. } => id.clone(),
@@ -2840,22 +3048,30 @@ impl SystemEvent {
             | Self::StandingApplyDropped { thread_id, .. } => thread_id.to_string(),
             Self::LaneBatchStarted { batch_id, .. }
             | Self::LaneBatchLanded { batch_id, .. }
-            | Self::LaneBatchFailed { batch_id, .. } => batch_id.to_string(),
-            Self::MainPushFailed { repo, .. } | Self::MainFollowRefused { repo, .. } => {
-                repo.clone()
-            }
+            | Self::LaneBatchFailed { batch_id, .. }
+            | Self::LaneArrivalsHeld { batch_id }
+            | Self::LaneArrivalsReleased { batch_id, .. } => batch_id.to_string(),
+            Self::MainPushFailed { repo, .. }
+            | Self::MainFollowRefused { repo, .. }
+            | Self::MainFollowed { repo, .. } => repo.clone(),
             Self::MainCheckStarted { check_id, .. }
             | Self::MainCheckRunLinked { check_id, .. }
             | Self::MainCheckPassed { check_id, .. }
+            | Self::MainCheckRepairStarted { check_id, .. }
             | Self::MainCheckFailed { check_id, .. }
             | Self::MainCheckAbandoned { check_id, .. }
+            | Self::MainCheckSuperseded { check_id, .. }
             | Self::MainCheckRedClosed { check_id, .. } => check_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
             // The preview is engine-level, but WHICH thread's worktree it shows
             // is its identity: one preview per thread, one slot at a time.
             Self::FrontendPreviewStarted { thread_id, .. }
             | Self::FrontendPreviewStopped { thread_id, .. } => thread_id.to_string(),
+            Self::ModelSpendCapReached { provider, .. }
+            | Self::ModelSpendCapHoldEnded { provider, .. } => provider.clone(),
             Self::EmailSent { account, .. } => account.clone(),
+            Self::OrdinarySubmissionAccepted { thread_id, .. } => thread_id.to_string(),
+            Self::DraftSubmissionAccepted { receipt, .. } => receipt.thread_id.to_string(),
             Self::ThreadQueued { entry_id, .. }
             | Self::ThreadQueueAdmitted { entry_id, .. }
             | Self::ThreadQueueDropped { entry_id, .. }
@@ -2893,7 +3109,7 @@ impl SystemEvent {
             _ => match serde_json::to_value(self) {
                 Ok(v) => v,
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventBus] WARNING: {} payload would not serialize ({}), persisting it empty",
                         self.event_type(),
                         e
@@ -2952,7 +3168,7 @@ fn merge_actor(mut payload: serde_json::Value, actor: &Option<MessageOrigin>) ->
                 serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
             );
         } else {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventBus] WARNING: DomainEvent actor dropped — payload is not a JSON object (got: {}). \
                  Wrap primitive/array payloads in an object so the actor can attach.",
                 match &payload {

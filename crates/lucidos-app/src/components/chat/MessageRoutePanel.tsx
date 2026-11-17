@@ -1,11 +1,12 @@
+import { openSettingsSubview } from '../../store/actions/menu';
 import { useRef } from 'preact/hooks';
 import { UNTITLED_THREAD } from '../../utils/threadTitle';
 import type { ComponentChildren } from 'preact';
 import { AppIcon } from '../shared/AppIcon';
-import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName } from '../../store/store';
+import { messageRoutePanel, closeMessageRoutePanel, contextViewer, triggers, threadMap, repositories, appsList, workspaceName, settingsScrollTarget } from '../../store/store';
 import { loadApps } from '../../store/actions/apps';
 import { turnDeviceName } from '../../store/actions/devices';
-import { operators, personName } from '../../store/actions/operators';
+import { gatewayUsers, userName } from '../../store/actions/gatewayUsers';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import {
   openThreadAcrossWorkspaces,
@@ -32,9 +33,11 @@ import {
   plainEventName,
   sortEventsChronologically,
   SYSTEM_LABEL,
+  unattestedCallerLabel,
   type Exchange,
   type EngineReason,
   type MessageOrigin,
+  type SpawnVerdict,
   type StoredEvent,
   type ThreadMeta,
 } from '../../store/thread-events';
@@ -234,6 +237,7 @@ export function renderOriginSection(
     : null;
   const explainer = continuationWhy
     ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason)
+      : origin?.kind === 'unattested_caller' ? renderCallerExplainer(origin)
       : unrecordedSeed ? renderExplainer(ENGINE_WHY_HEADING, UNRECORDED_ENGINE_SEED_EXPLAINER)
         : null);
   const paused = pausedBy ? renderFoldedPause(pausedBy) : null;
@@ -342,12 +346,49 @@ function renderTechnicalDetails(
   userEvent: StoredEvent,
   origin: MessageOrigin | undefined,
 ): preact.JSX.Element {
+  return (
+    <div class="route-technical" data-role="route-technical">
+      <EventRowFoldView
+        label="Technical details"
+        body={technicalDetailRows(userEvent, origin).map(([label, value]) => (
+          <div key={label} class="route-row">
+            <strong>{label}</strong>
+            <span class="mono">{value}</span>
+          </div>
+        ))}
+      />
+    </div>
+  );
+}
+
+/** The calling workspace's spawn-gate verdict, in words. */
+function spawnVerdictText(verdict: SpawnVerdict): string {
+  switch (verdict.kind) {
+    case 'allowed':    return 'Allowed';
+    case 'unattested': return 'The calling workspace could not establish who started its thread';
+    case 'refused':    return `Refused: ${verdict.reason}`;
+  }
+}
+
+/** The label and value pairs [`renderTechnicalDetails`] draws. */
+export function technicalDetailRows(
+  userEvent: StoredEvent,
+  origin: MessageOrigin | undefined,
+): [string, string][] {
   const rows: [string, string][] = [['Event type', userEvent.type]];
   if (origin?.kind === 'api' && origin.user_agent) rows.push(['Client', origin.user_agent]);
+  if (origin?.kind === 'unattested_caller') {
+    if (origin.claimed_device_id) rows.push(['Claimed device id', origin.claimed_device_id]);
+    if (origin.claimed_local_token) rows.push(['Claimed credential', 'Machine-local token']);
+    if (origin.claimed_workspace) rows.push(['Claimed workspace', origin.claimed_workspace]);
+    if (origin.claimed_thread_id) rows.push(['Claimed thread id', origin.claimed_thread_id]);
+    if (origin.user_agent) rows.push(['Client', origin.user_agent]);
+  }
   if (origin?.kind === 'workspace') {
     if (origin.thread_id) rows.push(['Thread id', origin.thread_id]);
     if (origin.event_id) rows.push(['Event id', origin.event_id]);
     if (origin.user_agent) rows.push(['Client', origin.user_agent]);
+    if (origin.verdict) rows.push(['Its gate said', spawnVerdictText(origin.verdict)]);
   }
   if (origin?.kind === 'engine' && origin.reason.kind === 'event_wait' && origin.reason.watched.length > 0) {
     rows.push(['Waited for', origin.reason.watched.join(', ')]);
@@ -360,19 +401,7 @@ function renderTechnicalDetails(
     rows.push(['Fired on', userEvent.invocation.event_type]);
     if (userEvent.invocation.event_id) rows.push(['Event id', userEvent.invocation.event_id]);
   }
-  return (
-    <div class="route-technical" data-role="route-technical">
-      <EventRowFoldView
-        label="Technical details"
-        body={rows.map(([label, value]) => (
-          <div key={label} class="route-row">
-            <strong>{label}</strong>
-            <span class="mono">{value}</span>
-          </div>
-        ))}
-      />
-    </div>
-  );
+  return rows;
 }
 
 /** When a read message was sent and when the agent read it. Its header shows
@@ -474,6 +503,25 @@ function renderIssuedByRow(label: string): preact.JSX.Element {
   );
 }
 
+function renderCallerExplainer(origin: Extract<MessageOrigin, { kind: 'unattested_caller' }>) {
+  if (!origin.claimed_workspace) return renderExplainer('Who sent this', origin.claimed_device_id
+    ? 'It named a device, but nothing checked that claim, so Lucidos cannot tell which program sent it.'
+    : origin.claimed_local_token
+      ? 'It reached Lucidos from this computer but named no workspace or thread, so Lucidos cannot tell which program it was.'
+      : 'This request named no workspace, device or program, so Lucidos cannot tell who sent it.');
+  return (
+    <div class="route-explainer">
+      <strong>How Lucidos can check it</strong>
+      <p>{`This request reached ${workspaceName.value} directly, not through a gateway, so nothing checked who sent it. Lucidos can check calls sent by a thread through its gateway. If the workspaces use separate gateways, pair them first.`}</p>
+      <button class="accent-link" onClick={() => {
+        openSettingsSubview('access');
+        settingsScrollTarget.value = 'access:pair-gateway';
+        closeMessageRoutePanel();
+      }}>Pair a gateway in Settings</button>
+    </div>
+  );
+}
+
 /** The popover's "why" paragraph. One heading per question the panel can
  *  answer ("Why the response stopped", "Why this resumed", "Why Lucidos
  *  acted"); the body comes from the matching `describe*` helper. Renders
@@ -516,14 +564,29 @@ export function renderChannelSection(
   deviceLabel = 'Device',
 ): preact.JSX.Element | null {
   switch (origin.kind) {
-    case 'device': {
-      const person = personName(operators.value, origin.device_id);
+    case 'saved_draft': {
+      const threadId = origin.submitted_by_thread_id;
       return (
         <>
-          {person && (
+          <div class="route-row"><strong>Content</strong><span>Your saved draft</span></div>
+          <div class="route-row">
+            <strong>Submitted by</strong>
+            <button type="button" class="accent-link" onClick={() => {
+              focusThreadOrBootstrap(threadId);
+              closeMessageRoutePanel();
+            }}>{getLiveTitle?.(threadId) ?? UNTITLED_THREAD}</button>
+          </div>
+        </>
+      );
+    }
+    case 'device': {
+      const user = userName(gatewayUsers.value, origin.device_id);
+      return (
+        <>
+          {user && (
             <div class="route-row">
-              <strong>Person</strong>
-              <span>{person}</span>
+              <strong>User</strong>
+              <span>{user}</span>
             </div>
           )}
           <div class="route-row">
@@ -563,6 +626,13 @@ export function renderChannelSection(
         </div>
       );
     }
+    case 'unattested_caller':
+      return (
+        <div class="route-row">
+          <strong>Sent from</strong>
+          <span>{unattestedCallerLabel(origin, origin.claimed_device_id ? turnDeviceName(origin.claimed_device_id, { knownOnly: true }) : undefined)}{origin.claimed_workspace ? ', by its own account' : ''}</span>
+        </div>
+      );
     case 'workspace': {
       const tid = origin.thread_id;
       return (
@@ -682,8 +752,8 @@ export function renderExecutorSection(
   const ccActive = extras.branch !== undefined || extras.ccSessionId !== undefined;
   const repo = ccActive ? resolveRepoLabel(extras.repoId) : undefined;
   // App coding-agent threads carry their kind on the projection; resolve the
-  // app's icon + display name so the App row reads "{icon} {name}" above the
-  // Branch row. The folder's last segment is the canonical app id.
+  // app's icon + display name so the visible App row reads "{icon} {name}".
+  // The folder's last segment is the canonical app id.
   const appInfo = meta.codingAgentKind === 'app' ? resolveAppInfo(meta.codingAgentFolder) : undefined;
 
   return (
@@ -733,16 +803,9 @@ export function renderExecutorSection(
         </div>
       )}
       {extras.ccSessionId && (
-        <div class="route-technical">
-          <EventRowFoldView
-            label="Technical details"
-            body={
-              <div class="route-row">
-                <strong>Session id</strong>
-                <span class="mono">{extras.ccSessionId}</span>
-              </div>
-            }
-          />
+        <div class="route-row">
+          <strong>Session id</strong>
+          <span class="mono">{extras.ccSessionId}</span>
         </div>
       )}
     </section>

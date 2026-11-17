@@ -101,7 +101,7 @@ impl StoredGatewayAccess {
                     )));
                     return Err(not_signed_in());
                 }
-                crate::log!("[ClaudeGateway] Refreshed the token for {}", account.issuer);
+                crate::log_legacy!("[ClaudeGateway] Refreshed the token for {}", account.issuer);
                 let (pool, event_bus, bearer) = (
                     self.pool.clone(),
                     self.event_bus.clone(),
@@ -115,7 +115,7 @@ impl StoredGatewayAccess {
             Ok(TokenReply::Refused(refusal)) => refusal,
             Err(e) => return Err(unreachable_gateway(&*e)),
         };
-        crate::log!(
+        crate::log_legacy!(
             "[ClaudeGateway] {} refused the token refresh: {}",
             account.issuer,
             refusal
@@ -137,7 +137,7 @@ impl StoredGatewayAccess {
         if let Err(e) =
             ClaudeGatewayAccountStore::forget_rejected(&self.pool, &self.event_bus, rejected).await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[ClaudeGateway] Could not forget the rejected sign-in: {}",
                 e
             );

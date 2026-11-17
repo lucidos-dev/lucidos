@@ -118,8 +118,8 @@ asks for it, and no `npm ci` when the dependencies already match.
   reruns the same selection on GitHub at the HEAD recorded at the start, and
   prints `[e2e] host busy`. Any other exit is the run's verdict. `--local`
   and a dirty tree keep the waits.
-- **`--webkit` on a macOS host runs here.** `/harden` adds
-  `ENGINE_CARGO_PROFILE=e2e` for that leg (ADR 0616).
+- **Manual `--webkit` on a macOS host runs here.** `/harden` sends its touched
+  WebKit specs to GitHub on every host (ADR 0658).
 - **`--github` sends a filtered run to GitHub.** Use it when both slots are
   busy, for a mobile-webkit spec, or to confirm a fix on Linux and macOS
   (`./scripts/e2e-browser.sh --github -f <spec>`). Wait for the lock only for

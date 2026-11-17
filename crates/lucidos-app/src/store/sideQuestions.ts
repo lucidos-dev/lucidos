@@ -70,21 +70,18 @@ export type SideQuestionRoute =
 export const SIDE_QUESTION_NOT_STARTED =
   'Side questions work once this thread has started. Send a normal message first.';
 export const SIDE_QUESTION_EMPTY = 'Type the side question first.';
-export const SIDE_QUESTION_CODEX =
-  'Side questions are not available in Codex threads. Send it as a normal message instead.';
 
 /** Route a submit. `asked` is true when the user chose a side question: the
  *  composer is in side-question mode, or was when an upload queued it. A side
  *  question never becomes a turn: it is asked, or refused with the draft kept.
- *  A Codex thread takes none, and refusing here keeps the draft and its images. */
+ */
 export function routeSideQuestion(
   message: string,
-  thread: { started: boolean; codex: boolean },
+  thread: { started: boolean },
   asked: boolean,
 ): SideQuestionRoute {
   if (!asked) return { kind: 'message' };
   if (!thread.started) return { kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED };
-  if (thread.codex) return { kind: 'refuse', toast: SIDE_QUESTION_CODEX };
   const question = message.trim();
   if (question === '') return { kind: 'refuse', toast: SIDE_QUESTION_EMPTY };
   return { kind: 'ask', question };

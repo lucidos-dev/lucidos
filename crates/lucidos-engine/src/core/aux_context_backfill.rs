@@ -114,7 +114,7 @@ pub async fn backfill_auxiliary_captures(
         let found = match found {
             Ok(found) => found,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[AuxContextBackfill] could not read {:?} calls, skipping them: {}",
                     purpose,
                     e
@@ -125,7 +125,7 @@ pub async fn backfill_auxiliary_captures(
         let written = write_missing(pool, event_bus, purpose, found).await?;
         total += written;
         if written > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[AuxContextBackfill] reconstructed {} {:?} call(s)",
                 written,
                 purpose

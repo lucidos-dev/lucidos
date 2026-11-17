@@ -7,7 +7,7 @@ import { loadThreadEvents, loadOlderThreadEvents, ensureWholeThreadLoaded, force
 import { checkConnection } from '../../store/actions/connection';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { replaceDocument } from '../../utils/documentNavigation';
-import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
+import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-event-repair';
 import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { StoppedChildNotice } from './StoppedChildNotice';
 import { ContinuedFromNotice, ContinuedInNotice } from './SuccessorNotice';
@@ -20,7 +20,7 @@ import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, deepLinkTargetIndex, exchangeKey, drawnResponseEvents, hasContentEvents, turnBodyFolded, type Exchange } from '../../store/thread-events';
 import { rowsDrawnByClamp } from '../../store/event-rendering';
 import { statusLabel } from '../../store/exchange-status';
-import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkTarget, scrolledFromTop } from './scrollState';
+import { showScrollToBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, isScrollHeld, isWhereWeLastScrolledIt, markAnchorScroll, onScrollHoldReleased, scrollHoldReleased, deepLinkTarget, scrolledFromTop } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { EMPTY_FILL_LEDGER, WHOLE_THREAD, chargeFillRound, drawnRowsInWindow, fillRoundAllowed, settleFillLedger, anythingAbove, atScrollTop, clampedScrollTop, scrollAsksForOlder, canSeedRenderWindow, deepLinkEdge, edgeHasMoreAbove, edgeMustReachRow, exchangeRenderCost, readingChaseAction, READING_CHASE_PAGE_SIZE, expandWindowEdge, fillAction, reseedOnReopen, seedWindowEdge, UPWARD_SCROLL_KEYS, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll, type FillLedger, type RowsAt, type StoredWindowKind, type WindowEdge } from './threadWindow';
 import { transcriptScrolls } from './transcriptScrolls';
@@ -39,7 +39,7 @@ import { refreshClient } from '../../hooks/sw-update';
 import { recordPerfSample } from '../../utils/perfQueue';
 import { takeThreadOpenStart, takeThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { readRenderPhaseTotals } from '../../utils/renderPhaseTimers';
-import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
+import { reportAbsentThreadRender, reportThreadRenderProbe } from '../../utils/threadRenderProbe';
 import { postClientLog } from '../../utils/liveness';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { FindBar } from '../shared/FindBar';
@@ -48,7 +48,8 @@ import { transcriptRenderRequest } from '../../store/actions/transcriptRenderReq
 import { lazyComponent } from '../../utils/lazyComponent';
 
 // Team-only: a personal gateway never draws it, so the first frame skips it.
-const ThreadPeopleRow = lazyComponent(() => import('./ThreadPeopleRow').then((m) => m.ThreadPeopleRow));
+const ThreadUsersPanel = lazyComponent(() => import('./ThreadUsers').then((m) => m.ThreadUsersPanel));
+const ThreadUsersButton = lazyComponent(() => import('./ThreadUsers').then((m) => m.ThreadUsersButton));
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -316,7 +317,7 @@ export type ReadingTarget = { kind: 'turn'; id: string } | { kind: 'row'; id: st
 
 /** The target a record names, or null for a record that names none. */
 export function readingTargetOf(record: SavedScroll | null): ReadingTarget | null {
-    if (record?.kind === 'anchor') return { kind: 'turn', id: record.eventId };
+    if (record?.kind === 'anchor' || record?.kind === 'line') return { kind: 'turn', id: record.eventId };
     if (record?.kind === 'row') return { kind: 'row', id: record.rowEventId };
     return null;
 }
@@ -1055,7 +1056,7 @@ export function ThreadView() {
     // to avoid subscribing the render to the signal (prevents extra re-renders).
     const shouldReveal = shouldRevealThread(threadId, animating, hasContent);
 
-    const isUp = awayFromBottom.value;
+    const isUp = showScrollToBottom.value;
     const isNotAtTop = notAtTop.value;
 
     // Mobile draws its own scroll indicator, because the fixed header covers
@@ -1342,7 +1343,10 @@ export function ThreadView() {
         if (!threadId || !isWebKit()) return;
         const timer = setTimeout(() => {
             const thread = threadMap.value.get(threadId);
-            if (!thread) return;
+            if (!thread) {
+                reportAbsentThreadRender(threadId);
+                return;
+            }
             const fresh = computeExchanges(thread);
             reportThreadRenderProbe({
                 threadId,
@@ -1981,7 +1985,7 @@ export function ThreadView() {
     return (
         <div class="thread-view">
             <DesktopThreadTitleBar threadId={eventThread.meta.id} />
-            <ThreadPeopleRow threadId={eventThread.meta.id} />
+            <ThreadUsersPanel threadId={eventThread.meta.id} />
             <FindBar key="find" surface="thread" scope={`thread:${eventThread.meta.id}`} placeholder="Find in thread" />
             {/* `has-scroll-indicator` is what licenses the CSS to hide the
                 native scrollbar on this scroller: the suppression is scoped to
@@ -2111,6 +2115,7 @@ export function DesktopThreadTitleBar({ threadId }: { threadId: string }) {
         <div class={`thread-view-header${scrolledFromTop.value ? ' scrolled' : ''}`}>
             <ThreadTitleMenu thread={thread} title={title} status={threadVisualStatus(thread)} />
             <ThreadTitlePin thread={thread} />
+            <ThreadUsersButton threadId={threadId} />
         </div>
     );
 }

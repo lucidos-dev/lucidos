@@ -42,7 +42,8 @@ engine and the gateway (ADR 0063). The switch adopts all three, in this order:
 2. **The engine**, respawned by that gateway from the published binary.
 3. **The window**, which follows the engine it shows. Once that engine started
    after the published window binary, the window exits and `tauri-dev.sh`
-   starts that binary on the page the window showed.
+   starts that binary on the page the window showed. ADR 0659 amends this:
+   the page is `main`'s, and the relaunch restores every recorded window.
 
 `tauri-dev.sh` no longer runs `cargo tauri dev`. It builds and publishes the
 window binary, then runs that binary in the foreground. No file watcher

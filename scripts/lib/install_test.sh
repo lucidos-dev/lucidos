@@ -18,6 +18,7 @@ python3 "$SCRIPT_DIR/linux_dev_install_test.py" || exit 1
 
 bash "$SCRIPT_DIR/stage_runtime_test.sh" || exit 1
 python3 "$SCRIPT_DIR/stage_runtime_linux_test.py" || exit 1
+python3 "$SCRIPT_DIR/stage_runtime_packaged_smoke_test.py" || exit 1
 bash "$SCRIPT_DIR/headless_tarball_test.sh" || exit 1
 
 # Sandbox env-as-flag inputs a live dev workspace exports (its engine carries

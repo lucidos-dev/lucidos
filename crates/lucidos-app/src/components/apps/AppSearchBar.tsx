@@ -11,7 +11,7 @@ interface Props {
   dataRole: string;
 }
 
-function SearchRow({ placeholder, dataRole, inputRef }: Props & { inputRef: RefObject<HTMLInputElement> }) {
+function SearchRow({ placeholder, dataRole, inputRef, onClose }: Props & { inputRef: RefObject<HTMLInputElement>; onClose: () => void }) {
   return (
     <div class="apps-search-bar">
       <SearchField
@@ -21,9 +21,9 @@ function SearchRow({ placeholder, dataRole, inputRef }: Props & { inputRef: RefO
         placeholder={placeholder}
         value={appSearchQuery.value}
         onInput={(e) => { appSearchQuery.value = e.currentTarget.value; }}
-        onKeyDown={(e) => { if (e.key === 'Escape') closeAppSearch(); }}
+        onKeyDown={(e) => { if (e.key === 'Escape') onClose(); }}
       />
-      <button class="icon-btn header-icon" onClick={closeAppSearch} aria-label="Close search">
+      <button class="icon-btn header-icon" onClick={onClose} aria-label="Close search">
         <CloseIcon />
       </button>
     </div>
@@ -36,12 +36,21 @@ function SearchRow({ placeholder, dataRole, inputRef }: Props & { inputRef: RefO
 export function AppSearchBar(props: Props) {
   const open = appSearchOpen.value;
   const inputRef = useRef<HTMLInputElement>(null);
+  const previousFocus = useRef<Element | null>(null);
   useEffect(() => {
-    if (open) inputRef.current?.focus({ preventScroll: true });
+    if (open) {
+      previousFocus.current = document.activeElement;
+      inputRef.current?.focus({ preventScroll: true });
+    }
   }, [open]);
+  const close = () => {
+    const previous = previousFocus.current;
+    if (previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true });
+    closeAppSearch();
+  };
   return (
     <Disclosure open={open}>
-      <SearchRow {...props} inputRef={inputRef} />
+      <SearchRow {...props} inputRef={inputRef} onClose={close} />
     </Disclosure>
   );
 }

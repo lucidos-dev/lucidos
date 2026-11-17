@@ -23,7 +23,8 @@ suite does" — runs into a hard platform wall.
 Packaged e2e is a **headless boot smoke test** of the service → gateway →
 embedded Postgres → engine → static-serving chain, **not** UI automation of the
 WKWebView. It is implemented as `scripts/e2e-packaged.sh`, which runs the
-bundle's own service role (`Lucidos --service`) under an isolated temp `HOME` and
+bundle's own disposable role (`Lucidos --disposable-service <new-root> <port>`,
+ADR 0702) under fresh owned storage and
 asserts the chain over HTTP + on disk. Native (non-UI) logic in the Tauri layer
 is covered separately by pure-function unit tests in `crates/lucidos-app`
 (`lib.rs`, `notifications.rs`, alongside the existing `desktop.rs` tests).
@@ -38,11 +39,11 @@ is covered separately by pure-function unit tests in `crates/lucidos-app`
   embedded Postgres relocatable tree, the gateway env wiring, and the engine
   spawn are the things that differ from dev and that historically regress. A boot
   smoke test catches exactly those, with no browser in the loop.
-- **The service role is cleanly headless.** `Lucidos --service` runs
-  `desktop::run_service()` → `spawn_gateway()` and never touches
+- **The disposable role is cleanly headless.** It runs an owned supervisor,
+  gateway and engines, and never touches
   AppKit/Tauri/notifications/updater/tray/launchd (those are client-role only),
-  so it is fully scriptable with no display and no launchd pollution. A temp
-  `HOME` isolates the embedded cluster + workspaces + logs from any real install.
+  so it is fully scriptable with no display and no launchd pollution. Fresh
+  `home/`, `gateway/` and `private/` directories isolate it from real installs.
 
 ## Consequences
 
@@ -57,7 +58,31 @@ is covered separately by pure-function unit tests in `crates/lucidos-app`
 - The smoke test is **heavy** (full release + DMG build + a Postgres download),
   so it is a standalone script, kept out of the default `e2e.sh` run; the nightly
   opts in via `e2e.sh --packaged` / `LUCIDOS_E2E_PACKAGED=1`.
-- It is **macOS-only** and skips gracefully elsewhere.
+- It is **macOS-only**. The packaged proxy/script smoke extension makes an
+  explicit invocation fail on unsupported hosts rather than report an
+  unexecuted test as successful.
+
+### Proxy and Python assertions
+
+An explicit invocation fails on unsupported hosts or missing signing prerequisites
+before building. Coding-agent worktrees use the disposable role; the persistent
+gateway's worktree refusal remains unconditional. Each invocation rebuilds this
+checkout, requiring a Developer ID-signed hardened engine, and checks
+an approved script-handshake proxy request plus a credential-bearing Python
+script against a local fake upstream. Credential delivery lives behind
+`credential_helper` in `scripts/lib/stage_runtime_packaged_smoke.py`. Cheap
+negative checks run with `python3 scripts/lib/stage_runtime_packaged_smoke_test.py`;
+they do not certify packaged execution. Failed service logs are retained at
+`.lucidos/packaged-smoke-service.log` for diagnosis, and failed disposable scopes
+remain on disk with their process evidence. Cleanup failure fails the test.
+
+The actual package also provisions a new workspace and bundled Postgres for
+each lifecycle case: normal stop, controller cancellation and abrupt controller
+loss. Recorded process identities, engine/gateway ports and `postmaster.pid`
+must all be released before a passing scope is deleted. An optional embedding
+cache seed is copied into owned storage after the gateway's fresh-storage claim;
+it is never symlinked into host storage. Unit tests cannot certify these package
+assertions.
 
 ## Alternatives considered
 

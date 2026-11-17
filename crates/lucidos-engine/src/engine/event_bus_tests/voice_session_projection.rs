@@ -10,6 +10,7 @@ async fn a_draft(bus: &EventBus, pool: &sqlx::PgPool) -> Uuid {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },

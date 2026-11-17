@@ -21,7 +21,12 @@ pub(crate) use conflict_probe::*;
 pub(crate) use harden_marker::*;
 pub(crate) use merge::*;
 pub(crate) use origin::*;
-pub(crate) use plan_approval::PlanApprovalError;
+#[cfg(test)]
+pub(crate) use plan_approval::user_approved_plan;
+pub(crate) use plan_approval::{
+    approves as plan_approves, proposed_plan_binding, user_approved_plan_for,
+    user_picked_plan_variant, ApprovalTarget, HumanInput, PlanApprovalError, PlanBinding,
+};
 pub(crate) use plan_marker::*;
 pub(crate) use restart_detection::*;
 pub(crate) use worktree::*;
@@ -405,7 +410,7 @@ fn classify_git_answer(
         }
         Ok(o) => {
             if on_nonzero.is_unknown() {
-                log!(
+                log_legacy!(
                     "[Git] `git {}` failed in {}: {}. Treating as unknown, never as a no",
                     args.join(" "),
                     dir.display(),
@@ -415,7 +420,7 @@ fn classify_git_answer(
             on_nonzero
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Git] cannot answer `git {}` in {}: {}. Treating as unknown, never as a no",
                 args.join(" "),
                 dir.display(),

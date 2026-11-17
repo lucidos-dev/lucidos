@@ -483,7 +483,7 @@ fn chat_inbox_idle_shows_archive_then_save() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Archive, Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Save]);
 }
 
 #[test]
@@ -498,7 +498,7 @@ fn chat_archived_idle_shows_only_save() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Save]);
 }
 
 #[test]
@@ -514,7 +514,7 @@ fn chat_running_shows_no_close_actions() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Save]);
 }
 
 #[test]
@@ -532,10 +532,10 @@ fn cc_inbox_with_changes_shows_apply_discard() {
     assert_eq!(
         actions,
         vec![
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Save
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Save
         ]
     );
 }
@@ -552,7 +552,7 @@ fn cc_inbox_no_changes_shows_archive() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Archive, Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Save]);
 }
 
 #[test]
@@ -572,7 +572,7 @@ fn external_repo_cc_no_pending_change_shows_archive() {
     );
     assert_eq!(
         actions,
-        vec![Action::Archive, Action::Save],
+        vec![ThreadAction::Archive, ThreadAction::Save],
         "External repo threads without pending changes must show Archive, not Apply/Discard"
     );
 }
@@ -589,7 +589,7 @@ fn cc_archived_no_changes_shows_only_save() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Save]);
 }
 
 #[test]
@@ -611,10 +611,10 @@ fn cc_archived_with_pending_changes_shows_apply_discard() {
     assert_eq!(
         actions,
         vec![
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Save
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Save
         ]
     );
 }
@@ -633,7 +633,7 @@ fn chat_inbox_descendants_block_archive_hides_archive() {
     );
     assert_eq!(
         actions,
-        vec![Action::Save],
+        vec![ThreadAction::Save],
         "Idle chat with blocking descendants must not surface Archive"
     );
 }
@@ -652,7 +652,7 @@ fn cc_inbox_descendants_block_archive_hides_archive() {
     );
     assert_eq!(
         actions,
-        vec![Action::Save],
+        vec![ThreadAction::Save],
         "Idle CC with blocking descendants must not surface Archive"
     );
 }
@@ -674,10 +674,10 @@ fn cc_inbox_pending_changes_still_show_apply_discard_when_descendants_block() {
     assert_eq!(
         actions,
         vec![
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Save
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Save
         ]
     );
 }
@@ -699,7 +699,11 @@ fn draft_is_front_most_close_layer() {
     );
     assert_eq!(
         actions,
-        vec![Action::DiscardDraft, Action::Archive, Action::Save]
+        vec![
+            ThreadAction::DiscardDraft,
+            ThreadAction::Archive,
+            ThreadAction::Save
+        ]
     );
 }
 
@@ -717,7 +721,10 @@ fn draft_discard_available_while_running() {
         true, // has_unsent_draft
         false,
     );
-    assert_eq!(actions, vec![Action::DiscardDraft, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![ThreadAction::DiscardDraft, ThreadAction::Save]
+    );
 }
 
 #[test]
@@ -737,11 +744,11 @@ fn full_cascade_draft_change_then_save() {
     assert_eq!(
         actions,
         vec![
-            Action::DiscardDraft,
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Save
+            ThreadAction::DiscardDraft,
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Save
         ]
     );
 }
@@ -760,7 +767,7 @@ fn saved_thread_shows_unsave_not_save() {
         false,
         true, // is_saved
     );
-    assert_eq!(actions, vec![Action::Archive, Action::Unsave]);
+    assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Unsave]);
 }
 
 #[test]
@@ -778,10 +785,10 @@ fn saved_cc_pending_shows_unsave() {
     assert_eq!(
         actions,
         vec![
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Unsave
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Unsave
         ]
     );
 }
@@ -844,7 +851,7 @@ fn a_subscribed_thread_is_idle_and_offers_archive() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Archive, Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Save]);
 }
 
 // ── a parked thread's change is not resolvable ── the thread wakes on its
@@ -871,7 +878,10 @@ fn a_parked_cc_thread_with_a_change_offers_what_a_running_one_does() {
         false,
         false,
     );
-    assert_eq!(parked, vec![Action::ApplyWhenSettled, Action::Save]);
+    assert_eq!(
+        parked,
+        vec![ThreadAction::ApplyWhenSettled, ThreadAction::Save]
+    );
 
     let running = available_thread_actions(
         ThreadType::CodingAgent,
@@ -885,7 +895,7 @@ fn a_parked_cc_thread_with_a_change_offers_what_a_running_one_does() {
     );
     assert_eq!(
         running,
-        vec![Action::ApplyWhenSettled, Action::Save],
+        vec![ThreadAction::ApplyWhenSettled, ThreadAction::Save],
         "a Running thread offers no close action either, plus the standing apply"
     );
 }
@@ -907,10 +917,10 @@ fn clearing_the_last_wait_restores_apply_and_discard() {
     assert_eq!(
         actions,
         vec![
-            Action::Discard,
-            Action::Apply,
-            Action::SetAside,
-            Action::Save
+            ThreadAction::Discard,
+            ThreadAction::Apply,
+            ThreadAction::SetAside,
+            ThreadAction::Save
         ]
     );
 }
@@ -930,7 +940,11 @@ fn a_parked_thread_can_still_discard_its_unsent_draft() {
     );
     assert_eq!(
         actions,
-        vec![Action::DiscardDraft, Action::ApplyWhenSettled, Action::Save]
+        vec![
+            ThreadAction::DiscardDraft,
+            ThreadAction::ApplyWhenSettled,
+            ThreadAction::Save
+        ]
     );
 }
 
@@ -951,7 +965,7 @@ fn a_live_wait_beside_a_question_or_a_failure_offers_no_standing_apply() {
             false,
         );
         assert!(
-            !actions.contains(&Action::ApplyWhenSettled),
+            !actions.contains(&ThreadAction::ApplyWhenSettled),
             "{status:?} with a live wait must not offer a standing apply: {actions:?}"
         );
     }
@@ -970,5 +984,5 @@ fn a_parked_chat_thread_keeps_archive() {
         false,
         false,
     );
-    assert_eq!(actions, vec![Action::Archive, Action::Save]);
+    assert_eq!(actions, vec![ThreadAction::Archive, ThreadAction::Save]);
 }

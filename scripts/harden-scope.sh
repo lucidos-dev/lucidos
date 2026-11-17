@@ -32,6 +32,9 @@
 # Exit status: 0 for every answer.
 
 set -uo pipefail
+# comm needs input in its own collation order. Pin both sort and comm to byte
+# order, since some coreutils builds disagree under a UTF-8 locale.
+export LC_ALL=C
 
 sha=${1:-}
 base=${2:-main}

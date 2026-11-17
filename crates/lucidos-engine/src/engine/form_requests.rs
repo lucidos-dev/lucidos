@@ -85,6 +85,19 @@ pub async fn pending(pool: &PgPool) -> Result<Vec<PendingFormRequest>, sqlx::Err
         .collect())
 }
 
+/// Requested identities with persisted resolution evidence, regardless of archive state.
+pub async fn resolved_ids(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<Uuid>, sqlx::Error> {
+    let ids: Vec<String> = ids.iter().map(Uuid::to_string).collect();
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT payload->>'request_id' FROM events \
+         WHERE event_type = 'FormRequestResolved' AND payload->>'request_id' = ANY($1)",
+    )
+    .bind(&ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().filter_map(|id| id.parse().ok()).collect())
+}
+
 /// One open request row, for the in-engine sweeps.
 struct OpenRequest {
     request_id: Uuid,
@@ -187,7 +200,7 @@ pub async fn resolve_or_log(
     actor: Option<MessageOrigin>,
 ) {
     if let Err(e) = resolve(pool, bus, request_id, outcome, actor).await {
-        crate::log!("[FormRequests] resolving {request_id} as {outcome:?} failed: {e}");
+        crate::log_legacy!("[FormRequests] resolving {request_id} as {outcome:?} failed: {e}");
     }
 }
 
@@ -206,9 +219,9 @@ pub async fn complete_named_request(
             resolve_or_log(pool, bus, request_id, FormRequestOutcome::Completed, actor).await
         }
         Ok(found) => {
-            crate::log!("[FormRequests] {request_id} is {found:?}, not a {kind}; left open")
+            crate::log_legacy!("[FormRequests] {request_id} is {found:?}, not a {kind}; left open")
         }
-        Err(e) => crate::log!("[FormRequests] looking up {request_id} failed: {e}"),
+        Err(e) => crate::log_legacy!("[FormRequests] looking up {request_id} failed: {e}"),
     }
 }
 
@@ -225,7 +238,7 @@ async fn resolve_open_where(
     let open = match open_requests(pool, thread_id, types).await {
         Ok(open) => open,
         Err(e) => {
-            crate::log!("[FormRequests] open-request query failed: {e}");
+            crate::log_legacy!("[FormRequests] open-request query failed: {e}");
             return;
         }
     };

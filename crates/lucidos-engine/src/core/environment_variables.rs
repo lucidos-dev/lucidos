@@ -81,11 +81,13 @@ impl NameRejection {
 const RESERVED_EXACT: &[&str] = &[
     // The workspace database (see `core::lucidos_database_url_env`).
     crate::core::LUCIDOS_DATABASE_URL,
+    crate::core::MANAGED_DATABASE_ENV,
     // Process / build env the engine controls.
     "PATH",
     "RUSTC_WRAPPER",
     // Engine-owned LUCIDOS_* (see `api::actor` + `runtime::spawn_env`).
     "LUCIDOS_WORKSPACE",
+    "LUCIDOS_WORKSPACE_ORIGIN",
     crate::api::actor::ENV_AGENT_ORIGIN_TOKEN,
     crate::api::actor::ENV_SOURCE_THREAD_ID,
     "LUCIDOS_HOST_PID",
@@ -361,7 +363,7 @@ impl EnvironmentVariableStore {
     /// an empty fallback would strip live variables on a DB hiccup.
     pub async fn spawn_pairs(pool: &PgPool, label: &str) -> Vec<(String, String)> {
         Self::env_pairs(pool).await.unwrap_or_else(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[{}] Failed to load user environment variables, using the startup copy: {}",
                 label,
                 e
@@ -485,7 +487,7 @@ pub async fn migrate_env_file_to_db(
     let contents = match std::fs::read_to_string(&env_path) {
         Ok(c) => c,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EnvMigration] Failed to read {} — leaving it in place: {}",
                 env_path.display(),
                 e
@@ -523,7 +525,11 @@ pub async fn migrate_env_file_to_db(
                     Ok(None) => {}
                     Err(e) => {
                         failed += 1;
-                        crate::log!("[EnvMigration] Could not read '{}' from the DB: {}", key, e);
+                        crate::log_legacy!(
+                            "[EnvMigration] Could not read '{}' from the DB: {}",
+                            key,
+                            e
+                        );
                         continue;
                     }
                 }
@@ -531,7 +537,7 @@ pub async fn migrate_env_file_to_db(
                     Ok(_) => imported += 1,
                     Err(e) => {
                         failed += 1;
-                        crate::log!("[EnvMigration] Failed to import '{}': {}", key, e);
+                        crate::log_legacy!("[EnvMigration] Failed to import '{}': {}", key, e);
                     }
                 }
             }
@@ -542,7 +548,7 @@ pub async fn migrate_env_file_to_db(
                     Ok(Some(_)) => already += 1,
                     _ => {
                         held += 1;
-                        crate::log!(
+                        crate::log_legacy!(
                             "[EnvMigration] Not importing '{}' from data/.env: {}",
                             key,
                             NameRejection::CodeInjecting.message(key)
@@ -550,7 +556,7 @@ pub async fn migrate_env_file_to_db(
                     }
                 }
             }
-            Err(rejection) => crate::log!(
+            Err(rejection) => crate::log_legacy!(
                 "[EnvMigration] Skipping '{}' from data/.env: {}",
                 key,
                 rejection.message(key)
@@ -567,7 +573,7 @@ pub async fn migrate_env_file_to_db(
     // rest. That also bounds a permanently failing line: the file stays, and
     // every boot after the first does the same small read and no writes.
     if failed > 0 || held > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[EnvMigration] Imported {} var(s), skipped {} already in the DB, {} failed, {} held for Settings, so data/.env stays for the next boot",
             imported,
             already,
@@ -578,12 +584,12 @@ pub async fn migrate_env_file_to_db(
     }
 
     match std::fs::remove_file(&env_path) {
-        Ok(()) => crate::log!(
+        Ok(()) => crate::log_legacy!(
             "[EnvMigration] Imported {} var(s) from data/.env into the DB, skipped {} already there, and removed the file",
             imported,
             already
         ),
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[EnvMigration] Imported {} var(s) but failed to delete {}: {}",
             imported,
             env_path.display(),
@@ -619,7 +625,7 @@ pub async fn apply_to_process_env(pool: &PgPool) {
     let pairs = match EnvironmentVariableStore::env_pairs(pool).await {
         Ok(pairs) => pairs,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EnvVars] Failed to load environment variables for process env: {}",
                 e
             );
@@ -637,7 +643,9 @@ pub async fn apply_to_process_env(pool: &PgPool) {
         }
     }
     if STARTUP_ENV_VARS.set(pairs).is_err() {
-        crate::log!("[EnvVars] apply_to_process_env ran twice; keeping the first startup copy");
+        crate::log_legacy!(
+            "[EnvVars] apply_to_process_env ran twice; keeping the first startup copy"
+        );
     }
 }
 
@@ -715,6 +723,22 @@ mod tests {
                 "{name} must not be storable as a user variable"
             );
         }
+    }
+
+    #[test]
+    fn workspace_origin_is_reserved() {
+        assert_eq!(
+            validate_name("LUCIDOS_WORKSPACE_ORIGIN"),
+            Err(NameRejection::Reserved)
+        );
+    }
+
+    #[test]
+    fn managed_database_handoff_is_reserved() {
+        assert_eq!(
+            validate_name("LUCIDOS_MANAGED_DATABASE"),
+            Err(NameRejection::Reserved)
+        );
     }
 
     /// The engine sets none of these any more (ADR 0481), so they belong to the

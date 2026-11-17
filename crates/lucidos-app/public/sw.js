@@ -1,3 +1,5 @@
+// Temporary worker instance mark: docs/temporary-measures.md, Page health log.
+const WORKER_INSTANCE = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
 // Lucidos Service Worker — handles push notifications and PWA support
 
 // Base path this SW is scoped to (ADR 0014): "/<slug>/" behind the workspace
@@ -13,6 +15,10 @@ const SCOPE_PATH = (() => {
     return '/';
   }
 })();
+
+// Remote subscriptions use this A-owned script, granted only their exact scope
+// by A's gateway. They handle push only; they never cache or intercept B data.
+const IS_REMOTE_SCOPE = SCOPE_PATH.includes('@');
 
 /** Strip the scope prefix from an absolute pathname, yielding a scope-relative
  *  path (always starting with "/"). `/myws/api/v1/x` → `/api/v1/x`; `/` → `/`. */
@@ -39,7 +45,7 @@ function swLog(message, data, generation = 'unknown') {
     return fetch(`${self.location.origin}${SCOPE_PATH}api/v1/internal/client-log`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-lucidos-restore-generation': generation },
-      body: JSON.stringify({ category: 'sw', message, data: data || {} }),
+      body: JSON.stringify({ category: 'sw', code: message, message, data: data || {} }),
       keepalive: true,
     }).catch(() => {});
   } catch {
@@ -59,7 +65,7 @@ self.addEventListener('install', (event) => {
   // handler caches the shell on the first successful navigation. Built mode only
   // — `cache: 'reload'` bypasses the HTTP cache so we store the CURRENT build's
   // shell, and SHELL_CACHE is build-id-keyed so activate() purges it on a bump.
-  if (IS_BUILT) {
+  if (IS_BUILT && !IS_REMOTE_SCOPE) {
     event.waitUntil((async () => {
       try {
         const shellKey = new Request(self.location.origin + SCOPE_PATH);
@@ -83,10 +89,12 @@ self.addEventListener('activate', (event) => {
   // generation instead of leaking it forever.
   event.waitUntil(
     (async () => {
-      const names = await caches.keys();
-      await Promise.all(
-        names.filter((name) => !KEEP_CACHES.includes(name)).map((name) => caches.delete(name)),
-      );
+      if (!IS_REMOTE_SCOPE) {
+        const names = await caches.keys();
+        await Promise.all(
+          names.filter((name) => !KEEP_CACHES.includes(name)).map((name) => caches.delete(name)),
+        );
+      }
       await clients.claim();
     })(),
   );
@@ -94,25 +102,11 @@ self.addEventListener('activate', (event) => {
 
 // Required for iOS PWA — without a fetch listener iOS won't treat this as a valid SW.
 //
-// We intercept same-origin GET /api/v1/* requests with explicit respondWith(fetch())
-// to work around an iOS Safari bug where the implicit "don't call respondWith"
-// fallback returns empty/corrupted responses after the SW is killed and restarted
-// under memory pressure (manifests as blank thread views). Workspace images under
-// /data/ are fetched explicitly too, and read whole (see fetchWhole). Built /assets/*
-// bundles are also served Cache-first (see SHELL_CACHE) to speed up reloads, and
-// a miss is read whole before it is cached.
-//
-// We DO NOT intercept non-GET methods (POST/PUT/PATCH/DELETE). iOS WebKit's body
-// stream cloning is unreliable when respondWith re-issues a request with a body —
-// large bodies (e.g. base64-encoded image uploads) reject with "TypeError: Load
-// failed", surfacing as "Failed to send message" toasts even though the request
-// would succeed if the browser handled it natively.
-//
-// We also exclude SSE /api/v1/events because Chrome keeps the SW alive for the entire
-// streaming connection, causing hangs when two SW versions coexist (active + waiting).
-//
-// For GETs we wrap fetch in a single retry — iOS occasionally rejects the first
-// request when the SW just woke from suspension, and a retry succeeds.
+// API reads go directly to the network, with one transport retry in the page.
+// Only immutable blobs and the marked worker health probe use respondWith.
+// Keep the worker out of ordinary reads: an unanswered fetch can trigger
+// WebKit's worker stop path, which can also end the page process.
+// Workspace images and built bundles still use their cache and body checks.
 //
 // Content-addressed blob endpoints (/api/v1/blobs/<hash>[/preview]) get an extra
 // Cache API layer on top — the bytes for a hash never change, so a Cache entry
@@ -164,6 +158,7 @@ const KEEP_CACHES = [BLOB_CACHE, SHELL_CACHE];
 const FETCH_PROBE_PARAM = 'sw-fetch-probe';
 
 self.addEventListener('fetch', (event) => {
+  if (IS_REMOTE_SCOPE) return;
   if (event.request.method !== 'GET') return;
   const url = event.request.url;
   // Only ever touch our own origin — cross-origin requests (CDNs, third-party
@@ -176,30 +171,14 @@ self.addEventListener('fetch', (event) => {
   const rel = scopeRelative(path);
 
   if (rel.startsWith('/api/v1/')) {
-    // SSE: Chrome keeps the SW alive for the whole streaming connection, so
-    // intercepting it hangs the worker — let the browser handle it natively.
-    if (rel === '/api/v1/events') return;
-    // The connection watchdog's probe, and the one request whose LATENCY is the
-    // signal rather than its body. It carries its own short deadline (sized
-    // against the poll interval, see HEALTH_PROBE_TIMEOUT_MS) and that deadline
-    // covers whatever happens in here, so fetchWithRetry's second attempt cannot rescue
-    // the probe: it can only spend what is left of the budget belonging to the
-    // attempt that matters, and turn a fast honest failure into a timeout. The
-    // retry it is giving up is worth nothing here anyway, because a failed probe
-    // is already cheap by construction: three consecutive ones are suppressed
-    // and the next is 5s away. Same reasoning as the SSE line above, for a
-    // different reason: this endpoint's semantics are not what the SW assumes.
-    // The one exception is the page's fetch-path probe (swFetchPathProbe.ts).
-    // It goes through fetchWithRetry like any other read, so a worker whose own
-    // fetch() never settles leaves it unanswered while the plain probe answers.
-    if (rel === '/api/v1/health' && !new URL(url).searchParams.has(FETCH_PROBE_PARAM)) return;
     // Content-addressed blobs are immutable for the lifetime of the hash.
     if (rel.startsWith('/api/v1/blobs/')) {
       event.respondWith(cacheFirst(event.request, BLOB_CACHE));
       return;
     }
-    // Other GETs get the iOS empty-response retry workaround (see top comment).
-    event.respondWith(fetchWithRetry(event.request));
+    if (rel === '/api/v1/health' && new URL(url).searchParams.has(FETCH_PROBE_PARAM)) {
+      event.respondWith(fetchWithRetry(event.request));
+    }
     return;
   }
 
@@ -472,7 +451,11 @@ function resolveNavigate(relativeUrl) {
   // (trailing slash).
   try {
     const scopeRelativeUrl = relativeUrl.replace(/^\//, '');
-    return new URL(scopeRelativeUrl, self.location.origin + SCOPE_PATH).toString();
+    const target = new URL(scopeRelativeUrl, self.location.origin + SCOPE_PATH);
+    if (IS_REMOTE_SCOPE && (target.origin !== self.location.origin || target.pathname !== SCOPE_PATH)) {
+      return self.location.origin + SCOPE_PATH;
+    }
+    return target.toString();
   } catch {
     return self.location.origin + SCOPE_PATH;
   }
@@ -559,7 +542,12 @@ self.addEventListener('push', (event) => {
     requireInteraction: true,
     silent: isWake,
     // Buttons beside the banner, where the browser draws them. iOS draws none.
-    actions: Array.isArray(notification.actions) ? notification.actions : [],
+    actions: Array.isArray(notification.actions)
+      ? (IS_REMOTE_SCOPE
+        ? notification.actions.filter(a => a?.action === UNWATCH_PUSH_ACTION && typeof a.title === 'string')
+          .map(a => ({action: UNWATCH_PUSH_ACTION, title: a.title.slice(0, 80)}))
+        : notification.actions)
+      : [],
     // `navigate` is the spec-level bypass for the macOS-Chrome partial-wedge
     // bug (Safari 18.5+ honors it; Chrome ignores it until #382298314 ships
     // and falls through to notificationclick). This is the engine's QUERY
@@ -592,7 +580,7 @@ self.addEventListener('message', (event) => {
   // is the first statement of notificationclick), no pong reaches the page
   // and the page recovers via unregister + re-register.
   if (event.data?.type === 'lucidos:ping' && event.source) {
-    event.source.postMessage({ type: 'lucidos:pong' });
+    event.source.postMessage({ type: 'lucidos:pong', instance: WORKER_INSTANCE });
     return;
   }
   // Build-id query (control panel debugging aid): report which build this SW
@@ -638,7 +626,7 @@ self.addEventListener('notificationclick', (event) => {
     const headers = { 'x-lucidos-restore-generation': generation };
     const url = (path) => `${self.location.origin}${SCOPE_PATH}api/v1/${path}`;
     const threadId = encodeURIComponent(data.unwatch_thread_id);
-    const unwatch = fetch(url(`threads/${threadId}/people/unwatch`), { method: 'POST', headers });
+    const unwatch = fetch(url(`threads/${threadId}/users/unwatch`), { method: 'POST', headers });
     const read = notificationId
       ? fetch(url(`notification/read?id=${encodeURIComponent(notificationId)}`), { method: 'POST', headers })
       : Promise.resolve();

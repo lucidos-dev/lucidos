@@ -84,14 +84,14 @@ async fn oauth_token_for_request(pool: &PgPool, provider: &str) -> Result<Option
     match oauth::get_account_with_fresh_token(pool, provider).await {
         Ok(account) => Ok(Some(account.access_token)),
         Err(AccountLookupError::NotConnected) => {
-            log!(
+            log_legacy!(
                 "[OAuth] No {} account found, skipping token injection",
                 provider
             );
             Ok(None)
         }
         Err(AccountLookupError::DbError(e)) => {
-            log!("[OAuth] Failed to look up {} account: {}", provider, e);
+            log_legacy!("[OAuth] Failed to look up {} account: {}", provider, e);
             Ok(None)
         }
         Err(AccountLookupError::RefreshFailed(msg)) => Err(msg),
@@ -135,7 +135,7 @@ impl LucidosEngine {
         let stored_credential = match CredentialStore::find_by_url(&self.pool, url).await {
             Ok(found) => found,
             Err(e) => {
-                log!(@http_request, "Cannot look up stored credentials for {}: {}. Sending unauthenticated", url, e);
+                log_legacy!(@http_request, "Cannot look up stored credentials for {}: {}. Sending unauthenticated", url, e);
                 None
             }
         };
@@ -170,7 +170,7 @@ impl LucidosEngine {
             {
                 if let Ok(header_val) = reqwest::header::HeaderValue::from_str(&auth_value) {
                     headers.insert(header_name, header_val);
-                    log!(@http_request, "Injected {} credentials for {}", cred.service_name, url);
+                    log_legacy!(@http_request, "Injected {} credentials for {}", cred.service_name, url);
                 }
             }
         }
@@ -189,9 +189,9 @@ impl LucidosEngine {
                 match reqwest::header::HeaderValue::from_str(&format!("Bearer {access_token}")) {
                     Ok(val) => {
                         headers.insert(reqwest::header::AUTHORIZATION, val);
-                        log!("[OAuth] Injected {} token for {}", oauth_provider, url);
+                        log_legacy!("[OAuth] Injected {} token for {}", oauth_provider, url);
                     }
-                    Err(e) => log!(
+                    Err(e) => log_legacy!(
                         "[OAuth] {} token is not a valid header value ({}); leaving the request's existing auth in place for {}",
                         oauth_provider,
                         e,
@@ -330,17 +330,20 @@ impl LucidosEngine {
                                                 if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", account.access_token)) {
                                                     headers.insert(reqwest::header::AUTHORIZATION, val);
                                                 }
-                                                log!("[OAuth] Re-refreshed {} token after 401 (attempt {}/{})",
+                                                log_legacy!("[OAuth] Re-refreshed {} token after 401 (attempt {}/{})",
                                                     provider, attempt + 1, MAX_RETRIES);
                                             }
-                                            Err(e) => log!("[OAuth] Force-refresh failed for {} after 401 (attempt {}/{}): {}",
+                                            Err(e) => log_legacy!("[OAuth] Force-refresh failed for {} after 401 (attempt {}/{}): {}",
                                                 provider, attempt + 1, MAX_RETRIES, e),
                                         }
                                     }
                                     Ok(None) => {
-                                        log!("[OAuth] No {} account found for 401 retry", provider)
+                                        log_legacy!(
+                                            "[OAuth] No {} account found for 401 retry",
+                                            provider
+                                        )
                                     }
-                                    Err(e) => log!(
+                                    Err(e) => log_legacy!(
                                         "[OAuth] Failed to look up {} account for 401 retry: {}",
                                         provider,
                                         e
@@ -349,7 +352,7 @@ impl LucidosEngine {
                             }
                         }
                         let delay = 1u64 << attempt; // 1s, 2s, 4s
-                        log!(@http_request, "HTTP {} from {} — retrying in {}s (attempt {}/{})",
+                        log_legacy!(@http_request, "HTTP {} from {} — retrying in {}s (attempt {}/{})",
                             status, url, delay, attempt + 1, MAX_RETRIES);
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         continue;
@@ -363,7 +366,7 @@ impl LucidosEngine {
                     };
                     if attempt < MAX_RETRIES && retry_allowed(method, outcome) {
                         let delay = 1u64 << attempt;
-                        log!(@http_request, "Request failed for {} — retrying in {}s (attempt {}/{}): {}",
+                        log_legacy!(@http_request, "Request failed for {} — retrying in {}s (attempt {}/{}): {}",
                             url, delay, attempt + 1, MAX_RETRIES, e);
                         tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                         continue;
@@ -439,6 +442,9 @@ impl LucidosEngine {
                         &body_bytes,
                         &format!("HTTP response: {}", artifact_path),
                         WriteAnnouncement::Entity {
+                            writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(
+                                thread_id,
+                            ),
                             source: Some("http_request".to_string()),
                             writer_thread_id: Some(thread_id),
                         },
@@ -742,24 +748,6 @@ mod tests {
         assert!(text.contains('\u{FFFD}'));
     }
 
-    /// The two tests above only exercise the helper. This one pins the tool
-    /// itself to it: `execute_http_tool` must not reach for `.text()` on the
-    /// response, because that body is what `output_path` / `temp_path` write
-    /// to disk. The error-formatting branches decode `body_bytes` at the end
-    /// instead, so no `.text()` call belongs in this file's production code.
-    #[test]
-    fn the_http_tool_never_reads_its_response_body_as_text() {
-        let source = crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/tools/http.rs"),
-        );
-        assert!(
-            !source.contains(".text().await"),
-            "engine/tools/http.rs reads the response body as text again. That is \
-             a lossy UTF-8 decode and the body is persisted verbatim, so use \
-             read_response_body instead."
-        );
-    }
-
     /// An expired token with no refresh token cannot be renewed. The tool
     /// refuses, names the account and the fix, and sends nothing.
     #[tokio::test]
@@ -802,5 +790,25 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         assert_eq!(oauth_token_for_request(&pool, "spotify").await, Ok(None));
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    mod guard_tests {
+        /// The two tests above only exercise the helper. This one pins the tool
+        /// itself to it: `execute_http_tool` must not reach for `.text()` on the
+        /// response, because that body is what `output_path` / `temp_path` write
+        /// to disk. The error-formatting branches decode `body_bytes` at the end
+        /// instead, so no `.text()` call belongs in this file's production code.
+        #[test]
+        fn the_http_tool_never_reads_its_response_body_as_text() {
+            let source = crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("engine/tools/http.rs"),
+            );
+            assert!(
+                !source.contains(".text().await"),
+                "engine/tools/http.rs reads the response body as text again. That is \
+             a lossy UTF-8 decode and the body is persisted verbatim, so use \
+             read_response_body instead."
+            );
+        }
     }
 }

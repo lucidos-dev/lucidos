@@ -80,6 +80,10 @@ pub enum EngineReason {
     /// Engine held a turn-end proposal because the branch's plan marker does
     /// not satisfy the gate, and told the agent how to set one.
     MissingPlan,
+    /// The user approved building the plan, and the turn ended with no source
+    /// change, so the engine told the agent to start: the *approved-plan
+    /// re-entry*.
+    ApprovedPlanUnstarted,
     /// The session grew past its *context ceiling*, so the engine asked the
     /// agent to hand off: the *ceiling re-entry* (ADR 0629).
     ContextCeiling,
@@ -140,6 +144,10 @@ pub enum EngineReason {
 /// The serde `kind` of [`EngineReason::CacheKeepAlive`], for SQL that reads a
 /// keep-alive anchor. A test ties it to the tag.
 pub const CACHE_KEEP_ALIVE_REASON_KIND: &str = "cache_keep_alive";
+
+/// The serde `kind` of [`EngineReason::EventWait`], for SQL that reads an
+/// event-wait re-entry's anchor. A test ties it to the tag.
+pub const EVENT_WAIT_REASON_KIND: &str = "event_wait";
 
 /// How an event wait ended, as the re-entry it caused reports it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -263,6 +271,7 @@ fn default_thread_direction_parent() -> ThreadDirection {
 /// Invariants enforced at construction in `engine/chat/events.rs`:
 /// - `Device { .. }`            ⇒ `mode == ActorMode::Human` (intrinsic)
 /// - `Api { mode, .. }`         ⇒ `mode == carried mode` (Human, Agent, or Engine)
+/// - `UnattestedCaller { mode, .. }` ⇒ `mode == carried mode`
 /// - `Workspace { mode, .. }`   ⇒ `mode == carried mode`
 /// - `ThreadLink { mode, .. }`  ⇒ `mode == carried mode`
 /// - `Engine { .. }`            ⇒ `mode == ActorMode::Engine` (intrinsic)
@@ -273,11 +282,20 @@ fn default_thread_direction_parent() -> ThreadDirection {
 /// says they answer the agent's own subscription, and `held_deliveries` keys
 /// on that mode to hold a re-entry behind an open question.
 ///
-/// Workspace caller_* body fields are display hints only — they are user-controllable
-/// (any HTTP client can send them) and MUST NOT be used for authorization.
+/// The caller_* body fields are claims any HTTP client can send. Only a gateway
+/// stamp over them builds `Workspace`, and only its verdict is ever read for
+/// authorization. Without one they build `UnattestedCaller`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageOrigin {
+    /// Owner-authored saved compose content, submitted by an authenticated
+    /// agent on owner authority (ADR 0651). This is Human content without a
+    /// Device origin: it never opens a fresh owner-authorized turn. The
+    /// acceptance event retains the submitter and authority evidence.
+    SavedDraft {
+        submission_event_id: uuid::Uuid,
+        submitted_by_thread_id: uuid::Uuid,
+    },
     /// Mode = Human. Human at a known device. `device_id` is the TEXT primary
     /// key from the `devices` table (not necessarily a UUID).
     ///
@@ -313,8 +331,34 @@ pub enum MessageOrigin {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         emitting_trigger_id: Option<String>,
     },
+    /// An API caller the engine cannot tie to a signed identity: it carries
+    /// no valid origin token and no gateway stamp. It may read, chat and
+    /// write, under this actor and never the owner's.
+    ///
+    /// What it claimed rides along as a display hint, never as authority.
+    UnattestedCaller {
+        /// The mode the caller claimed. Defaults to Human, as on `Api`.
+        #[serde(default = "default_api_mode")]
+        mode: ActorMode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_agent: Option<String>,
+        /// A device id the request named with no valid stamp.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claimed_device_id: Option<String>,
+        /// The request carried the machine-local token, which proves a process
+        /// on this machine and not who runs it (`api::local_auth`).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        claimed_local_token: bool,
+        /// A `caller_workspace` the request named with no gateway stamp.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claimed_workspace: Option<String>,
+        /// A caller thread named without a gateway stamp. Display only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        claimed_thread_id: Option<uuid::Uuid>,
+    },
     /// Mode = Human or Agent (carried in `mode`). HTTP request from another
-    /// Lucidos workspace, identified by the `caller_workspace` body field.
+    /// Lucidos workspace, named by the `caller_workspace` body field and
+    /// verified by the gateway's stamp over it.
     Workspace {
         workspace: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -329,6 +373,12 @@ pub enum MessageOrigin {
         /// field. Read by `MessageOrigin::mode()` to derive the request's `ActorMode`.
         #[serde(default = "default_workspace_mode")]
         mode: ActorMode,
+        /// The calling workspace's spawn-gate verdict on its thread, carried
+        /// under a gateway stamp. Every cross-workspace spawn carries one.
+        /// `None` is a row written before stamps, which keeps its old reading,
+        /// or an actor that never starts a thread (a snapshot restore).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        verdict: Option<SpawnVerdict>,
     },
     /// Mode = Human, Agent, or Engine (carried in `mode`). Bidirectional link
     /// to another thread in the same workspace. `direction = Parent` means
@@ -384,6 +434,52 @@ pub enum MessageOrigin {
     System,
 }
 
+/// What the calling workspace's spawn gate says about the thread that made a
+/// cross-workspace call. The receiving workspace honors it and never upgrades
+/// it, since only the caller can read the caller's provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SpawnVerdict {
+    /// The caller's gate would start a coding agent for this thread.
+    Allowed,
+    /// The caller's gate refuses, for `reason`, in the caller's own words.
+    Refused { reason: String },
+    /// An unattested caller started the calling thread.
+    Unattested,
+}
+
+impl SpawnVerdict {
+    const ALLOWED: &'static str = "allowed";
+    const UNATTESTED: &'static str = "unattested";
+    const REFUSED_PREFIX: &'static str = "refused:";
+
+    /// The verdict as a header value. A reason is percent-encoded, since it is
+    /// free text and a header value is bytes.
+    pub fn to_header(&self) -> String {
+        match self {
+            Self::Allowed => Self::ALLOWED.to_string(),
+            Self::Unattested => Self::UNATTESTED.to_string(),
+            Self::Refused { reason } => {
+                format!("{}{}", Self::REFUSED_PREFIX, urlencoding::encode(reason))
+            }
+        }
+    }
+
+    /// Read [`Self::to_header`] back. `None` for anything else.
+    pub fn from_header(value: &str) -> Option<Self> {
+        match value {
+            Self::ALLOWED => Some(Self::Allowed),
+            Self::UNATTESTED => Some(Self::Unattested),
+            _ => {
+                let reason = value.strip_prefix(Self::REFUSED_PREFIX)?;
+                Some(Self::Refused {
+                    reason: urlencoding::decode(reason).ok()?.into_owned(),
+                })
+            }
+        }
+    }
+}
+
 fn default_workspace_mode() -> ActorMode {
     ActorMode::Human
 }
@@ -402,8 +498,8 @@ impl MessageOrigin {
     /// intrinsic to the variant.
     pub fn mode(&self) -> ActorMode {
         match self {
-            Self::Device { .. } => ActorMode::Human,
-            Self::Api { mode, .. } => *mode,
+            Self::Device { .. } | Self::SavedDraft { .. } => ActorMode::Human,
+            Self::Api { mode, .. } | Self::UnattestedCaller { mode, .. } => *mode,
             Self::Workspace { mode, .. } | Self::ThreadLink { mode, .. } => *mode,
             Self::Agent { .. } => ActorMode::Agent,
             Self::Webhook { .. } | Self::Engine { .. } | Self::System => ActorMode::Engine,
@@ -461,6 +557,160 @@ impl MessageOrigin {
             spawning_event_id: None,
             mode,
             direction: ThreadDirection::Child,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Invariant 11 of the unattested-callers plan: an origin stored before
+    /// the stamp existed still reads as what it was. The spawn gate cannot
+    /// tell a forged past origin from a real one, so nothing reclassifies it.
+    #[test]
+    fn origins_stored_before_the_stamp_keep_their_kind() {
+        let device: MessageOrigin = serde_json::from_value(
+            serde_json::json!({ "kind": "device", "device_id": "d1", "label": "Old" }),
+        )
+        .unwrap();
+        assert_eq!(
+            device,
+            MessageOrigin::Device {
+                device_id: "d1".into()
+            }
+        );
+        let workspace: MessageOrigin =
+            serde_json::from_value(serde_json::json!({ "kind": "workspace", "workspace": "dev" }))
+                .unwrap();
+        assert!(matches!(
+            workspace,
+            MessageOrigin::Workspace {
+                mode: ActorMode::Human,
+                verdict: None,
+                ..
+            }
+        ));
+        let api: MessageOrigin =
+            serde_json::from_value(serde_json::json!({ "kind": "api", "mode": "engine" })).unwrap();
+        assert!(matches!(
+            api,
+            MessageOrigin::Api {
+                mode: ActorMode::Engine,
+                source_thread_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn an_unattested_caller_round_trips_and_defaults_to_human() {
+        let origin = MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Human,
+            user_agent: None,
+            claimed_device_id: Some("d1".into()),
+            claimed_local_token: false,
+            claimed_workspace: None,
+            claimed_thread_id: None,
+        };
+        let wire = serde_json::to_value(&origin).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "unattested_caller", "mode": "human", "claimed_device_id": "d1" })
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageOrigin>(wire).unwrap(),
+            origin
+        );
+        let bare: MessageOrigin =
+            serde_json::from_value(serde_json::json!({ "kind": "unattested_caller" })).unwrap();
+        assert_eq!(bare.mode(), ActorMode::Human);
+        assert!(matches!(
+            bare,
+            MessageOrigin::UnattestedCaller {
+                claimed_local_token: false,
+                claimed_thread_id: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_claimed_local_token_rides_the_wire_only_when_set() {
+        let origin = MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Engine,
+            user_agent: None,
+            claimed_device_id: None,
+            claimed_local_token: true,
+            claimed_workspace: None,
+            claimed_thread_id: None,
+        };
+        let wire = serde_json::to_value(&origin).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({ "kind": "unattested_caller", "mode": "engine", "claimed_local_token": true })
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageOrigin>(wire).unwrap(),
+            origin
+        );
+    }
+
+    #[test]
+    fn a_stamped_workspace_origin_round_trips_its_verdict() {
+        let origin = MessageOrigin::Workspace {
+            workspace: "dev".into(),
+            thread_id: None,
+            event_id: None,
+            user_agent: None,
+            mode: ActorMode::Agent,
+            verdict: Some(SpawnVerdict::Refused {
+                reason: "no grant".into(),
+            }),
+        };
+        let wire = serde_json::to_value(&origin).unwrap();
+        assert_eq!(
+            wire["verdict"],
+            serde_json::json!({ "kind": "refused", "reason": "no grant" })
+        );
+        assert_eq!(
+            serde_json::from_value::<MessageOrigin>(wire).unwrap(),
+            origin
+        );
+    }
+
+    #[test]
+    fn a_verdict_round_trips_through_its_header_form() {
+        for verdict in [
+            SpawnVerdict::Allowed,
+            SpawnVerdict::Unattested,
+            SpawnVerdict::Refused {
+                reason: "The trigger \u{201c}N\u{e5}r\u{201d} has no grant.\nTick it.".into(),
+            },
+            SpawnVerdict::Refused {
+                reason: String::new(),
+            },
+        ] {
+            let header = verdict.to_header();
+            assert!(
+                axum::http::HeaderValue::from_str(&header).is_ok(),
+                "{header:?} must be a valid header value"
+            );
+            assert_eq!(SpawnVerdict::from_header(&header), Some(verdict));
+        }
+    }
+
+    #[test]
+    fn a_malformed_verdict_header_reads_as_none() {
+        for bad in [
+            "",
+            "Allowed",
+            "refused",
+            "refused%3a",
+            "owner",
+            "refused:%ff",
+        ] {
+            assert_eq!(SpawnVerdict::from_header(bad), None, "{bad:?}");
         }
     }
 }

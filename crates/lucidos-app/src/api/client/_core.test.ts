@@ -382,3 +382,25 @@ describe('a mutation waits for a pending device registration', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('API read transport retry', () => {
+  afterEach(() => { globalThis.fetch = originalFetch; });
+  it('retries a transport failure through json', async () => {
+    const request = vi.fn().mockRejectedValueOnce(new TypeError('Load failed')).mockResolvedValueOnce(okJson());
+    globalThis.fetch = request;
+    await expect(json(API + '/threads/list')).resolves.toEqual({ ok: true });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+  it('does not retry the latency health probe', async () => {
+    const request = vi.fn().mockRejectedValue(new TypeError('Load failed'));
+    globalThis.fetch = request;
+    await expect(json(API + '/health')).rejects.toThrow('Load failed');
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+  it('does not retry body parsing', async () => {
+    const request = vi.fn().mockResolvedValue(new Response('bad JSON'));
+    globalThis.fetch = request;
+    await expect(json(API + '/threads/list')).rejects.toThrow();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});

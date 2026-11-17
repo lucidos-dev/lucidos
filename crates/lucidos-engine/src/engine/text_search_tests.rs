@@ -404,7 +404,7 @@ fn timing_against_a_real_workspace() {
                 TextSearchResponse::Searched { hits, .. } => hits.len(),
                 TextSearchResponse::QueryTooShort { .. } => 0,
             };
-            println!(
+            crate::log_legacy!(
                 "{query:>14} {mode:?} run {run}: {hits} hits in {:?}",
                 started.elapsed()
             );

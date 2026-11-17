@@ -66,7 +66,7 @@ impl LucidosEngine {
         } = inputs;
         // Include current file list so LLM doesn't need to call list_files
         let file_list_context = if !classification.needs_file_list {
-            log!("[Chat] Skipping file list context (not needed for this query)");
+            log_legacy!("[Chat] Skipping file list context (not needed for this query)");
             String::new()
         } else {
             // A walk that FAILED is not a workspace with no files, and the
@@ -76,7 +76,7 @@ impl LucidosEngine {
             let all_files = match self.artifact_manager.list_artifacts() {
                 Ok(files) => files,
                 Err(e) => {
-                    log!("[Chat] Cannot list artifacts for the file-list section: {}. The turn goes out without it", e);
+                    log_legacy!("[Chat] Cannot list artifacts for the file-list section: {}. The turn goes out without it", e);
                     Vec::new()
                 }
             };
@@ -100,7 +100,7 @@ impl LucidosEngine {
         let credentials_context = if classification.needs_credentials {
             self.credentials_section().await
         } else {
-            log!("[Chat] Skipping stored credentials context (not needed for this query)");
+            log_legacy!("[Chat] Skipping stored credentials context (not needed for this query)");
             self.builtin_proxies_section().await
         };
         let email_accounts_context =
@@ -113,7 +113,7 @@ impl LucidosEngine {
         let app_context = app_context.filter(|ctx| {
             let traversal = crate::core::is_path_traversal(&ctx.app_id);
             if traversal {
-                log!(
+                log_legacy!(
                     "[Chat] Ignoring app context with a path-traversal app id: {}",
                     ctx.app_id
                 );
@@ -203,7 +203,7 @@ URL: {}\n\
                 Ok(Some(d)) => d + 1,
                 Ok(None) => 1, // parent not yet in projection — default to depth 1
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] Failed to query parent thread depth for context: {}",
                         e
                     );
@@ -301,7 +301,7 @@ impl LucidosEngine {
         crate::engine::home_thread::is_home_thread(&self.pool, thread_id)
             .await
             .unwrap_or_else(|e| {
-                log!("[Chat] Could not read whether {} is home: {}", thread_id, e);
+                log_legacy!("[Chat] Could not read whether {} is home: {}", thread_id, e);
                 false
             })
     }
@@ -341,7 +341,7 @@ impl LucidosEngine {
     /// credentials", and the prompt renders the two alike, so it says why here.
     pub(crate) async fn stored_credentials_for_prompt(&self) -> Vec<crate::core::CredentialInfo> {
         CredentialStore::list(&self.pool).await.unwrap_or_else(|e| {
-            log!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
+            log_legacy!("[Chat] Cannot list credentials for the prompt: {}. The turn goes out as if none were configured", e);
             Vec::new()
         })
     }
@@ -349,7 +349,7 @@ impl LucidosEngine {
     /// The email accounts a prompt names, with a failed read logged.
     pub(crate) async fn email_accounts_for_prompt(&self) -> Vec<crate::core::EmailAccountInfo> {
         EmailStore::list(&self.pool).await.unwrap_or_else(|e| {
-            log!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
+            log_legacy!("[Chat] Cannot list email accounts for the prompt: {}. The turn goes out as if none were configured", e);
             Vec::new()
         })
     }
@@ -357,7 +357,7 @@ impl LucidosEngine {
     /// The OAuth accounts a prompt names, with a failed read logged.
     pub(crate) async fn oauth_accounts_for_prompt(&self) -> Vec<crate::core::OAuthAccountInfo> {
         OAuthStore::list(&self.pool).await.unwrap_or_else(|e| {
-            log!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
+            log_legacy!("[Chat] Cannot list OAuth accounts for the prompt: {}. The turn goes out as if none were connected", e);
             Vec::new()
         })
     }

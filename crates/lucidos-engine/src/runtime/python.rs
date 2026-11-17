@@ -1,5 +1,6 @@
 use crate::core::sanitize_for_jsonb;
 use crate::core::shell::{finalize_stream, KEPT_BYTES_CAP};
+use crate::runtime::agent_sandbox::Sandbox;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -174,7 +175,7 @@ impl PythonRuntime {
         })?;
         let exhaust_path = workspace_path.join(".lucidos").join("exhaust");
         if let Err(e) = fs::create_dir_all(&exhaust_path) {
-            log!(
+            log_legacy!(
                 "[Python] Failed to create exhaust dir at {}: {}",
                 exhaust_path.display(),
                 e
@@ -188,7 +189,7 @@ impl PythonRuntime {
         let staging_root = workspace_path.join(".lucidos/staging");
         if staging_root.exists() {
             if let Err(e) = fs::remove_dir_all(&staging_root) {
-                log!(
+                log_legacy!(
                     "[Python] Failed to clean up orphaned staging dir {}: {}",
                     staging_root.display(),
                     e
@@ -243,7 +244,7 @@ impl PythonRuntime {
             }
             let path = entry.path();
             if let Err(e) = fs::remove_dir_all(&path) {
-                log!(
+                log_legacy!(
                     "[Python] Failed to reclaim stale exhaust dir {}: {}",
                     path.display(),
                     e
@@ -285,7 +286,7 @@ impl PythonRuntime {
             return Ok(());
         }
 
-        log!(
+        log_legacy!(
             "[Python] Creating virtual environment at {}",
             self.venv_path.display()
         );
@@ -310,7 +311,7 @@ impl PythonRuntime {
             ));
         }
 
-        log!("[Python] Virtual environment created");
+        log_legacy!("[Python] Virtual environment created");
         self.install_agent_origin_shim()?;
         Ok(())
     }
@@ -396,9 +397,8 @@ impl PythonRuntime {
 
     /// Shared execution core: writes preamble + user code to a script, runs it, returns output.
     /// The preamble is empty for `execute_with_env` (no monkey-patching) and the staging-redirect
-    /// `builtins.open` shim for `execute_staged`. Scripts run with full host write access — the
-    /// previous outside-workspace write-guard was removed for consistency with `run_bash`,
-    /// `run_bash_background`, and `run_python_background`, none of which sandbox writes.
+    /// `builtins.open` shim for `execute_staged`. Scripts run in the agent sandbox, the same
+    /// one `run_bash`, `run_bash_background` and `run_python_background` get (ADR 0645).
     ///
     /// This is the *string-code* path (`run_python`, via `execute_staged`),
     /// where the LLM supplies code that has no home on disk — so the copy under
@@ -409,6 +409,7 @@ impl PythonRuntime {
     /// exists on disk must go through `execute_file_with_env` instead.
     async fn run_script(
         &self,
+        sandbox: &Sandbox,
         preamble: &str,
         code: &str,
         env_vars: Vec<(String, String)>,
@@ -420,7 +421,8 @@ impl PythonRuntime {
         let script_path = run_dir.join("script.py");
         fs::write(&script_path, &full_code).map_err(|e| e.to_string())?;
 
-        self.spawn_python(&script_path, &run_dir, env_vars).await
+        self.spawn_python(sandbox, &script_path, &run_dir, env_vars)
+            .await
     }
 
     /// Execute an EXISTING Python file **in place**, from its real on-disk path.
@@ -442,12 +444,14 @@ impl PythonRuntime {
     /// env, output sanitizing, exhaust audit logs, error shaping).
     pub async fn execute_file_with_env(
         &self,
+        sandbox: &Sandbox,
         script_path: &std::path::Path,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
         self.ensure_venv().await?;
         let run_dir = self.new_run_dir()?;
-        self.spawn_python(script_path, &run_dir, env_vars).await
+        self.spawn_python(sandbox, script_path, &run_dir, env_vars)
+            .await
     }
 
     /// Spawn `python <script_path>` in the workspace, capture output, drop the
@@ -468,11 +472,14 @@ impl PythonRuntime {
     /// removes its staging tree and commits nothing, exactly like a crash.
     async fn spawn_python(
         &self,
+        sandbox: &Sandbox,
         script_path: &std::path::Path,
         run_dir: &std::path::Path,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
-        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        let mut cmd = sandbox
+            .command(&self.python_bin)
+            .map_err(|e| format!("Failed to execute Python: {}", e))?;
         cmd.arg(script_path)
             .current_dir(&self.workspace_path)
             .stdin(std::process::Stdio::null())
@@ -529,10 +536,10 @@ impl PythonRuntime {
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&err.kept));
 
         if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
-            log!("[Python] Failed to write stdout debug log: {}", e);
+            log_legacy!("[Python] Failed to write stdout debug log: {}", e);
         }
         if let Err(e) = fs::write(run_dir.join("stderr.txt"), &stderr) {
-            log!("[Python] Failed to write stderr debug log: {}", e);
+            log_legacy!("[Python] Failed to write stderr debug log: {}", e);
         }
 
         if status.success() {
@@ -565,7 +572,7 @@ impl PythonRuntime {
             self.execution_timeout.as_secs(),
             crate::llm::tools::BG_MAX_TIMEOUT_SECS,
         );
-        log!("[Python] {}", message);
+        log_legacy!("[Python] {}", message);
         // Marked as engine-written: every other line in this file is the
         // child's own stderr, and an empty run dir would leave a reader with
         // no way to tell a timeout from a spawn that never happened.
@@ -573,7 +580,7 @@ impl PythonRuntime {
             run_dir.join("stderr.txt"),
             format!("[lucidos] {}\n", message),
         ) {
-            log!(
+            log_legacy!(
                 "[Python] Failed to write timeout note to stderr debug log: {}",
                 e
             );
@@ -658,31 +665,37 @@ impl PythonRuntime {
 
     pub async fn execute_with_env(
         &self,
+        sandbox: &Sandbox,
         code: &str,
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
-        self.run_script("", code, env_vars).await
+        self.run_script(sandbox, "", code, env_vars).await
     }
 
     /// Execute Python with staging: writes under data/ are redirected to the staging directory.
     /// Reads check staging first (for files written this run), then fall through to workspace.
     pub async fn execute_staged(
         &self,
+        sandbox: &Sandbox,
         code: &str,
         env_vars: Vec<(String, String)>,
         staging_dir: &std::path::Path,
     ) -> Result<String, String> {
         fs::create_dir_all(staging_dir).map_err(|e| e.to_string())?;
         let preamble = self.staging_preamble(staging_dir);
-        self.run_script(&preamble, code, env_vars).await
+        self.run_script(sandbox, &preamble, code, env_vars).await
     }
 
-    pub async fn execute(&self, code: &str) -> Result<String, String> {
-        self.execute_with_env(code, vec![]).await
+    pub async fn execute(&self, sandbox: &Sandbox, code: &str) -> Result<String, String> {
+        self.execute_with_env(sandbox, code, vec![]).await
     }
 
     /// Install multiple packages in a single pip invocation.
-    pub async fn ensure_packages(&self, packages: &[&str]) -> Result<(), String> {
+    pub async fn ensure_packages(
+        &self,
+        sandbox: &Sandbox,
+        packages: &[&str],
+    ) -> Result<(), String> {
         if packages.is_empty() {
             return Ok(());
         }
@@ -694,7 +707,9 @@ impl PythonRuntime {
         let mut args = vec!["-m", "pip", "install", "--quiet", "--"];
         args.extend(packages);
 
-        let mut cmd = tokio::process::Command::new(&self.python_bin);
+        let mut cmd = sandbox
+            .command(&self.python_bin)
+            .map_err(|e| format!("Failed to install packages: {}", e))?;
         cmd.args(&args)
             .stdin(std::process::Stdio::null())
             // pip install can hang on a slow network — kill_on_drop ensures
@@ -823,7 +838,7 @@ async fn read_capped<R: tokio::io::AsyncRead + Unpin>(
                 append_keeping_tail(&mut captured.end, &chunk[..n], PY_ERROR_BYTE_BUDGET);
             }
             Err(e) => {
-                log!("[Python] Output pipe read failed: {}", e);
+                log_legacy!("[Python] Output pipe read failed: {}", e);
                 break;
             }
         }
@@ -1041,6 +1056,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/append-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "open('data/artifacts/log.jsonl', 'a').write('three\\n')\nprint('done')",
                 vec![],
                 &staging,
@@ -1074,6 +1090,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/truncate-run");
         runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "open('data/artifacts/report.csv', 'w').write('fresh\\n')",
                 vec![],
                 &staging,
@@ -1101,6 +1118,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/update-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "with open('data/artifacts/notes.txt', 'r+') as f:\n    print(f.read().strip())",
                 vec![],
                 &staging,
@@ -1123,6 +1141,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/huge-run");
         let out = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "import sys\nsys.stdout.write('x' * 3_000_000)",
                 vec![],
                 &staging,
@@ -1150,6 +1169,7 @@ mod staging_seed_tests {
         let staging = ws.join(".lucidos/staging/flood-run");
         let err = runtime
             .execute_staged(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
                 "import sys\nsys.stderr.write('w' * 2_000_000)\nraise ValueError('the real cause')",
                 vec![],
                 &staging,
@@ -1160,6 +1180,51 @@ mod staging_seed_tests {
             err.contains("the real cause"),
             "{}",
             &err[..err.len().min(300)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_regression_tests {
+    use super::*;
+    use crate::runtime::agent_sandbox::Sandbox;
+
+    #[tokio::test]
+    #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
+    async fn reopened_workspace_runs_python_and_reports_hidden_read_errors() {
+        if let lucidos_agent_sandbox::Availability::Unavailable(why) =
+            lucidos_agent_sandbox::probe()
+        {
+            panic!("the real sandbox is unavailable: {why}");
+        }
+        let scratch = tempfile::tempdir().unwrap();
+        let gateway = std::fs::canonicalize(scratch.path())
+            .unwrap()
+            .join("gateway");
+        let ws = gateway.join("workspaces/ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(gateway.join("secret"), "secret").unwrap();
+        let runtime = PythonRuntime::new(ws).unwrap();
+        runtime.ensure_venv().await.unwrap();
+        let sandbox = Sandbox::enforced_for_test(lucidos_agent_sandbox::Policy {
+            hidden: vec![gateway.clone()],
+            open_within_hidden: vec![gateway.join("workspaces")],
+            ..Default::default()
+        });
+        assert_eq!(
+            runtime
+                .execute(&sandbox, "print('ready')")
+                .await
+                .unwrap()
+                .trim(),
+            "ready"
+        );
+        let code = format!("open({:?}).read()", gateway.join("secret"));
+        let error = runtime.execute(&sandbox, &code).await.unwrap_err();
+        assert!(error.contains("PermissionError"), "{error}");
+        assert!(
+            error.contains("Operation not permitted") || error.contains("Permission denied"),
+            "{error}"
         );
     }
 }

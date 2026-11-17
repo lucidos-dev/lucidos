@@ -16,8 +16,9 @@ use crate::core::prefs;
 use crate::core::{AppManager, DeviceStore, PreferenceStore};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::pending_answers::{await_answer, forget_answer, PendingAnswers};
-use crate::engine::thread_events::{EventMeta, ThreadEvent};
+use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::tools::navigate::device_actor;
+use crate::engine::widget_fit_sessions::{FitScope, FitSessions};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::{BTreeMap, HashMap};
@@ -249,7 +250,7 @@ async fn renderer(pool: &PgPool, preferred: Option<&str>) -> Result<String, Stri
         match DeviceStore::seen(pool, id).await {
             Ok(Some(seen)) if seen.visible_now => return Ok(id.to_string()),
             Ok(_) => {}
-            Err(e) => log!("[WidgetFit] presence lookup failed for device {id}: {e}"),
+            Err(e) => log_legacy!("[WidgetFit] presence lookup failed for device {id}: {e}"),
         }
     }
     let seen = DeviceStore::recently_seen(pool, RENDERER_CANDIDATES, 1)
@@ -269,6 +270,18 @@ pub(crate) struct WidgetFitContext<'a> {
     pub pending: &'a PendingWidgetFits,
 }
 
+/// A fit-specific responder; app captures and generic pending answers retain
+/// their device-only contract.
+pub(crate) enum FitResponder<'a> {
+    Device(Option<&'a str>),
+    AgentRenderer {
+        sessions: &'a FitSessions,
+        handle: &'a str,
+        device: &'a str,
+        actor: MessageOrigin,
+    },
+}
+
 /// Render `app_id` at every size it declares and return the note. `preferred`
 /// is the device to render on when its window is visible, such as the turn's
 /// last used device.
@@ -277,6 +290,23 @@ pub(crate) async fn check_widget_fit(
     app_id: &str,
     thread_id: Uuid,
     preferred: Option<&str>,
+    box_budget: Duration,
+) -> String {
+    check_widget_fit_with_responder(
+        cx,
+        app_id,
+        thread_id,
+        FitResponder::Device(preferred),
+        box_budget,
+    )
+    .await
+}
+
+pub(crate) async fn check_widget_fit_with_responder(
+    cx: &WidgetFitContext<'_>,
+    app_id: &str,
+    thread_id: Uuid,
+    responder: FitResponder<'_>,
     box_budget: Duration,
 ) -> String {
     let app = match cx.apps.get_app(app_id) {
@@ -291,14 +321,41 @@ pub(crate) async fn check_widget_fit(
         Ok(scale) => scale,
         Err(e) => return not_checked(app_id, &format!("could not read the UI scale: {e}")),
     };
-    let device = match renderer(cx.pool, preferred).await {
-        Ok(device) => device,
-        Err(reason) => return not_checked(app_id, &reason),
-    };
-
     let request_id = Uuid::new_v4().to_string();
-    let rx = await_answer(cx.pending, &request_id, Some(&device));
-    log!("[WidgetFit] check thread={thread_id} app={app_id} device={device}");
+    let (device, rx, actor, renderer_session_id) = match &responder {
+        FitResponder::Device(preferred) => {
+            let device = match renderer(cx.pool, *preferred).await {
+                Ok(device) => device,
+                Err(reason) => return not_checked(app_id, &reason),
+            };
+            let rx = await_answer(cx.pending, &request_id, Some(&device));
+            let actor = device_actor(&device);
+            (device, rx, actor, None)
+        }
+        FitResponder::AgentRenderer {
+            sessions,
+            handle,
+            device,
+            actor,
+        } => {
+            let scope = FitScope {
+                thread: thread_id,
+                app: app_id.to_string(),
+                device: device.to_string(),
+            };
+            let rx = match sessions.select(handle, &scope, &request_id) {
+                Ok(rx) => rx,
+                Err(reason) => return not_checked(app_id, reason),
+            };
+            (
+                device.to_string(),
+                rx,
+                actor.clone(),
+                Some(handle.to_string()),
+            )
+        }
+    };
+    log_legacy!("[WidgetFit] check thread={thread_id} app={app_id} device={device}");
     let emitted = cx
         .bus
         .emit(BusEvent::Thread {
@@ -309,12 +366,20 @@ pub(crate) async fn check_widget_fit(
                 sizes: sizes.clone(),
                 ui_scale: scale.percent,
                 scale_device_id: scale.device_id.clone(),
+                renderer_device_id: renderer_session_id.as_ref().map(|_| device.clone()),
+                renderer_session_id,
             },
-            meta: EventMeta::with_actor(Some(device_actor(&device))),
+            meta: EventMeta::with_actor(Some(actor)),
         })
         .await;
     if let Err(e) = emitted {
         forget_answer(cx.pending, &request_id);
+        if let FitResponder::AgentRenderer {
+            sessions, handle, ..
+        } = &responder
+        {
+            sessions.forget(handle);
+        }
         return not_checked(app_id, &format!("could not send the request: {e}"));
     }
 
@@ -332,6 +397,19 @@ pub(crate) async fn check_widget_fit(
         Ok(Err(_)) => not_checked(app_id, "the request was dropped"),
         Err(_) => {
             forget_answer(cx.pending, &request_id);
+            if let FitResponder::AgentRenderer {
+                sessions, handle, ..
+            } = &responder
+            {
+                sessions.forget(handle);
+                return not_checked(
+                    app_id,
+                    &format!(
+                        "the agent renderer did not answer within {} s",
+                        timeout.as_secs()
+                    ),
+                );
+            }
             let label = DeviceStore::friendly_name(cx.pool, &device).await;
             not_checked(
                 app_id,

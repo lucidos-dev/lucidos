@@ -231,7 +231,7 @@ fn consecutive_compactions_read_most_of_their_view_from_cache() {
             100.0 * uncached / sent
         ));
     }
-    log!("[SummaryTree] Compaction view cache, {entries} entries:\n{report}");
+    log_legacy!("[SummaryTree] Compaction view cache, {entries} entries:\n{report}");
     for cache in [Cache::Lookback, Cache::ExactMark] {
         let (sent, uncached) = cost(&view, cache);
         assert!(uncached <= 0.15 * sent, "{cache:?}\n{report}");
@@ -255,7 +255,7 @@ fn a_stalled_prefix_keeps_merges_reading_from_cache() {
         &mut CompactionView::default(),
     );
     let (sent, uncached) = cost(&view, Cache::ExactMark);
-    log!(
+    log_legacy!(
         "[SummaryTree] Workspace-shaped drain, {entries} entries: {sent:.0} bytes per call, \
          {uncached:.0} uncached ({:.1}%)",
         100.0 * uncached / sent

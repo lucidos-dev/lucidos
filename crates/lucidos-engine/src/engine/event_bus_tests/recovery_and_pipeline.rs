@@ -128,6 +128,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::ChangeApplied {
+                content: Default::default(),
                 change_id: test_change_id(child_id).to_string(),
                 requires_restart: false,
                 client_update: false,
@@ -157,10 +158,8 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
 
 #[tokio::test]
 async fn a_required_user_actor_reaches_the_persisted_system_event() {
-    use crate::api::actor::HEADER_DEVICE_ID;
     use crate::core::DeviceStore;
     use crate::engine::thread_events::MessageOrigin;
-    use axum::http::{HeaderMap, HeaderName, HeaderValue};
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
@@ -179,11 +178,8 @@ async fn a_required_user_actor_reaches_the_persisted_system_event() {
         .await
         .unwrap();
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        HeaderName::from_static(HEADER_DEVICE_ID),
-        HeaderValue::from_static("test-device-emit"),
-    );
+    let headers =
+        crate::api::gateway_stamp::test_support::stamped_device_headers("test-device-emit");
 
     // `DataFileWritten` (rather than the spec's `AppDeleted`) so the
     // assertion below can read the row back from the `events` table with the

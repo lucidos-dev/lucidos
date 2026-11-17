@@ -20,7 +20,7 @@ pub(super) fn capture_workspace_archive(
     let (dump_end, _, _) = estimate_weights(ws_bytes);
 
     // Phase 1: pg_dump (0% → dump_end%)
-    crate::log!("[Backup] Phase 1/4: pg_dump");
+    crate::log_legacy!("[Backup] Phase 1/4: pg_dump");
     progress("dumping_db", 1, 100);
     let dump_path = temp_path.join("lucidos_backup.dump");
     pg_dump(database_url, &dump_path)?;
@@ -33,7 +33,7 @@ pub(super) fn capture_workspace_archive(
     )?;
 
     // Phase 2: tar + zstd compress (dump_end% → compress_end%)
-    crate::log!("[Backup] Phase 2/4: tar + zstd compress");
+    crate::log_legacy!("[Backup] Phase 2/4: tar + zstd compress");
     progress("compressing", dump_end, 100);
     let compressed_path = temp_path.join("backup.tar.zst");
     tar_and_compress(

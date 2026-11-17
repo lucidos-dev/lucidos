@@ -211,12 +211,13 @@ pub fn wiped_database_message(workspace_dir: &std::path::Path) -> String {
 /// not help), once both schemes have failed, or once the timeout expires. A
 /// no-op when not gateway-spawned, and after the first call (see [`claim`]).
 pub async fn report(message: &str) {
+    crate::internal_faults::record_pending(crate::internal_faults::FaultKind::BootFailure);
     if !claim(&REPORTED) {
         return;
     }
     // Log unconditionally: a non-gateway engine (dev / e2e) has no splash to
     // render this, and even under a gateway the log is the durable copy.
-    crate::log!("[Startup] Boot failed: {}", message);
+    crate::log_legacy!("[Startup] Boot failed: {}", message);
     let (Ok(port), Ok(id)) = (
         std::env::var("LUCIDOS_GATEWAY_PORT"),
         std::env::var("LUCIDOS_WORKSPACE_ID"),
@@ -238,9 +239,9 @@ async fn post_failure(port: &str, id: &str, message: &str) {
     else {
         return;
     };
-    // Scheme via `net_config::peer_scheme_order` (never hardcoded — the dev
+    // Scheme via `net_config::gateway_scheme_order` (never hardcoded — the dev
     // gateway serves TLS, packaged serves plain http).
-    for scheme in crate::net_config::peer_scheme_order() {
+    for scheme in crate::net_config::gateway_scheme_order() {
         let url =
             format!("{scheme}://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-failure");
         if client
@@ -499,9 +500,9 @@ mod tests {
     /// request seen. A hand-rolled listener keeps this dependency-free.
     ///
     /// It must ACCEPT IN A LOOP rather than serve exactly one connection:
-    /// `peer_scheme_order()` puts https first whenever this process resolves to
-    /// TLS (which it does under the dev env), so the reporter's first attempt is a
-    /// TLS ClientHello into this plaintext socket. That connection has to be
+    /// `gateway_scheme_order()` puts https first when the env names TLS, as
+    /// the dev env does. The reporter's first attempt is then a TLS
+    /// ClientHello into this plaintext socket. That connection has to be
     /// consumed and discarded so the http retry — the one carrying the actual
     /// request — still finds a listener.
     async fn stub_gateway(status: &'static str) -> (String, tokio::task::JoinHandle<String>) {

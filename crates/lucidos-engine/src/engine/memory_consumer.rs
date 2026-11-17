@@ -54,7 +54,7 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
                 run(&engine, job).await;
             }
         }
-        log!(@Memory, "Memory indexer stream ended");
+        log_legacy!(@Memory, "Memory indexer stream ended");
     })
 }
 
@@ -206,6 +206,7 @@ mod tests {
             commit: "abc123".into(),
             source: None,
             writer_thread_id: None,
+            writer: None, // Legacy event fixture.
         }))
         .await
         .unwrap();
@@ -253,12 +254,14 @@ mod tests {
                 commit: "abc123".into(),
                 source: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
             SystemEvent::ArtifactUpdated {
                 artifact_path: "notes.md".into(),
                 commit: "abc123".into(),
                 source: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
             SystemEvent::ArtifactImported {
                 artifact_path: "notes.md".into(),
@@ -267,6 +270,7 @@ mod tests {
                 commit_hash: "abc123".into(),
                 summary: None,
                 writer_thread_id: None,
+                writer: None, // Legacy event fixture.
             },
         ];
         for write in writes {

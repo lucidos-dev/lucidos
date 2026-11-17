@@ -36,6 +36,31 @@ scan state-as-action "classList[[:space:]]*\.[[:space:]]*(toggle|remove|replace)
 
 ## Checks
 
+- **Remote app documents.** Standalone remote tabs are opaque too; their scoped file passes retain the remote URL alias.
+  Check private operations against `system-knowhow/js-sdk.md` § Remote workspace client contract.
+  The generated client version does not add an SDK method or broaden app authority.
+
+- **Apps invoking host-log transfers.** Flag calls to `/engine/host-log-transfer` as **broken**; the routes require agent provenance.
+  See `system-knowhow/js-sdk.md` § Not every endpoint is reachable.
+
+- **Video previews retaining idle decoders.** Check custom players against `system-knowhow/js-sdk.md` § `lucidos.media`.
+  Flag a loaded video used only for an idle preview as **smell**; recommend a poster and loading on intent.
+  Flag canvas capture of workspace video inside an opaque frame as **broken**; use the host poster helper.
+  Poster failure must preserve a usable play control, including external clips whose servers refuse CORS.
+
+- **Plan stages derived from code landings.** Apps consuming planning facts must distinguish plan-only changes from code.
+  Match plan paths and approval scope; use `system-knowhow/thread-events.md` for stage evidence.
+
+- For app-owned scripts that write the workspace database, apply `system-knowhow/workspace-audit/scripts`' origin-aware table-policy check.
+
+- **Client-derived thread liveness.** Use `lucidos.threads.liveness()` or the `liveness` on list rows, as documented in `system-knowhow/js-sdk.md`.
+  Flag apps deriving working, quiet or stalled from timestamps as **stale**.
+
+- **An app trying to clear a provider hold.** Flag calls to `/models/spend-cap-holds` and its clear route as **broken**.
+  These routes are host-only; see `system-knowhow/js-sdk.md` § Not every endpoint is reachable.
+  Route the user to Settings → Providers instead.
+
+
 - **Capture fallback.** Screenshot failure still returns a DOM snapshot. Do not require a nonempty screenshot to accept capture.
 
 - **Calls retained across a workspace restore.** Check custom request wrappers and SSE handlers against `system-knowhow/js-sdk.md` restore-generation rules.
@@ -51,6 +76,9 @@ Per `system-knowhow/js-sdk.md`:
   Check that apps await readiness, surface load failures and destroy removed fields.
 - `index.html` matches the current boilerplate (script order, which pieces are required vs optional).
 - Every `lucidos.*` call used in app code appears in the SDK reference. Calls not listed are either deprecated or invented.
+- For thread roles, recommend `lucidos.threads.users` and its `user` result.
+  The older alias still works; mark it **stale**, per `system-knowhow/js-sdk.md`
+  § "lucidos.threads.users: Driver and Watchers".
 - **External-API calls from the iframe: USE `lucidos.proxy(name).fetch(path, init)`.** The engine forwards the request server-side, strips this side's headers, and injects the configured auth header from the credential store. The credential never reaches the iframe. Use a builtin provider when available; otherwise configure the backend in `data/config/apis.json`. Reference: `system-knowhow/js-sdk.md` § `lucidos.proxy`, which owns the strip list.
 
   **DO NOT USE** either of the following. Flag each occurrence and recommend the SDK helper:
@@ -87,7 +115,8 @@ Per `system-knowhow/js-sdk.md`:
 
     The remedy: keep the app's state in its fragment or query, written as above. Inbound deep links arrive on the fragment, so apply `location.hash` at boot and subscribe to `hashchange`. Reference: `system-knowhow/js-sdk.md` § Setup (what the frame is granted) and § "fragment: opening at a place inside the app".
   - **A write to `/env-vars`**, through `lucidos.request` or the app's own `fetch`. The route opens `GET` only. A user env var reaches every command the agent runs, so a name the interpreter loads from would be host code execution. Severity: **broken**, since the call answers 403 and the app's settings never persist. § Remediation below carries the replacement.
-  - **A write of a human-only preference**, through `lucidos.preferences.set` or a `PUT /preferences`. The route stays open, but two key classes are refused to an app. One the Lucidos Agent may not write either: `command_guard`, `coding_agent_auto_answer`, `max_tool_calls`, `network_bind`, `local_base_url`, the judge settings and the `provider_enabled_*` switches. One the agent may write but an app may not: the coding-agent paths and permission mode, and `opencode_free_enabled`. These would let an app run its own script as the user, read local-model chat, or send chat to an anonymous relay. Severity: **broken** (403); § Remediation below carries the answer.
+  - The generated preference catalog also includes device appearance settings such as `agent-brand-colours`. These are writable; do not flag them as human-only.
+  - **A write of a human-only preference**, through `lucidos.preferences.set` or a `PUT /preferences`. The route stays open, but two key classes are refused to an app. One the Lucidos Agent may not write either: `command_guard`, `coding_agent_auto_answer`, `max_tool_calls`, `network_bind`, `local_base_url`, the judge and permission-answer settings and the `provider_enabled_*` switches. One the agent may write but an app may not: the coding-agent paths and permission mode, and `opencode_free_enabled`. These would let an app run its own script as the user, read local-model chat, or send chat to an anonymous relay. Severity: **broken** (403); § Remediation below carries the answer.
   - **A read or write of engine bookkeeping**, such as the last backup's outcome in `backup_last_run`. A preference read leaves it out, and an app's `PUT /preferences` naming it is refused. Severity: **broken** (403 on write, a missing key on read); § Remediation below carries the answer.
   - **The app's own bundled file, fetched by a relative path.** `fetch('data/song.json')`, ``fetch(`audio/clips/${name}.json`)``, any `fetch` whose first argument is a relative path. The frame's origin is opaque, so the browser refuses it like an engine call: `Load failed` in WebKit, a `window.TypeError` in Chromium. It reads as safe, and the engine-fetch pattern misses it, since nothing in the string says `/api/v1`. Split the severity the way the failure does:
     - **broken** where the throw escapes setup, or the fetch is the app's only data path. The app renders an error banner, or nothing.
@@ -234,12 +263,18 @@ Per `system-knowhow/building-an-app.md` § Widgets:
   - **drift**: text sized in `px`, or shrunk to fit a size. The UI scale cannot reach px type. Suggest the `--font-size-*` tokens, and showing less at a smaller size.
   - **drift**: data text cut with `text-overflow: ellipsis` (rule 8). Suggest showing less at that size.
   - **drift**: content a box cuts off. Run `lucidos widgets fit --app-id <id>` with a Lucidos window open, and report each line of its `[WIDGET FIT]` note. A `not checked` note is no finding and no pass: say so.
+  - **broken**: an automation recipe treats a logical device id as an attested Device for fit reports.
+    A verified source-thread launcher can explicitly select a fit-only renderer instead (`docs/widget-fit-renderer.md`).
+    Require genuine SDK measurements and the server's caveats; HTTP 200 alone proves no fit.
 
 Per `system-knowhow/best-practices.md`:
 
 - `manifest.json` carries only user-facing metadata; no operational knowledge has leaked in.
 - Single-app docs live under `apps/<id>/knowhow/`; multi-consumer docs live under shared `data/knowhow/`.
 - App data persists under `data/artifacts/<app-id>/`.
+
+SDK GET transport recovery is automatic; see `js-sdk.md` for its retry limit.
+Do not add an immediate transport retry around SDK reads.
 
 ## Remediation
 
@@ -354,3 +389,8 @@ under it:
 | `data-widget-place="home"` in a selector | `data-widget-place="dashboard"` |
 | `lucidos.widget.place() === 'home'` | `lucidos.widget.place() === 'dashboard'` |
 | `lucidos.ui.navigate('home-board')` | `lucidos.ui.navigate('dashboard')` |
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

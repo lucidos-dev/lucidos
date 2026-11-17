@@ -121,7 +121,7 @@
    (chat/input-messages.css) and .content-pane-body (panels/shell.css) make, and
    their comments carry the longer form.
 
-   The progress dialog's body takes focus on purpose, so a modal with no Cancel
+   The progress dialog's frame takes focus on purpose, so a modal with no Cancel
    cannot leave the keyboard behind it (ProgressDialog.tsx). The others carry
    tabIndex={-1} at their render site, because Chrome promotes an
    overflowing scroller with no focusable child to a Tab stop and each sits
@@ -140,8 +140,8 @@
 .explainer-body:focus-visible,
 .event-condition-popover-body:focus,
 .event-condition-popover-body:focus-visible,
-.progress-dialog-body:focus,
-.progress-dialog-body:focus-visible,
+.progress-dialog:focus,
+.progress-dialog:focus-visible,
 .toast-heading:focus,
 .toast-heading:focus-visible,
 .toast-text:focus,
@@ -367,12 +367,6 @@
 /* The progress dialog reuses .confirm-dialog's box, so only its own parts are
    declared here. It narrates an operation that takes the workspace away, so
    there is nothing to lay out beside the message except the readout. */
-.progress-dialog-body {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-}
-
 .progress-dialog-readout {
     display: flex;
     flex-direction: column;

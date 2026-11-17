@@ -381,7 +381,7 @@ impl LucidosEngine {
         ) else {
             return Ok(());
         };
-        log!(
+        log_legacy!(
             "[Apps] file tool emitting {} for app '{}' (path {})",
             event.event_type(),
             app_id,
@@ -444,7 +444,7 @@ impl LucidosEngine {
             // The write landed and only the record failed. Failing the write
             // now would be a lie, so the log is the signal here, and the
             // runner's own refusal is what the user meets.
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Files] Failed to record handshake approval for {}: {}",
                 rel,
                 e
@@ -467,7 +467,7 @@ impl LucidosEngine {
             return;
         }
         if let Err(e) = crate::core::handshake_approvals::forget(self.workspace_path(), &rel) {
-            log!(
+            log_legacy!(
                 "[Files] Failed to drop handshake approval for {}: {}",
                 rel,
                 e
@@ -716,6 +716,7 @@ pub(crate) struct EditFileArgs<'a> {
     pub message: Option<&'a str>,
     /// The thread whose turn made the edit, stamped on the artifact event.
     pub writer_thread_id: Option<uuid::Uuid>,
+    pub writer_origin: crate::core::artifact_writer::ArtifactWriterOrigin,
 }
 
 impl LucidosEngine {
@@ -775,7 +776,12 @@ impl LucidosEngine {
             commit,
             message,
             writer_thread_id,
+            writer_origin,
         } = args;
+        let writer = writer_origin
+            .resolve(self.event_bus.pool())
+            .await
+            .map_err(|e| format!("Failed to resolve artifact writer: {e}"))?;
 
         // Checked before the read, so a rejected call never touches disk.
         check_commit_pairing(repo.is_some(), commit)?;
@@ -886,6 +892,7 @@ impl LucidosEngine {
                     commit: commit_sha.clone(),
                     source: None,
                     writer_thread_id,
+                    writer: Some(writer),
                 }))
                 .await
                 .map_err(|e| format!("Failed to emit event: {}", e))?;
@@ -1160,7 +1167,10 @@ pub(crate) fn read_text_from_zip(
     })?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {}", e))?;
     let mut entry = zip
-        .by_name(inner_path)
+        .by_name_with_options(
+            inner_path,
+            zip::read::ZipReadOptions::new().enforce_header_consistency(true),
+        )
         .map_err(|e| format!("zip entry '{}' not found: {}", inner_path, e))?;
     let size = entry.size();
     if size > max_uncompressed {
@@ -1309,6 +1319,10 @@ impl LucidosEngine {
                 read_resolved_file(data_path.as_str(), &full_path, args)
             }
             "write_file" => {
+                let writer = crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id)
+                    .resolve(self.event_bus.pool())
+                    .await?;
+
                 let content = args["content"].as_str().unwrap_or("");
 
                 let (data_path, full_path) =
@@ -1396,6 +1410,7 @@ impl LucidosEngine {
                             commit_sha.clone(),
                             None,
                             Some(thread_id),
+                            writer.clone(),
                         )))
                         .await?;
                 }
@@ -1451,6 +1466,9 @@ impl LucidosEngine {
                         commit: args.get("commit").and_then(|v| v.as_bool()),
                         message: args.get("message").and_then(|v| v.as_str()),
                         writer_thread_id: Some(thread_id),
+                        writer_origin: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(
+                            thread_id,
+                        ),
                     })
                     .await
                 {
@@ -1609,6 +1627,10 @@ impl LucidosEngine {
                 }
             }
             "copy_file" => {
+                let writer = crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id)
+                    .resolve(self.event_bus.pool())
+                    .await?;
+
                 let (src_data_path, src_path) =
                     match self.resolve_data_path(args["source"].as_str().unwrap_or("")) {
                         Ok(p) => p,
@@ -1704,6 +1726,7 @@ impl LucidosEngine {
                             commit_sha.clone(),
                             None,
                             Some(thread_id),
+                            writer.clone(),
                         )))
                         .await?;
                 }
@@ -1723,7 +1746,7 @@ impl LucidosEngine {
                     // The copy landed and only the read-back failed, so the
                     // file stays unapproved. Fail-closed, and the runner's own
                     // refusal names the fix.
-                    Err(e) => log!(
+                    Err(e) => log_legacy!(
                         "[Files] Could not read {} back to record it: {}",
                         dst_path.display(),
                         e

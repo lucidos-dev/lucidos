@@ -25,7 +25,8 @@ fn fixture_row() -> ThreadRow {
         message_count: 3,
         section: "inbox".into(),
         active_children_count: 1,
-        waiting_children_count: 2,
+        awaited_children_count: 2,
+        awaited_by_parent: true,
         total_children_count: 4,
         blocking_descendant_count: 5,
         attention_descendant_count: 6,
@@ -71,6 +72,7 @@ fn fixture_row() -> ThreadRow {
         compose_mode: Some("claude_code".into()),
         compose_selection: None,
         compose_epoch: 9,
+        compose_restorations: serde_json::json!([]),
     }
 }
 
@@ -87,7 +89,8 @@ fn thread_summary_serializes_to_the_pinned_bytes() {
             r#""channel":"claude_code","initiator":"user","created_at":"2026-01-02T03:04:05Z","#,
             r#""last_activity":"2026-01-02T03:04:06Z","last_user_action":"2026-01-02T03:04:07Z","#,
             r#""last_agent_action":"2026-01-02T03:04:08Z","message_count":3,"saved":true,"#,
-            r#""section":"inbox","active_children_count":1,"waiting_children_count":2,"#,
+            r#""section":"inbox","active_children_count":1,"awaited_children_count":2,"#,
+            r#""awaited_by_parent":true,"#,
             r#""total_children_count":4,"live_event_wait_count":1,"live_event_waits":{waits},"#,
             r#""blocking_descendant_count":5,"attention_descendant_count":6,"is_stopped_child":true,"read_requested":true,"reply_seen_devices":["d1"],"apply_in_flight":true,"#,
             r#""status":"waiting_for_user_answer","summary_version":42,"#,
@@ -101,7 +104,7 @@ fn thread_summary_serializes_to_the_pinned_bytes() {
             r#""coding_agent_kind":"lucidos","coding_agent_folder":"/home/user/example-repo","#,
             r#""coding_agent":"claude-code","coding_agents":["claude-code","codex"],"#,
             r#""state":"composing","compose_text":"draft","#,
-            r#""compose_images":[],"compose_mode":"claude_code","compose_epoch":9}}"#,
+            r#""compose_images":[],"compose_mode":"claude_code","compose_epoch":9,"compose_restorations":[]}}"#,
         ),
         waits = WAIT_JSON,
     );
@@ -118,7 +121,7 @@ fn thread_aggregate_serializes_to_the_pinned_bytes() {
             r#""lastActivity":"2026-01-02T03:04:06Z","lastUserAction":"2026-01-02T03:04:07Z","#,
             r#""lastAgentAction":"2026-01-02T03:04:08Z","messageCount":3,"section":"inbox","#,
             r#""status":"waiting_for_user_answer","summaryVersion":42,"activeChildrenCount":1,"#,
-            r#""waitingChildrenCount":2,"#,
+            r#""awaitedChildrenCount":2,"awaitedByParent":true,"#,
             r#""totalChildrenCount":4,"blockingDescendantCount":5,"attentionDescendantCount":6,"#,
             r#""isStoppedChild":true,"readRequested":true,"replySeenDevices":["d1"],"applyInFlight":true,"liveEventWaitCount":1,"liveEventWaits":{waits},"#,
             r#""cacheKeepAliveStatus":null,"#,

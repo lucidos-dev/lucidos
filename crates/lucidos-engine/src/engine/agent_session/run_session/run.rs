@@ -19,6 +19,7 @@ use crate::engine::thread_events::{
     CodingAgentExit, CodingAgentExitStage, EventChannel, SessionEndReason,
 };
 use crate::engine::{AgentUserInput, LucidosEngine, ProcessResult, QuietPick, StopReason};
+use crate::runtime::billing_provider::BillingAttribution;
 use crate::runtime::{AgentEvent, AgentExitFacts, AgentInput, CodingAgent};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -34,18 +35,19 @@ use crate::engine::agent_session::io_helpers::{
     drain_lost_followups, lost_followups_to_orphans, requeue_at_head,
 };
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action, idle_change_write, is_definitive_session_not_found,
-    is_resume_settle_result, is_stale_resume_signal, require_agent_input, reset_per_turn_flags,
-    result_auto_commits, should_auto_commit_on_cleanup, starts_turn_after_terminal,
-    terminal_clears_user_hit_stop, terminate_decision, turn_ended_cleanly, turn_has_terminal,
-    watchdog_gate, IdleAction, IdleChangeWrite, IdleSession, StaleResumeInputs, TerminalKind,
-    TerminateDecision, TurnTerminal, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
-    WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
+    ceiling_turn_end, classify_result, idle_action, idle_change_write,
+    is_definitive_session_not_found, is_resume_settle_result, is_stale_resume_signal,
+    require_agent_input, reset_per_turn_flags, result_auto_commits, should_auto_commit_on_cleanup,
+    starts_turn_after_terminal, terminal_clears_user_hit_stop, terminate_decision,
+    turn_ended_cleanly, turn_has_terminal, watchdog_gate, CeilingTurnEnd, IdleAction,
+    IdleChangeWrite, IdleSession, StaleResumeInputs, TerminalKind, TerminateDecision, TurnTerminal,
+    WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS,
+    WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
 };
 use crate::engine::agent_session::prompts::standing_instruction_section;
 use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, live_claude_config_dir,
-    resolve_resume_context,
+    resolve_run_resume, RunKind, RunResume,
 };
 use crate::engine::agent_session::spawn::{spawn_or_resume, ResumeAttempt};
 use crate::engine::agent_session::withdraw::{
@@ -100,7 +102,7 @@ async fn await_process_teardown(
             Ok(Some(_)) => continue,
             Ok(None) => return,
             Err(_) => {
-                log!(
+                log_legacy!(
                     "[AgentSession] teardown wait after {} timed out for thread {}; the old process may briefly linger",
                     why,
                     thread_id
@@ -118,6 +120,75 @@ struct StartupDeath {
     /// stderr, else a note that a signal killed it.
     reason: Option<String>,
     exit: AgentExitFacts,
+}
+
+/// Whether the live session still takes input. After a handoff or a provider
+/// block, input waits in the channel. The idle exit leaves it to the next
+/// session, which reads the handoff's opening or the block's brief first.
+#[derive(Debug, Default)]
+struct InputGate {
+    /// The session handed off.
+    handed_off: bool,
+    /// The provider blocked a turn: its history must not be replayed.
+    provider_blocked: bool,
+    /// Later input belongs to the successor, even before delivery is safe.
+    ceiling_owed: bool,
+}
+
+impl InputGate {
+    fn receives(&self) -> bool {
+        !self.handed_off && !self.provider_blocked
+    }
+
+    fn forwards(&self) -> bool {
+        self.receives() && !self.ceiling_owed
+    }
+}
+
+/// Tracks the read boundary, not the send: Claude Code may read after Result.
+#[derive(Debug, Default)]
+struct CeilingDelivery {
+    pending: Option<(Uuid, Uuid)>,
+    read_in_turn: Option<bool>,
+}
+
+impl CeilingDelivery {
+    fn observe(&mut self, event: &AgentEvent, started_turn: bool) {
+        match event {
+            AgentEvent::InputRead { input } | AgentEvent::InputRejected { input }
+                if self.pending.is_some_and(|(uuid, _)| uuid == *input) =>
+            {
+                self.pending = None;
+                self.read_in_turn = Some(started_turn);
+            }
+            _ => {}
+        }
+    }
+
+    fn turn_ended(&mut self) -> Option<bool> {
+        self.read_in_turn.take()
+    }
+}
+
+/// Forward directly, preserving all of the running user's turn state.
+fn forward_ceiling_input(
+    reentry: AgentUserInput,
+    inputs: &mut InputLedger,
+    delivery: &mut CeilingDelivery,
+    tx: &tokio::sync::mpsc::UnboundedSender<AgentInput>,
+) -> bool {
+    let Some(anchor) = reentry.origin_event_id else {
+        return false;
+    };
+    let input = AgentInput {
+        defer_on_steer_failure: true,
+        text: reentry.text,
+        images: Vec::new(),
+        uuid: Uuid::new_v4(),
+    };
+    delivery.pending = Some((input.uuid, anchor));
+    inputs.forwarded(vec![anchor], &input, None);
+    tx.send(input).is_ok()
 }
 
 /// The coding-agent driver dropped its input receiver before the engine could
@@ -232,6 +303,8 @@ fn unregistered_lucidos_root(
 /// The token counts of one `AgentEvent::Usage`, as the agent reported them.
 #[derive(Debug)]
 struct ReportedUsage {
+    billing: BillingAttribution,
+    restored: Option<crate::runtime::agent_runtime::CodexUsageSnapshot>,
     input_tokens: u32,
     output_tokens: u32,
     cache_read_tokens: u32,
@@ -243,23 +316,58 @@ struct ReportedUsage {
     reasoning_effort: Option<String>,
 }
 
-/// How long a stopped session waits for Claude Code's driver to flush a
-/// cut-off call. The flush follows the stop at once, ahead of the group
-/// teardown, so this bounds only a driver that is stuck.
+impl ReportedUsage {
+    fn unscoped(snapshot: crate::runtime::agent_runtime::CodexUsageSnapshot) -> Self {
+        Self {
+            restored: None,
+            ..Self::restored(snapshot)
+        }
+    }
+
+    fn restored(snapshot: crate::runtime::agent_runtime::CodexUsageSnapshot) -> Self {
+        Self {
+            billing: BillingAttribution::default(),
+            input_tokens: snapshot.input_tokens,
+            output_tokens: snapshot.output_tokens,
+            cache_read_tokens: snapshot.cache_read_tokens,
+            cache_creation_tokens: snapshot.cache_creation_tokens,
+            cache_creation_1h_tokens: None,
+            parent_tool_use_id: None,
+            api_call_id: None,
+            duration_ms: None,
+            reasoning_effort: None,
+            restored: Some(snapshot),
+        }
+    }
+}
+
+/// Bound the stop-time usage drain. Claude Code flushes ahead of group teardown;
+/// Codex can still send a usage notification already being mapped at the stop.
 const USAGE_FLUSH_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The `Usage` events a stopped driver sends, read up to its `OutputEnded`
 /// (or `Exited`, or a closed channel) and at most for `wait`. Every other
-/// event is dropped, as the stopped loop would have dropped it.
+/// event is dropped except billing observations, which scope the usage.
 async fn usage_flushed_at_stop(
     events_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentEvent>,
     wait: std::time::Duration,
+    billing: &mut BillingAttribution,
 ) -> Vec<(Option<String>, ReportedUsage)> {
     let deadline = tokio::time::Instant::now() + wait;
     let mut flushed = Vec::new();
     loop {
-        match tokio::time::timeout_at(deadline, events_rx.recv()).await {
-            Ok(Some(AgentEvent::Usage {
+        let event = match tokio::time::timeout_at(deadline, events_rx.recv()).await {
+            Ok(event) => event,
+            Err(_) => {
+                log_legacy!(
+                    "[AgentSession] stop-time usage drain reached its {}s deadline",
+                    wait.as_secs()
+                );
+                break;
+            }
+        };
+        match event {
+            Some(AgentEvent::Usage {
                 model,
                 input_tokens,
                 output_tokens,
@@ -270,9 +378,11 @@ async fn usage_flushed_at_stop(
                 api_call_id,
                 duration_ms,
                 reasoning_effort,
-            })) => flushed.push((
+            }) => flushed.push((
                 model,
                 ReportedUsage {
+                    billing: billing.clone(),
+                    restored: None,
                     input_tokens,
                     output_tokens,
                     cache_read_tokens,
@@ -284,15 +394,15 @@ async fn usage_flushed_at_stop(
                     reasoning_effort,
                 },
             )),
-            Ok(Some(AgentEvent::OutputEnded | AgentEvent::Exited { .. })) | Ok(None) => break,
-            Ok(Some(_)) => {}
-            Err(_) => {
-                log!(
-                    "[AgentSession] no OutputEnded within {}s of the stop; a cut-off call may go unrecorded",
-                    wait.as_secs()
-                );
-                break;
+            Some(AgentEvent::UsageRestored { snapshot }) => {
+                flushed.push((None, ReportedUsage::restored(snapshot)));
             }
+            Some(AgentEvent::UsageUnscoped { snapshot }) => {
+                flushed.push((None, ReportedUsage::unscoped(snapshot)));
+            }
+            Some(AgentEvent::BillingObserved { attribution }) => *billing = attribution,
+            Some(AgentEvent::OutputEnded | AgentEvent::Exited { .. }) | None => break,
+            Some(_) => {}
         }
     }
     flushed
@@ -400,15 +510,41 @@ fn coding_agent_capture(
         reasoning_effort,
         duration_ms: reported.duration_ms,
         served_model: models.served_model,
-        provider: None,
+        provider: Some(reported.billing.provider_id().to_string()),
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }
 
 impl LucidosEngine {
+    async fn observe_coding_agent_billing(
+        &self,
+        thread_id: Uuid,
+        coding_agent: CodingAgent,
+        launch_id: Uuid,
+        attribution: &BillingAttribution,
+        meta: &crate::engine::thread_events::EventMeta,
+    ) {
+        self.event_bus
+            .emit_or_log(
+                crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::CodingAgentBillingObserved {
+                        coding_agent,
+                        launch_id,
+                        attribution: attribution.clone(),
+                        billing_mode: attribution.billing_mode(),
+                    },
+                    meta: meta.clone(),
+                },
+                "[AgentSession] CodingAgentBillingObserved",
+            )
+            .await;
+    }
+
     /// Record one coding-agent API call as a `ContextCaptured` carrying its
     /// usage and the effort it ran at. A main-session call also sets the
     /// session's effort in force, which `token` names as this run's.
@@ -422,10 +558,27 @@ impl LucidosEngine {
         models: CallModels,
         mut reported: ReportedUsage,
         spawn_effort: Option<&str>,
+        launch_id: Uuid,
     ) {
-        let reasoning_effort =
-            effort_in_force(coding_agent, spawn_effort, reported.reasoning_effort.take());
-        if reported.parent_tool_use_id.is_none() {
+        let restored_provider = if let Some(snapshot) = &reported.restored {
+            super::resume_billing::restored_provider(
+                &self.event_store,
+                thread_id,
+                launch_id,
+                snapshot,
+            )
+            .await
+        } else {
+            None
+        };
+        let restored = reported.restored.is_some();
+        let reasoning_effort = effort_in_force(
+            coding_agent,
+            if restored { None } else { spawn_effort },
+            reported.reasoning_effort.take(),
+        );
+        let main_capture = !restored && reported.parent_tool_use_id.is_none();
+        if main_capture {
             super::completion::note_effort_in_force(
                 &mut *self.agent_sessions.lock().await,
                 thread_id,
@@ -440,22 +593,42 @@ impl LucidosEngine {
         let context_window =
             crate::runtime::coding_agent_context_window(coding_agent, &models.model)
                 .unwrap_or_else(|| self.context_window_for(&models.model, None));
+        let mut capture = coding_agent_capture(
+            coding_agent,
+            models,
+            context_window,
+            reported,
+            reasoning_effort,
+        );
+        if restored {
+            if let crate::engine::thread_events::ThreadEvent::ContextCaptured { provider, .. } =
+                &mut capture
+            {
+                *provider = Some(restored_provider.unwrap_or_else(|| "unknown".to_string()));
+            }
+        }
         self.event_bus
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
-                    event: coding_agent_capture(
-                        coding_agent,
-                        models,
-                        context_window,
-                        reported,
-                        reasoning_effort,
-                    ),
+                    event: capture,
                     meta: meta.clone(),
                 },
                 "[AgentSession] ContextCaptured",
             )
             .await;
+        if main_capture {
+            if let Err(e) =
+                crate::engine::context_ceiling::record_capture_crossing(&self.event_bus, thread_id)
+                    .await
+            {
+                log_legacy!(
+                    "[AgentSession] Could not record context ceiling crossing for {}: {}",
+                    thread_id,
+                    e
+                );
+            }
+        }
     }
 
     /// Decide the idle exit again after the ledger changed outside an agent
@@ -469,13 +642,13 @@ impl LucidosEngine {
         owed: u32,
         agent_cancel: &tokio_util::sync::CancellationToken,
         action: IdleAction,
-        handed_off: &mut bool,
+        input_gate: &mut InputGate,
     ) -> bool {
         if action == IdleAction::Nothing {
             return false;
         }
         let exited = self
-            .exit_idle_subprocess_unless_owed(thread_id, msg_rx, owed, agent_cancel, handed_off)
+            .exit_idle_subprocess_unless_owed(thread_id, msg_rx, owed, agent_cancel, input_gate)
             .await;
         exited && action == IdleAction::EndSession
     }
@@ -485,7 +658,7 @@ impl LucidosEngine {
     /// redirect. The next turn then resumes with `--resume`. Returns whether
     /// it exited.
     ///
-    /// Refreshes the run loop's `handed_off` flag. A handoff that ended, for
+    /// Refreshes the gate's `handed_off` flag. A handoff that ended, for
     /// example by a Stop, re-opens the input arm for what it left queued.
     async fn exit_idle_subprocess_unless_owed(
         &self,
@@ -493,11 +666,12 @@ impl LucidosEngine {
         msg_rx: &tokio::sync::mpsc::UnboundedReceiver<AgentUserInput>,
         owed: u32,
         agent_cancel: &tokio_util::sync::CancellationToken,
-        handed_off: &mut bool,
+        input_gate: &mut InputGate,
     ) -> bool {
         // Read before the lock: a query must not hold it.
-        *handed_off = crate::engine::successor::handoff_pending(self.pool(), thread_id).await;
-        let handed_off = *handed_off;
+        input_gate.handed_off =
+            crate::engine::successor::handoff_pending(self.pool(), thread_id).await;
+        let leaves_queue_to_next_session = !input_gate.forwards();
         // Hold the `agent_sessions` lock across the whole read-decide-act, so
         // the chat fast path's check-and-send takes the same lock and cannot
         // interleave. Otherwise a follow-up could `msg_tx.send` into a
@@ -512,13 +686,18 @@ impl LucidosEngine {
             .get_mut(&thread_id)
             .map(|s| std::mem::take(&mut s.redirect_followup_pending))
             .unwrap_or(false);
-        match terminate_decision(msg_rx.len(), owed, redirect_pending, handed_off) {
+        match terminate_decision(
+            msg_rx.len(),
+            owed,
+            redirect_pending,
+            leaves_queue_to_next_session,
+        ) {
             TerminateDecision::KeepAliveForFollowup {
                 queued,
                 unread,
                 redirect_pending,
             } => {
-                log!("[AgentSession] Skipping subprocess termination for thread {}: a follow-up is still on its way ({} queued, {} unread, redirect pending: {})", thread_id, queued, unread, redirect_pending);
+                log_legacy!("[AgentSession] Skipping subprocess termination for thread {}: a follow-up is still on its way ({} queued, {} unread, redirect pending: {})", thread_id, queued, unread, redirect_pending);
                 false
             }
             TerminateDecision::Terminate => {
@@ -531,17 +710,16 @@ impl LucidosEngine {
                     s.process_exited = true;
                     s.idle_notify.notify_waiters();
                 }
-                log!("[AgentSession] Idle reached — terminating the coding-agent subprocess for thread {} so next turn resumes via --resume", thread_id);
+                log_legacy!("[AgentSession] Idle reached — terminating the coding-agent subprocess for thread {} so next turn resumes via --resume", thread_id);
                 agent_cancel.cancel();
                 true
             }
         }
     }
 
-    /// After a hard stop, record the usage Claude Code's driver flushes for a
-    /// call cut off mid-stream. The provider billed its prompt, and the event
-    /// loop no longer reads. Reads up to `OutputEnded`, dropping everything
-    /// else, which the stopped loop would have dropped too.
+    /// After a hard stop, record queued usage and restored snapshots.
+    /// Claude Code also flushes calls cut off mid-stream. Read through
+    /// `OutputEnded` or `Exited`, retaining billing observations and usage.
     #[allow(clippy::too_many_arguments)]
     async fn record_usage_flushed_at_stop(
         &self,
@@ -552,11 +730,23 @@ impl LucidosEngine {
         coding_agent: CodingAgent,
         session_model: Option<&str>,
         spawn_effort: Option<&str>,
+        billing: &mut BillingAttribution,
+        launch_id: Uuid,
     ) {
-        if coding_agent != CodingAgent::ClaudeCode {
-            return;
-        }
-        for (model, reported) in usage_flushed_at_stop(events_rx, USAGE_FLUSH_WAIT).await {
+        let mut recorded_billing = billing.clone();
+        let flushed = usage_flushed_at_stop(events_rx, USAGE_FLUSH_WAIT, billing).await;
+        for (model, reported) in flushed {
+            if reported.restored.is_none() && reported.billing != recorded_billing {
+                self.observe_coding_agent_billing(
+                    thread_id,
+                    coding_agent,
+                    launch_id,
+                    &reported.billing,
+                    meta,
+                )
+                .await;
+                recorded_billing = reported.billing.clone();
+            }
             self.record_coding_agent_usage(
                 thread_id,
                 token,
@@ -565,8 +755,13 @@ impl LucidosEngine {
                 CallModels::of(session_model, model.as_deref()),
                 reported,
                 spawn_effort,
+                launch_id,
             )
             .await;
+        }
+        if *billing != recorded_billing {
+            self.observe_coding_agent_billing(thread_id, coding_agent, launch_id, billing, meta)
+                .await;
         }
     }
 
@@ -639,17 +834,18 @@ impl LucidosEngine {
         let thread_id = claim.thread_id;
         // A run on an open lane batch's lane thread resolves that batch,
         // whoever started it: the lane, a follow-up, a Continue or a switch
-        // resume (ADR 0463). A turn the lane sent for a batch that has
-        // since ended is refused.
+        // resume (ADR 0463). Closed lane threads refuse every route,
+        // including conflict recovery and hardening sessions (ADR 0662).
+        let lane_duty = crate::engine::landing_lane::lane_duty_for_run(
+            self.pool(),
+            self.workspace_path(),
+            self.repo_root(),
+            thread_id,
+            origin_id,
+        )
+        .await?;
         let lane_duty = if conflict.is_none() && recovery_worktree.is_none() {
-            crate::engine::landing_lane::lane_duty_for_run(
-                self.pool(),
-                self.workspace_path(),
-                self.repo_root(),
-                thread_id,
-                origin_id,
-            )
-            .await?
+            lane_duty
         } else {
             None
         };
@@ -798,7 +994,7 @@ impl LucidosEngine {
                         // Folder is NULL but kind is 'app'. Reconstructing the
                         // id from disk would race the projection, so refuse and
                         // let the caller retry once the row settles.
-                        log!(
+                        log_legacy!(
                             "[AgentSession] thread {} has coding_agent_kind='app' but NULL folder — \
                              folder reconstruction would race the projection; refusing to spawn",
                             thread_id
@@ -846,33 +1042,29 @@ impl LucidosEngine {
             thread_id.to_string(),
         );
 
-        // A conflict-resolution or orphan-recovery session never looks up a
-        // session to resume, so it records no continuity either.
-        let looks_up_resume = recovery_worktree.is_none() && !is_resolution_session;
-        // Its first session is the thread's *successor session*. Read under
-        // the handoff lock, so a withdraw either lands first or sees this
-        // run's claim and refuses.
-        let pending_handoff = if looks_up_resume {
-            let claim = crate::engine::successor::lock_handoff(self.pool(), thread_id).await?;
-            let pending = crate::engine::successor::pending_handoff(self.pool(), thread_id).await?;
-            claim.commit().await?;
-            pending
+        let run_kind = if recovery_worktree.is_some() || conflict_change_id.is_some() {
+            RunKind::Resolution
+        } else if lane_duty.is_some() {
+            RunKind::Lane
         } else {
-            None
+            RunKind::Ordinary
         };
-        let (resume_session_id, resume_branch) = if looks_up_resume {
-            resolve_resume_context(
-                self.pool(),
-                self.changes(),
-                thread_id,
-                resume_session_id,
-                recorded_pin.as_ref().map(|pin| pin.dir.as_str()),
-                pending_handoff.is_some(),
-            )
-            .await
-        } else {
-            (resume_session_id, None)
-        };
+        let run_resume = resolve_run_resume(
+            self.pool(),
+            self.changes(),
+            thread_id,
+            run_kind,
+            resume_session_id,
+            recorded_pin.as_ref().map(|pin| pin.dir.as_str()),
+        )
+        .await?;
+        let records_continuity = run_resume.records_continuity(run_kind);
+        let RunResume {
+            pending_handoff,
+            blocking_policy,
+            session_id: resume_session_id,
+            branch: resume_branch,
+        } = run_resume;
 
         // Conflict resolution mode: run in the merge worktree (not repo root)
         let conflict_change = if let Some(cid) = conflict_change_id {
@@ -886,7 +1078,7 @@ impl LucidosEngine {
             None
         };
 
-        log!(
+        log_legacy!(
             "[AgentSession] [TIMING] resume lookup: {:?}",
             cc_start.elapsed()
         );
@@ -1063,16 +1255,16 @@ impl LucidosEngine {
         // A successor session starts clean: its opening carries the context.
         if pending_handoff.is_none() {
             let thread_messages = self.event_store.get_thread_messages(&thread_id_str).await?;
-            // The first prompt's turn-gap note carries the people-only messages
+            // The first prompt's turn-gap note carries the user-only messages
             // since the previous turn, so the history leaves them out.
             let in_first_prompt: Vec<String> =
                 crate::engine::agent_session::turn_gap::compute_turn_gap_note(
                     &self.pool, thread_id, origin_id, None,
                 )
                 .await
-                .map(|note| note.people_event_ids.iter().map(Uuid::to_string).collect())
+                .map(|note| note.user_event_ids.iter().map(Uuid::to_string).collect())
                 .unwrap_or_default();
-            let operators = crate::gateway_operators::current();
+            let users = crate::gateway_users::current();
             let (prior, current_at) = before_current_message(
                 thread_messages
                     .iter()
@@ -1081,7 +1273,7 @@ impl LucidosEngine {
                             .as_ref()
                             .is_none_or(|id| !in_first_prompt.contains(id))
                     })
-                    .map(|m| HistoryLine::of(m, &operators))
+                    .map(|m| HistoryLine::of(m, &users))
                     .collect(),
                 user_message,
             );
@@ -1095,7 +1287,7 @@ impl LucidosEngine {
                         attached.push(hash);
                         images.push(crate::api::ChatImage { base64, mime_type });
                     }
-                    None => log!(
+                    None => log_legacy!(
                         "[AgentSession] Image {} of thread {} is gone; the fresh session goes without it",
                         hash,
                         thread_id
@@ -1105,10 +1297,17 @@ impl LucidosEngine {
             session_context.push(&thread_history_block(&prior, &attached));
             session_context.attach_images(images);
         }
-        // A successor session reads its opening first, whatever input started it.
-        let opened_message = pending_handoff
-            .as_ref()
-            .map(|handoff| handoff.first_message(user_message));
+        // A successor session, or one after a provider block, reads its opening
+        // first, whatever input started it.
+        let opened_message = match (&pending_handoff, blocking_policy) {
+            (Some(handoff), _) => Some(handoff.first_message(user_message)),
+            (None, Some(policy)) => Some(crate::engine::successor::provider_blocked_input(
+                thread_id,
+                policy,
+                user_message,
+            )),
+            (None, None) => None,
+        };
         let first_message = opened_message.as_deref().unwrap_or(user_message);
         // A keep-alive carries no notes: the agent must not act on anything.
         let first_prompt = if self.event_bus.in_keep_alive_turn(thread_id) {
@@ -1130,14 +1329,19 @@ impl LucidosEngine {
         };
 
         if resume_session_id.is_some() {
-            log!("[AgentSession] Resuming session for thread {}", thread_id);
+            log_legacy!("[AgentSession] Resuming session for thread {}", thread_id);
         }
         let agent_cancel = claim.entry.agent_cancel.clone();
-        let allowed_tools = crate::engine::claude_code::cc_allowed_tools(&self.grants_dir());
+        let allowed_tools =
+            crate::engine::claude_code::cc_allowed_tools(&self.event_bus, &self.grants_dir()).await;
         // User-managed env vars injected into the coding-agent subprocess.
         // Applied first in `apply_lucidos_env`, so engine-owned vars still win.
         let user_env_vars =
             crate::core::EnvironmentVariableStore::spawn_pairs(&self.pool, "AgentSession").await;
+        let build_slot_class =
+            crate::engine::main_check::repair_build_class(self.pool(), thread_id)
+                .await
+                .map_err(|error| format!("Could not read repair build class: {error}"))?;
         // Masked out of every tool result this session stores.
         let tool_result_secrets =
             crate::runtime::spawn_env::session_secret_values(thread_id, &user_env_vars);
@@ -1152,12 +1356,11 @@ impl LucidosEngine {
         let injected_pin = recorded_pin
             .as_ref()
             .map(|recorded| recorded.resolve(&user_env_vars));
-        let effective_pin = injected_pin.clone().or_else(|| {
-            crate::runtime::AccountPin::for_first_session(
-                live_claude_config_dir(&user_env_vars),
-                default_claude_config_dir(),
-            )
-        });
+        let live_account = crate::runtime::AccountPin::for_first_session(
+            live_claude_config_dir(&user_env_vars),
+            default_claude_config_dir(),
+        );
+        let effective_pin = injected_pin.clone().or_else(|| live_account.clone());
         // CC's defaults, resolved as the spawned CC will resolve them. The
         // settings files are a CC-only fallback, reached only for a model the
         // registry has no default effort for: their effort vocabulary must not
@@ -1244,44 +1447,56 @@ impl LucidosEngine {
             .await;
             return Ok(self.settle_canceled_startup(claim, request_id, &meta).await);
         };
-        log!(
+        log_legacy!(
             "[AgentSession] [TIMING] Startup semaphore acquired: {:?}",
             cc_start.elapsed()
         );
-        let (runtime, resume_attempt) = match spawn_or_resume(
-            self,
-            coding_agent,
-            crate::runtime::SpawnArgs {
-                worktree_path: &cwd,
-                coding_agent_kind: session_kind,
-                workspace_path: self.workspace_path(),
-                allowed_tools: Some(&allowed_tools),
-                system_prompt: Some(&system_prompt),
-                session_context: Some(&session_context),
-                resume_session_id: resume_session_id.as_deref(),
-                model: cc_model.as_deref(),
-                reasoning_effort: cc_reasoning_effort.as_deref(),
-                thread_id,
-                spawning_event_id,
-                repo_name: repo_name.as_deref(),
-                interactive: interactive_session,
-                user_env_vars: &user_env_vars,
-                binary_override: binary_override.as_deref(),
-                permission_mode: permission_mode.as_deref(),
-                account_pin: injected_pin.as_ref(),
-                additional_directories: &repo_directory_grants,
-                auto_compact,
-                keep_alive: matches!(first_prompt, PromptFor::KeepAlive(_)),
-                agent_run: crate::runtime::agent_run_marker::AgentRun::for_thread(
-                    self.workspace_path(),
-                    thread_id,
-                    self.teardown_handover.clone(),
-                ),
-            },
-            agent_cancel.clone(),
-        )
-        .await
-        {
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), self.workspace_path())
+                .await;
+        let sandbox_mode = sandbox.as_ref().ok().map(|sandbox| sandbox.mode());
+        let execution_sandbox = sandbox.as_ref().ok().cloned();
+        let spawned = match sandbox {
+            Ok(sandbox) => {
+                spawn_or_resume(
+                    self,
+                    coding_agent,
+                    crate::runtime::SpawnArgs {
+                        worktree_path: &cwd,
+                        coding_agent_kind: session_kind,
+                        workspace_path: self.workspace_path(),
+                        allowed_tools: Some(&allowed_tools),
+                        system_prompt: Some(&system_prompt),
+                        session_context: Some(&session_context),
+                        resume_session_id: resume_session_id.as_deref(),
+                        model: cc_model.as_deref(),
+                        reasoning_effort: cc_reasoning_effort.as_deref(),
+                        thread_id,
+                        spawning_event_id,
+                        repo_name: repo_name.as_deref(),
+                        interactive: interactive_session,
+                        build_slot_class,
+                        user_env_vars: &user_env_vars,
+                        binary_override: binary_override.as_deref(),
+                        permission_mode: permission_mode.as_deref(),
+                        account_pin: injected_pin.as_ref(),
+                        additional_directories: &repo_directory_grants,
+                        auto_compact,
+                        keep_alive: matches!(first_prompt, PromptFor::KeepAlive(_)),
+                        agent_run: crate::runtime::agent_run_marker::AgentRun::for_thread(
+                            self.workspace_path(),
+                            thread_id,
+                            self.teardown_handover.clone(),
+                        ),
+                        sandbox,
+                    },
+                    agent_cancel.clone(),
+                )
+                .await
+            }
+            Err(e) => Err(e),
+        };
+        let (runtime, resume_attempt) = match spawned {
             Ok(r) => r,
             Err(e) => {
                 // Remove ONLY what this attempt created. Running both git calls
@@ -1300,7 +1515,7 @@ impl LucidosEngine {
             }
         };
 
-        log!(
+        log_legacy!(
             "[AgentSession] [TIMING] CC process spawned: {:?}",
             cc_start.elapsed()
         );
@@ -1356,6 +1571,7 @@ impl LucidosEngine {
         )
         .await;
         let first_input = AgentInput {
+            defer_on_steer_failure: false,
             text: first.text,
             images,
             uuid: Uuid::new_v4(),
@@ -1390,7 +1606,7 @@ impl LucidosEngine {
                         startup_failure_error(coding_agent, death, plain)
                     }
                     StartupFailure::StaleResume => {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] thread {} could not resume sid={}: the coding agent has no such session. Retrying with a fresh one.",
                             thread_id,
                             resume_session_id.as_deref().unwrap_or("")
@@ -1465,6 +1681,7 @@ impl LucidosEngine {
                             }
                         })
                     });
+                session.execution_sandbox = execution_sandbox.clone();
                 session.worktree_path = worktree_path.clone();
                 session.branch_name = Some(branch_name.clone());
                 session.repo_root = Some(repo_root.clone());
@@ -1499,6 +1716,14 @@ impl LucidosEngine {
 
         self.redeliver_stranded_follow_ups(thread_id, &msg_tx, msg_rx, stranded)
             .await;
+        if !self.event_bus.in_keep_alive_turn(thread_id) {
+            let held = crate::engine::thread_stop::held_inputs(self.pool(), thread_id).await?;
+            if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+                crate::engine::thread_stop::queue_held_inputs(session, held, |id| {
+                    inputs.forwarded_here(id)
+                });
+            }
+        }
 
         let chat_cancel = cancel_token.clone();
         let images: Vec<String> = Vec::new();
@@ -1522,12 +1747,13 @@ impl LucidosEngine {
             repo_root.to_string_lossy().to_string()
         };
         // Read before the emit below, which would count as an earlier session.
-        let continuity = if looks_up_resume || resume_attempt == ResumeAttempt::Resumed {
+        let continuity = if records_continuity || resume_attempt == ResumeAttempt::Resumed {
             resolve_session_continuity(
                 self.pool(),
                 thread_id,
                 resume_attempt,
                 branch_gone,
+                blocking_policy.is_some(),
                 pending_handoff.as_ref(),
             )
             .await
@@ -1539,6 +1765,7 @@ impl LucidosEngine {
             .emit(crate::engine::event_bus::BusEvent::Thread {
                 thread_id,
                 event: crate::engine::thread_events::ThreadEvent::SessionStarted {
+                    sandbox: sandbox_mode,
                     session_id: String::new(),
                     branch: branch_name.clone(),
                     repo_id: repo_id.clone(),
@@ -1555,7 +1782,7 @@ impl LucidosEngine {
             })
             .await
         {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to emit initial SessionStarted for {}: {}",
                 thread_id,
                 e
@@ -1605,7 +1832,7 @@ impl LucidosEngine {
                 })
                 .await
             {
-                log!(
+                log_legacy!(
                     "[AgentSession] Failed to persist initial CodingAgentSettingsChanged for {}: {}",
                     thread_id,
                     e
@@ -1641,6 +1868,16 @@ impl LucidosEngine {
         // outright. Without it, a healthy resume that says nothing is
         // indistinguishable from a dead one.
         let mut init_session_id: Option<String> = None;
+        let billing_launch_id = Uuid::new_v4();
+        let mut billing_attribution = BillingAttribution::default();
+        self.observe_coding_agent_billing(
+            thread_id,
+            coding_agent,
+            billing_launch_id,
+            &billing_attribution,
+            &meta,
+        )
+        .await;
         let mut claude_text_buf = CodingAgentTextBuffer::default();
         // Reasoning stream buffer, coalesced like the text buffer above. Deltas
         // arrive per-token, so flush on a paragraph boundary or once
@@ -1650,13 +1887,15 @@ impl LucidosEngine {
         let mut last_thought_persisted_len: usize = 0;
         const THOUGHT_FLUSH_THRESHOLD: usize = 240;
         let mut is_waiting = false;
-        // The session handed off: it forwards no more input.
-        let mut handed_off = false;
+        let mut input_gate = InputGate::default();
         let mut proposed_change = false;
         // What each turn-end re-entry last went out for.
         let mut reentry_ledger = crate::engine::turn_end::ReentryLedger::default();
-        // The turn in flight reads the ceiling re-entry, so it is the engine's.
+        // Forwarding holds later input; only the read classifies its turn.
         let mut ceiling_reentry_forwarded = false;
+        let mut ceiling_delivery = CeilingDelivery::default();
+        let mut approved_ceiling_reentry = None;
+        let mut held_ceiling_inputs = Vec::new();
         let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
                                                 // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
                                                 // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
@@ -1716,7 +1955,7 @@ impl LucidosEngine {
                 event_opt = events_rx.recv() => {
                     let Some(ev) = event_opt else {
                         // Driver task exited without sending Exited (defensive).
-                        log!(
+                        log_legacy!(
                             "[AgentSession] events_rx closed without AgentEvent::Exited for thread {}",
                             thread_id
                         );
@@ -1728,6 +1967,44 @@ impl LucidosEngine {
                     if matches!(ev, AgentEvent::OutputEnded) {
                         continue;
                     }
+                    // An auth observation cannot start/re-arm a model turn.
+                    // Observe each new process independently, even on resume.
+                    if let AgentEvent::BillingObserved { attribution } = &ev {
+                        billing_attribution = attribution.clone();
+                        self.observe_coding_agent_billing(
+                            thread_id, coding_agent, billing_launch_id, &billing_attribution, &meta,
+                        ).await;
+                        continue;
+                    }
+                    if let AgentEvent::UsageRestored { snapshot } = ev {
+                        self.record_coding_agent_usage(
+                            thread_id, &external_terminal_emitted, &meta, coding_agent,
+                            CallModels::of(normalized_model.as_deref(), None),
+                            ReportedUsage::restored(snapshot), None, billing_launch_id,
+                        ).await;
+                        continue;
+                    }
+                    if let AgentEvent::UsageUnscoped { snapshot } = ev {
+                        // Uncertain identity cannot prove that no model call happened.
+                        api_calls_seen = api_calls_seen.saturating_add(1);
+                        self.record_coding_agent_usage(
+                            thread_id, &external_terminal_emitted, &meta, coding_agent,
+                            CallModels::of(normalized_model.as_deref(), None),
+                            ReportedUsage::unscoped(snapshot), None, billing_launch_id,
+                        ).await;
+                        continue;
+                    }
+                    if let AgentEvent::SteerFallback { can_steer, interrupting } = ev {
+                        if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+                            session.can_steer = can_steer;
+                        }
+                        if interrupting && !is_waiting {
+                            user_hit_stop = true;
+                            redirect_cause = Some(crate::engine::thread_events::CancelCause::SupersededByFollowup);
+                            interrupt_escalate_at = Some(tokio::time::Instant::now() + INTERRUPT_ESCALATE_AFTER);
+                        }
+                        continue;
+                    }
                     settle_answered_withdraws(&self.event_bus, thread_id, &mut inputs, &mut pending_withdraws).await;
                     // Only a read that settles an owed input can start a turn. A
                     // replay naming no owed input settles nothing. The read is
@@ -1736,7 +2013,7 @@ impl LucidosEngine {
                     let (read_owed_input, reads) = match inputs.observe(&ev) {
                         Settled::Read(reads) => (true, reads),
                         Settled::Rejected => {
-                            log!("[AgentSession] The agent rejected a forwarded input on thread {}; it stays unread", thread_id);
+                            log_legacy!("[AgentSession] The agent rejected a forwarded input on thread {}; it stays unread", thread_id);
                             (false, Vec::new())
                         }
                         Settled::Nothing => (false, Vec::new()),
@@ -1782,10 +2059,10 @@ impl LucidosEngine {
                                 idle_exit(&mut guard, thread_id, &external_terminal_emitted)
                             };
                             let IdleExit::Release(entry) = exit else {
-                                log!("[AgentSession] CC process exited while idle with a stop pending for thread {}; finalize carries it out", thread_id);
+                                log_legacy!("[AgentSession] CC process exited while idle with a stop pending for thread {}; finalize carries it out", thread_id);
                                 break;
                             };
-                            log!("[AgentSession] CC process exited while idle, releasing thread {}", thread_id);
+                            log_legacy!("[AgentSession] CC process exited while idle, releasing thread {}", thread_id);
                             // Save slash commands to cache now the session is gone.
                             // Model/effort are persisted via CodingAgentSettingsChanged events.
                             let cache_snapshot = entry.and_then(|s| {
@@ -1800,6 +2077,9 @@ impl LucidosEngine {
                             // Drain follow-ups that arrived between CodingAgentIdled
                             // and process exit. Convert to orphaned injections so the
                             // caller re-processes them instead of showing "interrupted".
+                            for held in held_ceiling_inputs.drain(..).rev() {
+                                requeue_at_head(&msg_tx, msg_rx, held);
+                            }
                             let orphans = lost_followups_to_orphans(drain_lost_followups(msg_rx));
 
                             // A turn the backend ended on a transient upstream
@@ -1834,7 +2114,7 @@ impl LucidosEngine {
                                 orphaned_injections: orphans,
                             });
                         }
-                        log!(
+                        log_legacy!(
                             "[AgentSession] CC exited without Result event for thread {} (buffered_text_len={})",
                             thread_id,
                             claude_text_buf.as_str().len()
@@ -1875,7 +2155,7 @@ impl LucidosEngine {
                         }
                     };
                     if new_turn_after_terminal {
-                        log!(
+                        log_legacy!(
                             "[AgentSession] A new turn started on a terminal-armed session for thread {}, re-arming emission",
                             thread_id
                         );
@@ -1892,6 +2172,7 @@ impl LucidosEngine {
                             &mut meta.actor,
                         );
                     }
+                    ceiling_delivery.observe(&ev, new_turn_after_terminal);
                     announce_reads(
                         &self.event_bus,
                         thread_id,
@@ -1902,16 +2183,26 @@ impl LucidosEngine {
                     .await;
                     let turn_ended = turn_has_terminal(emitted_terminal_event, &external_terminal_emitted);
                     match ev {
-                        AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills, agent_version } => {
-                            log!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
+                        AgentEvent::SteerFallback { .. } | AgentEvent::BillingObserved { .. } | AgentEvent::UsageRestored { .. } | AgentEvent::UsageUnscoped { .. } => unreachable!("billing and snapshots handled before activity"),
+                        AgentEvent::Init { session_id: cc_sid, model: init_model, slash_commands: cmds, skills, agent_version, can_steer } => {
+                            log_legacy!("[AgentSession] [TIMING] Init event received: {:?}", cc_start.elapsed());
                             // Record what the backend actually attached to before
                             // anything else: the stale-resume veto reads it.
-                            init_session_id = Some(cc_sid.clone());
+                            let first_init = init_session_id.replace(cc_sid.clone()).is_none();
+                            let requested_model = cc_model.as_deref().or(cc_default_model.as_deref());
+                            // Claude Code repeats Init on every turn of one
+                            // process, so only the first one reports.
+                            let substitution = init_model
+                                .as_deref()
+                                .filter(|_| first_init && coding_agent == CodingAgent::ClaudeCode)
+                                .and_then(|m| crate::runtime::claude_code::substituted_cc_model(requested_model, m))
+                                .zip(requested_model.map(String::from));
                             // Enable --resume for follow-ups and engine restart
                             let cache_update = {
                                 let mut sessions = self.agent_sessions.lock().await;
                                 if let Some(s) = sessions.get_mut(&thread_id) {
                                     s.backend_session_id = Some(cc_sid.clone());
+                                    s.can_steer = can_steer;
                                     // Always update from Init: CC reports the full
                                     // model id, which is authoritative over any
                                     // alias the user selected.
@@ -1920,7 +2211,7 @@ impl LucidosEngine {
                                         // the [1m] suffix survives. CC strips it,
                                         // and `context_window_for` keys on it.
                                         let norm = crate::runtime::claude_code::reconcile_cc_model(
-                                            cc_model.as_deref().or(cc_default_model.as_deref()),
+                                            requested_model,
                                             m,
                                         );
                                         s.current_model = Some(norm.clone());
@@ -1937,7 +2228,13 @@ impl LucidosEngine {
                                 }
                             };
                             if coding_agent == CodingAgent::ClaudeCode {
-                                self.refresh_cc_models_if_stale(agent_version.as_deref());
+                                self.refresh_cc_models_if_stale(
+                                    agent_version.as_deref(),
+                                    live_account.as_ref(),
+                                );
+                                if first_init {
+                                    self.observe_cc_live_account(live_account.as_ref());
+                                }
                             }
                             // Update per-repo cache outside sessions lock to avoid nested locks
                             if let Some(info) = cache_update {
@@ -1967,12 +2264,31 @@ impl LucidosEngine {
                                 },
                                 meta: meta.clone(),
                             }).await {
-                                log!("[AgentSession] Failed to persist Init CodingAgentSettingsChanged for {}: {}", thread_id, e);
+                                log_legacy!("[AgentSession] Failed to persist Init CodingAgentSettingsChanged for {}: {}", thread_id, e);
+                            }
+                            // A respawn asks for the served model, so this
+                            // fires once per refused pick, not once per turn.
+                            if let Some((served, requested)) = substitution {
+                                self.record_cc_model_refusal(
+                                    &requested,
+                                    agent_version.as_deref(),
+                                    effective_pin.as_ref(),
+                                    live_account.as_ref(),
+                                );
+                                self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
+                                    thread_id,
+                                    event: crate::engine::thread_events::ThreadEvent::CodingAgentModelSubstituted {
+                                        requested,
+                                        served,
+                                        coding_agent,
+                                    },
+                                    meta: meta.clone(),
+                                }, "[AgentSession] CodingAgentModelSubstituted").await;
                             }
                             // The process is initialized and mostly idle now.
                             if let Some(permit) = startup_permit.take() {
                                 drop(permit);
-                                log!("[AgentSession] [TIMING] Startup semaphore released: {:?}", cc_start.elapsed());
+                                log_legacy!("[AgentSession] [TIMING] Startup semaphore released: {:?}", cc_start.elapsed());
                             }
                         }
                         // Straggler guard: the runtime sometimes delivers a
@@ -1984,7 +2300,7 @@ impl LucidosEngine {
                         AgentEvent::Message { text, .. } | AgentEvent::ProgressNote { text }
                             if turn_ended =>
                         {
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Dropping post-terminal straggler text ({} chars) for thread {} — would resurrect 'running' on an idled thread",
                                 text.len(),
                                 thread_id
@@ -2092,7 +2408,7 @@ impl LucidosEngine {
                             if crate::runtime::is_user_question_tool(&name) {
                                 question_flushes.0.flushed(&id, &name, &input);
                             }
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Dropping post-terminal straggler tool call for thread {} — would resurrect 'running' on an idled thread",
                                 thread_id
                             );
@@ -2177,7 +2493,7 @@ impl LucidosEngine {
                         AgentEvent::ToolResult { id, .. } if turn_ended => {
                             release_tool_slot(&tools_in_flight);
                             tool_names.take(&id);
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Dropping post-terminal straggler tool result for thread {} — would resurrect 'running' on an idled thread",
                                 thread_id
                             );
@@ -2211,6 +2527,7 @@ impl LucidosEngine {
                             duration_ms,
                             reasoning_effort,
                         } => {
+                            let main_capture = parent_tool_use_id.is_none();
                             // A usage frame reaches us only for a real API call
                             // (the parser drops all-zero ones), so this is the
                             // proof-of-model-call the resume-settle skip reads.
@@ -2222,6 +2539,8 @@ impl LucidosEngine {
                                 coding_agent,
                                 CallModels::of(normalized_model.as_deref(), cc_msg_model.as_deref()),
                                 ReportedUsage {
+                                    billing: billing_attribution.clone(),
+                                    restored: None,
                                     input_tokens,
                                     output_tokens,
                                     cache_read_tokens,
@@ -2233,8 +2552,41 @@ impl LucidosEngine {
                                     reasoning_effort,
                                 },
                                 cc_reasoning_effort.as_deref(),
+                                billing_launch_id,
                             )
                             .await;
+                            if main_capture && !is_resolution_session && !self.event_bus.in_keep_alive_turn(thread_id) {
+                                match crate::engine::context_ceiling::past_ceiling(self.pool(), thread_id).await {
+                                    Ok(owed) => {
+                                        input_gate.ceiling_owed = owed.is_some();
+                                        if !input_gate.ceiling_owed && !ceiling_reentry_forwarded {
+                                            for held in held_ceiling_inputs.drain(..).rev() {
+                                                requeue_at_head(&msg_tx, msg_rx, held);
+                                            }
+                                        }
+                                    },
+                                    Err(e) => log_legacy!("[AgentSession] Ceiling debt unreadable for {thread_id}: {e}"),
+                                }
+                                let can_steer = {
+                                    let mut sessions = self.agent_sessions.lock().await;
+                                    sessions.get_mut(&thread_id).is_some_and(|s| {
+                                        s.in_ceiling_reentry = input_gate.ceiling_owed || ceiling_reentry_forwarded;
+                                        s.can_steer
+                                    })
+                                };
+                                if input_gate.ceiling_owed && can_steer && !ceiling_reentry_forwarded && !user_hit_stop {
+                                    match crate::engine::context_ceiling::ceiling_steer(
+                                        &self.event_bus, thread_id, inputs.owed() > 0, can_steer, &mut reentry_ledger, &mut approved_ceiling_reentry,
+                                    ).await {
+                                        Ok(Some(reentry)) => {
+                                            ceiling_reentry_forwarded = forward_ceiling_input(reentry, &mut inputs, &mut ceiling_delivery, &agent_input_tx);
+                                            if !ceiling_reentry_forwarded { break 'event_loop; }
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => log_legacy!("[AgentSession] Ceiling steer not recorded for {thread_id}: {e}"),
+                                    }
+                                }
+                            }
                         }
                         AgentEvent::Compacted { trigger, pre_tokens, post_tokens } => {
                             // The summary may have dropped the device block.
@@ -2273,9 +2625,12 @@ impl LucidosEngine {
                             blocks_in_flight.remove(&input);
                         }
                         AgentEvent::Exited { .. } => unreachable!("Exited handled above"),
-                        AgentEvent::Result { text, error: cc_error, .. } => {
+                        AgentEvent::Result { text, error: cc_error, provider_error, turn_end, .. } => {
                                         let err_suffix = cc_error.as_deref().map(|e| format!(" (error: {})", e)).unwrap_or_default();
-                                        log!("[AgentSession] Result event received — entering waiting state{}", err_suffix);
+                                        log_legacy!("[AgentSession] Result event received — entering waiting state{}", err_suffix);
+                                        if provider_error.as_ref().is_some_and(|e| e.is_policy_block()) {
+                                            input_gate.provider_blocked = true;
+                                        }
                                         // Final flush of any pending reasoning: a
                                         // turn that reasoned then ended without
                                         // text, or the tail below the threshold.
@@ -2376,7 +2731,7 @@ impl LucidosEngine {
                                         // happen and kill the subprocess
                                         // mid-answer. Skip it and keep reading.
                                         if is_resume_settle_result(stale_inputs, api_calls_seen == 0) {
-                                            log!(
+                                            log_legacy!(
                                                 "[AgentSession] thread {} resumed sid={} and the backend confirmed the attach, but this Result carries no text, no tool call and no error: it closes the resume-settle turn, not ours. Skipping it and waiting for the real Result.",
                                                 thread_id,
                                                 resume_session_id.as_deref().unwrap_or("")
@@ -2399,7 +2754,7 @@ impl LucidosEngine {
                                         if api_calls_seen > 0
                                             && is_resume_settle_result(stale_inputs, true)
                                         {
-                                            log!(
+                                            log_legacy!(
                                                 "[AgentSession] thread {} resumed sid={} and produced an empty Result with no tool calls, but {} API call(s) were made: it answers our prompt, not a resume-settle turn. Classifying it.",
                                                 thread_id,
                                                 resume_session_id.as_deref().unwrap_or(""),
@@ -2409,7 +2764,7 @@ impl LucidosEngine {
                                         if is_stale_resume_signal(stale_inputs)
                                             || explicit_session_not_found
                                         {
-                                            log!("[AgentSession] Stale resume detected (empty-echo heuristic or explicit session-not-found) — aborting session to retry with a fresh spawn.");
+                                            log_legacy!("[AgentSession] Stale resume detected (empty-echo heuristic or explicit session-not-found) — aborting session to retry with a fresh spawn.");
                                             agent_cancel.cancel();
                                             // The entry goes back to `Starting`: the
                                             // caller's retry runs on this claim, so
@@ -2535,12 +2890,18 @@ impl LucidosEngine {
                                             let (model, reasoning_effort) = self
                                                 .terminal_model_settings(thread_id, &external_terminal_emitted)
                                                 .await;
-                                            let terminal_event = Self::make_terminal_event(
+                                            let mut terminal_event = Self::make_terminal_event(
                                                 terminal_kind,
                                                 terminal_text,
                                                 model,
                                                 reasoning_effort,
                                             );
+                                            if let crate::engine::thread_events::ThreadEvent::ResponseFailed { spend_cap, provider_error: failed_provider_error, .. } = &mut terminal_event {
+                                                if let Some(notice) = spend_cap {
+                                                    notice.provider = coding_agent.display_name().to_owned();
+                                                }
+                                                *failed_provider_error = provider_error;
+                                            }
                                             self.event_bus.emit_or_log(crate::engine::event_bus::BusEvent::Thread {
                                                 thread_id,
                                                 event: terminal_event,
@@ -2643,14 +3004,14 @@ impl LucidosEngine {
                                         // An idle agent polls nothing, so a clean turn end
                                         // covers its running tasks, polled ones included.
                                         // Before `holds_live_wait`: the wait holds the
-                                        // proposal, and keeps a waiting child unfinished.
+                                        // proposal, and keeps a child holding it unfinished.
                                         // Pinned by `the_idle_arm_covers_polled_tasks_before_it_idles`.
-                                        let ceiling_turn = std::mem::take(&mut ceiling_reentry_forwarded);
+                                        let ceiling_read = ceiling_delivery.turn_ended();
+                                        let ceiling_turn = ceiling_read == Some(true);
                                         let ended_cleanly = turn_ended_cleanly(&last_terminal_kind, is_resolution_session, keep_alive_turn || ceiling_turn);
-                                        // A re-entry that ended without a handoff, by prose,
-                                        // a failure or a Stop, gets a brief one. Before the
-                                        // pending-handoff reads below and the idle.
-                                        if ceiling_turn {
+                                        let ceiling_end = ceiling_turn_end(last_terminal_kind.as_ref(), is_shutdown);
+                                        // Stop and failure settle the debt without an agent turn.
+                                        if !is_shutdown && (ceiling_read.is_some() || ceiling_end == CeilingTurnEnd::Brief) {
                                             self.settle_owed_ceiling_handoff(thread_id).await;
                                         }
                                         if ended_cleanly {
@@ -2672,7 +3033,7 @@ impl LucidosEngine {
                                             match crate::engine::change_ops::withhold_handed_off_work(self.pool(), &self.event_bus, thread_id, &repo_root, &branch_name).await {
                                                 Ok(true) => self.broadcast_changes_updated().await,
                                                 Ok(false) => {}
-                                                Err(e) => log!("[AgentSession] Could not withdraw the handed-off change of thread {}: {}", thread_id, e),
+                                                Err(e) => log_legacy!("[AgentSession] Could not withdraw the handed-off change of thread {}: {}", thread_id, e),
                                             }
                                         } else if let Some(write) = idle_write {
                                             // Reuses the single probe above rather than re-asking git.
@@ -2683,7 +3044,7 @@ impl LucidosEngine {
                                             // hiccup. Both wait for the next idle.
                                             match changed_files.as_deref() {
                                                 None => {
-                                                    log!(
+                                                    log_legacy!(
                                                         "[AgentSession] Skipping propose/reconcile at idle for thread {}: the diff probe could not be answered",
                                                         thread_id
                                                     );
@@ -2699,7 +3060,7 @@ impl LucidosEngine {
                                                     self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
                                                 }
                                                 Some(_) if !write.may_create() && !self.branch_has_open_change(&branch_name).await => {
-                                                    log!(
+                                                    log_legacy!(
                                                         "[AgentSession] Holding the idle proposal for thread {}: it holds a live event wait",
                                                         thread_id
                                                     );
@@ -2743,7 +3104,7 @@ impl LucidosEngine {
                                                         }
                                                         Ok(ProposeOutcome::Unfinished | ProposeOutcome::AwaitingLanding(_)) => {}
                                                         Err(e) => {
-                                                            log!("[AgentSession] Failed to propose change at idle: {}", e);
+                                                            log_legacy!("[AgentSession] Failed to propose change at idle: {}", e);
                                                         }
                                                     }
                                                     self.broadcast_changes_updated().await;
@@ -2765,6 +3126,17 @@ impl LucidosEngine {
                                             .iter()
                                             .any(|task| !task.stop_requested);
 
+                                        // Read before this turn's idle is written: the
+                                        // query counts approvals since the latest idle.
+                                        // Complete already rules out a Stop, a failure, a
+                                        // live event wait and a pending handoff.
+                                        let approved_plan_unstarted = idle_write == Some(IdleChangeWrite::Complete)
+                                            && emit_idle
+                                            && !bg_bash_running
+                                            && inputs.owed() == 0
+                                            && crate::engine::turn_end::approved_plan::no_source_change(changed_files.as_deref())
+                                            && crate::engine::turn_end::approved_plan::approved_this_turn_and_idle(self.pool(), thread_id).await;
+
                                         // Shutdown: emitting idle would make recover_orphaned_worktrees
                                         // skip this session as "truly idle" and break recovery.
                                         if emit_idle {
@@ -2784,6 +3156,7 @@ impl LucidosEngine {
                                                     bg_bash_pending: bg_bash_running,
                                                     worktree_path: worktree_path.as_deref(),
                                                     turn: IdleTurn::of(keep_alive_turn, ceiling_turn),
+                                                    turn_end,
                                                 },
                                                 &meta,
                                                 coding_agent,
@@ -2812,42 +3185,66 @@ impl LucidosEngine {
                                         // After the idle, so a re-entry opens its own
                                         // exchange. Before `terminate_decision`, which
                                         // then sees it queued and keeps the subprocess.
-                                        // Only an ordinary clean turn end reads the
-                                        // ceiling, after the idle it counts as a turn.
-                                        let ceiling = if ended_cleanly && emit_idle {
+                                        // Delivery reads the debt recorded by usage captures.
+                                        let ceiling = if ceiling_end == CeilingTurnEnd::Reenter && emit_idle && !keep_alive_turn && !is_resolution_session {
                                             crate::engine::context_ceiling::ceiling_crossing(self.pool(), thread_id, inputs.owed() > 0).await
                                         } else {
                                             None
                                         };
-                                        if ceiling.is_some() || held_proposal.is_some() {
+                                        if ceiling.is_some() || held_proposal.is_some() || approved_plan_unstarted {
                                             let gate = crate::engine::turn_end::TurnEndState::at_session_idle(
                                                 true,
                                                 idle_write == Some(IdleChangeWrite::Complete),
                                                 crate::engine::turn_end::SessionFacts {
                                                     head: branch_head_sha(&repo_root, &branch_name).await,
                                                     held: held_proposal,
+                                                    approved_plan_unstarted,
                                                 },
                                                 ceiling,
                                             );
-                                            match reentry_ledger.take_due(&gate) {
+                                            // A paused thread asks the owner instead (I1).
+                                            // Read at the idle, so a pause placed during the
+                                            // turn counts here. An asked re-entry was not
+                                            // sent, so the ledger forgets it.
+                                            crate::engine::context_ceiling::recheck_ceiling_approval(&self.event_bus, thread_id, &mut approved_ceiling_reentry).await;
+                                            let due = match reentry_ledger.take_due(&gate) {
+                                                Some(due) if approved_ceiling_reentry.is_none() && crate::engine::automation_pause::ask_before_step(&self.event_bus, thread_id, due.step()).await
+                                                    != crate::engine::automation_pause::StepVerdict::Run => {
+                                                    reentry_ledger.forget(due);
+                                                    None
+                                                }
+                                                due => due,
+                                            };
+                                            match due {
                                                 Some(crate::engine::turn_end::DueReentry::Ceiling(crossing)) => {
-                                                    // At the head, ahead of input queued for the
-                                                    // successor. The input arm then closes until
-                                                    // the re-entry turn ends.
-                                                    match crate::engine::context_ceiling::record_ceiling_reentry(&self.event_bus, thread_id, crossing).await {
+                                                    // Before input held for the successor. The
+                                                    // read will open the engine's own turn.
+                                                    let reentry = match approved_ceiling_reentry.take() {
+                                                        Some(input) => Ok(input),
+                                                        None => crate::engine::context_ceiling::record_ceiling_reentry(&self.event_bus, thread_id, crossing).await,
+                                                    };
+                                                    match reentry {
                                                         Ok(reentry) => {
-                                                            let _sessions = self.agent_sessions.lock().await;
-                                                            requeue_at_head(&msg_tx, msg_rx, reentry);
+                                                            ceiling_reentry_forwarded = forward_ceiling_input(reentry, &mut inputs, &mut ceiling_delivery, &agent_input_tx);
+                                                            if let Some(s) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+                                                                s.in_ceiling_reentry = true;
+                                                            }
+                                                            if !ceiling_reentry_forwarded { break 'event_loop; }
                                                         }
                                                         Err(e) => {
-                                                            log!("[AgentSession] Ceiling re-entry for thread {} not sent: {}", thread_id, e);
+                                                            log_legacy!("[AgentSession] Ceiling re-entry for thread {} not sent: {}", thread_id, e);
                                                             self.settle_owed_ceiling_handoff(thread_id).await;
                                                         }
                                                     }
                                                 }
+                                                Some(crate::engine::turn_end::DueReentry::ApprovedPlan) => {
+                                                    if let Err(e) = self.send_approved_plan_reentry(thread_id, &msg_tx).await {
+                                                        log!("[AgentSession] Approved-plan re-entry for thread {} not sent: {}", thread_id, lucidos_diagnostic_log::private(&e));
+                                                    }
+                                                }
                                                 Some(crate::engine::turn_end::DueReentry::Hold(hold)) => {
                                                     if let Err(e) = self.nudge_held_proposal_in_session(thread_id, hold, &msg_tx).await {
-                                                        log!("[AgentSession] Proposal-hold re-entry for thread {} not sent: {}", thread_id, e);
+                                                        log_legacy!("[AgentSession] Proposal-hold re-entry for thread {} not sent: {}", thread_id, e);
                                                     }
                                                 }
                                                 None => {}
@@ -2858,13 +3255,13 @@ impl LucidosEngine {
                                             IdleAction::EndSession => {
                                                 // The rule an ordinary session exits by: a
                                                 // follow-up on its way gets its turn first.
-                                                if self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut handed_off).await {
-                                                    log!("[AgentSession] Resolution session idle for thread {}: ending loop", thread_id);
+                                                if self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut input_gate).await {
+                                                    log_legacy!("[AgentSession] Resolution session idle for thread {}: ending loop", thread_id);
                                                     break 'event_loop;
                                                 }
                                             }
                                             IdleAction::ExitSubprocess => {
-                                                self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut handed_off).await;
+                                                self.exit_idle_subprocess_unless_owed(thread_id, msg_rx, inputs.owed(), &agent_cancel, &mut input_gate).await;
                                             }
                                             IdleAction::Nothing => {}
                                         }
@@ -2941,7 +3338,7 @@ impl LucidosEngine {
                                     // resolves through the same recovery paths
                                     // Claude Code uses.
                                     _ = respond.closed() => {
-                                        log!(
+                                        log_legacy!(
                                             "[AgentSession] agent died with permission card pending for thread {} — abandoning waiter",
                                             thread_id
                                         );
@@ -2958,18 +3355,69 @@ impl LucidosEngine {
                     }
                 }
 
-                Some(mut user_input) = msg_rx.recv(), if !handed_off && !ceiling_reentry_forwarded => {
-                    // After a handoff, and through the ceiling re-entry turn,
-                    // input waits in the channel for the successor session.
-                    // The idle exit drains it there.
+                Some(mut user_input) = msg_rx.recv(), if input_gate.receives() && !ceiling_reentry_forwarded => {
+                    // After a handoff or a provider block, and through the
+                    // ceiling re-entry turn, input waits in the channel for the
+                    // next session. The idle exit drains it there.
                     if crate::engine::successor::handoff_pending(self.pool(), thread_id).await {
-                        handed_off = true;
+                        input_gate.handed_off = true;
                         let _sessions = self.agent_sessions.lock().await;
                         requeue_at_head(&msg_tx, msg_rx, user_input);
                         continue 'event_loop;
                     }
+                    if crate::engine::thread_stop::is_automatic_input(user_input.kind)
+                        && crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await {
+                        // The event-backed input stays unread for the resume. A
+                        // turn-end nudge is recomputed at the next idle.
+                        if let Some(id) = user_input.origin_event_id {
+                            if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+                                session.unforwarded_inputs.remove(&id);
+                            }
+                        }
+                        continue 'event_loop;
+                    }
+                    // A pause placed after this nudge was queued holds it
+                    // back, and asks the owner instead (I2).
+                    if let Some(step) = crate::engine::automation_pause::withheld_queued_step(self.pool(), thread_id, &user_input).await {
+                        log_legacy!("[AgentSession] Thread {} was paused after its {:?} nudge was queued: asking instead", thread_id, step);
+                        crate::engine::automation_pause::ask_before_step(&self.event_bus, thread_id, step).await;
+                        continue 'event_loop;
+                    }
                     if user_input.kind == crate::engine::AgentInputKind::CeilingReentry {
-                        ceiling_reentry_forwarded = true;
+                        approved_ceiling_reentry = Some(user_input);
+                        input_gate.ceiling_owed = true;
+                        let can_steer = {
+                            let mut sessions = self.agent_sessions.lock().await;
+                            sessions.get_mut(&thread_id).is_some_and(|s| {
+                                s.in_ceiling_reentry = true;
+                                is_waiting || s.can_steer
+                            })
+                        };
+                        match crate::engine::context_ceiling::ceiling_steer(
+                            &self.event_bus, thread_id, inputs.owed() > 0, can_steer, &mut reentry_ledger, &mut approved_ceiling_reentry,
+                        ).await {
+                            Ok(Some(reentry)) => {
+                                ceiling_reentry_forwarded = forward_ceiling_input(reentry, &mut inputs, &mut ceiling_delivery, &agent_input_tx);
+                                if !ceiling_reentry_forwarded { break 'event_loop; }
+                            }
+                            Ok(None) => {}
+                            Err(e) => log_legacy!("[AgentSession] Approved ceiling steer not sent for {thread_id}: {e}"),
+                        }
+                        continue 'event_loop;
+                    }
+                    if input_gate.ceiling_owed {
+                        held_ceiling_inputs.push(user_input);
+                        continue 'event_loop;
+                    }
+                    if matches!(user_input.kind, crate::engine::AgentInputKind::User | crate::engine::AgentInputKind::Continuation) {
+                        match crate::engine::thread_stop::held_inputs(self.pool(), thread_id).await {
+                            Ok(held) => {
+                                if let Some(session) = self.agent_sessions.lock().await.get_mut(&thread_id) {
+                                    crate::engine::thread_stop::queue_held_inputs(session, held, |id| inputs.forwarded_here(id));
+                                }
+                            }
+                            Err(e) => log_legacy!("[AgentSession] Held deliveries of {thread_id} unreadable: {e}"),
+                        }
                     }
                     // The input just left the channel and is about to reach the
                     // driver. It therefore moves from the "sent, not yet
@@ -3043,7 +3491,7 @@ impl LucidosEngine {
                             })
                             .await
                             .unwrap_or_else(|e| {
-                                log!("[EventBus] [AgentSession] CodingAgentPromptSent emit failed: {}", e);
+                                log_legacy!("[EventBus] [AgentSession] CodingAgentPromptSent emit failed: {}", e);
                                 None
                             })
                             .map(|emitted| emitted.event_id)
@@ -3068,6 +3516,7 @@ impl LucidosEngine {
                     )
                     .await;
                     let agent_input = AgentInput {
+                        defer_on_steer_failure: false,
                         text: follow_up.text,
                         images,
                         uuid: Uuid::new_v4(),
@@ -3090,7 +3539,7 @@ impl LucidosEngine {
                     }
                     child_reports.publish(&inputs);
                     if agent_input_tx.send(agent_input).is_err() {
-                        log!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
+                        log_legacy!("[AgentSession] Failed to forward user input to agent runtime — channel closed");
                         break;
                     }
                     if let Some(id) = user_input.origin_event_id {
@@ -3132,7 +3581,7 @@ impl LucidosEngine {
                     }
                     child_reports.publish(&inputs);
                     let action = idle_action(is_resolution_session, self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed)));
-                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut handed_off).await {
+                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut input_gate).await {
                         break;
                     }
                 }
@@ -3141,7 +3590,7 @@ impl LucidosEngine {
                     finish_withdraw(&self.event_bus, thread_id, &mut inputs, answered).await;
                     child_reports.publish(&inputs);
                     let action = idle_action(is_resolution_session, self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed)));
-                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut handed_off).await {
+                    if is_waiting && self.idle_exit_ends_session(thread_id, msg_rx, inputs.owed(), &agent_cancel, action, &mut input_gate).await {
                         break;
                     }
                 }
@@ -3156,6 +3605,26 @@ impl LucidosEngine {
                     // During shutdown, the post-loop cleanup bails out early
                     // (no worktree removal, no SessionEnded). The session resumes
                     // after restart via recover_orphaned_worktrees.
+                    let interruption_cause = self.take_session_redirect_cause(thread_id).await;
+                    let shutdown_interrupt = self.session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
+                    if interruption_cause.is_none() && !shutdown_interrupt {
+                        if let Some((uuid, anchor)) = ceiling_delivery.pending {
+                            if !crate::engine::agent_session::withdraw::withdraw_ceiling_before_stop(
+                                &self.event_bus, thread_id, &mut inputs, &agent_withdraw_tx,
+                                &mut pending_withdraws, anchor, meta.actor.clone(),
+                            ).await {
+                                // Stop owns cancellation. A refused withdrawal must
+                                // never leave a queued engine turn in a live driver.
+                                agent_cancel.cancel();
+                            }
+                            if !inputs.owes(uuid) { ceiling_delivery.pending = None; }
+                            if is_waiting {
+                                self.settle_owed_ceiling_handoff(thread_id).await;
+                                agent_cancel.cancel();
+                                break 'event_loop;
+                            }
+                        }
+                    }
                     if !is_waiting {
                         user_hit_stop = true;
                         // Distinguish a redirect (a follow-up, an effort
@@ -3163,7 +3632,7 @@ impl LucidosEngine {
                         // its own neutral cause, the latter is UserStop
                         // ("Canceled ✕"). Drained on read; cleared at the Result
                         // turn boundary below alongside user_hit_stop.
-                        redirect_cause = self.take_session_redirect_cause(thread_id).await;
+                        redirect_cause = interruption_cause;
                         // Drain the device that clicked Cancel (stamped by
                         // `interrupt_agent`) onto `meta` so the terminal
                         // `ResponseCanceled` records it — the popover's Device row.
@@ -3171,12 +3640,12 @@ impl LucidosEngine {
                         if let Some(cancel_actor) = self.take_session_cancel_actor(thread_id).await {
                             meta.actor = Some(cancel_actor);
                         }
-                        log!("[AgentSession] Sending control_request interrupt to CC process");
+                        log_legacy!("[AgentSession] Sending control_request interrupt to CC process");
                         if agent_control_tx
                             .send(crate::runtime::ControlRequest::Interrupt)
                             .is_err()
                         {
-                            log!("[AgentSession] Failed to forward interrupt: agent control channel closed");
+                            log_legacy!("[AgentSession] Failed to forward interrupt: agent control channel closed");
                         }
                         // Arm the bounded fallback: if CC doesn't emit a Result
                         // within the window, the escalation arm hard-stops below.
@@ -3211,7 +3680,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(), &mut billing_attribution, billing_launch_id,
                     ).await;
                     break;
                 }
@@ -3229,7 +3698,7 @@ impl LucidosEngine {
                         None => std::future::pending::<()>().await,
                     }
                 } => {
-                    log!(
+                    log_legacy!(
                         "[AgentSession] CC did not honor interrupt within {}s — escalating to hard stop for thread {}",
                         INTERRUPT_ESCALATE_AFTER.as_secs(),
                         thread_id
@@ -3258,7 +3727,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(), &mut billing_attribution, billing_launch_id,
                     ).await;
                     break;
                 }
@@ -3283,7 +3752,7 @@ impl LucidosEngine {
                     ).await;
                     emitted_terminal_event = true;
                     self.record_usage_flushed_at_stop(
-                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(),
+                        &mut events_rx, thread_id, &external_terminal_emitted, &meta, coding_agent, normalized_model.as_deref(), cc_reasoning_effort.as_deref(), &mut billing_attribution, billing_launch_id,
                     ).await;
                     break;
                 }
@@ -3328,7 +3797,7 @@ impl LucidosEngine {
                         if elapsed_ms >= WATCHDOG_DIAG_LOG_THRESHOLD_MS
                             && gate != WatchdogGate::NotStale
                         {
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] [Watchdog DIAG] thread={} elapsed={}s is_waiting={} tools_in_flight={} session_present={} gate={}",
                                 thread_id,
                                 elapsed_ms / 1000,
@@ -3357,7 +3826,7 @@ impl LucidosEngine {
                                     .await
                                     .unwrap_or(false);
                                 if !still_running {
-                                    log!(
+                                    log_legacy!(
                                         "[AgentSession] Watchdog: thread {} past hung-tool ceiling with {} tool(s) in flight but no longer `running` (awaiting user answer / already settled) — not firing",
                                         thread_id,
                                         tif
@@ -3368,7 +3837,7 @@ impl LucidosEngine {
                             _ => false,
                         };
                         if should_fire {
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] Watchdog ({}): no events for {}s while mid-turn for thread {} (hung subprocess / hung tool) — killing the coding-agent subprocess; will auto-resume via ContinuationRequested once events_rx EOFs",
                                 gate.diag_tag(),
                                 elapsed_ms / 1000,
@@ -3382,6 +3851,9 @@ impl LucidosEngine {
             }
         }
 
+        for held in held_ceiling_inputs.into_iter().rev() {
+            requeue_at_head(&msg_tx, msg_rx, held);
+        }
         self.finalize_direct_agent(
             thread_id,
             request_id,
@@ -3788,7 +4260,7 @@ fn prepend_resume_notes(thread_id: Uuid, notes: &[&str], message: &str) -> Strin
         return message.to_string();
     }
     let block = notes.join("\n");
-    log!(
+    log_legacy!(
         "[AgentSession] Injecting resume note for thread {} ({} chars)",
         thread_id,
         block.len()
@@ -3816,7 +4288,7 @@ struct HistoryLine<'a> {
     content: &'a str,
     image_hashes: &'a [String],
     event_id: Option<&'a str>,
-    /// Who typed a user message: the operator's name on a team gateway,
+    /// Who typed a user message: the user's name on a team gateway,
     /// else "User". The same name chat history gives it.
     speaker: String,
 }
@@ -3824,7 +4296,7 @@ struct HistoryLine<'a> {
 impl<'a> HistoryLine<'a> {
     fn of(
         message: &'a crate::core::store::SessionMessage,
-        operators: &crate::gateway_operators::OperatorSnapshot,
+        users: &crate::gateway_users::UserSnapshot,
     ) -> Self {
         Self {
             role: &message.role,
@@ -3832,7 +4304,7 @@ impl<'a> HistoryLine<'a> {
             content: &message.content,
             image_hashes: &message.user_image_hashes,
             event_id: message.event_id.as_deref(),
-            speaker: operators.speaker_of_device(message.sender_device_id.as_deref()),
+            speaker: users.speaker_of_device(message.sender_device_id.as_deref()),
         }
     }
 
@@ -4234,6 +4706,8 @@ https://claude-gateway.example.com. Check your network connection, or sign in ag
                 text: String::new(),
                 duration_ms: 0,
                 error: Some("Failed to start Codex: No such file or directory".to_string()),
+                provider_error: None,
+                turn_end: None,
             },
             exited(AgentExitFacts::default()),
         ]);
@@ -4279,6 +4753,8 @@ https://claude-gateway.example.com. Check your network connection, or sign in ag
             text: String::new(),
             duration_ms: 0,
             error: Some("   ".to_string()),
+            provider_error: None,
+            turn_end: None,
         }]);
         assert_eq!(death.reason, None);
     }
@@ -4411,6 +4887,52 @@ mod usage_flushed_at_stop_tests {
     use super::{usage_flushed_at_stop, AgentEvent};
     use tokio::sync::mpsc;
 
+    #[tokio::test]
+    async fn codex_snapshots_at_stop_keep_order_counts_and_current_billing() {
+        use crate::runtime::agent_runtime::CodexUsageSnapshot;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let snapshot = CodexUsageSnapshot {
+            session_id: "resumed".into(),
+            turn_id: Some("old".into()),
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_tokens: 100,
+            cache_creation_tokens: 0,
+        };
+        tx.send(AgentEvent::UsageRestored {
+            snapshot: snapshot.clone(),
+        })
+        .unwrap();
+        tx.send(usage(100)).unwrap();
+        tx.send(AgentEvent::UsageUnscoped { snapshot }).unwrap();
+        let mut billing = super::BillingAttribution::codex_account(
+            Some("openai"),
+            &serde_json::json!({
+                "requiresOpenaiAuth": true, "account": {"type": "apiKey"}
+            }),
+        )
+        .codex_endpoint_checked(true);
+        let original = billing.clone();
+        drop(tx);
+        let flushed =
+            usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(1), &mut billing).await;
+        assert_eq!(flushed.len(), 3);
+        assert!(flushed[0].1.restored.is_some());
+        assert_eq!(flushed[1].1.billing, original);
+        assert_eq!(flushed[2].1.billing.provider_id(), "unknown");
+        assert_eq!(billing, original);
+        for (_, usage) in flushed {
+            assert_eq!(
+                (
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.cache_read_tokens
+                ),
+                (2, 4, 100)
+            );
+        }
+    }
+
     fn usage(cache_read_tokens: u32) -> AgentEvent {
         AgentEvent::Usage {
             model: Some("claude-sonnet-5".into()),
@@ -4424,6 +4946,34 @@ mod usage_flushed_at_stop_tests {
             duration_ms: None,
             reasoning_effort: None,
         }
+    }
+
+    #[tokio::test]
+    async fn queued_billing_evidence_is_kept_for_a_cut_off_call() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let gateway = super::BillingAttribution::claude_initialize(&serde_json::json!({
+            "account": {"apiProvider": "gateway"}
+        }));
+        tx.send(AgentEvent::BillingObserved {
+            attribution: gateway.clone(),
+        })
+        .unwrap();
+        tx.send(usage(100)).unwrap();
+        tx.send(AgentEvent::BillingObserved {
+            attribution: super::BillingAttribution::default(),
+        })
+        .unwrap();
+        tx.send(usage(200)).unwrap();
+        tx.send(AgentEvent::OutputEnded).unwrap();
+        let mut billing = super::BillingAttribution::default();
+        let flushed =
+            usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(1), &mut billing).await;
+        assert_eq!(flushed.len(), 2);
+        assert_eq!(flushed[0].1.billing, gateway);
+        assert_eq!(flushed[0].1.cache_read_tokens, 100);
+        assert_eq!(flushed[1].1.billing, super::BillingAttribution::default());
+        assert_eq!(flushed[1].1.cache_read_tokens, 200);
+        assert_eq!(billing, super::BillingAttribution::default());
     }
 
     /// Every `Usage` up to `OutputEnded` is kept, and nothing after it is read.
@@ -4440,7 +4990,12 @@ mod usage_flushed_at_stop_tests {
             tx.send(ev).expect("send");
         }
 
-        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+        let flushed = usage_flushed_at_stop(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            &mut super::BillingAttribution::default(),
+        )
+        .await;
 
         let cache_reads: Vec<u32> = flushed.iter().map(|(_, u)| u.cache_read_tokens).collect();
         assert_eq!(cache_reads, vec![100, 200]);
@@ -4471,7 +5026,12 @@ mod usage_flushed_at_stop_tests {
         .expect("send");
         drop(tx);
 
-        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+        let flushed = usage_flushed_at_stop(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            &mut super::BillingAttribution::default(),
+        )
+        .await;
 
         assert_eq!(
             flushed[0].1.parent_tool_use_id.as_deref(),
@@ -4486,7 +5046,12 @@ mod usage_flushed_at_stop_tests {
         tx.send(usage(7)).expect("send");
         drop(tx);
 
-        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(5)).await;
+        let flushed = usage_flushed_at_stop(
+            &mut rx,
+            std::time::Duration::from_secs(5),
+            &mut super::BillingAttribution::default(),
+        )
+        .await;
 
         assert_eq!(flushed.len(), 1);
     }
@@ -4496,7 +5061,12 @@ mod usage_flushed_at_stop_tests {
     async fn a_silent_driver_cannot_hold_the_stop() {
         let (_tx, mut rx) = mpsc::unbounded_channel();
 
-        let flushed = usage_flushed_at_stop(&mut rx, std::time::Duration::from_secs(2)).await;
+        let flushed = usage_flushed_at_stop(
+            &mut rx,
+            std::time::Duration::from_secs(2),
+            &mut super::BillingAttribution::default(),
+        )
+        .await;
 
         assert!(flushed.is_empty());
     }
@@ -4587,8 +5157,348 @@ mod coding_agent_capture_tests {
     use super::{coding_agent_capture, effort_in_force, CallModels, ReportedUsage};
     use crate::runtime::CodingAgent;
 
+    #[tokio::test]
+    async fn context_ceiling_stop_and_failure_record_a_brief_and_run_no_turn() {
+        use crate::engine::agent_session::lifecycle::{
+            ceiling_turn_end, CeilingTurnEnd, TerminalKind,
+        };
+        use crate::engine::context_ceiling::{record_ceiling_reached, CeilingCrossing};
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{CancelCause, EventMeta};
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, setup_test_db, start_cc_session, teardown_test_db,
+        };
+        use uuid::Uuid;
+        let name = concat!(
+            module_path!(),
+            "::context_ceiling_stop_and_failure_record_a_brief_and_run_no_turn"
+        );
+        if !in_engine_child(name.strip_prefix("lucidos_engine::").unwrap()).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        for terminal in [
+            TerminalKind::Canceled(CancelCause::UserStop),
+            TerminalKind::Failed {
+                error: "failure".into(),
+            },
+        ] {
+            let thread = Uuid::new_v4();
+            start_cc_session(&engine.event_bus, thread, "test/context-ceiling", None).await;
+            record_ceiling_reached(
+                &engine.event_bus,
+                thread,
+                CeilingCrossing {
+                    context_tokens: 301_000,
+                    ceiling: 300_000,
+                    window: Some(1_000_000),
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                ceiling_turn_end(Some(&terminal), false),
+                CeilingTurnEnd::Brief
+            );
+            engine
+                .event_bus
+                .emit(BusEvent::Thread {
+                    thread_id: thread,
+                    event: crate::engine::LucidosEngine::make_terminal_event(
+                        terminal,
+                        String::new(),
+                        None,
+                        None,
+                    ),
+                    meta: EventMeta::NONE,
+                })
+                .await
+                .unwrap();
+            engine.settle_owed_ceiling_handoff(thread).await;
+            let handoffs: Vec<serde_json::Value> = sqlx::query_scalar(
+                "SELECT payload FROM events WHERE thread_id = $1 AND event_type = 'SessionHandedOff'"
+            ).bind(thread).fetch_all(&pool).await.unwrap();
+            assert_eq!(handoffs.len(), 1);
+            assert_eq!(handoffs[0]["opening"], "brief");
+            assert_eq!(handoffs[0]["cause"], "context-ceiling");
+            assert_eq!(handoffs[0]["starts"], "on-next-input");
+            let prompts: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'PromptInjected'"
+            ).bind(thread).fetch_one(&pool).await.unwrap();
+            assert_eq!(prompts, 0);
+        }
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn context_ceiling_capture_recording_ignores_restored_and_child_usage() {
+        use crate::engine::context_ceiling::past_ceiling;
+        use crate::engine::thread_events::EventMeta;
+        use crate::runtime::agent_runtime::CodexUsageSnapshot;
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, setup_test_db, start_cc_session, teardown_test_db,
+        };
+        use std::sync::atomic::AtomicBool;
+        use uuid::Uuid;
+        let name = concat!(
+            module_path!(),
+            "::context_ceiling_capture_recording_ignores_restored_and_child_usage"
+        );
+        if !in_engine_child(name.strip_prefix("lucidos_engine::").unwrap()).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let thread = Uuid::new_v4();
+        start_cc_session(&engine.event_bus, thread, "test/context-ceiling", None).await;
+        let token = AtomicBool::new(false);
+        let launch = Uuid::new_v4();
+        for (tokens, restored, child) in [
+            (60_000, false, false),
+            (400_000, true, false),
+            (500_000, false, true),
+            (301_000, false, false),
+            (654_000, false, false),
+        ] {
+            let mut usage = ReportedUsage::unscoped(CodexUsageSnapshot {
+                session_id: "test-session".into(),
+                turn_id: Some("turn".into()),
+                input_tokens: tokens,
+                output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+            });
+            if restored {
+                usage.restored = Some(CodexUsageSnapshot {
+                    session_id: "test-session".into(),
+                    turn_id: Some("old-turn".into()),
+                    input_tokens: tokens,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                });
+            }
+            usage.parent_tool_use_id = child.then(|| "child-tool".into());
+            engine
+                .record_coding_agent_usage(
+                    thread,
+                    &token,
+                    &EventMeta::NONE,
+                    CodingAgent::ClaudeCode,
+                    CallModels::of(Some("claude-opus-5-5"), None),
+                    usage,
+                    None,
+                    launch,
+                )
+                .await;
+            let crossing = past_ceiling(&pool, thread).await.unwrap();
+            if tokens < 300_000 || restored || child {
+                assert_eq!(crossing, None);
+            } else {
+                assert_eq!(crossing.unwrap().context_tokens, 301_000);
+            }
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ContextCeilingReached'"
+        ).bind(thread).fetch_one(&pool).await.unwrap();
+        assert_eq!(count, 1);
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn codex_resume_recording_preserves_snapshots_without_pinning_new_billing() {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{EventMeta, ThreadEvent};
+        use crate::runtime::agent_runtime::CodexUsageSnapshot;
+        use crate::runtime::billing_provider::{
+            BillingAttribution, BillingEvidenceSource, BillingProvider,
+        };
+        use crate::test_support::{
+            boot_mock_engine, in_engine_child, setup_test_db, start_cc_session, teardown_test_db,
+        };
+        use std::sync::atomic::AtomicBool;
+        use uuid::Uuid;
+        let name = concat!(
+            module_path!(),
+            "::codex_resume_recording_preserves_snapshots_without_pinning_new_billing"
+        );
+        let name = name
+            .strip_prefix("lucidos_engine::")
+            .expect("engine crate prefix");
+        if !in_engine_child(name).await {
+            return;
+        }
+        let (pool, db) = setup_test_db().await;
+        let (engine, _workspace) = boot_mock_engine(&db).await;
+        let thread = Uuid::new_v4();
+        let launch = Uuid::new_v4();
+        let live_billing = BillingAttribution::Known {
+            provider: BillingProvider::ChatgptPlan,
+            source: BillingEvidenceSource::CodexAccount,
+        };
+        let settings = || ThreadEvent::CodingAgentSettingsChanged {
+            model: None,
+            reasoning_effort: None,
+            coding_agent: CodingAgent::Codex,
+            cc_session_id: Some("codex-session".into()),
+            claude_config_dir: None,
+            claude_config_dir_explicit: None,
+        };
+        start_cc_session(&engine.event_bus, thread, "test/resume-provider", None).await;
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event: settings(),
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        let mut original = reported();
+        original.billing = BillingAttribution::Known {
+            provider: BillingProvider::Openai,
+            source: BillingEvidenceSource::CodexAccount,
+        };
+        let original = coding_agent_capture(
+            CodingAgent::Codex,
+            CallModels::of(Some("test-model"), None),
+            200_000,
+            original,
+            None,
+        );
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event: original,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        start_cc_session(&engine.event_bus, thread, "test/resume-provider", None).await;
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id: thread,
+                event: settings(),
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap();
+        engine
+            .observe_coding_agent_billing(
+                thread,
+                CodingAgent::Codex,
+                launch,
+                &live_billing,
+                &EventMeta::NONE,
+            )
+            .await;
+        let snapshot = CodexUsageSnapshot {
+            session_id: "codex-session".into(),
+            turn_id: Some("old-turn".into()),
+            input_tokens: 2,
+            output_tokens: 4,
+            cache_read_tokens: 8,
+            cache_creation_tokens: 0,
+        };
+        let token = AtomicBool::new(false);
+        let unscoped = snapshot.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut billing = live_billing.clone();
+        tokio::join!(
+            engine.record_usage_flushed_at_stop(
+                &mut rx,
+                thread,
+                &token,
+                &EventMeta::NONE,
+                CodingAgent::Codex,
+                Some("test-model"),
+                None,
+                &mut billing,
+                launch,
+            ),
+            async move {
+                // The driver can finish mapping a line after cancellation.
+                tokio::task::yield_now().await;
+                use crate::runtime::agent_runtime::AgentEvent;
+                for _ in 0..2 {
+                    tx.send(AgentEvent::UsageRestored {
+                        snapshot: snapshot.clone(),
+                    })
+                    .unwrap();
+                }
+                tx.send(AgentEvent::Usage {
+                    model: None,
+                    input_tokens: 2,
+                    output_tokens: 4,
+                    cache_read_tokens: 8,
+                    cache_creation_tokens: 0,
+                    cache_creation_1h_tokens: None,
+                    parent_tool_use_id: None,
+                    api_call_id: None,
+                    duration_ms: None,
+                    reasoning_effort: None,
+                })
+                .unwrap();
+            }
+        );
+        engine
+            .record_coding_agent_usage(
+                thread,
+                &token,
+                &EventMeta::NONE,
+                CodingAgent::Codex,
+                CallModels::of(Some("test-model"), None),
+                ReportedUsage::unscoped(unscoped),
+                None,
+                launch,
+            )
+            .await;
+        let events = engine
+            .event_store
+            .get_thread_events(&thread.to_string())
+            .await
+            .unwrap();
+        let captures: Vec<_> = events
+            .iter()
+            .filter(|row| row.event_type == "ContextCaptured")
+            .map(|row| &row.payload)
+            .collect();
+        assert_eq!(captures.len(), 5);
+        assert_eq!(
+            captures
+                .iter()
+                .map(|p| p["provider"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["openai", "openai", "openai", "chatgpt-plan", "unknown"]
+        );
+        for capture in &captures[1..] {
+            assert_eq!(capture["usage"], captures[0]["usage"]);
+        }
+        let observations: Vec<_> = events
+            .iter()
+            .filter(|row| row.event_type == "CodingAgentBillingObserved")
+            .collect();
+        assert_eq!(
+            observations.len(),
+            1,
+            "snapshot attribution must not repin billing"
+        );
+        assert_eq!(
+            observations[0].payload["attribution"]["provider"],
+            "chatgpt-plan"
+        );
+        drop(engine);
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
     fn reported() -> ReportedUsage {
         ReportedUsage {
+            billing: super::BillingAttribution::default(),
+            restored: None,
             input_tokens: 2,
             output_tokens: 4,
             cache_read_tokens: 8,
@@ -4610,6 +5520,86 @@ mod coding_agent_capture_tests {
             effort,
         );
         serde_json::to_value(&event).expect("serializes")
+    }
+
+    #[tokio::test]
+    async fn resumed_keep_alive_captures_preserve_process_billing() {
+        use crate::engine::event_bus::EventBus;
+        use crate::runtime::billing_provider::BillingAttribution;
+        use crate::test_support::{
+            seed_thread_event, setup_test_db, start_cc_session, teardown_test_db,
+        };
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = uuid::Uuid::new_v4();
+        start_cc_session(&bus, thread, "test/keep-alive-billing", None).await;
+        let _held = bus.begin_keep_alive_turn(thread).await;
+        for billing in [
+            BillingAttribution::claude_initialize(&serde_json::json!({
+                "account": {"apiProvider": "gateway"}
+            })),
+            BillingAttribution::default(),
+        ] {
+            let expected = billing.provider_id();
+            let mut usage = reported();
+            usage.billing = billing;
+            let capture = coding_agent_capture(
+                CodingAgent::ClaudeCode,
+                CallModels::of(Some("test-model"), None),
+                200_000,
+                usage,
+                None,
+            );
+            let id = seed_thread_event(&bus, thread, capture).await;
+            let payload: serde_json::Value =
+                sqlx::query_scalar("SELECT payload FROM events WHERE id = $1")
+                    .bind(id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(payload["provider"], expected);
+            assert_eq!(payload["model"], "test-model");
+        }
+        bus.mark_keep_alive_turn(thread, false).await;
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[test]
+    fn a_coding_agent_capture_never_silently_omits_provider() {
+        let payload = captured_payload(None);
+        assert!(payload["provider"].is_string(), "{payload}");
+    }
+
+    #[test]
+    fn old_capture_without_provider_still_replays_as_unattributed() {
+        let mut payload = captured_payload(None);
+        payload.as_object_mut().unwrap().remove("provider");
+        let event: crate::engine::thread_events::ThreadEvent =
+            serde_json::from_value(payload).unwrap();
+        let replay = serde_json::to_value(event).unwrap();
+        assert!(replay.get("provider").is_none());
+    }
+
+    #[test]
+    fn provider_is_independent_of_producer_and_model() {
+        for agent in CodingAgent::ALL {
+            let mut usage = reported();
+            usage.billing = super::BillingAttribution::claude_initialize(&serde_json::json!({
+                "account": {"apiProvider": "gateway"}
+            }));
+            let event = coding_agent_capture(
+                agent,
+                CallModels::of(Some("test-model"), None),
+                200_000,
+                usage,
+                None,
+            );
+            let payload = serde_json::to_value(event).unwrap();
+            assert_eq!(payload["provider"], "claude-gateway");
+            assert_eq!(payload["model"], "test-model");
+            assert_eq!(payload["usage"]["input_tokens"], 10);
+        }
     }
 
     #[test]
@@ -4651,5 +5641,107 @@ mod coding_agent_capture_tests {
             effort_in_force(CodingAgent::Codex, Some("medium"), None),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod context_ceiling_delivery_tests {
+    use super::*;
+
+    fn forward() -> (CeilingDelivery, InputLedger, AgentInput) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut delivery = CeilingDelivery::default();
+        let mut ledger = InputLedger::new();
+        assert!(forward_ceiling_input(
+            AgentUserInput {
+                text: "Hand off".into(),
+                images: None,
+                origin_event_id: Some(Uuid::new_v4()),
+                kind: crate::engine::AgentInputKind::CeilingReentry,
+                completion: None,
+            },
+            &mut ledger,
+            &mut delivery,
+            &tx
+        ));
+        (delivery, ledger, rx.try_recv().unwrap())
+    }
+
+    #[test]
+    fn context_ceiling_merged_read_preserves_user_turn_decisions() {
+        let (mut delivery, mut ledger, input) = forward();
+        assert!(input.defer_on_steer_failure);
+        assert_eq!(
+            delivery.turn_ended(),
+            None,
+            "a Result before the read settles nothing"
+        );
+        let read = AgentEvent::InputRead { input: input.uuid };
+        assert!(matches!(ledger.observe(&read), Settled::Read(_)));
+        delivery.observe(&read, false);
+        assert_eq!(delivery.turn_ended(), Some(false));
+        assert_eq!(delivery.turn_ended(), None);
+    }
+
+    #[test]
+    fn context_ceiling_read_after_result_is_an_engine_turn() {
+        let (mut delivery, mut ledger, input) = forward();
+        ledger.turn_ended();
+        assert_eq!(delivery.turn_ended(), None);
+        assert!(ledger.owes(input.uuid));
+        let read = AgentEvent::InputRead { input: input.uuid };
+        ledger.observe(&read);
+        delivery.observe(&read, true);
+        assert_eq!(delivery.turn_ended(), Some(true));
+    }
+
+    #[test]
+    fn context_ceiling_crossing_holds_followups_before_any_steer() {
+        let gate = InputGate {
+            ceiling_owed: true,
+            ..InputGate::default()
+        };
+        assert!(!gate.forwards());
+    }
+
+    #[tokio::test]
+    async fn context_ceiling_stop_withdraws_unread_steer_before_interrupt() {
+        use crate::engine::agent_session::withdraw::withdraw_ceiling_before_stop;
+        use crate::test_support::{seed_coding_thread, setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool);
+        let thread = seed_coding_thread(&bus, None).await;
+        let (delivery, mut ledger, input) = forward();
+        let anchor = delivery.pending.unwrap().1;
+        let (driver, mut rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::runtime::WithdrawRequest>();
+        let responder = async {
+            let withdraw = rx.recv().await.unwrap();
+            assert_eq!(withdraw.input_uuid, input.uuid);
+            withdraw
+                .reply
+                .send(crate::runtime::InputWithdrawal::Withdrawn)
+                .unwrap();
+        };
+        let mut pending = PendingWithdraws::new();
+        let (settled, ()) = tokio::join!(
+            withdraw_ceiling_before_stop(
+                &bus,
+                thread,
+                &mut ledger,
+                &driver,
+                &mut pending,
+                anchor,
+                None
+            ),
+            responder,
+        );
+        assert!(settled);
+        assert_eq!(ledger.owed(), 0);
+        assert_eq!(
+            ledger.observe(&AgentEvent::InputRead { input: input.uuid }),
+            Settled::Nothing
+        );
+        teardown_test_db(&db).await;
     }
 }

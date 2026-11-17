@@ -245,7 +245,7 @@ impl LucidosEngine {
             Ok(Some(facts)) => facts,
             Ok(None) => return RequestState::Closed,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ArchiveRequest] facts for {} could not be read: {}",
                     thread_id,
                     e
@@ -270,12 +270,12 @@ impl LucidosEngine {
                 .await
                 {
                     Ok(outcome) if outcome.archived.contains(&thread_id) => {
-                        log!("[ArchiveRequest] {} settled and was archived", thread_id);
+                        log_legacy!("[ArchiveRequest] {} settled and was archived", thread_id);
                         RequestState::Closed
                     }
                     Ok(_) => RequestState::Open,
                     Err(rejection) => {
-                        log!(
+                        log_legacy!(
                             "[ArchiveRequest] {} not archived yet: {}",
                             thread_id,
                             crate::api::threads::archive::rejection_text(&rejection)
@@ -322,7 +322,7 @@ impl LucidosEngine {
     ) {
         match threads_with_open_requests(self.pool()).await {
             Ok(open) => *watched = open,
-            Err(e) => log!("[ArchiveRequest] open request scan failed: {}", e),
+            Err(e) => log_legacy!("[ArchiveRequest] open request scan failed: {}", e),
         }
         for thread_id in watched.clone() {
             self.track_archive_request(thread_id, watched, retry).await;
@@ -340,7 +340,7 @@ impl LucidosEngine {
         let engine = self.clone();
         let (retry_tx, mut retry_rx) = tokio::sync::mpsc::unbounded_channel::<Uuid>();
         tokio::spawn(async move {
-            log!("[ArchiveRequest] resolver started");
+            log_legacy!("[ArchiveRequest] resolver started");
             let mut watched = HashSet::new();
             engine
                 .recover_archive_requests(&mut watched, &retry_tx)
@@ -371,14 +371,14 @@ impl LucidosEngine {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             // The skipped batch may hold a request or the settle
                             // it waits for, so rebuild from the log.
-                            log!(
+                            log_legacy!(
                                 "[ArchiveRequest] subscriber lagged by {} events, re-resolving",
                                 n
                             );
                             engine.recover_archive_requests(&mut watched, &retry_tx).await;
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                            log!("[ArchiveRequest] EventBus closed, resolver stopping");
+                            log_legacy!("[ArchiveRequest] EventBus closed, resolver stopping");
                             break;
                         }
                     },

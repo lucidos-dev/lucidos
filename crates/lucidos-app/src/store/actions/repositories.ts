@@ -1,13 +1,12 @@
-import { readWindowItem, removeWindowItem } from '../../utils/windowStorage';
 import {
   repoSource, repoFiles, repoDiff, repoPending,
   repoViewMode, repoExpandedFolders, expandedFolders, revealedFolder, selectedLines, lineScrollTarget, findRequest,
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   repositories, showToast,
-  panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
+  panelOverlay, parseRepoPath, encodeRepoPath,
   threadMap, type RepoDiff, type RepoLocator, type RepoPendingInfo, type Repository,
 } from '../store';
-import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
+import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, failedIfFresh, loadedOr, setLoadingIfFresh, type Loadable } from '../types';
 import { openFilePreview } from './artifacts';
@@ -384,33 +383,7 @@ export async function loadChangeContextById(changeId: string): Promise<void> {
   }
 }
 
-/** Restore the user's last-selected change after a reload. Without this, the
- *  Files panel always lands on the All Files tree even if the user was
- *  viewing a Diff. Only definitively-gone IDs (404 from the engine) drop the
- *  saved id; transient failures (network, 5xx) keep it so the next reload
- *  retries — silently nuking on transient errors would lose the user's
- *  selection because of a momentary outage. */
-export async function restoreRepoSelectionFromStorage(): Promise<void> {
-  const savedId = readWindowItem(SELECTED_CHANGE_KEY);
-  if (!savedId) return;
-  // If a file-preview overlay re-hydrated for the same change, RepoFilePreview's
-  // useEffect already calls loadChangeContextById — skip to avoid a duplicate
-  // round-trip for getChangeById/getChangeDiff/listRepoFiles on every reload.
-  const overlay = panelOverlay.value;
-  if (overlay?.type === 'file-preview') {
-    const parsed = parseRepoPath(overlay.path);
-    if (parsed?.mode === 'diff' && parsed.changeId === savedId) return;
-  }
-  try {
-    const change = await getChangeById(savedId);
-    await loadChangeContext(change);
-  } catch (e) {
-    if (e instanceof ApiError && e.httpCode === 404) {
-      removeWindowItem(SELECTED_CHANGE_KEY);
-    }
-    // Transient errors (network, 5xx): keep the saved id and let next reload retry.
-  }
-}
+export { restoreRepoSelectionFromStorage } from './repoSelectionRestore';
 
 /** Open the file-preview panel on a path in the current repo. The split-view
  *  sidebar inside the panel reuses this — when called while the panel is

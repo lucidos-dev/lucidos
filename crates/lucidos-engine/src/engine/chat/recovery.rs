@@ -40,6 +40,7 @@ pub(crate) async fn settle_restored_threads(
                 .emit(BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::UserQuestionAnswered {
+                        compose: None,
                         tool_use_id,
                         answer: crate::engine::thread_events::AnswerKind::Canceled,
                         quiet: false,
@@ -363,7 +364,7 @@ impl LucidosEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[Recovery] Failed to query orphaned threads: {}", e);
+                log_legacy!("[Recovery] Failed to query orphaned threads: {}", e);
                 return;
             }
         };
@@ -372,7 +373,7 @@ impl LucidosEngine {
             return;
         }
 
-        log!("[Recovery] Found {} orphaned thread(s)", rows.len());
+        log_legacy!("[Recovery] Found {} orphaned thread(s)", rows.len());
 
         for (
             thread_id,
@@ -400,7 +401,7 @@ impl LucidosEngine {
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[Recovery] Failed to emit ResponseAborted for thread {}: {}",
                     thread_id,
                     e
@@ -408,7 +409,7 @@ impl LucidosEngine {
                 continue;
             }
 
-            log!("[Recovery] Recovered orphaned thread {}", thread_id);
+            log_legacy!("[Recovery] Recovered orphaned thread {}", thread_id);
         }
     }
 }
@@ -481,7 +482,7 @@ pub(crate) async fn switch_resume_candidates(pool: &sqlx::PgPool) -> Vec<uuid::U
     {
         Ok(rows) => rows.into_iter().map(|(id, _)| id).collect(),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] chat switch-resume candidate scan failed: {} — \
                  affected threads keep their manual Continue",
                 e
@@ -524,7 +525,7 @@ impl LucidosEngine {
 
         if candidates.len() > MAX_CHAT_SWITCH_RESUMES {
             let skipped = candidates.split_off(MAX_CHAT_SWITCH_RESUMES);
-            log!(
+            log_legacy!(
                 "[Recovery] {} chat thread(s) interrupted by the switch exceed the \
                  per-boot resume cap of {} — these keep their manual Continue: {:?}",
                 skipped.len(),
@@ -533,16 +534,19 @@ impl LucidosEngine {
             );
         }
 
-        log!(
+        log_legacy!(
             "[Recovery] Auto-resuming {} chat/trigger thread(s) after a user switch",
             candidates.len()
         );
 
         let mut resumed = Vec::with_capacity(candidates.len());
         for thread_id in candidates {
+            if crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await {
+                continue;
+            }
             match self.continue_chat(thread_id, None).await {
                 Ok(outcome) => {
-                    log!(
+                    log_legacy!(
                         "[Recovery] chat switch-resume for thread {}: {:?}",
                         thread_id,
                         outcome
@@ -551,7 +555,7 @@ impl LucidosEngine {
                 }
                 // NOT added to `resumed`: the promise was not kept, so the floor
                 // must withdraw it and restore the manual Continue button.
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Recovery] chat switch-resume for thread {} failed: {} — \
                      the manual Continue affordance remains",
                     thread_id,
@@ -594,7 +598,7 @@ impl LucidosEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[Recovery] orphan ToolCalled query failed: {}", e);
+                log_legacy!("[Recovery] orphan ToolCalled query failed: {}", e);
                 return;
             }
         };
@@ -662,7 +666,7 @@ impl LucidosEngine {
         }
 
         if total_orphans > 0 {
-            log!(
+            log_legacy!(
                 "[Recovery] Emitted {} synthetic ToolResult(s) for orphan ToolCalled events",
                 total_orphans
             );

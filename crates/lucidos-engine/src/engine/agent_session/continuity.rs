@@ -8,12 +8,14 @@ use crate::engine::thread_events::{FreshSessionReason, SessionContinuity, Sessio
 /// The continuity of the session about to start on `thread_id`. `None` when
 /// the thread's history could not be read: an absent field draws nothing,
 /// where a guess could tell the user something false. A pending `handoff`
-/// makes it a *successor session*.
+/// makes it a *successor session*. `provider_blocked` says the previous
+/// session's last turn was blocked, so the spawn started fresh on purpose.
 pub(super) async fn resolve_session_continuity(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
     attempt: ResumeAttempt,
     branch_gone: bool,
+    provider_blocked: bool,
     handoff: Option<&crate::engine::successor::PendingHandoff>,
 ) -> Option<SessionContinuity> {
     if let Some(handoff) = handoff.filter(|_| attempt != ResumeAttempt::Resumed) {
@@ -39,11 +41,12 @@ pub(super) async fn resolve_session_continuity(
             had_session_before,
             attempt,
             branch_gone,
+            provider_blocked,
             closer_type.as_deref(),
             closer_reason.as_deref(),
         )),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Could not read thread {}'s sessions for continuity: {}",
                 thread_id,
                 e
@@ -53,18 +56,21 @@ pub(super) async fn resolve_session_continuity(
     }
 }
 
-/// Pure half of [`resolve_session_continuity`]. A refused resume names itself
-/// first, then a gone branch, then whatever closed the previous turn.
+/// Pure half of [`resolve_session_continuity`]. A provider block names itself
+/// first, then a refused resume, then a gone branch, then whatever closed the
+/// previous turn.
 fn session_continuity(
     had_session_before: bool,
     attempt: ResumeAttempt,
     branch_gone: bool,
+    provider_blocked: bool,
     closer_type: Option<&str>,
     closer_reason: Option<&str>,
 ) -> SessionContinuity {
     let reason = match attempt {
         ResumeAttempt::Resumed => return SessionContinuity::Resumed,
         _ if !had_session_before => return SessionContinuity::First,
+        _ if provider_blocked => FreshSessionReason::ProviderBlocked,
         ResumeAttempt::FellBack => FreshSessionReason::ResumeFailed,
         ResumeAttempt::NotAttempted if branch_gone => FreshSessionReason::BranchGone,
         ResumeAttempt::NotAttempted => fresh_reason_after(closer_type, closer_reason),
@@ -106,11 +112,11 @@ mod tests {
     #[test]
     fn a_taken_resume_is_resumed_and_a_first_session_is_first() {
         assert_eq!(
-            session_continuity(true, ResumeAttempt::Resumed, false, None, None),
+            session_continuity(true, ResumeAttempt::Resumed, false, false, None, None),
             SessionContinuity::Resumed
         );
         assert_eq!(
-            session_continuity(false, ResumeAttempt::NotAttempted, false, None, None),
+            session_continuity(false, ResumeAttempt::NotAttempted, false, false, None, None),
             SessionContinuity::First
         );
     }
@@ -121,6 +127,7 @@ mod tests {
             session_continuity(
                 true,
                 ResumeAttempt::FellBack,
+                false,
                 false,
                 Some("CodingAgentIdled"),
                 None
@@ -136,6 +143,7 @@ mod tests {
                 true,
                 ResumeAttempt::NotAttempted,
                 true,
+                false,
                 Some("CodingAgentIdled"),
                 None
             ),
@@ -146,7 +154,14 @@ mod tests {
     #[test]
     fn the_previous_turn_closer_names_the_reason() {
         let after = |closer: Option<&str>, reason: Option<&str>| {
-            session_continuity(true, ResumeAttempt::NotAttempted, false, closer, reason)
+            session_continuity(
+                true,
+                ResumeAttempt::NotAttempted,
+                false,
+                false,
+                closer,
+                reason,
+            )
         };
         assert_eq!(
             after(Some("ChangeApplied"), None),
@@ -171,6 +186,37 @@ mod tests {
         assert_eq!(
             after(None, None),
             fresh(FreshSessionReason::NoResumableSession)
+        );
+    }
+
+    #[test]
+    fn a_provider_block_names_itself_before_every_other_reason() {
+        let blocked = |attempt, branch_gone| {
+            session_continuity(
+                true,
+                attempt,
+                branch_gone,
+                true,
+                Some("CodingAgentIdled"),
+                None,
+            )
+        };
+        assert_eq!(
+            blocked(ResumeAttempt::NotAttempted, false),
+            fresh(FreshSessionReason::ProviderBlocked)
+        );
+        assert_eq!(
+            blocked(ResumeAttempt::NotAttempted, true),
+            fresh(FreshSessionReason::ProviderBlocked)
+        );
+        assert_eq!(
+            session_continuity(false, ResumeAttempt::NotAttempted, false, true, None, None),
+            SessionContinuity::First,
+            "a thread with no earlier session has nothing to be blocked from"
+        );
+        assert_eq!(
+            serde_json::to_value(fresh(FreshSessionReason::ProviderBlocked)).unwrap(),
+            serde_json::json!({ "kind": "fresh", "reason": "provider-blocked" })
         );
     }
 
@@ -228,6 +274,7 @@ mod tests {
 
     fn session_started(continuity: Option<SessionContinuity>) -> ThreadEvent {
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: "lucidos-claude-code-repo-lucidos-fix-1a2b3c4d".into(),
@@ -248,8 +295,15 @@ mod tests {
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = uuid::Uuid::new_v4();
         assert_eq!(
-            resolve_session_continuity(&pool, thread_id, ResumeAttempt::NotAttempted, false, None)
-                .await,
+            resolve_session_continuity(
+                &pool,
+                thread_id,
+                ResumeAttempt::NotAttempted,
+                false,
+                false,
+                None
+            )
+            .await,
             Some(SessionContinuity::First)
         );
 
@@ -272,8 +326,15 @@ mod tests {
             .unwrap();
         }
         assert_eq!(
-            resolve_session_continuity(&pool, thread_id, ResumeAttempt::NotAttempted, false, None)
-                .await,
+            resolve_session_continuity(
+                &pool,
+                thread_id,
+                ResumeAttempt::NotAttempted,
+                false,
+                false,
+                None
+            )
+            .await,
             Some(fresh(FreshSessionReason::ResumeFailed))
         );
         let handoff: crate::engine::successor::PendingHandoff =
@@ -286,6 +347,7 @@ mod tests {
                 &pool,
                 thread_id,
                 ResumeAttempt::NotAttempted,
+                false,
                 false,
                 Some(&handoff)
             )

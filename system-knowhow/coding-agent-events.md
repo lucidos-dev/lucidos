@@ -11,7 +11,7 @@ description: ThreadEvents a Claude Code or Codex session emits, which ones the s
 
 The session's *worktree* wraps a git repo that depends on `coding_agent_kind`:
 
-- `lucidos` (default): a full checkout of the Lucidos source repo. It exists only when the engine was launched from a Lucidos source checkout. A packaged install ships the binary alone, so the compose destination picker hides the "Lucidos source" target and `run_coding_agent` with `folder` omitted is refused.
+- `lucidos` (default): a full checkout of the Lucidos source repo. It exists only when the engine was launched from a Lucidos source checkout. A packaged install ships the binary alone, so the compose destination picker hides the "Lucidos source" target and `run_coding_agent` with `folder` omitted is refused. An `.app` bundle remains packaged even when built inside a checkout; it cannot discover platform source above the bundle or through its compile-time build path.
 - `app`: a sparse checkout of the workspace git, narrowed to `data/apps/<id>/` (see *app worktree*). Apply ff-merges to the workspace git's local `main`, with no engine restart and no `/harden`. `AppUiRefreshRequested` emits when iframe-bundled files change.
 - `external`: a full checkout of the user-registered external git repository. No Apply / Discard surface.
 
@@ -21,6 +21,8 @@ The session's *worktree* wraps a git repo that depends on `coding_agent_kind`:
 
 `run_coding_agent`'s `folder` argument selects the kind above, so pick it before
 you call. Ambiguous? Ask which folder first.
+
+The `coding_agent` argument picks Claude Code or Codex. Omit it to run the installed agent, Claude Code first. Naming an agent that is not installed is refused, and the refusal names the one that is. A spawn into another workspace (`workspace`) skips this check: this engine cannot see that host's agents, so an omitted `coding_agent` means Claude Code there.
 
 | `folder` | Kind | Notes |
 |---|---|---|
@@ -42,7 +44,11 @@ prohibition: a stray "do not harden" has made a session skip a required step.
 Mention one only to ask for something other than its default.
 
 **Cross-workspace.** Set `workspace` to the target workspace's basename, and the
-tool POSTs to that engine, where the session lands. It requires
+session lands on that engine. The call goes through the gateway, which vouches
+for this thread and its coding-agent check, so the target honors that check.
+When no gateway can vouch (none serves the target, and no paired one does), the
+tool posts directly. A coding agent there then waits for the owner's **Allow
+once**. It requires
 `relation: "top"`, because a child auto-resume callback does not cross
 workspaces. Child plus cross-workspace is refused with an error. `folder` then
 resolves on the TARGET workspace, so the app must be installed or the repo
@@ -75,7 +81,7 @@ Differences a workspace can observe:
 
 - Codex emits coarse tool events (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, `todo_list`) instead of CC's named tools (`Bash`, `Read`, `Edit`, …). Trigger conditions on `CodingAgentToolCalled.name` must match per backend.
 - `UserQuestionAsked` / `UserQuestionAnswered` fire for **both** backends. CC routes through its `AskUserQuestion` PreToolUse hook. Codex calls the `ask_user_question` tool on the `lucidos` MCP server (one question per call), which hits the same blocking engine endpoint. The answer returns inside the same Codex turn as the MCP tool result. Neither backend emits a `CodingAgentToolCalled` for the question tool (`AskUserQuestion` and `mcp__lucidos__ask_user_question` are suppressed), so wire triggers to `UserQuestionAsked`, not to the tool name.
-- `CodingAgentPermissionRequest` / `CodingAgentPermissionResolved` always fire for CC. They fire for Codex under the default `app-server` protocol (`approvalPolicy: on-request`). There, sandbox-escaping commands and out-of-worktree file changes raise the same PermissionCard, with `command_execution` / `file_change` as the `tool_name`. Under the `LUCIDOS_CODEX_PROTOCOL=exec` escape hatch, Codex runs with the OS sandbox (`--sandbox workspace-write`) as the only guard and emits **no** permission events.
+- `CodingAgentPermissionRequest` / `CodingAgentPermissionResolved` always fire for CC. They fire for Codex under the default `app-server` protocol. Inside the agent sandbox Codex runs with `approvalPolicy: untrusted`. Every command then raises the same PermissionCard as a CC `Bash` call, which `coding_agent_auto_answer` can settle, and so does every out-of-worktree file change. With the sandbox off, Codex keeps its own sandbox and `on-request`, so only sandbox-escaping commands ask, as `command_execution` / `file_change`. Under the `LUCIDOS_CODEX_PROTOCOL=exec` escape hatch, Codex runs with the OS sandbox (`--sandbox workspace-write`) as the only guard and emits **no** permission events.
 - `/harden`, Apply / Discard, worktrees, branches and every event in this file are backend-agnostic: same lifecycle, same payload shapes.
 
 Two recurring confusions: there is no `CodingAgentPermission*Event` separate from `UserQuestionAsked`, and there is no `CodingAgentErrored` event at all.
@@ -113,10 +119,12 @@ All variants below are defined on `ThreadEvent` in `crates/lucidos-engine/src/en
 |---|---|---|
 | `CodingAgentUserMessageSent` | A user message was relayed into the agent's input stream. One per user-typed message on a coding-agent thread. | One per user message |
 | `CodingAgentPromptSent` | A prompt was forwarded into a live session: an engine-synthesized one (orphan-recovery, hardening retrigger, merge-conflict explainer, post-question continuation), or a user follow-up, which carries the user's text and no `origin`. `input_event_id` names the event that carried the input (the follow-up's `MessageReceived`), absent for an engine prompt with no starter event. Carries an `origin: Option<MessageOrigin>` so the route popover can render "Engine · …". Persisted for audit; not rendered as a chat bubble. It bounds the turn-gap note, see § Resume-time notes. A follow-up a dead process never read is forwarded again by the next session, so its message can carry a second one (ADR 0506). | One per engine-driven injection or live-session follow-up, plus one per redelivery |
-| `CodingAgentInputRead` | The coding agent took in an input the engine forwarded. Claude Code reports it by replaying the input under the uuid the engine wrote it with, local commands such as `/cost` included; Codex when its turn for the input starts (the app-server accepts `turn/start`, or `codex exec` prints its first line). Only the agent's own report is a read: a Codex turn that never starts its input leaves it unread, with the turn's error. Rows written before 2026-10-12 can carry `assumed: true`, a read a since-removed timer settled with no report; the turn-gap note does not count one as a delivery. `verbatim: true` (omitted when false) marks the read of a slash command the engine forwarded exactly as typed, which carried no note, so the turn-gap note does not count it either. Carries `input_event_id`, the event that carried the input (the `MessageReceived` for a message, the `ChildThreadCompleted` for a child wake, the `CodingAgentPromptSent` for an engine prompt with no starter event). Until it lands the input is owed, so the session keeps its subprocess at idle (ADR 0268). A message the user takes back before the read (a `QueuedMessageRemoved` on a Claude Code thread, ADR 0323) never gets one. The transcript marks the message "Sent", then "Read". `started_turn: true` (omitted when false) means the read opened a new turn after the last one ended, such as a queued message after a Stop. That read sets the thread running again and ends a *stopped child*. | One per forwarded input the user did not take back |
+| `CodingAgentInputRead` | The coding agent took in an input the engine forwarded. Claude Code reports it by replaying the input under the uuid the engine wrote it with, local commands such as `/cost` included; Codex when its turn for the input starts (the app-server accepts `turn/start` or a mid-turn `turn/steer`, or `codex exec` prints its first line). Only the agent's own report is a read: a Codex turn that never starts its input leaves it unread, with the turn's error. Rows written before 2026-10-12 can carry `assumed: true`, a read a since-removed timer settled with no report; the turn-gap note does not count one as a delivery. `verbatim: true` (omitted when false) marks the read of a slash command the engine forwarded exactly as typed, which carried no note, so the turn-gap note does not count it either. Carries `input_event_id`, the event that carried the input (the `MessageReceived` for a message, the `ChildThreadCompleted` for a child wake, the `CodingAgentPromptSent` for an engine prompt with no starter event). Until it lands the input is owed, so the session keeps its subprocess at idle (ADR 0268). A message the user takes back before the read (a `QueuedMessageRemoved` on a Claude Code thread, ADR 0323) never gets one. The transcript marks the message "Sent", then "Read". `started_turn: true` (omitted when false) means the read opened a new turn after the last one ended, such as a queued message after a Stop. That read sets the thread running again and ends a *stopped child*. | One per forwarded input the user did not take back |
 | `CodingAgentInputDiscarded` | Older threads only: a reasoning-effort pick once interrupted a Claude Code turn before the agent read the input that opened it. A pick no longer can, because the rung locks while a turn runs. Claude Code discards such an input, so it will never be read in that session. Carries `input_event_id`, the event that carried the input. A message, a child's report or an engine prompt it names stays owed until a `CodingAgentInputRead` names it, unless the user takes it back with a `QueuedMessageRemoved`. A continuation or a cache keep-alive is never owed. The effort resume opens with it. Any other session that starts first redelivers it behind its own first prompt, with a late-delivery note naming who sent it. Only a redelivered message writes a `CodingAgentPromptSent`. Persisted for the record and not rendered: the input keeps its current state until that read marks it "Read". | One per input an effort pick discarded |
-| `ChildReportTaken` | The coding agent took a child's report while its turn ran, before the driver delivered the queued copy. An agent reads input only between turns (Claude Code at its next tool boundary, Codex at the next turn), so the agent's own `lucidos` calls carry the report instead: most calls note it on stderr, `lucidos background-task wait` returns early with it, and `lucidos threads child-reports` reads it. The engine withdraws the queued copy first: Claude Code drops it from its input queue, and a Codex driver drops it while it is still queued. A copy the agent already read is not taken, so the report arrives once and no turn is interrupted. Carries `input_event_id`, the `ChildThreadCompleted` card. It takes the place of a `CodingAgentInputRead` for that card, and the boot refire treats the card as handled. Not rendered. | One per report taken mid-turn |
+| `ChildReportTaken` | The coding agent took a child's report while its turn ran, before the driver delivered the queued copy. A forwarded report may still be unread (Claude Code takes it at a tool boundary, Codex via `turn/steer` when supported, otherwise at the next turn), so the agent's own `lucidos` calls can carry the report instead: most calls note it on stderr, `lucidos background-task wait` returns early with it, and `lucidos threads child-reports` reads it. The engine withdraws the queued copy first: Claude Code drops it from its input queue, and a Codex driver drops it while it is still queued. A copy the agent already read is not taken, so the report arrives once and no turn is interrupted. Carries `input_event_id`, the `ChildThreadCompleted` card. It takes the place of a `CodingAgentInputRead` for that card, and the boot refire treats the card as handled. Not rendered. | One per report taken mid-turn |
 | `CodingAgentCompacted` | Claude Code compacted the session's context (its `compact_boundary` message), before a call that would pass its window. Carries `trigger` (`auto` or `manual`), and `pre_tokens` and `post_tokens` when Claude Code reports them. It can fire mid-turn and under `--resume`. Changes no status. The auto-compact trial reads it to see where compaction really fired. Codex never emits it. | Per compaction |
+| `CodingAgentModelSubstituted` | Claude Code ran another model than the pinned id the spawn asked for: its Init line names a different model. That happens when the account may not run the pick. Carries `requested`, `served` and `coding_agent`. Recorded at the first Init of a process only, since Claude Code repeats Init per turn. An alias pick (`default`, `opus`, `sonnet`, `haiku`, their `[1m]` forms) never records one, nor does an echo that only drops `[1m]`, an `@` pin or a release date. Changes no status. Codex never emits it. | Once per refused pick |
+| `CodingAgentBillingObserved` | [Billing evidence](#billing-evidence) from the serving runtime. Passive metadata; captures carry usage. | On fresh evidence |
 | `CodingAgentSettingsChanged` | Two roles. (1) The user picked a model or reasoning effort between turns in the in-thread control. It carries the user's `actor` and records the pick, not what ran: the effort the calls ran at is on each main-session `ContextCaptured`. The next spawn runs on it. While a turn runs the rung is locked, and the control endpoint refuses a pick with 409 `turn-running` (ADR 0542). Older threads may show an *effort restart*: a `ResponseCanceled` and a `ContinuationStarted` with `effort_restart`, from when a pick interrupted the turn. The permission mode is not an in-thread control: it is the *coding-agent permission mode* preference, fixed at spawn. (2) Emitted once at backend init with `cc_session_id: Some(..)`, `claude_config_dir` and `claude_config_dir_explicit`, so all three are durable *before* the first `CodingAgentIdled`. Persisted so settings survive idle exit + respawn, and so a mid-turn engine restart can still resume: `lookup_latest_cc_session_id` reads `cc_session_id` here as well as from `CodingAgentIdled`. `claude_config_dir` is where transcripts live: `$CLAUDE_CONFIG_DIR/projects/<cwd>/<sid>.jsonl`. `claude_config_dir_explicit: false` means `CLAUDE_CONFIG_DIR` was unset, so the dir is Claude Code's default `~/.claude`. Claude Code treats those as two logins, with different keychain entries and `.claude.json` files. A coding-agent thread is **pinned to the profile of its first session**. The engine replays that earliest pair on *every* later spawn (`lookup_pinned_cc_config_dir`): the same path when set, no variable when unset. It also scopes the auto-detected resume session id to that dir (`lookup_latest_cc_session_id_for_config_dir`). So only a thread's first turn adopts the live global toggle. | Once at init + on each user toggle |
 | `CodingAgentPermissionRequest` | The coding agent asked to confirm a tool call. Claude Code raises this through its MCP permission-prompt subprocess (Edit/Write/Bash on a path outside the session's *working directories*, anything under `.claude/` or `.git/`); Codex raises it through the app-server approval bridge for sandbox-escaping commands and out-of-worktree file changes. The user resolves it via `POST /api/v1/permission/<request_id>/{allow,deny}`. **Clickable in every session**, whoever started it. A catastrophic command is denied instead, and that deny emits this event plus its resolution (see "Every session uses the workspace's grants" below). | Per tool call needing consent, plus one per catastrophic deny |
 | `CodingAgentPermissionResolved` | The above request was answered (or auto-resolved by recovery / supersession). Carries `allowed: bool`, an optional `persist_scope` (`narrow`/`broad`/`session`) recording which "Always allow"-style scope the user picked, and a `reason` for failure / orphan-recovery / superseded cases. | Pairs 1:1 with `CodingAgentPermissionRequest`. Three engine paths emit `allowed: false`: orphan-recovery (the agent died first), supersession (the user replied instead of clicking), and a catastrophic deny. Each carries its own `reason`. |
@@ -160,6 +168,56 @@ These are NOT prefixed `CodingAgent*`, because the same machinery serves any age
 |---|---|
 | `UserQuestionAsked` | One of the three tools raised an interactive question. `meta.channel` records the lane: `claude_code` (the coding-agent channel, both backends) or `chat`. The raising agent blocks while the card is on screen. CC's PreToolUse hook and Codex's MCP server both long-poll the engine's internal endpoint, and the chat tool blocks in-process. `POST /api/v1/threads/{thread_id}/answer-question` emits `UserQuestionAnswered` and dispatches the channel's resume path. |
 | `UserQuestionAnswered` | The user (or, on the orphan-recovery path, the engine) supplied an answer. Pairs 1:1 with the matching `UserQuestionAsked` via `tool_use_id`. `meta.channel` tells chat answers from coding-agent answers without looking up the `Asked`. |
+
+## Billing evidence
+
+`CodingAgentBillingObserved` records passive metadata, never a turn or usage row.
+Its `coding_agent` is `claude-code` or `codex`; `launch_id` scopes the runtime launch.
+`attribution` has one of these shapes:
+
+- `{status: "known", provider, source}`
+- `{status: "unresolved", reason, source}`
+
+Sources are `claude-initialize`, `codex-account` and `unavailable`.
+Reasons are `missing-evidence`, `unsupported-backend`, `unknown-auth-method`,
+`unknown-endpoint` and `conflicting-evidence`.
+The provider IDs are `claude-gateway`, `vertex`, `bedrock`, `foundry`, `anthropic`,
+`anthropic-subscription`, `openai` and `chatgpt-plan`.
+
+Every new coding-agent `ContextCaptured` sets its existing `provider` field to
+one of those IDs or `unknown`. There is no nested billing block.
+Old captures without `provider` remain unattributed; do not infer from model names.
+Producer, model and token counts retain their existing meanings.
+
+`billing_mode` is `plan` for `anthropic-subscription` and `chatgpt-plan`,
+`token-metered` for other known providers except `claude-gateway`, and `unknown`
+for the gateway or unresolved evidence. Plan costs are list-price equivalents,
+not extra charges. Gateway identity alone does not prove a billing contract.
+
+Claude queries initialize and status on the serving process, including its wrapper,
+cwd, environment and account pin. Non-gateway attribution needs complete endpoint
+status. Codex app-server refreshes account, config and provider reports before
+each turn, with a bounded wait. Typed `modelProvider/list` builtin OpenAI settings
+resolve default routing when `config/read` agrees. Legacy servers need explicit
+builtin endpoint fields; missing config alone never proves default routing.
+Codex exec exposes no proven auth report and stays unresolved.
+
+Codex app-server also reports restored usage while resuming a thread.
+Each notification still records a capture with its original counts, including repeats.
+A restored snapshot retains the latest prior main-session capture's provider only
+when its exact usage vector and persisted Codex backend-session binding match.
+The lookup stops before the current launch and cannot cross an unbound process boundary.
+
+Missing history, unknown prior providers and mismatched usage remain `unknown`.
+A late notification with no proven restored or current turn also remains `unknown`.
+Restored attribution never pins billing for new work; new turns require fresh process evidence.
+
+Opaque wrappers and unsupported protocols also stay unresolved.
+This covers the macOS/Linux runtime paths; arbitrary MDM policies need actual
+serving-process evidence, not host configuration guesses.
+
+Use a running source version with this recording path and genuinely new captures
+for verification. Historical captures do not gain attribution from current settings.
 
 ## Concrete payload shapes
 
@@ -205,14 +263,15 @@ A bounded fallback escalates to the hard stop if CC ignores the interrupt for ~8
 
 ### Side questions are recorded, and hidden from every agent
 
-A *side question* is asked from side-question mode. The question-mark toggle in the composer row, or ⌥↵, turns the mode on, and its round Ask button asks the box. It is answered beside any running turn, from the thread's own context, with no tools. It may carry images. It works in Claude Code and Lucidos Agent threads, and each takes one path, text and images alike:
+A *side question* is asked from side-question mode. The question-mark toggle in the composer row, or ⌥↵, turns the mode on, and its round Ask button asks the box. It is answered beside any running turn, from the thread's own context, with no tools. It may carry images. It works in Claude Code, Codex and Lucidos Agent threads. Each takes one path, text and images alike:
 
 - **Claude Code** asks a copy of the session: the session's own command resumed with `--no-session-persistence`, under a settings file whose PreToolUse hook refuses every tool. It keeps the session's tools and appended system prompt, so the prompt cache holds, and it writes nothing to the transcript. Its cost is recorded as `ContextCaptured` with purpose `side_question`. Claude Code's own `side_question` control request is not used, since it carries text only (ADR 0324).
+- **Codex** asks an ephemeral app-server fork of its saved session with a synchronous catch-all PreToolUse denial. Shell, hosted search, image generation, browser, computer, connector, plugin and MCP tool sources are disabled. Before asking, `hooks/list` must verify the exact enabled guard as trusted or managed, without load errors. Approvals are declined and attempts interrupted; declined commands and patches permit retry, while completed or failed tools fail the ask. It never appends to the main session; usage records as `ContextCaptured` with purpose `side_question`, including failures after usage arrives. A CLI without verifiable protection shows update instructions (ADR 0684).
 - **Lucidos Agent** makes one model call with a turn's system prompt, tools and history. A tool call is refused, never run. Its cost is recorded as `ContextCaptured` with purpose `side_question`.
 
 The endpoints:
 
-- **Ask:** `POST /api/v1/side-questions` with `{thread_id, side_question_id, question, image_hashes?}` returns `{answer}`. The client names `side_question_id` (a UUID), and `image_hashes` names blobs already uploaded to this workspace. A 400 refuses a draft, a Codex thread, a Claude Code thread with no session yet, an empty question, or an unknown image. A 409 refuses an id still running or answered, while a failed one may be asked again (a card's Retry). No refusal records anything. An ask waits at most 120 seconds.
+- **Ask:** `POST /api/v1/side-questions` with `{thread_id, side_question_id, question, image_hashes?}` returns `{answer}`. The client names `side_question_id` (a UUID), and `image_hashes` names blobs already uploaded to this workspace. A 400 refuses a draft, a coding-agent thread with no session yet, an empty question, or an unknown image. A 409 refuses an id still running or answered, while a failed one may be asked again (a card's Retry). No refusal records anything. An ask waits at most 120 seconds.
 - **Dismiss:** `POST /api/v1/side-questions/dismiss` with `{thread_id, side_question_id}` returns `{ok: true}`, or 404 when no such ask exists on the thread.
 - **Recorded:** `SideQuestionAsked` (with any `image_hashes`), then `SideQuestionAnswered` or `SideQuestionFailed`, and `SideQuestionDismissed`. So a card survives reload and shows on every device. Startup fails every ask a restart left unanswered.
 - **Hidden:** no agent ever reads them. `events(action="query")`, triggers, event waits and every context builder leave them out, and they move no thread state.
@@ -246,7 +305,7 @@ A typed `/btw` is ordinary text. The chat route sends it as a normal message.
 | `options` | `Vec<QuestionOption>` (default `[]`) | Each option is `{ id, label, description?, preview?, widget?, quiet?, quiet_reply? }`. `quiet: true` marks a *quiet option*: the Lucidos Agent and Codex tools take a `quiet` field, and Claude Code, whose native tool takes no extra field, starts the label with `[quiet]`, which the engine strips. `quiet_reply` is the option's *quiet reply*: the Lucidos Agent and Codex take a `quiet_reply` field, and Claude Code writes `[quiet: <reply>]`, which ends at the first `]`. A reply on an option that is not quiet refuses the card. `preview` is markdown the card shows under the option: a picture or a short text sample. It comes from the option's `preview` field in the tool input, which Claude Code's native tool has. `widget` is `{ app_id, params?, label? }`: the engine lifts one *widget embed* out of the description or preview into it, and the card draws that widget under the option's label (ADR 0415). A broken or doubled embed, a missing or non-widget id, another thread's widget that is not reusable, or params the manifest does not take refuse the whole batch before any card is written. So does an embed in the chat card's `message` whose label names one of the options: that sample belongs in its option. Empty for free-text-only prompts. **There is no text-entry option kind**: picking an option resolves to its `label`. So an agent-authored "Other, I'll type it" row hands that literal phrase back as the answer. The card names both real escapes itself: typing in the prompt arrives as a `FreeText` answer, and Cancel arrives as `Canceled`. Every question tool description forbids authoring an "Other" option. |
 | `worktree_path` | `Option<String>` | The CC worktree at intercept. `--resume` needs it to find the session JSONL, since CC keys session storage by CWD. `None` for chat-channel questions and requests with no worktree context. |
 | `multi_select` | `bool` (default `false`) | `true` when the user may pick multiple options. |
-| `owner_approval` | `Option<{ verb, target_thread_id? }>` | Set only on an *owner approval card* (ADR 0387). Lucidos wrote this card's question and its two options in place of the agent's, and only the owner's device may answer it. Its **Allow once** lets the thread press that verb at that target once. |
+| `owner_approval` | `Option<{ verb, target_thread_id? }>` | Legacy: set only on the retired single-use card (ADR 0387). Nothing sets it now. A card Lucidos words in place of the agent's carries `permission_request` instead (ADR 0688). |
 
 The engine adds one thing to the tool input before it emits the event. Each
 workspace picture in `question`, `description` or `preview` gets an *image size
@@ -411,7 +470,7 @@ The recovery system prompts (`recovery_system_prompt` and siblings in `engine/ag
 1. the catastrophic floor, which denies whatever the grants say;
 2. the in-worktree write fast path (below);
 3. an "Allow for this thread" the user clicked on this thread;
-4. the workspace's "Always allow" lines in `cc-allowed-tools`;
+4. the workspace's standing "Always allow" grants;
 5. the command gate, which may let the command guard answer;
 6. a card that waits for a human, however long it takes.
 
@@ -444,9 +503,11 @@ A write **outside** the worktree, such as the user's global `~/.claude/settings.
 
 **Two folders join the worktree as *working directories*.** The engine grants them in `cc-settings.json`, so reaching either raises no card: the workspace's `data/` tree, and the OS temp dir. The `--permission-mode` above is a preference, the *coding-agent permission mode*. Under `auto`, Claude Code's own classifier decides instead of carding.
 
-**"Allow for this thread" survives an engine restart.** The grant persists as the resolution's `persist_scope: "session"`. On the first prompt after a restart, `cc_permission::hydrate_session_allows` refills the thread's in-memory set from the event store. It reads each pattern from the request event's `grant_offer.session`, the pattern the click stored, so the two cannot drift. Only `allowed: true` **and** `persist_scope: "session"` rehydrate. None of these do: an Allow-once, a Deny, the `narrow`/`broad` scopes (which live in `cc-allowed-tools`), and the engine's own supersession / session-ended / orphan-recovery resolutions.
+**"Allow for this thread" survives an engine restart.** The click records a grant the thread holds in the permission store, which a restart keeps in all three card lanes. The pattern is the request event's `grant_offer.session`, the pattern the card named, so the two cannot drift. An Allow-once, a Deny and the engine's own resolutions record nothing. Deleting the thread deletes its thread grants. Allows clicked before the upgrade import once as thread grants.
 
-**"Always allow" binds the session it was clicked in.** Both persisted scopes append a pattern to this workspace's `cc-allowed-tools`, which Claude Code reads as `--allowedTools` at spawn. That flag is frozen for the subprocess's life, so the engine's gate also reads the file itself, on every prompt. The grant covers the running session, and every other live thread in the workspace.
+**"Always allow" binds the session it was clicked in.** Both persisted scopes record a standing tool grant for this workspace. Claude Code gets the standing grants as `--allowedTools` at spawn. That flag is frozen for the subprocess's life, so the engine's gate also reads the grants itself, on every prompt. The grant covers the running session, and every other live thread in the workspace.
+
+**`cc-allowed-tools` is a mirror, not a way in** (ADR 0677). The engine rewrites it after every standing change. Deleting a line by hand revokes that grant. Adding one grants nothing: the next time the engine reads the grants, it drops the line from the file and raises one review card in the home thread. The line grants only when the owner taps Import. Edit grants under **Settings → Permissions → Coding agent permissions** instead.
 
 It honours a stored pattern only where `derive_allow_pattern` would have produced it, which is the codebase's own record of what CC respects. A line means the same whichever agent asks (ADR 0571).
 
@@ -462,13 +523,13 @@ Every `file_change` still cards. A command that names those paths is covered whe
 
 **A grant reads through nested shells, and never names one.** The head comes from the innermost of up to four `-c` layers, so `/bin/zsh -lc "bash -c 'git push'"` offers and matches `git`. A head that runs its own arguments grants nothing: a shell, an exec wrapper such as `timeout` or `xargs`, `sudo`, `env`, `eval` or `source`. No card offers it, and the gate never matches it. A redirect in front of a wrapped shell also cards. See `command_guard::grant_covers_command` and ADR 0568.
 
-A line naming such a head in `cc-allowed-tools`, such as `Bash(bash:*)`, is left out of `--allowedTools` at spawn, so it is inert.
+A grant naming such a head, such as `Bash(bash:*)`, is left out of `--allowedTools` at spawn, so it is inert.
 
 **A trusted repo script goes to the judge, like `make`, instead of a card.** A path head such as `./scripts/check.sh` is normally refused outright, since the agent may have just written it. The command gate trusts it when it is a tracked file of the session's worktree whose bytes match the default branch. A relative head is trusted only when the request names an absolute `cwd` (Codex does) and the line changes no directory. See `engine/trusted_repo_scripts.rs`.
 
 **A trusted repo script is grantable by its exact path.** The card offers "Always allow `./scripts/check.sh` commands", which stores `Bash(./scripts/check.sh:*)`, the worktree-relative path. The line covers a request only while the script is trusted and no segment runs before it, so `echo x > s.sh && ./s.sh` still cards. Claude Code never sees such a line in `--allowedTools`, since it would match with no trust check. A Claude Code request names no `cwd`, so a relative script head from it offers no path button. A basename line such as `Bash(check.sh:*)` covers no path head (ADR 0571).
 
-**Plugin MCP tools meet the same gate.** A Claude Code session starts the MCP servers of the user's enabled Claude Code plugins, beside the engine's `lucidos_perm` (ADR 0398). A plugin tool such as `mcp__plugin_slack_slack__conversations_replies` cards like any other tool, and "Always allow" records that one tool. To allow every tool of a server, add its server rule (`mcp__plugin_slack_slack`) to `cc-allowed-tools`. Claude Code applies it from the next session it spawns. A plugin whose launcher exits non-zero, such as a region gate refusing, adds no tools and leaves the session working.
+**Plugin MCP tools meet the same gate.** A Claude Code session starts the MCP servers of the user's enabled Claude Code plugins, beside the engine's `lucidos_perm` (ADR 0398). A plugin tool such as `mcp__plugin_slack_slack__conversations_replies` cards like any other tool, and "Always allow" records that one tool. To allow every tool of a server, add its server rule (`mcp__plugin_slack_slack`) under **Settings → Permissions → Coding agent permissions**. Claude Code applies it from the next session it spawns. A plugin whose launcher exits non-zero, such as a region gate refusing, adds no tools and leaves the session working.
 
 ## Question vs. permission: why both event families exist
 
@@ -477,7 +538,7 @@ Four user-facing prompt mechanisms ride on two event lanes:
 1. **CC's native `AskUserQuestion` tool.** CC calls it for structured input mid-turn ("which approach", "is this OK to do"). Fires `UserQuestionAsked` / `UserQuestionAnswered` with `meta.channel = claude_code`. The `question` payload field is the literal prompt text CC supplied.
 2. **Codex's `ask_user_question` MCP tool.** Same wire shape and QuestionCard, one question per call, raised from a Codex session via the `lucidos` MCP server (`lucidos mcp-permission-server`). The MCP server long-polls the endpoint CC's hook uses and returns the answer as the tool result, so the Codex turn continues in place. Fires with `meta.channel = claude_code` (the coding-agent channel). **Codex-only, and enforced**: CC spawns the same binary with `--permission-only`, so a CC session lacks the tool. In CC, every MCP tool call would cost a permission click.
 3. **Chat agent's `ask_user_question` tool.** Same wire shape and QuestionCard, raised by the in-process chat agent. Fires `UserQuestionAsked` / `UserQuestionAnswered` with `meta.channel = chat`. Its optional `message` arrives first, as one `TextStreamed` in the asking turn, just before the first card. The tool blocks on the question wait registry, then returns the joined `{question_text: label}` map as the tool result on the same turn. Use it from chat threads when a button-driven answer beats typing (see `crates/lucidos-engine/src/llm/tools/misc.rs` § `ask_user_question_tools`).
-4. **Coding-agent permission prompts.** Authorization for one tool call, possibly persisted ("Always allow Bash(git:*)"). Fires `CodingAgentPermissionRequest` / `CodingAgentPermissionResolved`. Two raise paths share the engine machinery. One is CC's MCP permission-prompt subprocess, consulted when CC would run `Edit`/`Write`/`Bash` on a path with no static allow rule. The other is the Codex app-server approval bridge (`item/commandExecution/requestApproval` / `item/fileChange/requestApproval` JSON-RPC requests under `approvalPolicy: on-request`).
+4. **Coding-agent permission prompts.** Authorization for one tool call, possibly persisted ("Always allow Bash(git:*)"). Fires `CodingAgentPermissionRequest` / `CodingAgentPermissionResolved`. Two raise paths share the engine machinery. One is CC's MCP permission-prompt subprocess, consulted when CC would run `Edit`/`Write`/`Bash` on a path with no static allow rule. The other is the Codex app-server approval bridge (`item/commandExecution/requestApproval` / `item/fileChange/requestApproval` JSON-RPC requests, under `approvalPolicy: untrusted` inside the agent sandbox, else `on-request`).
 
 Both render as a card the user must act on, but they are two separate event lanes. **A "permission prompt" is not a third event family**: it is whichever of these two raised it.
 
@@ -511,6 +572,8 @@ Everything else settles at the red `failed`, because nobody is coming back for i
 The frontend withholds the **Continue** button with the same predicate (`abortPromisesAutoResume`). So a paused thread never offers Continue, and a thread offering Continue never reads paused.
 
 **A pending change does not change that answer.** The status never becomes `waiting` for one. The thread list ranks `paused` and `failed` above the changes dot by itself, and a `proposed` change state says a change is there. `waiting` is not a value `preserving_verdict` protects, so the dying subprocess's drain would overwrite it with `running`. It would also hide the thread from the boot floor, which selects on `status = 'paused'`.
+
+**A provider block is a failure that never resumes.** When Codex ends a turn with a policy code (`misalignment_policy_violation`, `cyber_policy` or `bio_policy`), `ResponseFailed` carries `provider_error` and the card names the policy. The session is never resumed, because it would refuse again. The next message starts a new session from a *handoff brief* (`FreshSessionReason` `provider-blocked`), and the card offers a switch to Claude Code. A parent thread's card repeats OpenAI's words and says to rephrase the order or ask the user, never to resend it.
 
 The guard matters most for a coding agent, because its subprocess outlives the terminal event. A *Lucidos Agent* turn's loop emits nothing after its own terminator. A coding-agent turn emits four more things.
 
@@ -690,3 +753,17 @@ run:
 ```
 
 `ResponseFailed` fires for both chat and coding-agent failures. See "The error gap" above for what "error" means here, and for finer-grained alternatives.
+
+## A human Stop holds automatic wakes
+
+A device Stop makes a *stopped thread*, on chat and coding-agent threads alike.
+It takes no engine nudge until a device message, Continue, card answer, Harden
+or Apply resumes it. The hold folds from events and survives restart. An
+unreadable state holds rather than starting work.
+
+Event waits keep their subscriptions and unread delivery anchors. Child reports
+are filed, and a human resume reads them with the held waits. Queued deliveries
+retain their anchors, so the agent's read settles each once. Turn-end nudges
+are recomputed at the next idle. A message from Home or a parent may still
+start a turn; it does not lift the hold on engine wakes. See ADR 0696 and
+*stopped thread* in `system-knowhow/glossary.md`.

@@ -196,6 +196,10 @@ impl LucidosEngine {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "import_file" => {
+                let writer = crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id)
+                    .resolve(self.event_bus.pool())
+                    .await?;
+
                 let source_path = args["source_path"].as_str().unwrap_or("");
 
                 if source_path.is_empty() {
@@ -319,6 +323,7 @@ impl LucidosEngine {
                                     commit_hash: commit_sha.clone(),
                                     summary: Some(summary.clone()),
                                     writer_thread_id: Some(thread_id),
+                                    writer: Some(writer.clone()),
                                 }))
                                 .await?;
                             let short_sha = &commit_sha[..commit_sha.floor_char_boundary(7)];
@@ -354,6 +359,7 @@ impl LucidosEngine {
                         commit_hash: commit_sha.clone(),
                         summary: summary.clone(),
                         writer_thread_id: Some(thread_id),
+                        writer: Some(writer.clone()),
                     }))
                     .await?;
 
@@ -463,7 +469,7 @@ impl LucidosEngine {
                                 sub
                             ));
                         }
-                        log!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", shown_url, target);
+                        log_legacy!(@git_clone, "Cloning {} to {:?} (.lucidos/tmp/)", shown_url, target);
                         if let Err(e) = crate::core::git_auth::shallow_clone_within(
                             url,
                             branch.as_deref(),
@@ -492,7 +498,7 @@ impl LucidosEngine {
                     Err(e) => return Ok(format!("Error: cannot create a clone directory: {e}")),
                 };
                 let temp_dir = scratch.path().join("repo");
-                log!(@git_clone, "Cloning {} to {:?}", shown_url, temp_dir);
+                log_legacy!(@git_clone, "Cloning {} to {:?}", shown_url, temp_dir);
 
                 if let Err(e) = crate::core::git_auth::shallow_clone_within(
                     url,
@@ -604,7 +610,7 @@ impl LucidosEngine {
                 )
                 .await;
 
-                log!(@git_clone, "Imported {} files, skipped {}", imported_count, skipped_count);
+                log_legacy!(@git_clone, "Imported {} files, skipped {}", imported_count, skipped_count);
                 Ok(format!(
                     "[ACTION COMPLETED] CLONED REPOSITORY: {} files imported to artifacts/{} (skipped {} binary/excluded files, commit: {})",
                     imported_count, dest_base, skipped_count, &commit_sha[..commit_sha.floor_char_boundary(7)]
@@ -623,6 +629,7 @@ impl LucidosEngine {
         &self,
         source: &std::path::Path,
         dest_relative: &str,
+        writer: crate::engine::event_bus::ArtifactWriter,
     ) -> Result<(String, String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Check file exists
         if !source.exists() {
@@ -676,7 +683,7 @@ impl LucidosEngine {
                 .await?
         };
         drop(held);
-        log!(@import, "Committed: {}", &commit_sha[..commit_sha.floor_char_boundary(7)]);
+        log_legacy!(@import, "Committed: {}", &commit_sha[..commit_sha.floor_char_boundary(7)]);
 
         self.event_bus
             .emit(BusEvent::System(SystemEvent::ArtifactImported {
@@ -687,6 +694,7 @@ impl LucidosEngine {
                 summary: None,
                 // An upload from the UI, which no thread's turn made.
                 writer_thread_id: None,
+                writer: Some(writer),
             }))
             .await?;
 

@@ -12,6 +12,9 @@
  * about an audio device.
  */
 import type { ClientControl, ServerFrame } from './frames';
+import { CALL_IDLE } from './callIdle';
+
+export { CALL_IDLE };
 
 /**
  * Where a call is.
@@ -148,18 +151,6 @@ export interface CallState {
    */
   replyCount: number;
 }
-
-export const CALL_IDLE: CallState = {
-  phase: 'idle',
-  threadId: null,
-  note: null,
-  utterance: 'none',
-  utteranceCount: 0,
-  heard: null,
-  hearing: null,
-  said: '',
-  replyCount: 0,
-};
 
 /** Everything that can move a call. */
 export type CallInput =

@@ -105,7 +105,7 @@ impl SpawnDispatcher {
                 .redispatch_orphaned_continuations_on_startup()
                 .await
             {
-                log!(
+                log_legacy!(
                     "[SpawnDispatcher] redispatch_orphaned_continuations_on_startup failed: {}",
                     e
                 );
@@ -118,7 +118,7 @@ impl SpawnDispatcher {
     /// Dispatch every request the bus sends. Lives for the duration of the
     /// engine process.
     pub(crate) async fn run(self, mut requests: UnboundedReceiver<SpawnRequest>) {
-        log!("[SpawnDispatcher] starting");
+        log_legacy!("[SpawnDispatcher] starting");
         while let Some(request) = requests.recv().await {
             let SpawnRequest::Continue { event_id, .. } = request;
             if self.already_spawned(event_id).await {
@@ -126,7 +126,7 @@ impl SpawnDispatcher {
             }
             self.dispatch_spawn(request).await;
         }
-        log!("[SpawnDispatcher] request channel closed");
+        log_legacy!("[SpawnDispatcher] request channel closed");
     }
 
     /// Returns true when a spawn for this trigger has already happened — either
@@ -148,7 +148,7 @@ impl SpawnDispatcher {
             }
             Ok(false) => false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[SpawnDispatcher] already_spawned DB lookup failed for {}: {}",
                     event_id,
                     e
@@ -177,12 +177,12 @@ impl SpawnDispatcher {
         if let Err(e) = self.spawn_tx.send(request) {
             // Receiver gone → engine is shutting down, or the receiver task
             // died. The next boot's recovery owns the thread.
-            log!(
+            log_legacy!(
                 "[SpawnDispatcher] failed to send Continue spawn request for thread={} event={}: {}",
                 thread_id, event_id, e
             );
         } else {
-            log!(
+            log_legacy!(
                 "[SpawnDispatcher] dispatched Continue spawn thread={} event={}",
                 thread_id,
                 event_id
@@ -238,7 +238,7 @@ impl SpawnDispatcher {
         if rows.is_empty() {
             return Ok(());
         }
-        log!(
+        log_legacy!(
             "[SpawnDispatcher] re-dispatching {} orphaned ContinuationRequested event(s)",
             rows.len()
         );
@@ -295,7 +295,7 @@ pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id:
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[SpawnDispatcher] unactuated-continuation probe failed for {}: {}; emitting anyway",
             thread_id,
             e

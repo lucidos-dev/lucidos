@@ -101,6 +101,21 @@ impl ProviderKind {
         }
     }
 
+    /// How the user knows this backend, for an error that names who failed.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Vertex => "Vertex",
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
+            Self::OpenRouter => "OpenRouter",
+            Self::XAi => "xAI",
+            Self::OpenCodeFree => "OpenCode",
+            Self::Local => "Local server",
+            Self::ClaudeGateway => "Claude gateway",
+            Self::ChatGptPlan => "ChatGPT",
+        }
+    }
+
     /// Whether a call on this backend bills nobody, as on OpenCode's free tier.
     /// A route somebody pays for is never free, whoever the payer is. A ladder
     /// reads cost on a free route as "included" (ADR 0525).
@@ -307,7 +322,7 @@ pub async fn load_from_db(pool: &PgPool) -> HashMap<String, ModelRouting> {
             })
             .collect(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[ModelRegistry] Failed to load models table; routing falls back to prefix heuristic: {}",
                 e
             );
@@ -322,12 +337,12 @@ pub async fn reload(registry: &ModelRegistry, pool: &PgPool) {
     match registry.write() {
         Ok(mut guard) => {
             *guard = fresh;
-            crate::log!(
+            crate::log_legacy!(
                 "[ModelRegistry] reloaded model→provider map ({} entries)",
                 guard.len()
             );
         }
-        Err(e) => crate::log!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
+        Err(e) => crate::log_legacy!("[ModelRegistry] reload skipped (lock poisoned): {}", e),
     }
 }
 

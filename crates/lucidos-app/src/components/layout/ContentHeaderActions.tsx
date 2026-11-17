@@ -8,7 +8,7 @@ import { wrapToggleAvailable } from '../../store/previewWrap';
 import { closeUrl, openLocalFile, openUrlOutsideApp } from '../../store/actions/artifacts';
 import { previewCopyPath, previewDiskPath } from '../../utils/previewPath';
 import { copyToClipboard } from '../../utils/clipboard';
-import { getAppFrameSrc, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggleAppFullscreen } from '../../store/actions/apps';
+import { appPopoutHref, exitPseudoFullscreen, toggleAppSearch, popOutApp, toggleAppFullscreen } from '../../store/actions/apps';
 import { findAvailable, findSurface, toggleFind } from '../../store/actions/find-bar';
 import { panelRefreshAvailable, runPanelRefresh } from '../../store/panelRefresh';
 import { DIFF_REFRESH_PINNED, panelRefreshLive } from './RefreshIndicator';
@@ -67,7 +67,7 @@ function popoutSpec(
 export function appPopoutAction(): HeaderActionSpec | null {
   return isTauri()
     ? popoutSpec('app-open-in-tab', 'Open in browser', { onClick: () => popOutApp() })
-    : popoutSpec('app-open-in-tab', 'Open in new tab', { href: getAppFrameSrc() });
+    : popoutSpec('app-open-in-tab', 'Open in new tab', { href: appPopoutHref() });
 }
 
 /** What the packaged desktop client's control says. Not "browser", because the
@@ -335,8 +335,6 @@ export function ContentHeaderActions({ layout }: Props) {
     const measure = () => {
       const rem = parseFloat(getComputedStyle(row).getPropertyValue('--content-compact-breakpoint'));
       setCompact(row.clientWidth <= rem * getRemPx());
-      const host = hostRef.current;
-      if (host) host.style.setProperty('--content-actions-offset', `${host.offsetLeft}px`);
     };
     const observer = new ResizeObserver(measure);
     observer.observe(row);
@@ -436,6 +434,7 @@ export function ContentHeaderActions({ layout }: Props) {
     addAction({
       key: 'search',
       label: activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps',
+      tooltip: tooltipWithShortcut(activeMenuItem.value === 'plugins' ? 'Search plugins' : 'Search apps', 'searchApps'),
       icon: () => <SearchIcon />,
       onClick: toggleAppSearch,
       extraClass: 'apps-search-btn',

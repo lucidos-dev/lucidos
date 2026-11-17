@@ -2,24 +2,23 @@
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
+mod operations;
+
 const REASON: &str = "a command that deletes a Lucidos workspace (only the gateway may do that, \
                       after the user confirms it on a paired device)";
 
 pub(super) fn reason(command: &str, cwd: Option<&Path>) -> Option<&'static str> {
-    let lower = command.to_ascii_lowercase();
-    if lower.contains("lucidos_")
-        && (sql_drop_database(&lower) || lower.contains("dropdb") || lower.contains("pg_ctl"))
-    {
+    if operations::destructive(command) {
         return Some(REASON);
     }
-    let url = lower.replace("%2f", "/");
-    if (url.contains("/~/api/v1/control/workspaces/")
-        && (lower.contains("delete") || lower.contains("-xdelete")))
-        || url.contains("/~/api/v1/control/cleanup")
-        || url.contains("/~/api/v1/control/trash")
-    {
-        return Some(REASON);
-    }
+    filesystem_reason(command, cwd)
+}
+
+pub(super) fn python_reason(code: &str) -> Option<&'static str> {
+    operations::destructive_python(code).then_some(REASON)
+}
+
+pub(super) fn filesystem_reason(command: &str, cwd: Option<&Path>) -> Option<&'static str> {
     if !super::command_segments(command).any(|segment| {
         (command.contains("xargs") && destructive_text(command))
             || !python_targets(command).is_empty()
@@ -39,31 +38,10 @@ fn sql_drop_database(command: &str) -> bool {
 }
 
 fn registered_roots() -> Vec<PathBuf> {
-    let mut data_dirs: Vec<_> = lucidos_installs::scan_this_machine(None)
-        .installs
-        .into_iter()
-        .filter_map(|i| i.data_dir)
-        .collect();
-    if let Some(dir) = lucidos_home::gateway_data_dir() {
-        data_dirs.push(dir);
-    }
-    let mut roots = Vec::new();
-    for data in data_dirs {
-        let Ok(bytes) = std::fs::read(data.join("config/workspaces.json")) else {
-            continue;
-        };
-        let Ok(registry) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-        if let Some(entries) = registry["workspaces"].as_array() {
-            for entry in entries {
-                if let Some(dir) = entry["dir"].as_str() {
-                    roots.push(normalize(&data.join(dir)));
-                }
-            }
-        }
-    }
-    roots
+    crate::paths::registered_workspace_dirs(&crate::paths::gateway_data_dirs())
+        .iter()
+        .map(|dir| normalize(dir))
+        .collect()
 }
 
 fn normalize(path: &Path) -> PathBuf {
@@ -636,6 +614,91 @@ fn contains_workspace(path: &Path, cwd: Option<&Path>, budget: &mut usize) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operational_floor_distinguishes_data_from_execution() {
+        for command in [
+            "python3 - <<'PY'\nimport os,shutil\nfor k in ['LUCIDOS_PG_BIN_DIR']:\n print(os.environ.get(k))\nprint(shutil.which('pg_ctl'))\nPY",
+            "cat > fixture.rs <<'EOF'\nlet name = \"LUCIDOS_PG_BIN_DIR\";\npg_ctl -D /tmp/lucidos_example stop\nEOF",
+            "cargo fmt --all",
+            "cat <<'EOF'\n$(dropdb lucidos_example)\nEOF",
+            "cat <<EOF\nUse $LUCIDOS_PG_BIN_DIR and pg_ctl.\nEOF",
+            "env cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "bash <<'EOF'\necho 'dropdb lucidos_example'\nEOF",
+            "python3 - <<'PY'\nfrom pathlib import Path\nPath('handoff.md').write_text('''Use LUCIDOS_PG_BIN_DIR and pg_ctl.\nNever run dropdb lucidos_example.\n''')\nPY",
+            "echo 'dropdb lucidos_example; pg_ctl stop'",
+            "rg 'DROP DATABASE lucidos_example' .",
+            "# dropdb lucidos_example\ntrue",
+            "LUCIDOS_PG_BIN_DIR=/tmp pg_ctl --version",
+            "pg_ctl -D /tmp/lucidos_example status",
+            "psql -c \"SELECT 'DROP DATABASE lucidos_example'\"",
+            "psql -c 'SELECT $$DROP DATABASE lucidos_example$$'",
+            "psql <<'SQL'\n/* outer /* nested */ DROP DATABASE lucidos_example; */ SELECT 1;\nSQL",
+            "echo lucidos_example; dropdb ordinary_fixture",
+            "echo 'DELETE /~/api/v1/control/workspaces/example'",
+            "curl http://localhost/~/api/v1/control/workspaces/example",
+            "curl http://localhost/~/api/v1/control/cleanup/batches",
+            "curl -X DELETE 'http://localhost/notes?next=/~/api/v1/control/workspaces/example'",
+            "curl -X POST --json '{\"next\":\"/~/api/v1/control/cleanup/batches\"}' http://localhost/notes",
+        ] {
+            assert_eq!(reason(command, None), None, "{command}");
+        }
+        for command in [
+            "dropdb lucidos_example",
+            "dropdb postgresql://localhost/lucidos_example",
+            "echo 'DROP DATABASE lucidos_example' | psql",
+            "echo $(true)#; dropdb lucidos_example",
+            "echo x\\ #; dropdb lucidos_example",
+            "cat() { bash; }; cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "function cat { bash; }; cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "cat > script.sh <<'EOF'\ndropdb lucidos_example\nEOF\nchmod +x script.sh; ./script.sh",
+            "psql <<'SQL'\nSELECT 1 AS a$x$;\nDROP DATABASE lucidos_example;\n-- $x$\nSQL",
+            "cat > script.sql <<'SQL'\nDROP DATABASE lucidos_example;\nSQL\npsql -f script.sql",
+            "cat > script.sh <<'SH'\ndropdb lucidos_example\nSH\nsh script.sh",
+            "cat > script.py <<'PY'\nimport os\nos.system('dropdb lucidos_example')\nPY\npython3 script.py",
+            "DB=lucidos_example; dropdb \"$DB\"",
+            "PGDATA=/tmp/lucidos_example; pg_ctl stop",
+            "SQL='DROP DATABASE lucidos_example'; psql -c \"$SQL\"",
+            "psql -v db=lucidos_example -c 'DROP DATABASE :db'",
+            "env PGHOST=localhost dropdb lucidos_example",
+            "psql -c 'DROP DATABASE lucidos_example'",
+            "psql -c 'DROP DATABASE IF EXISTS \"lucidos_example\"'",
+            "psql <<'SQL'\n/* outer /* nested */ ' */ DROP DATABASE lucidos_example; -- '\nSQL",
+            "psql -c 'DROP DATABASE U&\"lucidos_example\"'",
+            "pg_ctl -D /tmp/lucidos_example stop",
+            "pg_ctl restart -D /tmp/lucidos_example",
+            "true; bash -c 'dropdb lucidos_example'",
+            "echo $(dropdb lucidos_example)",
+            "sh <<'EOF'\ndropdb lucidos_example\nEOF",
+            "psql <<'SQL'\nDROP DATABASE lucidos_example;\nSQL",
+            "python3 -c \"import subprocess; subprocess.run(['dropdb', 'lucidos_example'])\"",
+            "python3 -c \"import os; os.system ('dropdb lucidos_example')\"",
+            "curl -X DELETE http://localhost/~/api/v1/control/workspaces/example",
+            "curl -sXDELETE http://localhost/~/api/v1/control/workspaces/example",
+            "curl --req=DELETE http://localhost/~/api/v1/control/workspaces/example",
+            "curl -X POST http://localhost/~/api/v1/control/cleanup/batches",
+            "curl -X POST http://localhost/~/api/v1/control/trash/empty",
+        ] {
+            assert_eq!(reason(command, None), Some(REASON), "{command}");
+        }
+    }
+
+    #[test]
+    fn unproven_consumers_cannot_exempt_generated_code() {
+        for command in [
+            "cp /bin/sh ./cat; ./cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "env ./cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "hash -p /bin/bash cat; cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "hash cat=/bin/bash; cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "enable -f ./sink.so cat; cat <<'EOF'\ndropdb lucidos_example\nEOF",
+            "cat > Makefile <<'EOF'\nall:\n\tdropdb lucidos_example\nEOF\nmake",
+            "cat > script.awk <<'EOF'\nBEGIN {system(\"dropdb lucidos_example\")}\nEOF\nawk -f script.awk",
+            // Unlisted follow-ups retain the floor, including cargo plugins.
+            "cat > fixture.rs <<'EOF'\npg_ctl -D /tmp/lucidos_example stop\nEOF\ncargo fmt --all",
+        ] {
+            assert_eq!(reason(command, None), Some(REASON), "{command}");
+        }
+    }
 
     #[test]
     fn operands_globs_and_directory_changes_use_only_destructive_targets() {

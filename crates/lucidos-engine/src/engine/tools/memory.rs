@@ -39,7 +39,7 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
     {
         Ok(response) => response,
         Err(e) => {
-            log!(@Memory, "[correct_memory] LLM batch verification failed: {}. Aborting to be safe", e);
+            log_legacy!(@Memory, "[correct_memory] LLM batch verification failed: {}. Aborting to be safe", e);
             return None;
         }
     };
@@ -49,7 +49,7 @@ pub(crate) async fn verify_entries<P: LlmProvider + ?Sized>(
         .unwrap_or("")
         .trim()
         .to_lowercase();
-    log!(@Memory, "[correct_memory] LLM batch verdict: '{}'", &answer[..answer.floor_char_boundary(100)]);
+    log_legacy!(@Memory, "[correct_memory] LLM batch verdict: '{}'", &answer[..answer.floor_char_boundary(100)]);
     if answer.starts_with("none") || answer.is_empty() {
         return Some(vec![]);
     }
@@ -123,13 +123,13 @@ impl LucidosEngine {
         let mut candidates: Vec<(usize, f32)> = Vec::new();
         let mut kept_count: usize = 0;
 
-        log!(@Memory, "[correct_memory] Found {} keyword candidates for '{}'", results.entries.len(), search_query);
+        log_legacy!(@Memory, "[correct_memory] Found {} keyword candidates for '{}'", results.entries.len(), search_query);
 
         for (i, entry) in results.entries.iter().enumerate() {
             if i < candidate_embeddings.len() {
                 let similarity = cosine_similarity(&wrong_embedding, &candidate_embeddings[i]);
                 let truncated = &entry.summary[..entry.summary.floor_char_boundary(80)];
-                log!(@Memory, "[correct_memory]   score={:.3} '{}'", similarity, truncated);
+                log_legacy!(@Memory, "[correct_memory]   score={:.3} '{}'", similarity, truncated);
                 if similarity >= MEMORY_CORRECTION_THRESHOLD {
                     candidates.push((i, similarity));
                 } else {
@@ -138,7 +138,7 @@ impl LucidosEngine {
             }
         }
 
-        log!(@Memory, "[correct_memory] {} of {} candidates passed similarity filter (threshold={})",
+        log_legacy!(@Memory, "[correct_memory] {} of {} candidates passed similarity filter (threshold={})",
             candidates.len(), results.entries.len(), MEMORY_CORRECTION_THRESHOLD);
 
         if candidates.is_empty() {
@@ -151,7 +151,7 @@ impl LucidosEngine {
         // Safety cap
         const MAX_DELETIONS: usize = 10;
         if candidates.len() > MAX_DELETIONS {
-            log!(@Memory, "[correct_memory] BLOCKED: {} matches exceeds safety cap of {}", candidates.len(), MAX_DELETIONS);
+            log_legacy!(@Memory, "[correct_memory] BLOCKED: {} matches exceeds safety cap of {}", candidates.len(), MAX_DELETIONS);
             return Ok(format!(
                 "Too many matches ({} entries). The wrong_fact may be too broad. Please be more specific.",
                 candidates.len()
@@ -242,13 +242,13 @@ If NONE should be deleted, reply with "none"."#,
                 match index.delete(entry.id).await {
                     Ok(true) => {
                         deleted_summaries.push(entry.summary.clone());
-                        log!(@Memory, "[correct_memory]   DELETED id={}", entry.id);
+                        log_legacy!(@Memory, "[correct_memory]   DELETED id={}", entry.id);
                     }
                     Ok(false) => {
-                        log!(@Memory, "[correct_memory]   Entry {} already gone", entry.id);
+                        log_legacy!(@Memory, "[correct_memory]   Entry {} already gone", entry.id);
                     }
                     Err(e) => {
-                        log!(@Memory, "[correct_memory]   Failed to delete {}: {}", entry.id, e);
+                        log_legacy!(@Memory, "[correct_memory]   Failed to delete {}: {}", entry.id, e);
                         failed_summaries.push(format!("{} ({})", entry.summary, e));
                     }
                 }
@@ -389,7 +389,13 @@ If NONE should be deleted, reply with "none"."#,
             .and_then(|v| v.as_i64())
             .unwrap_or(20)
             .clamp(1, 50);
-        let found = crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
+        let mut found =
+            crate::engine::thread_search::combined_thread_search(self, q, limit).await?;
+        // The schema states 1-50, and the merge bounds each ARM rather than
+        // the total, so the promise is kept here.
+        found.truncate(limit.max(0) as usize);
+        crate::engine::thread_liveness::attach(&self.pool, found.iter_mut().map(|r| &mut r.info))
+            .await;
         // PROJECTED, never the raw `ThreadSearchResult`. That flattens ~30
         // bookkeeping fields the model has no use for. It also carries the
         // whole draft, and search may match a thread on its draft alone. So a
@@ -399,15 +405,14 @@ If NONE should be deleted, reply with "none"."#,
         let workspace = self.workspace_name();
         let projected: Vec<serde_json::Value> = found
             .iter()
-            // The schema states 1-50, and the merge bounds each ARM rather than
-            // the total, so the promise is kept here.
-            .take(limit.max(0) as usize)
             .map(|r| {
                 serde_json::json!({
                     // The id the model passes on: to the `events` tool's
                     // 'query' to read the thread, or to 'drafts' for its draft.
                     "thread_id": r.info.thread_id,
                     "title": r.info.title,
+                    "status": r.info.status,
+                    "liveness": r.info.liveness,
                     "last_activity": r.info.last_activity,
                     "message_count": r.info.message_count,
                     "channel": r.info.channel,
@@ -499,7 +504,7 @@ pub(crate) async fn correct_memory_by_id_impl(
         .map_err(|e| format!("Delete failed: {}", e))?;
     // Recorded either way, so the correction below still lands.
     let mut response = if deleted {
-        log!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
+        log_legacy!(@Memory, "[correct_memory_by_id] DELETED id={} topic={:?}", id, entry.topic);
         format!("Deleted memory entry {}:\n  - {}", id, entry.summary)
     } else {
         format!("Memory entry {} was already gone.", id)

@@ -15,6 +15,7 @@ import { BackupReminderBanner } from './BackupReminderBanner';
 import { ConnectionBanner } from './ConnectionBanner';
 import { IngressBanner } from './IngressBanner';
 import { WebhookRefusalBanner } from './WebhookRefusalBanner';
+import { AgentSandboxBanner } from './AgentSandboxBanner';
 import { SlownessBanner } from './SlownessBanner';
 import { PaneDrag, attachPaneDragTouches, type PaneTrack } from './paneDrag';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
@@ -358,6 +359,7 @@ export function AppHeader() {
         <SlownessBanner layout="mobile" />
         <IngressBanner layout="mobile" />
         <WebhookRefusalBanner layout="mobile" />
+        <AgentSandboxBanner layout="mobile" />
         <BackupReminderBanner layout="mobile" />
       </header>
     </>

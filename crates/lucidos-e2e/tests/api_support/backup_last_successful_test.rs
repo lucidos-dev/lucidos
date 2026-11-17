@@ -12,7 +12,8 @@
 //
 // 1. The route exists and takes no `provider`, unlike the rest of `/backup/*`.
 //    The gateway calls it with no query string at all.
-// 2. It answers the three keys the gateway reads, at those exact names.
+// 2. It answers the three keys the gateway reads, and `overdue` for the
+//    app-shell banner, at those exact names.
 // 3. It reads the workspace's own run history, so a workspace that has never
 //    backed up says so rather than erroring.
 //
@@ -47,6 +48,8 @@ async fn the_backup_line_answers_without_a_provider() {
         "`stale` must be the engine's verdict, not the picker's: {v}",
     );
     assert!(v["configured"].is_boolean(), "no `configured` bool: {v}");
+    // The app-shell banner reads `overdue` straight from the engine.
+    assert!(v["overdue"].is_boolean(), "no `overdue` bool: {v}");
 
     // The disposable e2e workspace has never run a backup, so this is the
     // "never backed up" answer: a real verdict, not a missing one.
@@ -56,4 +59,10 @@ async fn the_backup_line_answers_without_a_provider() {
         "the e2e workspace has no backup history: {v}",
     );
     assert_eq!(v["stale"], true, "no backup at all is the worst kind: {v}");
+    assert_eq!(v["overdue"], true, "no backup at all is overdue: {v}");
+    assert_eq!(
+        v["overdue_at"],
+        serde_json::Value::Null,
+        "no backup has no overdue instant: {v}",
+    );
 }

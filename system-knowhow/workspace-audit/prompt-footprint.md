@@ -33,8 +33,13 @@ The three numbers come from the user's *preference*s:
 `workspace_prompt_footprint_total_ceiling` and
 `workspace_prompt_footprint_unused_days`. The JSON carries the values in force.
 Quote them from there, never from memory.
+Read preference values from the workspace being audited; another workspace can have different values.
 
 ## Checks
+
+Background extraction settings, including `reasoning_memory`, do not control this footprint.
+Its forced-Claude thinking exception is documented in `system-knowhow/preferences.md`.
+
 
 For each finding, capture: **location** (the section id, then the item id),
 **what's wrong**, **which reference owns the rule**, **suggested fix**.

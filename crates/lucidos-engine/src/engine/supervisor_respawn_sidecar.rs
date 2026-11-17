@@ -41,7 +41,7 @@ fn take_sidecar(workspace: &Path) -> Option<RespawnInfo> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[SupervisorRespawn] failed to read {}: {}",
                 path.display(),
                 e,
@@ -53,7 +53,7 @@ fn take_sidecar(workspace: &Path) -> Option<RespawnInfo> {
     // re-processed on every startup. Logged at info-level — losing the
     // file is not fatal.
     if let Err(e) = std::fs::remove_file(&path) {
-        crate::log!(
+        crate::log_legacy!(
             "[SupervisorRespawn] failed to remove {}: {}",
             path.display(),
             e,
@@ -62,7 +62,7 @@ fn take_sidecar(workspace: &Path) -> Option<RespawnInfo> {
     match parse_sidecar(&String::from_utf8_lossy(&bytes)) {
         Ok(info) => Some(info),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[SupervisorRespawn] failed to parse sidecar: {} (content: {:?})",
                 e,
                 String::from_utf8_lossy(&bytes),
@@ -80,13 +80,17 @@ pub async fn emit_if_present(workspace: &Path, bus: &crate::engine::event_bus::E
     let Some(info) = take_sidecar(workspace) else {
         return;
     };
-    crate::log!(
+    crate::log_legacy!(
         "[SupervisorRespawn] previous engine pid {} died with exit {} at {} (supervisor pid {}) — emitting EngineSupervisorRespawned",
         info.old_pid,
         info.exit_code,
         info.died_at.to_rfc3339(),
         info.supervisor_pid,
     );
+    // Exit 1 can be a returned dependency failure, not a Lucidos crash.
+    if lucidos_diagnostic_log::fault::is_internal_engine_exit(info.exit_code) {
+        crate::internal_faults::record_pending(crate::internal_faults::FaultKind::EngineCrash);
+    }
     bus.emit_or_log(
         crate::engine::event_bus::BusEvent::System(
             crate::engine::event_bus::SystemEvent::EngineSupervisorRespawned {

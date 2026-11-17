@@ -1,4 +1,5 @@
 pub(crate) mod agent_context;
+pub mod agent_drafts;
 pub mod agent_pause;
 pub(crate) mod agent_question;
 pub mod agent_recovery;
@@ -9,6 +10,7 @@ pub(crate) mod apply_all_driver;
 pub(crate) mod apply_estimate;
 mod archive_request;
 pub mod auto_compact_trial;
+pub mod automation_pause;
 pub(crate) mod aux_purpose;
 mod background_build;
 pub(crate) mod cache_ttl;
@@ -20,6 +22,8 @@ pub mod change_summary_consumer;
 pub mod changelog;
 pub(in crate::engine) mod chat;
 pub mod chatgpt_plan_sign_in;
+pub(crate) mod consumption_claim;
+pub(crate) mod thread_stop;
 // Scheduler boot recovery shares the turn boundary list with chat sweeps.
 pub(crate) use chat::recovery::turn_terminal_events;
 pub(crate) mod claude_code;
@@ -37,6 +41,7 @@ pub mod config_change;
 pub(crate) mod context;
 pub mod context_ceiling;
 pub mod db_health;
+pub mod draft_submission;
 pub mod engine_version;
 /// The eval-only full-capture gate (ADR 0110). Inert without
 /// `LUCIDOS_EVAL_FULL_CAPTURE`, which only the eval harness sets.
@@ -74,6 +79,8 @@ pub mod model_call;
 pub(crate) mod pending_answers;
 mod pending_apply_actors;
 pub mod pending_change_watch;
+pub mod permission;
+pub(crate) mod plan_lifecycle;
 pub(crate) mod preferences;
 pub(crate) mod prompt_footprint;
 pub(crate) mod question_card_gate;
@@ -88,9 +95,11 @@ pub mod summary_tree;
 pub mod supervisor_respawn_sidecar;
 pub mod switch_estimate;
 pub(crate) mod text_search;
+pub(crate) mod thread_agent;
 pub mod thread_events;
 pub(crate) mod thread_family;
 pub mod thread_lifecycle;
+pub mod thread_liveness;
 pub mod thread_queue;
 pub(crate) mod thread_search;
 pub mod thread_state;
@@ -103,17 +112,20 @@ pub(crate) mod trigger_group_writes;
 pub(crate) mod trigger_writes;
 pub(crate) mod trusted_repo_scripts;
 pub(crate) mod turn_end;
+pub(crate) mod unattested_act;
 pub use turn_end::{
     decide_read_for_eval, decide_wake_for_eval, read_decision_chat_judge, wake_decision_chat_judge,
     AnsweredQuestion, EvalReadDecision, EvalWakeDecision, InFlight, OpeningSource, ParentView,
     PushedNotification, TurnRead,
 };
-pub mod thread_people;
+pub mod thread_users;
 pub mod types;
 pub(crate) mod until_restored;
+pub mod user_only_message_delivery;
 pub(crate) mod user_profile;
 pub mod widget_embed;
 pub(crate) mod widget_fit;
+pub(crate) mod widget_fit_sessions;
 pub mod widget_guidance;
 pub mod widgets;
 pub mod worktree_cleanup;
@@ -133,7 +145,8 @@ pub(crate) use change_ops::MERGE_OWNED_BY_RESOLVER_MESSAGE;
 pub(crate) use change_ops::SET_ASIDE_APPLY_REFUSAL;
 pub(crate) use landing_lane::LaneRemoval;
 pub(crate) use main_check::{
-    CloseRefusal as MainCheckCloseRefusal, FailedTest, MainCheckSnapshot, RedCloseReason,
+    CloseRefusal as MainCheckCloseRefusal, FailedTest, MainCheckSnapshot, MainRepairStartedBy,
+    RedCloseReason, SETTING_VALUES as MAIN_CHECK_SETTING_VALUES,
 };
 // The child-follow-up vocabulary, re-exported for the HTTP route in
 // `api::threads::follow_up`, which is outside `engine`. Only the ack and the
@@ -146,15 +159,18 @@ pub(crate) use chat::child_detach::{ChildDetachError, DetachAck, DetachCaller};
 pub(crate) use chat::child_follow_up::{
     ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpReach, FollowUpUrgency,
 };
+pub(crate) use chat::emit_routing_failure;
 pub(crate) use chat::input_order::{
     overtaken_message, InputAdmission, InputOrder, InputPosition, InputTurn, OVERTAKEN_REASON,
 };
+pub(crate) use chat::process::OrphanLane;
 pub use chat::rung::ChatSettingsOutcome;
 pub(crate) use chat::rung::{TURN_RUNNING_MESSAGE, TURN_RUNNING_REASON};
 pub(crate) use chat::PreEmittedOrigin;
 pub(crate) use chat::{generate_thread_title, title_call, IMAGE_DESCRIPTION_PROMPT};
 #[cfg(test)]
 pub(crate) use context::format_history_steps;
+pub(crate) use thread_agent::{thread_agent, ThreadAgent};
 // `core` resolves the schedule's two numbers, and `chat` is not reachable from
 // there. One type crossing beats two bare `usize` a caller can transpose in
 // silence.
@@ -256,28 +272,51 @@ pub enum InjectedPromptKind {
     /// **It never wakes an idle thread.** With no live handle there is nothing
     /// to inject into, and history carries the turn to the next round anyway.
     SpokenAside,
+    /// The rest of a spoken sentence this turn was started on (ADR 0198).
+    ///
+    /// The caller's own words, already recorded as their own row. So it
+    /// emits no `PromptInjected`, exactly as a spoken aside does.
+    ///
+    /// It never wakes an idle thread either: the row carries the words to the
+    /// next round. [`inject_the_rest_of_a_sentence`] says which live turn
+    /// gets one.
+    SpokenContinuation,
 }
 
 impl InjectedPromptKind {
     /// True for every kind that must NOT emit its own exchange-starter.
     ///
-    /// The two re-entries already put one on the wire. A spoken aside belongs
-    /// to somebody else's, which comes to the same rule from the other side.
+    /// The two re-entries already put one on the wire. The two spoken kinds
+    /// already have their own rows, which comes to the same rule.
     pub(crate) fn is_engine_reentry(&self) -> bool {
         matches!(
             self,
-            Self::ReentryFromEngine | Self::ReentryFromWait | Self::SpokenAside
+            Self::ReentryFromEngine
+                | Self::ReentryFromWait
+                | Self::SpokenAside
+                | Self::SpokenContinuation
         )
     }
 
     /// Whether a prompt of this kind can be the REASON a turn runs.
     ///
-    /// A spoken aside cannot, and is the only kind that cannot. It reports
-    /// what the talker said out loud, so it starts nothing (ADR 0149) and only
-    /// rides a round that was running anyway. Two paths ask this: one decides
-    /// whether a finished answer reopens, the other whether an orphan is
-    /// re-submitted.
+    /// The two spoken kinds cannot. They start nothing (ADR 0149) and only
+    /// ride a round that was running anyway. `drain_turn_orphans` asks this
+    /// before it re-submits an orphan.
     pub(crate) fn can_carry_a_turn(&self) -> bool {
+        !matches!(self, Self::SpokenAside | Self::SpokenContinuation)
+    }
+
+    /// Whether a prompt of this kind is worth reopening a finished answer for.
+    ///
+    /// Every kind that can carry a turn is. So is the rest of a spoken
+    /// sentence: it reaches only a turn whose history may lack it, and that
+    /// turn's answer would otherwise answer half a question. Reopening costs a
+    /// round but never a second answer, since the talker speaks only the
+    /// turn's last one.
+    ///
+    /// A spoken aside alone is not worth a round: it asks nothing.
+    pub(crate) fn reopens_a_finished_answer(&self) -> bool {
         !matches!(self, Self::SpokenAside)
     }
 }
@@ -354,6 +393,17 @@ pub struct ThreadHandle {
     /// Never needs clearing: the handle IS the turn, and `ThreadGuard::drop`
     /// removes it, so the value cannot outlive what it describes.
     pub request_event_id: Arc<std::sync::Mutex<Option<Uuid>>>,
+    /// The event ids of the prompts coalesced into this turn, besides its
+    /// anchor. Recorded by [`Self::inject`] and read by [`Self::took`].
+    coalesced_event_ids: std::sync::Mutex<std::collections::HashSet<Uuid>>,
+    /// The rest of a spoken sentence that arrived before its ask was coalesced
+    /// into this turn, keyed by the prompt carrying the ask. [`Self::inject`]
+    /// sends it right behind that prompt. Dropped with the handle when the
+    /// prompt goes elsewhere.
+    held_continuations: std::sync::Mutex<HashMap<Uuid, Vec<InjectedPrompt>>>,
+    /// Set by [`record_history_read_begun`] just before the turn reads its
+    /// history. A row committed before then is in that history.
+    history_read_begun: std::sync::atomic::AtomicBool,
 }
 
 impl ThreadHandle {
@@ -371,7 +421,17 @@ impl ThreadHandle {
             cancel_actor: Arc::new(std::sync::Mutex::new(None)),
             redirect_followup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             request_event_id: Arc::new(std::sync::Mutex::new(None)),
+            coalesced_event_ids: std::sync::Mutex::new(std::collections::HashSet::new()),
+            held_continuations: std::sync::Mutex::new(HashMap::new()),
+            history_read_begun: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether this turn was given the prompt `event_id`, as its anchor or
+    /// coalesced into it.
+    pub fn took(&self, event_id: Uuid) -> bool {
+        *self.request_event_id.lock().unwrap() == Some(event_id)
+            || self.coalesced_event_ids.lock().unwrap().contains(&event_id)
     }
 
     /// Deliver a prompt to the running agentic loop and wake anything
@@ -379,9 +439,42 @@ impl ThreadHandle {
     /// (the turn ended between the caller's lookup and this send) — the
     /// caller then falls back to starting a fresh turn.
     ///
+    /// A prompt that can carry a turn is recorded as taken. The rest of its
+    /// sentence, held because it arrived first, then goes right behind it.
+    ///
+    /// Callers hold the `active_threads` lock, which keeps this atomic with
+    /// [`inject_the_rest_of_a_sentence`]'s check and hold.
+    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+        let coalesced = prompt.event_id.filter(|_| prompt.kind.can_carry_a_turn());
+        if !self.send(prompt) {
+            return false;
+        }
+        if let Some(event_id) = coalesced {
+            self.coalesced_event_ids.lock().unwrap().insert(event_id);
+            let held = self.held_continuations.lock().unwrap().remove(&event_id);
+            for rest in held.into_iter().flatten() {
+                self.send(rest);
+            }
+        }
+        true
+    }
+
+    /// Hold the rest of a spoken sentence until `asked_turn`, the prompt
+    /// carrying its ask, is coalesced into this turn.
+    fn hold_until_taken(&self, asked_turn: Uuid, rest: InjectedPrompt) {
+        self.held_continuations
+            .lock()
+            .unwrap()
+            .entry(asked_turn)
+            .or_default()
+            .push(rest);
+    }
+
+    /// Put one prompt on the channel. False when the receiver is gone.
+    ///
     /// Count BEFORE sending, and wake after. Both orderings are load-bearing:
     ///
-    /// - **Count before send.** `send` publishes the prompt to the loop at
+    /// - **Count before send.** The channel send publishes the prompt to the loop at
     ///   once, so a drain can report it consumed before a post-send increment
     ///   lands. The saturating decrement would then no-op against a zero
     ///   count and the late `+1` would strand a phantom unread forever —
@@ -390,7 +483,7 @@ impl ThreadHandle {
     /// - **Wake after count.** A blocking tool registers its waiter and then
     ///   reads the counter, so it must never see "no notification AND no
     ///   pending work".
-    pub fn inject(&self, prompt: InjectedPrompt) -> bool {
+    fn send(&self, prompt: InjectedPrompt) -> bool {
         self.pending_injections
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         if self.injection_tx.send(prompt).is_ok() {
@@ -692,6 +785,7 @@ pub struct LucidosEngine {
     /// Widget fit checks waiting for a page's answer. The fit check inserts
     /// one; `POST /api/v1/widgets/fit-report` resolves it.
     pub(crate) pending_widget_fits: Arc<widget_fit::PendingWidgetFits>,
+    pub(crate) widget_fit_sessions: Arc<widget_fit_sessions::FitSessions>,
     /// The Claude gateway sign-in in progress, if any. Allowed-ephemeral: a
     /// restart mid-sign-in only means starting again.
     pub(crate) claude_gateway_sign_in: Arc<claude_gateway_sign_in::ClaudeGatewaySignIn>,
@@ -875,8 +969,7 @@ pub struct LucidosEngine {
     /// don't schedule anything; the SchedulerManager just owns the loader for
     /// startup-replay symmetry with triggers, while HTTP / LLM tool callers
     /// read this registry directly.
-    pub(crate) trigger_groups:
-        Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerGroup>>>,
+    pub(crate) trigger_groups: Arc<std::sync::RwLock<crate::triggers::TriggerGroupProjection>>,
     /// Serializes invariant-bearing writes (create, rename) on
     /// `trigger_groups`. The std `RwLock` on the registry above can't be held
     /// across `.await`, which leaves a TOCTOU window between the read-time
@@ -885,9 +978,8 @@ pub struct LucidosEngine {
     /// async mutex closes the window: helpers in `trigger_group_writes`
     /// acquire it for the full read-dedup + emit + apply span, so the
     /// unique-name invariant holds even under concurrent requests. Reads,
-    /// delete, and reorder don't acquire it (they can't violate the
-    /// invariant; delete-then-create false-positive 409 is a separate,
-    /// known-quirk).
+    /// delete, and reorder don't acquire it. The projection merges their
+    /// sequence-versioned updates independently.
     pub(crate) trigger_group_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes emit + registry-apply on `trigger_configs`, so the order the
     /// registry is written in is the order the event log records. Same shape as
@@ -1081,7 +1173,7 @@ async fn follow_vertex_region(
                     None => return true,
                 },
                 Err(e) => {
-                    log!("[Preferences] vertex_region re-read failed: {}", e);
+                    log_legacy!("[Preferences] vertex_region re-read failed: {}", e);
                     return true;
                 }
             }
@@ -1091,14 +1183,14 @@ async fn follow_vertex_region(
         Ok(mut guard) => {
             let old = std::mem::replace(&mut *guard, region.clone());
             if old != region {
-                log!(
+                log_legacy!(
                     "[Preferences] vertex_region updated live: {} → {}",
                     old,
                     region
                 );
             }
         }
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Preferences] vertex_region update skipped (lock poisoned): {}",
             e
         ),
@@ -1117,7 +1209,7 @@ fn lag_or_stop<T>(
     use tokio::sync::broadcast::error::RecvError;
     match e {
         RecvError::Lagged(n) => {
-            log!(
+            log_legacy!(
                 "{} subscriber lagged by {} events, re-reading its state",
                 subscriber,
                 n
@@ -1312,14 +1404,14 @@ pub(crate) async fn swap_in_rebuilt_providers(
             match llm_handle.write() {
                 Ok(mut guard) => {
                     *guard = llm;
-                    log!(
+                    log_legacy!(
                         "[Providers] active LLM provider swapped to {:?} after {} changed, no restart",
                         selection,
                         trigger
                     );
                 }
                 Err(e) => {
-                    log!("[Providers] provider swap skipped (lock poisoned): {}", e)
+                    log_legacy!("[Providers] provider swap skipped (lock poisoned): {}", e)
                 }
             }
             // Swapped in the same pass as the LLM provider: adding an
@@ -1329,7 +1421,7 @@ pub(crate) async fn swap_in_rebuilt_providers(
                 Ok(mut guard) => {
                     let ids = web_search.backend_ids();
                     *guard = web_search;
-                    log!(
+                    log_legacy!(
                         "[Providers] web search backends now: {}",
                         if ids.is_empty() {
                             "none configured".to_string()
@@ -1339,12 +1431,12 @@ pub(crate) async fn swap_in_rebuilt_providers(
                     );
                 }
                 Err(e) => {
-                    log!("[Providers] web search swap skipped (lock poisoned): {}", e)
+                    log_legacy!("[Providers] web search swap skipped (lock poisoned): {}", e)
                 }
             }
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Providers] provider rebuild after {} changed failed: {}. Keeping current provider",
                 trigger,
                 e
@@ -1367,7 +1459,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
         return;
     }
     if new_dir.exists() {
-        log!(
+        log_legacy!(
             "[Startup] both legacy {} and new {} auth-modules dirs exist; \
              leaving both alone (engine reads new path only)",
             legacy.display(),
@@ -1377,7 +1469,7 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
     }
     if let Some(parent) = new_dir.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            log!(
+            log_legacy!(
                 "[Startup] could not create parent {} for auth-modules migration: {}",
                 parent.display(),
                 e
@@ -1386,12 +1478,12 @@ pub(crate) fn migrate_legacy_auth_modules_dir(workspace_path: &Path) {
         }
     }
     match std::fs::rename(&legacy, &new_dir) {
-        Ok(()) => log!(
+        Ok(()) => log_legacy!(
             "[Startup] migrated auth-modules dir: {} -> {}",
             legacy.display(),
             new_dir.display()
         ),
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Startup] auth-modules migration failed ({} -> {}): {}",
             legacy.display(),
             new_dir.display(),
@@ -1428,7 +1520,7 @@ pub(crate) type ThreadRegistration = (
 
 /// Build the handle and its guard, and put the handle in the map.
 ///
-/// The shared body of the two admission functions below. Never call it
+/// The shared body of the admission functions. Never call it
 /// directly: on its own it is the unconditional insert they exist to prevent.
 fn install_thread_handle(
     threads: &mut HashMap<Uuid, ThreadHandle>,
@@ -1482,10 +1574,9 @@ impl Admission {
 
 /// Admit one run on `thread_id`, or refuse because a turn already owns it.
 ///
-/// **This is the single-flight point for the whole engine.** The question "is a
-/// turn already live here?" and the insert that answers it for the next caller
-/// happen under ONE lock acquisition, through a vacant entry. Nothing else may
-/// put a handle in `active_threads`.
+/// Admission keeps the engine single-flight: the check and insert happen
+/// under one lock. [`hand_over_or_admit`] shares that lock and installer.
+/// Only admission functions may put a handle in `active_threads`.
 ///
 /// The predecessor asked and inserted separately, and inserted unconditionally.
 /// Two wakes for one logical event both read "free", both inserted, and the
@@ -1613,7 +1704,7 @@ where
             };
 
         if tokio::time::Instant::now() >= deadline {
-            log!(
+            log_legacy!(
                 "[Chat] Thread {} stuck for {}s, force-cancelling and evicting",
                 thread_id,
                 stuck_turn_timeout.as_secs()
@@ -1624,14 +1715,14 @@ where
             {
                 return registration;
             }
-            log!(
+            log_legacy!(
                 "[Chat] Thread {} was handed to another waiter first, queuing behind its turn",
                 thread_id
             );
             continue;
         }
 
-        log!(
+        log_legacy!(
             "[Chat] Thread {} is busy, queuing follow-up request",
             thread_id
         );
@@ -1667,6 +1758,156 @@ pub(crate) fn record_request_event_id(
         .filter(|h| h.generation == generation)
     {
         *handle.request_event_id.lock().unwrap() = Some(request_event_id);
+    }
+}
+
+/// Record that `thread_id`'s turn is about to read its history, unless the
+/// registration has moved on. `generation` guards it as in
+/// [`record_request_event_id`].
+///
+/// Call it BEFORE the read. Marked late, a row committed in between would be
+/// in neither the history nor an injection.
+pub(crate) fn record_history_read_begun(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    generation: u64,
+) {
+    if let Some(handle) = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .filter(|h| h.generation == generation)
+    {
+        handle
+            .history_read_begun
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// What became of the rest of a spoken sentence offered to a live turn.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestOfSentence {
+    /// The turn that took the ask has it now.
+    Injected,
+    /// The live turn has not taken the ask yet. It gets the words right behind
+    /// the ask if the ask is coalesced into it.
+    Held,
+    /// Whatever turn takes the ask reads the row from its history.
+    LeftToHistory,
+}
+
+/// Offer the rest of a spoken sentence to the live turn on `thread_id`
+/// (ADR 0198).
+///
+/// `asked_turn` is the prompt the turn that took the ask was given: the ask
+/// itself, or the anchor of the turn it went into. The words are on the
+/// thread as their own row already. So only a live turn that took
+/// `asked_turn`, and has started reading its history, gets them:
+///
+/// - A turn still to read its history reads the row there, and an offer
+///   would make it read them twice.
+/// - A turn that has not taken `asked_turn` may still have it coalesced into
+///   it, so it holds the words for that. Any other turn never hears of them.
+pub(crate) fn inject_the_rest_of_a_sentence(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    asked_turn: Uuid,
+    prompt: InjectedPrompt,
+) -> RestOfSentence {
+    let threads = active_threads.lock().unwrap();
+    let Some(handle) = threads.get(&thread_id).filter(|h| {
+        h.history_read_begun
+            .load(std::sync::atomic::Ordering::Acquire)
+    }) else {
+        return RestOfSentence::LeftToHistory;
+    };
+    if !handle.took(asked_turn) {
+        handle.hold_until_taken(asked_turn, prompt);
+        return RestOfSentence::Held;
+    }
+    if handle.inject(prompt) {
+        RestOfSentence::Injected
+    } else {
+        RestOfSentence::LeftToHistory
+    }
+}
+
+/// The result of offering an orphan batch under the admission lock.
+pub(crate) enum OrphanAdmission {
+    HandedOver,
+    Closing(Vec<InjectedPrompt>),
+    Admitted(ThreadRegistration, Vec<InjectedPrompt>),
+}
+
+/// Hand over a batch or install its re-run under the same lock.
+pub(crate) fn hand_over_or_admit(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    completion_notify: &Arc<std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Notify>>>>,
+    thread_id: Uuid,
+    prompts: Vec<InjectedPrompt>,
+) -> OrphanAdmission {
+    let mut threads = active_threads.lock().unwrap();
+    let Some(handle) = threads.get(&thread_id) else {
+        let registration =
+            install_thread_handle(&mut threads, active_threads, completion_notify, thread_id);
+        return OrphanAdmission::Admitted(registration, prompts);
+    };
+    let mut prompts = prompts.into_iter();
+    while let Some(prompt) = prompts.next() {
+        if !handle.inject(prompt.clone()) {
+            return OrphanAdmission::Closing(std::iter::once(prompt).chain(prompts).collect());
+        }
+    }
+    OrphanAdmission::HandedOver
+}
+
+/// Own a registration during setup, recovering injections on an early return.
+pub(crate) struct PreAdmission {
+    registration: Option<ThreadRegistration>,
+    recover: Box<dyn FnOnce(Vec<InjectedPrompt>) + Send + Sync>,
+}
+
+impl PreAdmission {
+    pub(crate) fn new(
+        registration: ThreadRegistration,
+        recover: impl FnOnce(Vec<InjectedPrompt>) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            registration: Some(registration),
+            recover: Box::new(recover),
+        }
+    }
+
+    pub(crate) fn take(mut self) -> ThreadRegistration {
+        self.registration
+            .take()
+            .expect("pre-admission owns its registration")
+    }
+}
+
+/// Setup checks for a predecessor, excluding the registration it already owns.
+pub(crate) fn has_other_live_turn(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    admission: Option<&PreAdmission>,
+) -> bool {
+    let own_generation = admission
+        .and_then(|pending| pending.registration.as_ref())
+        .map(|(_, _, guard)| guard.generation());
+    active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .is_some_and(|handle| Some(handle.generation) != own_generation)
+}
+
+impl Drop for PreAdmission {
+    fn drop(&mut self) {
+        if let Some((_, mut rx, guard)) = self.registration.take() {
+            let prompts = LucidosEngine::finalize_turn_and_drain_injections(guard, &mut rx);
+            let recover = std::mem::replace(&mut self.recover, Box::new(|_| {}));
+            recover(prompts);
+        }
     }
 }
 
@@ -1806,6 +2047,10 @@ mod injection_tests;
 #[cfg(test)]
 #[path = "mod_tests/restart_anchor.rs"]
 mod restart_anchor_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/rest_of_sentence.rs"]
+mod rest_of_sentence_tests;
 
 #[cfg(test)]
 mod value_pins_tests;

@@ -118,7 +118,7 @@ impl StartupLedger {
                 std::fs::rename(temp, &path)
             });
         if let Err(e) = written {
-            crate::log!(
+            crate::log_legacy!(
                 "[StartupInstructions] could not write the ledger {}: {}",
                 path.display(),
                 e
@@ -187,14 +187,14 @@ impl StartupCheck {
         let recorded = match last_recorded_instructions(&path) {
             Ok(Some(recorded)) => recorded,
             Ok(None) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[StartupInstructions] {} has no instructions record. Key stays unverified.",
                     path.display()
                 );
                 return;
             }
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[StartupInstructions] cannot read {}: {}. Key stays unverified.",
                     path.display(),
                     e
@@ -205,7 +205,7 @@ impl StartupCheck {
         match self.expected.first_difference(&recorded) {
             None => {
                 StartupLedger::record(&self.workspace, &self.key, Verdict::Verified);
-                crate::log!(
+                crate::log_legacy!(
                     "[StartupInstructions] verified a key: Claude Code loaded exactly the \
                      mirror's {} files",
                     recorded.len()
@@ -213,7 +213,7 @@ impl StartupCheck {
             }
             Some(difference) => {
                 StartupLedger::record(&self.workspace, &self.key, Verdict::Failed);
-                crate::log!(
+                crate::log_legacy!(
                     "[StartupInstructions] the mirror differs from Claude Code, so these \
                      files stay unmoved: {}",
                     difference
@@ -317,7 +317,7 @@ fn probe_version(binary: &Path) -> Option<String> {
                 // Reaping a process we just killed is cleanup only.
                 let _ = child.kill();
                 let _ = child.wait();
-                crate::log!(
+                crate::log_legacy!(
                     "[StartupInstructions] {} --version did not answer in {}s",
                     binary.display(),
                     VERSION_PROBE_TIMEOUT.as_secs()

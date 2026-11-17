@@ -142,8 +142,8 @@ export interface ToastOptions {
   /** Auto-dismiss after this many ms. Omit for the host default: an error or
    *  warning stays until dismissed, success and info auto-close. */
   durationMs?: number;
-  /** false = never show the close (X) button. A toast that leaves on its own
-   *  timer and has no button shows none either way. Default true. */
+  /** false = hide the close (X) on persistent toasts. Timed toasts always
+   *  show the X so the user can dismiss them early. Default true. */
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
    *  updates the existing toast instead of stacking a new one, so an

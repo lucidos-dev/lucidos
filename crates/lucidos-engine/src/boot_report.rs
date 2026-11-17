@@ -90,14 +90,14 @@ pub fn report(phase: &str) {
             Ok(c) => c,
             Err(_) => return,
         };
-        // Scheme via `net_config::peer_scheme_order` (never hardcoded — the dev
-        // gateway serves TLS, packaged serves plain http): resolved scheme
-        // first, the other protocol as fallback so a mismatch still reports.
+        // Scheme via `net_config::gateway_scheme_order` (never hardcoded — the dev
+        // gateway serves TLS, packaged serves plain http): the gateway's scheme
+        // first, the other as fallback so a mismatch still reports.
         //
         // Best-effort: the gateway's own health probe is the source of truth for
         // readiness; a dropped phase report only costs a slightly less specific
         // splash label, and the next phase (or the healthy probe) supersedes it.
-        for scheme in crate::net_config::peer_scheme_order() {
+        for scheme in crate::net_config::gateway_scheme_order() {
             let url =
                 format!("{scheme}://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-phase");
             if client

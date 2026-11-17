@@ -11,7 +11,7 @@ export type DisplaySection = 'saved' | 'current' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';
 export const THREAD_STATUSES: readonly ThreadStatus[] = ['idle', 'running', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const;
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
-export type Action = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
+export type ThreadAction = 'discard_draft' | 'discard' | 'apply' | 'set_aside' | 'apply_when_settled' | 'archive' | 'save' | 'unsave';
 
 export const LEGAL_SECTIONS: Readonly<Record<ThreadType, readonly ArchiveState[]>> = {
   chat: ['archived', 'inbox'],
@@ -71,9 +71,17 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   WorkItemGateEscalated: 'metadata',
   WorkItemWatched: 'metadata',
   WorkItemUnwatched: 'metadata',
-  PeopleMessagePosted: 'metadata',
+  UserOnlyMessagePosted: 'metadata',
   AgentPaused: 'metadata',
   AgentResumed: 'metadata',
+  AutomationPaused: 'metadata',
+  AutomationUnpaused: 'metadata',
+  PermissionGranted: 'metadata',
+  PermissionSpent: 'metadata',
+  PermissionRestored: 'metadata',
+  PermissionRevoked: 'metadata',
+  PermissionRequestPrepared: 'metadata',
+  BatchItemRan: 'metadata',
   ThreadStarted: 'metadata',
   ThreadDiscarded: 'metadata',
   HomeThreadCreated: 'metadata',
@@ -106,10 +114,16 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   FormRequestResolved: 'metadata',
   McpConsentRequested: 'activity',
   CodingAgentSettingsChanged: 'metadata',
+  CodingAgentBillingObserved: 'metadata',
   ChatSettingsChanged: 'metadata',
+  ChatTurnSettingsResolved: 'metadata',
   CodingAgentCompacted: 'metadata',
+  CodingAgentModelSubstituted: 'metadata',
   SuccessorThreadSpawned: 'metadata',
   SessionHandedOff: 'metadata',
+  PlanStarted: 'metadata',
+  PlanProposed: 'metadata',
+  PlanApproved: 'metadata',
   HandoffCheckpointReached: 'metadata',
   SuccessorOfferDeclined: 'metadata',
   SuccessorRequested: 'metadata',
@@ -133,8 +147,11 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ContextKeptOpen: 'metadata',
   BackgroundBashStarted: 'metadata',
   BackgroundBashCompleted: 'metadata',
+  ConfinementRunStarted: 'metadata',
   OwnerApprovalRequested: 'metadata',
   OwnerApprovalSpent: 'metadata',
+  UnattestedActSpent: 'metadata',
+  MachineMadeWorkspaceChanged: 'metadata',
   ImageDescribed: 'metadata',
   ConversationSummarized: 'metadata',
   CommandCheckpointed: 'metadata',
@@ -178,6 +195,7 @@ export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([
   'ContinuationRequested',
   'MissingHardeningDetected',
   'CodingAgentSettingsChanged',
+  'CodingAgentBillingObserved',
   'UserQuestionAsked',
   'UserQuestionAnswered',
 ]);
@@ -214,7 +232,7 @@ export const LAST_ACTIVITY_EVENTS: ReadonlySet<string> = new Set([
   'VoiceSessionStarted',
   'SpokenMessageReceived',
   'SpokenReplyGenerated',
-  'PeopleMessagePosted',
+  'UserOnlyMessagePosted',
 ]);
 
 export function isSectionLegal(threadType: ThreadType, section: ArchiveState): boolean {
@@ -248,8 +266,8 @@ export function availableThreadActions(
   hasLiveEventWaits: boolean,
   hasUnsentDraft: boolean,
   isSaved: boolean,
-): Action[] {
-  const actions: Action[] = [];
+): ThreadAction[] {
+  const actions: ThreadAction[] = [];
   const live = status === 'running' || status === 'waiting_for_user_answer';
   const codingAgentPending = hasPendingChanges && threadType === 'claude_code';
   if (hasUnsentDraft) actions.push('discard_draft');

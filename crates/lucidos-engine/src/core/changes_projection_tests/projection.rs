@@ -114,6 +114,7 @@ async fn re_emit_with_none_description_preserves_existing() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: None,
             files: vec!["a.rs".to_string()],
@@ -166,6 +167,7 @@ async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("partial work from failed run".to_string()),
             files: vec!["a.rs".to_string()],
@@ -195,6 +197,7 @@ async fn incomplete_flag_round_trips_and_clears_on_re_emit() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("clean follow-up".to_string()),
             files: vec!["a.rs".to_string()],
@@ -239,6 +242,7 @@ async fn re_emitted_aggregate_updates_existing_row() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("updated".to_string()),
             files: vec!["a.rs".to_string()],
@@ -289,6 +293,7 @@ async fn change_applied_transitions_to_applied_with_commits() {
         &bus,
         thread,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: true,
             client_update: false,
@@ -393,6 +398,7 @@ async fn change_hardened_sets_hardened_flag() {
         &bus,
         thread,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("d".to_string()),
             files: vec!["a.rs".to_string()],

@@ -1,15 +1,17 @@
 use super::*;
+use crate::api::owner_door::{OnUnattested, OwnerAct};
 
 use crate::core::environment_variables::{validate_agent_name, validate_name, NameRejection};
-use crate::core::grants::{self, GrantFile};
+use crate::core::grants::{self, GrantFile, GrantSource};
 use crate::core::{
     validate_routes, AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore,
     ModelFields, ModelStore, OAuthStore, PinnedAppStore, PreferenceStore,
 };
+use crate::engine::permission::tool_grants::{self, ChangedBy, StandingChange};
 use crate::llm::{supported_efforts, ProviderKind};
 
 /// Response/request body for all three allowlist editors (`cc-allowed-tools`,
-/// `agent-allowed-commands` and `mcp-allowed-tools`): the raw file text, one
+/// `agent-allowed-commands` and `mcp-allowed-tools`): the grant file text, one
 /// pattern per line. The settings UI parses it into editable rows and
 /// reserializes on save.
 ///
@@ -25,76 +27,78 @@ pub(super) struct AllowlistRequest {
     pub(super) contents: String,
 }
 
-/// GET /api/v1/cc-allowed-tools — return the raw contents of
-/// `<workspace>/.lucidos/cc-allowed-tools` so the settings UI can display them.
-/// A missing file returns the seeded header (mirrors `cc_allowed_tools`).
+/// GET /api/v1/cc-allowed-tools: this workspace's standing coding-agent grants,
+/// in the grant file's own text shape, so the settings UI can display them.
 pub(super) async fn get_cc_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
-    let dir = state.engine.grants_dir();
-    let contents = grants::read_raw(&dir, GrantFile::CodingAgentTools).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read cc-allowed-tools: {}", e),
-        )
-    })?;
-    Ok(Json(AllowlistResponse { contents }))
+    read_grant_file(&state, GrantFile::CodingAgentTools).await
 }
 
-/// Overwrite one grant file, and announce what the permission became.
-///
-/// **The write and the emit are one operation.** Each of the three editors
-/// widens what an agent may run without a permission card. All three were a
-/// bare `fs::write` leaving no trace, so `PUT /api/v1/cc-allowed-tools` with
-/// `{"contents":"Bash(*)"}` was invisible in the events table.
-///
-/// One helper, rather than the pair copied into three handlers. Three copies
-/// is how the emit came to be missing from all of them.
-///
-/// The patterns come from the body we just wrote, not from a read-back, so a
-/// concurrent edit cannot make the event describe somebody else's write.
+/// One lane's standing grants as grant file text. The rows are the authority,
+/// so this never reads the mirror. A read that fails is an error, never an
+/// empty list, since saving an empty list back would revoke every grant.
+pub(super) async fn read_grant_file(
+    state: &AppState,
+    file: GrantFile,
+) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
+    let standing =
+        tool_grants::reconciled_standing(&state.engine.event_bus, &state.engine.grants_dir(), file)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read {}: {}", file.file_name(), e),
+                )
+            })?;
+    Ok(Json(AllowlistResponse {
+        contents: file.mirror_body(&standing),
+    }))
+}
+
+/// Make one lane's standing grants exactly the lines in `contents`. The change
+/// is a `PermissionGrantsChanged` with source `settings`, and the grant file
+/// mirror follows it.
 pub(super) async fn write_grant_file(
     state: &AppState,
     headers: &HeaderMap,
     file: GrantFile,
     contents: &str,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // Before the write. A grant file widens what an agent may run without a
+    // Before the write. A grant widens what an agent may run without a
     // permission card, so an unidentified caller must not reach it at all.
     let actor = crate::api::actor::require_user_actor(headers, &state.pool, None)
         .await
         .map_err(|e| (e.status, e.message))?;
-    super::thread_reach::refuse_agent_permission_grant(headers)
+    super::thread_reach::require_owner_for_permission_grant(headers)
         .map_err(|e| (e.status, e.message))?;
-    grants::write_raw(&state.engine.grants_dir(), file, contents).map_err(|e| {
+    let patterns = grants::parse_patterns(contents);
+    let by = ChangedBy {
+        source: GrantSource::Settings,
+        thread_id: None,
+        actor: Some(actor),
+    };
+    tool_grants::change_standing(
+        &state.engine.event_bus,
+        &state.engine.grants_dir(),
+        file,
+        StandingChange::Replace(&patterns),
+        by,
+    )
+    .await
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write {}: {}", file.file_name(), e),
+            format!("Failed to save {}: {}", file.file_name(), e),
         )
     })?;
-    let patterns = grants::parse_patterns(contents);
-    state
-        .engine
-        .event_bus
-        .emit_or_log(
-            crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::PermissionGrantsChanged {
-                    grant_file: file,
-                    patterns,
-                    actor: Some(actor),
-                },
-            ),
-            "[Settings] PermissionGrantsChanged",
-        )
-        .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// PUT /api/v1/cc-allowed-tools — overwrite the file with the provided contents
-/// (atomic).
+/// PUT /api/v1/cc-allowed-tools: replace the standing coding-agent grants.
 ///
-/// The engine's own permission gate reads this file fresh on each prompt, so an
-/// ADDED pattern binds every live session at once (ADR 0125). A REMOVED one
+/// The engine's own permission gate reads the grants fresh on each prompt, so
+/// an ADDED pattern binds every live session at once (ADR 0125). A REMOVED one
 /// binds the gate just as fast. But an in-flight subprocess keeps its frozen
 /// `--allowedTools` flag until it respawns, and never asks the engine about a
 /// call that flag already covers.
@@ -112,26 +116,17 @@ pub(super) async fn put_cc_allowed_tools(
     .await
 }
 
-/// GET /api/v1/agent-allowed-commands — return the raw contents of
-/// `<workspace>/.lucidos/agent-allowed-commands`, the Lucidos Agent command-guard
-/// allowlist (ADR 0002). Missing file returns the seeded header. The chat
-/// counterpart of `get_cc_allowed_tools`.
+/// GET /api/v1/agent-allowed-commands: the Lucidos Agent's standing command
+/// grants (ADR 0002). The chat counterpart of `get_cc_allowed_tools`.
 pub(super) async fn get_agent_allowed_commands(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, (StatusCode, String)> {
-    let dir = state.engine.grants_dir();
-    let contents = grants::read_raw(&dir, GrantFile::AgentCommands).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to read agent-allowed-commands: {}", e),
-        )
-    })?;
-    Ok(Json(AllowlistResponse { contents }))
+    read_grant_file(&state, GrantFile::AgentCommands).await
 }
 
-/// PUT /api/v1/agent-allowed-commands — overwrite the file (atomic). The command
-/// guard reads it fresh on each prompt, so an edit takes effect on the next
-/// gated command — no restart.
+/// PUT /api/v1/agent-allowed-commands: replace the standing command grants. The
+/// command guard reads them fresh on each prompt, so an edit takes effect on
+/// the next gated command, with no restart.
 pub(super) async fn put_agent_allowed_commands(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -342,10 +337,13 @@ pub(super) async fn update_credential(
             .await
             .map(|account| account.map(|a| a.require_send_confirmation));
         if lowers_send_confirmation(email.require_send_confirmation, stored_flag) {
-            if let Err(refusal) = crate::api::actor::refuse_agent_caller(
+            // A credential update carries a secret, so it cannot wait for
+            // the owner in the event log.
+            if let Err(refusal) = crate::api::actor::require_attested_owner(
                 &headers,
                 "An agent cannot turn off email send confirmation. Only the user \
                  turns it off, in the account's settings.",
+                crate::api::owner_door::OnUnattested::Refuse,
             ) {
                 return ApiResult::err(refusal.message);
             }
@@ -1048,10 +1046,17 @@ pub(super) async fn reauthorize_oauth(
         Some(p) if !p.is_empty() => p.to_string(),
         _ => return ApiResult::err("provider is required"),
     };
-    let scopes = match body["scopes"].as_str() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => return ApiResult::err("scopes is required"),
-    };
+    let requested_scopes = body["scopes"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // A Connect press asks the engine to add the provider's sign-in scopes, so
+    // the purpose alone may be empty. Every other caller names its exact scopes.
+    let sign_in = body["sign_in"].as_bool().unwrap_or(false);
+    if requested_scopes.is_empty() && !sign_in {
+        return ApiResult::err("scopes is required");
+    }
 
     // The OAuth client has to exist AND be able to drive a flow before the
     // authorization starts. Both shortfalls resolve to the same answer: hand the
@@ -1068,7 +1073,7 @@ pub(super) async fn reauthorize_oauth(
         .as_ref()
         .map(crate::core::oauth::OAuthClientOverrides::from_registry)
         .unwrap_or_default();
-    match CredentialStore::get_oauth_client(&state.pool, &cred_service).await {
+    let scopes = match CredentialStore::get_oauth_client(&state.pool, &cred_service).await {
         Ok(None) => return ApiResult::needs_credentials(&provider, &overrides),
         Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
         Ok(Some(cred)) => {
@@ -1090,8 +1095,40 @@ pub(super) async fn reauthorize_oauth(
                     ),
                 );
             }
+            // Judged on the RESOLVED secret, since a stored reference hides the
+            // value that would repeat the ID.
+            let config = match cred.secret(&state.pool).await {
+                Ok(secret) => serde_json::from_str::<serde_json::Value>(&secret)
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => return ApiResult::err(format!("Failed to read credentials: {}", e)),
+            };
+            if crate::core::oauth::client_secret_repeats_client_id(&config) {
+                return ApiResult::needs_credential_repair(
+                    &provider,
+                    crate::core::oauth::oauth_client_secret_repair_request(
+                        &provider,
+                        &overrides,
+                        cred.id,
+                        config["client_id"].as_str(),
+                    ),
+                );
+            }
+            if sign_in {
+                let rows =
+                    crate::core::oauth_registry::load_providers(state.engine.system_knowhow_dir());
+                crate::core::oauth::merge_scopes(
+                    &crate::core::oauth::sign_in_scopes_for(
+                        registry_row.as_ref(),
+                        cred.stored_value(),
+                        &rows,
+                    ),
+                    &requested_scopes,
+                )
+            } else {
+                requested_scopes
+            }
         }
-    }
+    };
 
     // The device clicking Connect is the one to bring back to the front when the
     // authorization lands, so it rides along to `OAuthAccountConnected`.
@@ -1200,7 +1237,7 @@ pub(super) async fn set_preference(
     // emits PreferencesChanged. The human edits internal keys here. An agent
     // is held to the keys its tool may write, and an app is refused by
     // `app_reach::enforce_app_reach`.
-    refuse_agent_human_only_preference(&headers, &query.key)?;
+    require_owner_for_human_only_preference(&headers, &query.key, setting_act(&query.key))?;
     let actor = preference_write_actor(
         &headers,
         &state.pool,
@@ -1233,7 +1270,7 @@ pub(super) async fn delete_preference(
 ) -> Result<Json<ApiResult>, ApiError> {
     let key = query.key;
     // Deleting a key restores its default, which is a write like any other.
-    refuse_agent_human_only_preference(&headers, &key)?;
+    require_owner_for_human_only_preference(&headers, &key, setting_act(&key))?;
     // `delete` emits the `PreferencesChanged` with `value: None` ("back to the
     // default") itself; resolve the device actor for it.
     let actor = preference_write_actor(&headers, &state.pool, &key, None).await?;
@@ -1261,6 +1298,7 @@ pub(in crate::api) async fn preference_write_actor(
                 pool,
                 device,
                 "snapshot_restore_policy_owner_device_required",
+                setting_act(key),
             )
             .await?,
         ))
@@ -1269,25 +1307,36 @@ pub(in crate::api) async fn preference_write_actor(
     }
 }
 
-/// Refuse an agent writing a preference its own tool may not write.
+/// Refuse anyone but the attested owner writing a preference an agent's own
+/// tool may not write.
 ///
 /// The preference catalog is the one list: every key with no agent access
 /// (`prefs::internal_hint`). That covers the command guard, the tool-call cap,
 /// the network bind, the provider switches and the local model host. An agent
 /// refused by `set_preference` must not reach the same key through
 /// `lucidos preferences set` or a raw HTTP call. See
-/// [`super::actor::refuse_agent_caller`] for what this layer does not close.
-pub(in crate::api) fn refuse_agent_human_only_preference(
+/// [`super::actor::require_attested_owner`] for what this layer does not close.
+pub(in crate::api) fn require_owner_for_human_only_preference(
     headers: &HeaderMap,
     key: &str,
+    on_unattested: OnUnattested,
 ) -> Result<(), ApiError> {
     match crate::core::prefs::internal_hint(key) {
-        Some(hint) => super::actor::refuse_agent_caller(
+        Some(hint) => super::actor::require_attested_owner(
             headers,
             format!("An agent cannot write the preference '{key}': {hint}."),
+            on_unattested,
         ),
         None => Ok(()),
     }
+}
+
+/// Ask the owner before an unattested caller writes the setting `key`.
+pub(in crate::api) fn setting_act(key: &str) -> OnUnattested {
+    OnUnattested::Ask(OwnerAct::new(format!(
+        "change the setting {}",
+        super::permission_requests::one_line(key)
+    )))
 }
 
 // ===== Network access (per-workspace engine bind) =====
@@ -1342,7 +1391,8 @@ pub(super) async fn put_network_config(
     headers: HeaderMap,
     Json(request): Json<SetNetworkConfigRequest>,
 ) -> Result<Json<ApiResult>, (StatusCode, String)> {
-    refuse_agent_human_only_preference(&headers, crate::core::prefs::NETWORK_BIND.key())
+    let key = crate::core::prefs::NETWORK_BIND.key();
+    require_owner_for_human_only_preference(&headers, key, setting_act(key))
         .map_err(|e| (e.status, e.message))?;
     if let Err(msg) = crate::net_config::validate_bind_input(&request.engine_bind) {
         return Err((StatusCode::BAD_REQUEST, msg));
@@ -1524,7 +1574,7 @@ async fn verified_workspace_serve_url(
     gateway_port: &str,
 ) -> Option<String> {
     let Some(ours) = own_gateway_instance(gateway_port).await else {
-        crate::log!(
+        crate::log_legacy!(
             "[TailnetStatus] gateway on :{} did not name its instance; no serve URL is published",
             gateway_port
         );
@@ -1600,7 +1650,7 @@ async fn own_gateway_instance(gateway_port: &str) -> Option<String> {
         .danger_accept_invalid_certs(true)
         .build()
         .ok()?;
-    for scheme in crate::net_config::peer_scheme_order() {
+    for scheme in crate::net_config::gateway_scheme_order() {
         let origin = format!("{scheme}://127.0.0.1:{gateway_port}");
         if let Some(id) = gateway_instance(&client, &origin).await {
             return Some(id);
@@ -1791,7 +1841,7 @@ pub(super) async fn hand_over_device(
     )
     .await
     .map_err(|e| {
-        log!("[Settings] Device hand-over failed: {}", e);
+        log_legacy!("[Settings] Device hand-over failed: {}", e);
         ApiError::internal(format!(
             "could not hand device {} over to {}: {e}",
             request.old_device_id, request.device_id
@@ -1808,7 +1858,7 @@ pub(super) async fn list_devices(
     match crate::core::DeviceStore::list(&state.pool).await {
         Ok(devices) => Ok(Json(DevicesListResponse { devices })),
         Err(e) => {
-            log!("[Settings] Failed to list devices: {}", e);
+            log_legacy!("[Settings] Failed to list devices: {}", e);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": e.to_string() })),
@@ -1889,10 +1939,11 @@ pub(super) async fn send_email_confirmed(
     // This route is the user's answer to a confirm form, so an agent pressing
     // it would skip `require_send_confirmation`. A 403 rather than the
     // `success: false` shape: no confirm form reads this refusal, the agent does.
-    crate::api::actor::refuse_agent_caller(
+    crate::api::actor::require_attested_owner(
         &headers,
         "An agent cannot confirm an email send. The user confirms the draft on the \
          form `send_email` opened, and only that sends it.",
+        OnUnattested::Ask(OwnerAct::new("send an email draft")),
     )?;
     Ok(send_confirmed_draft(&state, &headers, &body).await)
 }
@@ -2064,7 +2115,7 @@ async fn send_confirmed_draft(
             Json(serde_json::json!({ "success": true }))
         }
         Err(e) => {
-            log!("[Email] Failed to send email to {}: {}", to.join(", "), e);
+            log_legacy!("[Email] Failed to send email to {}: {}", to.join(", "), e);
             Json(serde_json::json!({ "success": false, "error": format!("{}", e) }))
         }
     }
@@ -2430,7 +2481,7 @@ mod tailnet_status_tests {
     #[tokio::test]
     async fn our_own_gateway_names_its_instance_over_loopback() {
         // Plain HTTP, so a run with TLS configured must fall through to the
-        // second scheme in `peer_scheme_order` to reach it.
+        // second scheme in `gateway_scheme_order` to reach it.
         let origin = stand_in_gateway(gateway_health("ours")).await;
         let port = origin.rsplit(':').next().expect("a port");
         assert_eq!(own_gateway_instance(port).await.as_deref(), Some("ours"));

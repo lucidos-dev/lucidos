@@ -130,7 +130,7 @@ pub(super) async fn post_blob(
     let preview_hash = resolved.hash.clone();
     tokio::task::spawn_blocking(move || {
         if let Err(e) = get_or_create_preview(&workspace, &preview_hash, PREVIEW_MAX_EDGE) {
-            crate::log!("[Blobs] preview pre-generation failed for {preview_hash}: {e}");
+            crate::log_legacy!("[Blobs] preview pre-generation failed for {preview_hash}: {e}");
         }
     });
 

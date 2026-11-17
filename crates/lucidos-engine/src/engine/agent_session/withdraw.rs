@@ -118,6 +118,48 @@ pub(crate) fn begin_withdraw(
     }));
 }
 
+/// Withdraw an unread ceiling input before forwarding Stop. Wait for its
+/// receipt so the driver's idle cannot start a queued engine turn meanwhile.
+pub(crate) async fn withdraw_ceiling_before_stop(
+    bus: &EventBus,
+    thread_id: Uuid,
+    inputs: &mut InputLedger,
+    driver: &mpsc::UnboundedSender<WithdrawRequest>,
+    pending: &mut PendingWithdraws,
+    anchor: Uuid,
+    actor: Option<MessageOrigin>,
+) -> bool {
+    let (reply, mut answer) = oneshot::channel();
+    begin_withdraw(
+        inputs,
+        driver,
+        bus.pool(),
+        thread_id,
+        WithdrawInputRequest {
+            input_event_id: anchor,
+            actor,
+            purpose: WithdrawPurpose::Remove,
+            reply,
+        },
+        pending,
+    );
+    let settled = tokio::time::timeout(WITHDRAW_TIMEOUT, async {
+        loop {
+            tokio::select! {
+                outcome = &mut answer => break outcome,
+                Some(answered) = pending.next() => {
+                    finish_withdraw(bus, thread_id, inputs, answered).await;
+                }
+            }
+        }
+    })
+    .await;
+    matches!(
+        settled,
+        Ok(Ok(InputWithdrawal::Withdrawn | InputWithdrawal::AlreadyRead))
+    )
+}
+
 /// The answer for an input this session never forwarded. Never a read of its
 /// own (the plan's first invariant).
 async fn unheld_outcome(
@@ -186,6 +228,8 @@ async fn record_tombstone(
             thread_id,
             event: ThreadEvent::QueuedMessageRemoved {
                 removed_message_id: input_event_id,
+                restore_to_compose: false,
+                compose: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::Chat),

@@ -292,16 +292,17 @@ below they do apply to engine-spawned sessions.
 `permissions.allow` in `.claude/settings.json` applies **only to a manual
 `claude` launch in this repo**. The engine passes `--allowedTools` when it
 spawns a session, which overrides settings.json permission rules entirely; the
-compiled default is empty and the effective list comes from
-`<workspace>/.lucidos/cc-allowed-tools`, which is **per workspace** (ADR 0095):
-a grant made in one workspace is asked again in the next. See `GrantFile` in
-`crates/lucidos-engine/src/core/grants/mod.rs`.
+compiled default is empty and the effective list is the workspace's standing
+tool grants, which are **per workspace** (ADR 0095): a grant made in one
+workspace is asked again in the next. `<workspace>/.lucidos/cc-allowed-tools`
+only mirrors them, and a line added there by hand grants nothing (ADR 0677).
+See `engine/permission/tool_grants.rs`.
 
 **An allowlist entry does not outrank CC's own path check.** Its Bash evaluator
 runs exact rules, then prefix rules, then a path-validation layer, and only then
 the allow rules. The path layer returns immediately when it asks, unless it
 marked the ask rule-overridable. A `cd` outside the session's allowed working
-directories never is, so `Bash` in `cc-allowed-tools` cannot suppress that card.
+directories never is, so a `Bash` grant cannot suppress that card.
 
 The engine grants two directories through `permissions.additionalDirectories`
 for exactly this reason. `<workspace>/data` holds the artifacts, knowhow, apps

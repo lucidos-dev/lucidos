@@ -4,6 +4,9 @@
 // Source of truth: the engine constant each export names, under
 // crates/lucidos-engine/src.
 
+/** `VERSION` in `../../lucidos-gateway-stamp/src/workspace_client.rs`. */
+export const WORKSPACE_CLIENT_VERSION = 1;
+
 /** `CLIENT_LOG_MAX_BATCH` in `api/internal.rs`. */
 export const CLIENT_LOG_MAX_BATCH = 100;
 
@@ -18,6 +21,9 @@ export const WIDGET_PARAMS_MAX_BYTES = 2048;
 
 /** `WidgetSize::ALL` in `core/apps.rs`. */
 export const WIDGET_SIZES = ["small", "medium", "large", "xl"] as const;
+
+/** `LivenessState::ALL` in `engine/thread_liveness.rs`. */
+export const LIVENESS_STATES = ["working", "quiet", "waiting_for_user_answer", "paused", "failed", "stalled", "waiting", "idle"] as const;
 
 /** `MAX_IDS` in `api/threads/archive_all.rs`. */
 export const ARCHIVE_ALL_MAX_IDS = 2000;
@@ -78,6 +84,18 @@ export const ENGINE_RESTART_INTERRUPT_REASON = "engine_restart_interrupt";
 
 /** `HARDEN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const HARDEN_REQUESTED_REASON = "harden_requested";
+
+/** `PLAN_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const PLAN_REQUESTED_REASON = "plan_requested";
+
+/** `BUILD_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const BUILD_REQUESTED_REASON = "build_requested";
+
+/** `HANDOFF_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const HANDOFF_REQUESTED_REASON = "handoff_requested";
+
+/** `REPORTS_REQUESTED_REASON` in `engine/agent_recovery/helpers.rs`. */
+export const REPORTS_REQUESTED_REASON = "reports_requested";
 
 /** `EFFORT_RESTART_REASON` in `engine/agent_recovery/helpers.rs`. */
 export const EFFORT_RESTART_REASON = "effort_restart";

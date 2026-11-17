@@ -127,6 +127,7 @@ async fn answering_a_question_card_counts_as_the_users_reply() {
     bus.emit(BusEvent::Thread {
         thread_id: caller,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "approve-triage".into(),
             quiet: false,
             answer: AnswerKind::Selected {
@@ -176,6 +177,8 @@ async fn a_queued_message_counts_only_once_the_agent_read_it() {
         thread_id: caller,
         event: ThreadEvent::QueuedMessageRemoved {
             removed_message_id: withdrawn,
+            restore_to_compose: false,
+            compose: None,
         },
         meta: EventMeta::NONE,
     })

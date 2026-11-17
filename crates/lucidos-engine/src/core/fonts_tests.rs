@@ -3,14 +3,6 @@ use std::path::PathBuf;
 
 use super::*;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repo root")
-        .to_path_buf()
-}
-
 #[test]
 fn ids_are_unique_kebab_case_and_never_the_follow_theme_value() {
     let mut seen = HashSet::new();
@@ -81,56 +73,6 @@ fn every_vendored_face_is_an_embedded_woff2() {
                 face.served
             );
         }
-    }
-}
-
-/// OFL permits redistribution with the license text beside the font.
-#[test]
-fn every_vendored_font_ships_its_license_text() {
-    let dir = repo_root().join("crates/lucidos-app/src/assets/fonts");
-    for font in FONT_CATALOG {
-        let FontSource::Vendored { family, .. } = font.source else {
-            continue;
-        };
-        let file = dir.join(format!("LICENSE-{}.txt", family.replace(' ', "")));
-        let text = std::fs::read_to_string(&file)
-            .unwrap_or_else(|_| panic!("{}: missing {}", font.id, file.display()));
-        assert!(
-            text.contains("SIL OPEN FONT LICENSE Version 1.1"),
-            "{}",
-            file.display()
-        );
-        assert_eq!(font.license, "OFL-1.1", "{}", font.id);
-    }
-}
-
-/// The knowhow the agent reads lists the values it may set. A new font it
-/// cannot see is a font it will never suggest.
-#[test]
-fn the_knowhow_names_every_font_id() {
-    for doc in ["system-knowhow/preferences.md", "system-knowhow/js-sdk.md"] {
-        let text = std::fs::read_to_string(repo_root().join(doc)).expect("the doc exists");
-        for value in FONT_PREFERENCE_VALUES {
-            assert!(
-                text.contains(&format!("`{value}`")),
-                "{doc} never names `{value}`"
-            );
-        }
-    }
-}
-
-/// The themes knowhow lists the fonts a theme may name, which is every one. One
-/// the agent cannot see is one it never suggests.
-#[test]
-fn the_themes_knowhow_names_every_font() {
-    let text = std::fs::read_to_string(repo_root().join("system-knowhow/themes.md"))
-        .expect("the doc exists");
-    for font in FONT_CATALOG {
-        assert!(
-            text.contains(&format!("`{}`", font.id)),
-            "themes.md never names `{}`",
-            font.id
-        );
     }
 }
 
@@ -392,4 +334,66 @@ fn a_face_reaches_bold_from_weight_600() {
     assert!(!weight_reaches_bold("300 500"));
     assert!(!weight_reaches_bold("400"));
     assert!(!weight_reaches_bold("not a weight"));
+}
+
+mod guard_tests {
+    use super::*;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("repo root")
+            .to_path_buf()
+    }
+
+    /// OFL permits redistribution with the license text beside the font.
+    #[test]
+    fn every_vendored_font_ships_its_license_text() {
+        let dir = repo_root().join("crates/lucidos-app/src/assets/fonts");
+        for font in FONT_CATALOG {
+            let FontSource::Vendored { family, .. } = font.source else {
+                continue;
+            };
+            let file = dir.join(format!("LICENSE-{}.txt", family.replace(' ', "")));
+            let text = std::fs::read_to_string(&file)
+                .unwrap_or_else(|_| panic!("{}: missing {}", font.id, file.display()));
+            assert!(
+                text.contains("SIL OPEN FONT LICENSE Version 1.1"),
+                "{}",
+                file.display()
+            );
+            assert_eq!(font.license, "OFL-1.1", "{}", font.id);
+        }
+    }
+
+    /// The knowhow the agent reads lists the values it may set. A new font it
+    /// cannot see is a font it will never suggest.
+    #[test]
+    fn the_knowhow_names_every_font_id() {
+        for doc in ["system-knowhow/preferences.md", "system-knowhow/js-sdk.md"] {
+            let text = std::fs::read_to_string(repo_root().join(doc)).expect("the doc exists");
+            for value in FONT_PREFERENCE_VALUES {
+                assert!(
+                    text.contains(&format!("`{value}`")),
+                    "{doc} never names `{value}`"
+                );
+            }
+        }
+    }
+
+    /// The themes knowhow lists the fonts a theme may name, which is every one. One
+    /// the agent cannot see is one it never suggests.
+    #[test]
+    fn the_themes_knowhow_names_every_font() {
+        let text = std::fs::read_to_string(repo_root().join("system-knowhow/themes.md"))
+            .expect("the doc exists");
+        for font in FONT_CATALOG {
+            assert!(
+                text.contains(&format!("`{}`", font.id)),
+                "themes.md never names `{}`",
+                font.id
+            );
+        }
+    }
 }

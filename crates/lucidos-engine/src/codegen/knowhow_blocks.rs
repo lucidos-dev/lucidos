@@ -6,6 +6,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::engine::thread_events::{self as events, ts_codegen};
+use crate::runtime::agent_sandbox::SandboxMode;
 
 macro_rules! samples {
     ($ty:ident; $($variant:ident $({$($field:ident: $value:expr),* $(,)?})?),* $(,)?) => {
@@ -44,16 +45,16 @@ pub(super) fn render(root: &Path) -> String {
         };
     }
     block!(SessionEndReason; Shutdown, Panic, Closed, StaleResume, LegacyNonTerminal);
-    block!(CancelCause; UserStop, UserAction, SupersededByFollowup, EffortRestart, Unknown);
+    block!(CancelCause; UserStop, UserAction, SupersededByFollowup, EffortRestart, Refused, Unknown);
     block!(AbortCause; EngineShutdown, SafetyNet, RecoveryAfterRestart, ProcessKilled, StaleSettle, SessionDropped, SnapshotRestored, Unknown);
-    block!(UnproposedReason; PlanMissing, PlanAwaitingApproval, OutsideBound, HardeningMissing,
+    block!(UnproposedReason; PlanMissing, PlanAwaitingApproval, PlanOnlyCode, OutsideBound, HardeningMissing,
         TurnIncomplete, AwaitingLanding, IntegratedIntoParent, CarriedBySuccessor);
     block!(EngineReason;
         ContinuationStarted, OrphanRecovery,
         Scheduler { trigger_id: String::new(), trigger_name: None, actor_email: None },
         HardenRetrigger, StaleSession, ArchivedBranchWork, UnmergedIntegratedWork,
         SuccessorResidue, SuccessorSession, MergeConflict, MainCheckRed, MainCheckFlaky,
-        MissingHardening, MissingPlan, ContextCeiling,
+        MissingHardening, MissingPlan, ApprovedPlanUnstarted, ContextCeiling,
         PluginAutoUpdate { plugin_id: String::new(), marketplace_id: String::new(), marketplace_name: String::new() },
         PluginSetup { plugin_id: String::new(), plugin_name: String::new(), version: String::new(),
             occasion: events::PluginSetupOccasion::FreshInstall, confirmed_on_device_id: None },
@@ -64,10 +65,23 @@ pub(super) fn render(root: &Path) -> String {
     block!(SessionContinuity; First, Resumed,
         Fresh { reason: events::FreshSessionReason::ChangeApplied },
         Handoff { checkpoint: None, progress: None, crossing: None, opening: events::HandoffOpening::Narrative, message: String::new() });
-    block!(FreshSessionReason; ChangeApplied, ChangeDiscarded, SessionEnded, BranchGone, ResumeFailed, NoResumableSession);
+    block!(FreshSessionReason; ChangeApplied, ChangeDiscarded, SessionEnded, BranchGone, ResumeFailed, NoResumableSession, ProviderBlocked);
     block!(HandoffOpening; Narrative, Brief);
     block!(HandoffCause; Checkpoint, User, ContextCeiling);
     block!(SessionStart; Now, AfterThisTurn, OnNextInput);
+    fragments.insert(
+        "SandboxMode",
+        values(
+            root,
+            "SandboxMode",
+            vec![
+                ("Enforced", SandboxMode::Enforced),
+                ("Inherited", SandboxMode::Inherited),
+                ("OwnerOptedOut", SandboxMode::OwnerOptedOut),
+                ("PermittedOutside", SandboxMode::PermittedOutside),
+            ],
+        ),
+    );
     let manifest = serde_json::json!({
         "schema_version": 1,
         "documents": { "system-knowhow/thread-events.md": fragments },
@@ -79,103 +93,113 @@ pub(super) fn render(root: &Path) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn fragments_use_serde_and_cover_the_declared_enums() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let manifest: serde_json::Value = serde_json::from_str(&render(&root)).unwrap();
-        let fragments = manifest["documents"]["system-knowhow/thread-events.md"]
-            .as_object()
-            .unwrap();
-        for (name, serialized) in [
-            (
-                "SessionEndReason",
-                serde_json::to_value(events::SessionEndReason::StaleResume).unwrap(),
-            ),
-            (
-                "CancelCause",
-                serde_json::to_value(events::CancelCause::UserStop).unwrap(),
-            ),
-            (
-                "AbortCause",
-                serde_json::to_value(events::AbortCause::SessionDropped).unwrap(),
-            ),
-            (
-                "AbortCause",
-                serde_json::to_value(events::AbortCause::SnapshotRestored).unwrap(),
-            ),
-            (
-                "UnproposedReason",
-                serde_json::to_value(events::UnproposedReason::AwaitingLanding).unwrap(),
-            ),
-            (
-                "EngineReason",
-                serde_json::to_value(events::EngineReason::CacheKeepAlive).unwrap(),
-            ),
-            (
-                "SessionContinuity",
-                serde_json::to_value(events::SessionContinuity::First).unwrap(),
-            ),
-            (
-                "FreshSessionReason",
-                serde_json::to_value(events::FreshSessionReason::ResumeFailed).unwrap(),
-            ),
-            (
-                "HandoffOpening",
-                serde_json::to_value(events::HandoffOpening::Brief).unwrap(),
-            ),
-        ] {
-            let wire = serialized
-                .as_str()
-                .or_else(|| serialized["kind"].as_str())
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn fragments_use_serde_and_cover_the_declared_enums() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let manifest: serde_json::Value = serde_json::from_str(&render(&root)).unwrap();
+            let fragments = manifest["documents"]["system-knowhow/thread-events.md"]
+                .as_object()
                 .unwrap();
-            assert!(fragments[name]
-                .as_str()
-                .unwrap()
-                .contains(&format!("\n- `{wire}`\n")));
+            for (name, serialized) in [
+                (
+                    "SandboxMode",
+                    serde_json::to_value(SandboxMode::Inherited).unwrap(),
+                ),
+                (
+                    "SessionEndReason",
+                    serde_json::to_value(events::SessionEndReason::StaleResume).unwrap(),
+                ),
+                (
+                    "CancelCause",
+                    serde_json::to_value(events::CancelCause::UserStop).unwrap(),
+                ),
+                (
+                    "AbortCause",
+                    serde_json::to_value(events::AbortCause::SessionDropped).unwrap(),
+                ),
+                (
+                    "AbortCause",
+                    serde_json::to_value(events::AbortCause::SnapshotRestored).unwrap(),
+                ),
+                (
+                    "UnproposedReason",
+                    serde_json::to_value(events::UnproposedReason::AwaitingLanding).unwrap(),
+                ),
+                (
+                    "EngineReason",
+                    serde_json::to_value(events::EngineReason::CacheKeepAlive).unwrap(),
+                ),
+                (
+                    "SessionContinuity",
+                    serde_json::to_value(events::SessionContinuity::First).unwrap(),
+                ),
+                (
+                    "FreshSessionReason",
+                    serde_json::to_value(events::FreshSessionReason::ResumeFailed).unwrap(),
+                ),
+                (
+                    "HandoffOpening",
+                    serde_json::to_value(events::HandoffOpening::Brief).unwrap(),
+                ),
+            ] {
+                let wire = serialized
+                    .as_str()
+                    .or_else(|| serialized["kind"].as_str())
+                    .unwrap();
+                assert!(fragments[name]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("\n- `{wire}`\n")));
+            }
         }
-    }
 
-    #[test]
-    fn serde_rename_changes_fragment_without_changing_variant_coverage() {
-        #[derive(Serialize)]
-        #[serde(rename_all = "snake_case")]
-        enum Renamed {
-            #[serde(rename = "fixture-stop")]
-            UserStop,
-            UserAction,
-            SupersededByFollowup,
-            EffortRestart,
-            Unknown,
+        #[test]
+        fn serde_rename_changes_fragment_without_changing_variant_coverage() {
+            #[derive(Serialize)]
+            #[serde(rename_all = "snake_case")]
+            enum Renamed {
+                #[serde(rename = "fixture-stop")]
+                UserStop,
+                UserAction,
+                SupersededByFollowup,
+                EffortRestart,
+                Refused,
+                Unknown,
+            }
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let fragment = values(
+                &root,
+                "CancelCause",
+                vec![
+                    ("UserStop", Renamed::UserStop),
+                    ("UserAction", Renamed::UserAction),
+                    ("SupersededByFollowup", Renamed::SupersededByFollowup),
+                    ("EffortRestart", Renamed::EffortRestart),
+                    ("Refused", Renamed::Refused),
+                    ("Unknown", Renamed::Unknown),
+                ],
+            );
+            // Pin the fixture's explicit serde rename, not a production spelling.
+            assert!(fragment.contains("`fixture-stop`"));
+            let manifest: serde_json::Value = serde_json::from_str(&render(&root)).unwrap();
+            assert_ne!(
+                fragment,
+                manifest["documents"]["system-knowhow/thread-events.md"]["CancelCause"]
+            );
         }
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let fragment = values(
-            &root,
-            "CancelCause",
-            vec![
-                ("UserStop", Renamed::UserStop),
-                ("UserAction", Renamed::UserAction),
-                ("SupersededByFollowup", Renamed::SupersededByFollowup),
-                ("EffortRestart", Renamed::EffortRestart),
-                ("Unknown", Renamed::Unknown),
-            ],
-        );
-        // Pin the fixture's explicit serde rename, not a production spelling.
-        assert!(fragment.contains("`fixture-stop`"));
-        let manifest: serde_json::Value = serde_json::from_str(&render(&root)).unwrap();
-        assert_ne!(
-            fragment,
-            manifest["documents"]["system-knowhow/thread-events.md"]["CancelCause"]
-        );
-    }
 
-    #[test]
-    #[should_panic(expected = "samples must cover every variant")]
-    fn new_variant_cannot_be_silently_omitted() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        values(
-            &root,
-            "SessionEndReason",
-            samples!(SessionEndReason; Shutdown),
-        );
+        #[test]
+        #[should_panic(expected = "samples must cover every variant")]
+        fn new_variant_cannot_be_silently_omitted() {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            values(
+                &root,
+                "SessionEndReason",
+                samples!(SessionEndReason; Shutdown),
+            );
+        }
     }
 }

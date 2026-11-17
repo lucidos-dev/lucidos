@@ -18,6 +18,7 @@ mod bundle_location;
 /// launched app a sink that discards both, so without this the client's
 /// diagnostics do not exist.
 mod client_log;
+pub use client_log::capture_relaunch as capture_client_relaunch_log;
 mod client_owner_lock;
 mod config_scalar;
 mod crash_watchdog;
@@ -73,6 +74,8 @@ pub(crate) const LUCIDOS_RELEASE: &str = {
 pub fn run_service() -> i32 {
     desktop::run_service()
 }
+
+pub use desktop::run_disposable_service;
 
 pub use client_owner_lock::claim_client_owner_lock;
 pub use launch_role::{launch_role, version_line, LaunchRole};
@@ -691,11 +694,17 @@ fn startup_status(app: tauri::AppHandle) -> String {
 /// `native-notification-tapped`, and the page routes it through the same
 /// `dispatchDeepLink` the web-push tap uses.
 ///
-/// No-op in the dev window and off macOS. See `notifications.rs` and
-/// `system-knowhow/notifications.md` §4.
+/// No-op in development; otherwise waits for OS acceptance. Unavailable off
+/// macOS. See `notifications.rs` and `system-knowhow/notifications.md` §4.
 #[tauri::command]
-fn show_native_notification(title: String, body: String, link: serde_json::Value) {
-    notifications::show(&title, &body, link);
+async fn show_native_notification(
+    title: String,
+    body: String,
+    link: serde_json::Value,
+) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || notifications::show(&title, &body, link))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 /// Remove an already-delivered native banner, the cross-device dismiss
@@ -907,7 +916,7 @@ fn startup_clamp_and_show(app: &tauri::AppHandle) {
                     // Only a window that actually reached the screen latches the
                     // gate, the same rule `front_window` follows.
                     Ok(()) => {
-                        window_screen::note_shown(app_window::MAIN_WINDOW_LABEL);
+                        app_window::note_window_shown(app, app_window::MAIN_WINDOW_LABEL, true);
                         window_persist::note_presented();
                     }
                     Err(e) => eprintln!("[Tauri] Failed to show the main window: {e}"),
@@ -992,16 +1001,12 @@ pub fn run() {
     // Created here so both ends are in scope: `nudge_dock_badge` holds the
     // sender as managed state, and `desktop::launch` takes the receiver.
     let (dock_badge_nudge_tx, dock_badge_nudge_rx) = std::sync::mpsc::channel::<()>();
-    tauri::Builder::default()
-        .plugin(
-            tauri_plugin_window_state::Builder::new()
-                .with_state_flags(window_persist::window_state_flags())
-                // `main` only. Every other label is a per-process counter, so
-                // the plugin would restore one window's geometry onto an
-                // unrelated one. See `window_persist::plugin_tracks`.
-                .with_filter(window_persist::plugin_tracks)
-                .build(),
-        )
+    let builder = tauri::Builder::default();
+    let builder = match window_persist::window_state_plugin() {
+        Some(plugin) => builder.plugin(plugin),
+        None => builder,
+    };
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(boot_splash_guard::plugin())
@@ -1042,6 +1047,7 @@ pub fn run() {
             app_window::focus_calling_window,
             nudge_dock_badge,
             app_window::get_native_window_active,
+            app_window::get_native_window_shown,
             take_pending_native_taps,
             updater::check_app_update,
             updater::install_app_update_and_restart,
@@ -1067,14 +1073,8 @@ pub fn run() {
         .on_window_event(|window, event| {
             let app = window.app_handle();
             match event {
-                // Packaged: closing a window must NOT quit the client or stop
-                // the always-on service, so the main window is hidden rather
-                // than closed. Secondary windows close normally, and dev keeps
-                // the default close-quits behavior.
-                //
-                // Geometry is flushed synchronously here on every platform. The
-                // plugin's own disk write is unreachable in the packaged client,
-                // and this close is when the user expects it remembered.
+                // Flush geometry before a close or hide. Packaged app windows
+                // retain their pages unless deliberate teardown has begun.
                 tauri::WindowEvent::CloseRequested { api, .. } => {
                     window_persist::persist_window_state_only(app);
                     // The SESSION only when this close is the user's own. A
@@ -1084,30 +1084,17 @@ pub fn run() {
                     if !window_persist::tearing_down() {
                         window_persist::persist_window_session(app);
                     }
-                    if !tauri::is_dev() && window.label() == "main" {
-                        // Keep the client resident: HIDE, for a fast reopen with
-                        // page state preserved, then drop to the tray if this was
-                        // the last visible window.
+                    if app_window::should_retain_on_close(
+                        window.label(),
+                        tauri::is_dev(),
+                        window_persist::tearing_down(),
+                    ) {
                         api.prevent_close();
-                        let _ = window.hide();
-                        // Off screen by our own hand. The watchdog reads this
-                        // rather than `[NSWindow isVisible]`, so a parked page
-                        // is left alone instead of reloaded.
-                        window_screen::note_hidden(window.label());
-                        // The WKWebView cannot report an `orderOut:`, and
-                        // `Focused(false)` may not fire on one. This is the
-                        // load-bearing signal that the page is inactive. It is
-                        // what lets the engine send the OS banner rather than a
-                        // suppressed in-app toast.
-                        app_window::emit_window_active(app, window.label(), false);
-                        app_window::enter_menu_bar_only_if_no_windows(app, Some(window.label()));
+                        app_window::hide_app_window(window);
                     }
                 }
-                // A secondary window closed. Drop its traffic-light resize
-                // observer, then re-evaluate the tray. The tray half is
-                // packaged-only; the observer half is not, because a leaked
-                // registration is keyed on the dead window's address in both
-                // builds. `main` never reaches here: its close is prevented.
+                // Destruction during teardown or development releases observers
+                // and updates the session only when its write gates allow it.
                 tauri::WindowEvent::Destroyed if app_window::is_app_window(window.label()) => {
                     traffic_lights::unwatch(window.label());
                     window_screen::forget(window.label());
@@ -1355,6 +1342,7 @@ pub fn run() {
             // click on the windowless client re-shows one. `quit_lucidos` sets
             // `QUITTING` so its own exit passes the guard.
             match event {
+                tauri::RunEvent::Exit => client_log::flush(),
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     if !tauri::is_dev() && !QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
                         api.prevent_exit();
@@ -2393,5 +2381,74 @@ mod acl_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod close_guard_tests {
+    #[test]
+    fn native_close_and_park_share_the_retention_operation() {
+        let source = include_str!("lib.rs");
+        let handler = source
+            .split_once("tauri::WindowEvent::CloseRequested { api, .. } => {")
+            .unwrap()
+            .1
+            .split_once("tauri::WindowEvent::Destroyed")
+            .unwrap()
+            .0;
+        assert!(handler.contains("app_window::should_retain_on_close("));
+        assert!(handler.contains("window_persist::tearing_down()"));
+        assert!(handler.contains("tauri::is_dev()"));
+        assert!(handler.contains("api.prevent_close()"));
+        assert!(handler.contains("app_window::hide_app_window(window)"));
+        assert!(!handler.contains("window.label() =="));
+
+        let windows = include_str!("app_window.rs");
+        let park = windows
+            .split_once("pub(crate) fn close_all_to_tray(")
+            .unwrap()
+            .1
+            .split_once("/// Show and focus the main window")
+            .unwrap()
+            .0;
+        assert!(park.contains("hide_app_window(&window)"));
+        let hide = windows
+            .split_once("pub(crate) fn hide_app_window(")
+            .unwrap()
+            .1
+            .split_once("/// Park the whole client")
+            .unwrap()
+            .0;
+        for effect in [
+            "window.hide()",
+            "note_window_shown(app, window.label(), false)",
+            "emit_window_active(app, window.label(), false)",
+            "enter_menu_bar_only_if_no_windows(app, None)",
+        ] {
+            assert!(hide.contains(effect), "missing hide effect: {effect}");
+        }
+        assert!(!hide.contains("get_webview_window"));
+    }
+    #[test]
+    fn shown_bridge_uses_calling_window_and_targeted_transitions() {
+        let source = include_str!("app_window.rs");
+        let seed = source
+            .split_once("fn get_native_window_shown(")
+            .unwrap()
+            .1
+            .split_once("/// Publish only")
+            .unwrap()
+            .0;
+        assert!(seed.contains("window_screen::shown_by_client(window.label())"));
+        assert!(!seed.contains("is_focused"));
+        assert!(source.contains(r#"app.emit_to(label, "native-window-shown", shown)"#));
+        let hide = source
+            .split_once("fn hide_app_window(")
+            .unwrap()
+            .1
+            .split_once("/// Park the whole client")
+            .unwrap()
+            .0;
+        assert!(hide.find("return;").unwrap() < hide.find("note_window_shown").unwrap());
     }
 }

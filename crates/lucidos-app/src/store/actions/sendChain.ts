@@ -6,12 +6,14 @@ import { pageOwnerId } from '../pageOwner';
 interface ChainLink {
   turn: Promise<void>;
   settled: Promise<void>;
+  /** Consecutive epochs proven by successful ordinary sends in this chain. */
+  acceptedEpochs?: { base: number; after: number };
 }
 
 /** Per-thread tail of the send chain. It keeps one POST per thread in flight,
  *  so a quick second press does not overtake the first.
  *
- *  It only paces. The engine orders: each send carries this page's input chain
+ *  The engine orders: each send carries this page's input chain
  *  and an input sequence. The engine refuses a send that a later one from this
  *  page overtook (ADR 0449). Without the pacing, the first of two quick sends
  *  could reach the engine second and be refused.
@@ -51,6 +53,10 @@ export interface SendSlot {
   /** Idempotent. Every caller releases in a `finally`. */
   release: () => void;
   position: InputPosition;
+  readonly intentEpoch?: number;
+  /** Frozen intent epoch, rebased only through a confirmed predecessor. */
+  epochForPost: () => number | undefined;
+  accepted: (epoch: number | undefined) => void;
 }
 
 /** Claim the thread's next chain slot and input sequence. **Synchronous, and
@@ -64,7 +70,7 @@ export interface SendSlot {
  *
  *  A successor waits for its predecessor to settle, however long that takes.
  *  Every await a send makes has its own deadline, so every send settles. */
-export function enterSendChain(threadId: string): SendSlot {
+export function enterSendChain(threadId: string, intentEpoch?: number): SendSlot {
   const predecessor = sendChains.get(threadId);
   let release!: () => void;
   const settled = new Promise<void>((resolve) => {
@@ -83,18 +89,33 @@ export function enterSendChain(threadId: string): SendSlot {
   void Promise.all([link.turn, settled]).then(() => {
     if (sendChains.get(threadId) === link) sendChains.delete(threadId);
   });
-  return { waitForTurn, release, position: claimInputPosition(threadId) };
-}
-
-/** Run a send other than a chat message in the thread's chain, such as an
- *  answer to a question card. A message sent after it then waits for it, and
- *  the engine orders it by the position it is handed. */
-export async function inSendChain<T>(threadId: string, send: (position: InputPosition) => Promise<T>): Promise<T> {
-  const slot = enterSendChain(threadId);
-  try {
-    if (slot.waitForTurn) await slot.waitForTurn;
-    return await send(slot.position);
-  } finally {
-    slot.release();
-  }
+  let submittedEpoch: number | undefined;
+  let causalBase = intentEpoch;
+  let prepared = false;
+  const epochForPost = (): number | undefined => {
+    if (!prepared) {
+      prepared = true;
+      submittedEpoch = intentEpoch;
+      const proof = predecessor?.acceptedEpochs;
+      if (intentEpoch !== undefined && proof && intentEpoch >= proof.base && intentEpoch <= proof.after) {
+        submittedEpoch = proof.after;
+        causalBase = proof.base;
+      }
+    }
+    return submittedEpoch;
+  };
+  return {
+    waitForTurn, release, position: claimInputPosition(threadId), intentEpoch, epochForPost,
+    accepted: (epoch) => {
+      if (epoch === undefined) return;
+      const before = epochForPost();
+      if (before === undefined) {
+        // An accepted send moves the epoch by exactly one, so an unfenced
+        // send consumed the draft at `epoch - 1`.
+        link.acceptedEpochs = { base: epoch - 1, after: epoch };
+      } else if (causalBase !== undefined && epoch === before + 1) {
+        link.acceptedEpochs = { base: causalBase, after: epoch };
+      }
+    },
+  };
 }

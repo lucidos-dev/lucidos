@@ -169,7 +169,7 @@ pub(super) async fn mint(
     // and that page must not be an app. A `POST` passes the service worker
     // untouched, so the shell's own `Referer` always arrives.
     if !reveal_request_allowed(headers, RefererRule::Required) {
-        crate::log!("[Voice] Refusing a call ticket for an app document or an unnamed page");
+        crate::log_legacy!("[Voice] Refusing a call ticket for an app document or an unnamed page");
         return Err(ApiError::new(StatusCode::FORBIDDEN, NOT_FROM_THE_SHELL));
     }
     let generation = crate::core::snapshot::boundary::read(pool)
@@ -181,6 +181,7 @@ pub(super) async fn mint(
         pool,
         None,
         super::voice::NOT_A_PERSONS_DEVICE,
+        crate::api::owner_door::OnUnattested::Refuse,
     )
     .await?;
     let MessageOrigin::Device { device_id, .. } = &actor else {

@@ -24,10 +24,39 @@ pub enum MainCheckState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RepairState {
+    #[default]
+    None,
+    Waiting,
+    Running,
+}
+
+/// The repair's admission state. A waiting repair has no thread yet.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MainRepairSnapshot {
+    pub state: RepairState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix_thread_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<super::MainRepairStartedBy>,
+    pub waiting_on: Vec<String>,
+}
+
 /// The main check right now. Fields a state has nothing for are absent.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MainCheckSnapshot {
     pub state: MainCheckState,
+    /// The main-check setting the driver runs under. Absent before restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setting: Option<super::MainCheckSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<MainRepairSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<super::state::FailedTest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flaky: Vec<super::state::FailedTest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_id: Option<Uuid>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,22 +81,17 @@ impl MainCheckSnapshot {
     /// the check, and `run_url` is the running check's run once known.
     pub(crate) fn of(check: &MainCheck, unavailable: Option<&str>, run_url: Option<&str>) -> Self {
         Self {
+            failures: check.red().map(|r| r.failures.clone()).unwrap_or_default(),
+            flaky: check
+                .flaky_fix()
+                .map(|f| f.flaky.clone())
+                .unwrap_or_default(),
             flaky_fix_thread_id: check.flaky_fix().map(|flaky| flaky.fix_thread_id),
             ..Self::of_state(check, unavailable, run_url)
         }
     }
 
     fn of_state(check: &MainCheck, unavailable: Option<&str>, run_url: Option<&str>) -> Self {
-        if let Some(running) = check.running() {
-            return Self {
-                state: MainCheckState::Running,
-                check_id: Some(running.check_id),
-                from_sha: Some(running.from_sha.clone()),
-                to_sha: Some(running.to_sha.clone()),
-                run_url: run_url.map(str::to_string),
-                ..Self::default()
-            };
-        }
         if let Some(red) = check.red() {
             return Self {
                 state: MainCheckState::Red,
@@ -77,6 +101,16 @@ impl MainCheckSnapshot {
                 run_url: red.run_url.clone(),
                 fix_thread_id: Some(red.fix_thread_id),
                 summary: Some(red.summary.clone()),
+                ..Self::default()
+            };
+        }
+        if let Some(running) = check.running() {
+            return Self {
+                state: MainCheckState::Running,
+                check_id: Some(running.check_id),
+                from_sha: Some(running.from_sha.clone()),
+                to_sha: Some(running.to_sha.clone()),
+                run_url: run_url.map(str::to_string),
                 ..Self::default()
             };
         }
@@ -184,5 +218,36 @@ mod tests {
         assert_eq!(json["state"], "running");
         assert_eq!(json["check_id"], id(1).to_string());
         assert!(json.get("run_url").is_none());
+    }
+}
+
+#[cfg(test)]
+mod continued_red_tests {
+    use super::*;
+    use crate::engine::main_check::state::Verdict;
+
+    #[test]
+    fn checking_newer_main_keeps_red_visible() {
+        let mut check = MainCheck::default();
+        let first = Uuid::new_v4();
+        let owner = Uuid::new_v4();
+        check.landed(Some("a"), false, Some("b"), first);
+        check.ended(
+            first,
+            Verdict::Failed {
+                summary: "Failed: engine".into(),
+                tail: String::new(),
+                failures: Vec::new(),
+                run_url: None,
+                fix_thread_id: owner,
+            },
+            Some("b"),
+            Uuid::new_v4(),
+        );
+        check.landed(Some("b"), false, Some("c"), Uuid::new_v4());
+        assert!(check.running().is_some());
+        let snapshot = MainCheckSnapshot::of(&check, None, None);
+        assert_eq!(snapshot.state, MainCheckState::Red);
+        assert_eq!(snapshot.fix_thread_id, Some(owner));
     }
 }

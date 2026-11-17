@@ -336,7 +336,7 @@ fn normalize_cc_model_id_preserves_unknown() {
 
 #[test]
 fn every_fable_generation_round_trips_through_cc_model_helpers() {
-    // A Fable id is not offered, but a thread already on one still reports it.
+    // An older Fable id is not offered, but a thread already on one reports it.
     // It passes through normalize unchanged, and the 1M variant reconciles like
     // the others. Fable 5.1 is the trap: `claude-fable-5` is a prefix of it,
     // so a prefix-shaped fold would rewrite one generation into the other.
@@ -478,6 +478,61 @@ fn reconcile_cc_model_passes_through_when_no_1m() {
     );
 }
 
+/// A pinned id that came back as another model is a substitution, and the
+/// served model is the one Claude Code reported.
+#[test]
+fn a_pinned_id_served_as_another_model_is_a_substitution() {
+    assert_eq!(
+        substituted_cc_model(Some("claude-fable-5-2"), "claude-opus-5-5").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(
+        substituted_cc_model(Some("claude-fable-5-2[1m]"), "claude-opus-5-5").as_deref(),
+        Some("claude-opus-5-5")
+    );
+    assert_eq!(
+        substituted_cc_model(Some("claude-opus-5@default"), "claude-sonnet-5-5").as_deref(),
+        Some("claude-sonnet-5-5")
+    );
+}
+
+/// The echo forms of the same model are not a substitution: Claude Code
+/// strips `[1m]` and the `@` pin, and may append a release date.
+#[test]
+fn an_echo_of_the_requested_model_is_not_a_substitution() {
+    for (requested, reported) in [
+        ("claude-opus-5-5", "claude-opus-5-5"),
+        ("claude-opus-5-5[1m]", "claude-opus-5-5"),
+        ("claude-opus-5@default", "claude-opus-5"),
+        ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+        ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5"),
+    ] {
+        assert_eq!(
+            substituted_cc_model(Some(requested), reported),
+            None,
+            "{requested} reported as {reported}"
+        );
+    }
+}
+
+/// A version-free alias resolves to whatever Claude Code points it at, by
+/// design. A version suffix on another model is not a date echo.
+#[test]
+fn an_alias_or_no_request_is_never_a_substitution() {
+    for requested in ["default", "opus", "opus[1m]", "sonnet", "haiku"] {
+        assert_eq!(
+            substituted_cc_model(Some(requested), "claude-opus-5-5"),
+            None,
+            "{requested}"
+        );
+    }
+    assert_eq!(substituted_cc_model(None, "claude-opus-5-5"), None);
+    assert_eq!(
+        substituted_cc_model(Some("claude-opus-5"), "claude-opus-5-5").as_deref(),
+        Some("claude-opus-5-5")
+    );
+}
+
 /// The offered list is Claude Code's own rows first, then the curated rows it
 /// did not list. Before it has answered, that is the offered curated rows alone.
 #[test]
@@ -487,7 +542,9 @@ fn the_offered_list_is_the_discovered_rows_then_the_curated_rest() {
         .filter(|o| o.offered)
         .collect();
     assert_eq!(
-        offered_cc_model_options(None).iter().collect::<Vec<_>>(),
+        offered_cc_model_options(None, &[])
+            .iter()
+            .collect::<Vec<_>>(),
         offered_curated
     );
     let discovered = vec![CcMenuOption {
@@ -501,7 +558,7 @@ fn the_offered_list_is_the_discovered_rows_then_the_curated_rest() {
         default_effort: None,
         offered: true,
     }];
-    let merged = offered_cc_model_options(Some(&discovered));
+    let merged = offered_cc_model_options(Some(&discovered), &[]);
     assert_eq!(merged[0], discovered[0], "a discovered row leads and wins");
     let expected_rest: Vec<&str> = offered_curated
         .iter()
@@ -579,11 +636,12 @@ fn the_picker_runs_strongest_first_and_shows_each_model_once() {
 /// each curated row runs a model of its own. Overlay-only rows are absent.
 #[test]
 fn the_fallback_picker_groups_by_family_newest_first() {
-    let rows = cc_picker_rows(&offered_cc_model_options(None));
+    let rows = cc_picker_rows(&offered_cc_model_options(None, &[]));
     assert_eq!(
         values(&rows),
         [
             "default",
+            "claude-fable-5-2",
             "claude-opus-5-5",
             "claude-opus-5-5[1m]",
             "claude-opus-4-8@default",
@@ -613,10 +671,7 @@ fn the_served_picker_names_the_model_each_row_runs() {
 }
 
 #[test]
-fn fable_52_keeps_the_fable_overlay_only_policy() {
-    assert!(!offered_cc_model_options(None)
-        .iter()
-        .any(|r| r.value == "claude-fable-5-2"));
+fn fable_52_declares_its_one_million_window() {
     assert_eq!(
         crate::runtime::coding_agent_context_window(
             crate::runtime::CodingAgent::ClaudeCode,

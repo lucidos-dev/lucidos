@@ -18,6 +18,7 @@
 //! thread caused the call. See [`AuxCapture`].
 
 mod capture;
+pub(crate) mod spend_cap;
 
 pub(crate) use capture::{
     auxiliary_capture, model_call_failed, usage_from_response, AuxCapture, CallDetail,
@@ -194,6 +195,14 @@ impl TurnSlot {
 
 #[async_trait::async_trait]
 impl CostSink for TurnSlot {
+    fn spend_cap_policy(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::llm::spend_cap::SpendCapPolicy>,
+        bool,
+    )> {
+        Some((std::sync::Arc::new(self.bus.clone()), true))
+    }
     async fn record(&self, cost: CallCost<'_>) {
         let response = match cost.reported {
             Reported::Chat(response) => Some(response),
@@ -268,7 +277,7 @@ impl Drop for TurnCapture {
             return;
         };
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            crate::log!("[ModelCall] A turn row was dropped with no runtime to record it");
+            crate::log_legacy!("[ModelCall] A turn row was dropped with no runtime to record it");
             return;
         };
         let bus = self.bus.clone();
@@ -296,6 +305,7 @@ impl Drop for TurnCapture {
             stable_prefix_fingerprint: None,
             ttft_ms: report.detail.ttft_ms,
             request_id: report.detail.request_id,
+            telemetry_owned_by_cli: false,
             session: None,
         };
         runtime.spawn(async move {

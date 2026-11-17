@@ -6,6 +6,7 @@ use futures::{FutureExt, StreamExt};
 
 fn sent(text: &str) -> AgentInput {
     AgentInput {
+        defer_on_steer_failure: false,
         text: text.into(),
         images: Vec::new(),
         uuid: Uuid::new_v4(),

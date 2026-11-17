@@ -1,5 +1,16 @@
 //! Build diagnostics stay reachable through the workspace HTTP router.
-use crate::support::{base_url, http_client};
+use crate::support::{base_url, http_client, user_client};
+
+#[tokio::test]
+async fn engine_rebuild_rejects_unknown_mode_without_starting_a_build() {
+    let response = user_client()
+        .await
+        .post(format!("{}/api/v1/engine/rebuild?mode=invalid", base_url()))
+        .send()
+        .await
+        .expect("rebuild request");
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+}
 
 #[tokio::test]
 async fn engine_build_log_returns_bounded_text_or_explicit_absence() {

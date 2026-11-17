@@ -3,7 +3,7 @@ import type { ComponentChildren, VNode } from 'preact';
 import { brandBadgeState, brandBadgeLabel, brandTooltipRows, BrandBadge, UnreadBrandBadge, unreadBadgeLabel } from './BrandBadge';
 import { GlyphBadge } from '../shared/GlyphBadge';
 import { vnodeToText } from '../chat/__tests__/vnodeToText';
-import { crossWorkspaceUnreadTotal, peerWorkspaces } from '../../store/actions/app-badge';
+import { notificationsMenuUnreadTotal, peerWorkspaces, remotePeerWorkspaces } from '../../store/actions/app-badge';
 import type { ActivityRow } from '../../store/actions/activityRows';
 import { connectionNotice } from '../../utils/connectionNotice';
 import type { Notification } from '../../store/types';
@@ -221,10 +221,11 @@ describe('BrandBadge', () => {
     ['busy', () => { engineBuilding.value = true; }],
     ['ready', () => { engineVersionReady.value = true; }],
     ['pending', () => { engineVersionPending.value = true; }],
-  ])('is a GlyphBadge with no handler in the %s state', (_state, arrange) => {
+  ])('is click-through with the correct layout in the %s state', (_state, arrange) => {
     arrange();
     const badge = findByClass(BrandBadge(), 'brand-badge')[0] as VNode<Record<string, unknown>> | undefined;
-    expect(badge?.type).toBe(GlyphBadge);
+    expect(badge?.type).toBe(_state === 'ready' ? GlyphBadge : 'span');
+    expect(String(badge?.props.class).includes('badge-icon')).toBe(_state === 'busy');
     expect(badge?.props.onClick).toBeUndefined();
   });
 
@@ -245,6 +246,7 @@ describe('BrandBadge', () => {
     };
     expect(findByClass(BrandBadge(), 'brand-badge-spinner')).toHaveLength(0);
     expect(findByClass(BrandBadge(), 'brand-badge-queued')).toHaveLength(1);
+    expect(findByClass(BrandBadge(), 'badge-icon')).toHaveLength(1);
     engineBuildDetail.value = null;
   });
 
@@ -273,14 +275,14 @@ describe('BrandBadge', () => {
   });
 });
 
-/** The unread count, the mark's SECOND badge and the only in-app mirror of the
- *  app-icon badge. A separate component from `BrandBadge` on purpose. Folding a
+/** The unread count, the mark's SECOND badge. A separate component from `BrandBadge` on purpose. Folding a
  *  count into that ladder would hide the rebuild spinner while anything is
  *  unread, which on a dev workspace is most of the time. */
 describe('UnreadBrandBadge', () => {
   beforeEach(() => {
     servedUnreadNotifications.value = { status: 'loaded', data: [] };
     peerWorkspaces.value = [];
+    remotePeerWorkspaces.value = [];
   });
 
   function unread(): VNode<{ 'aria-label'?: string }> | undefined {
@@ -303,12 +305,18 @@ describe('UnreadBrandBadge', () => {
     expect(UnreadBrandBadge()).toBeNull();
   });
 
-  it('shows the same total the app icon carries', () => {
+  it('shows the notification menu total', () => {
     servedUnreadNotifications.value = { status: 'loaded', data: notes(2) };
     expect(unread()).toBeDefined();
-    // The computed is the single source both surfaces read, so asserting the
-    // rendered number IS asserting the icon's.
-    expect(crossWorkspaceUnreadTotal.value).toBe(2);
+    expect(notificationsMenuUnreadTotal.value).toBe(2);
+  });
+
+  it('renders remote unreads when the current workspace has none', () => {
+    remotePeerWorkspaces.value = [{
+      gateway: 'lab', unreachable: null,
+      workspaces: [{ id: 'notes', name: 'Notes', health: 'healthy', unread_count: 9 }],
+    }];
+    expect(vnodeToText(UnreadBrandBadge())).toContain('>9</span>');
   });
 
   it('coexists with the engine state badge rather than replacing it', () => {

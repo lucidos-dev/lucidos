@@ -120,6 +120,14 @@ pub enum SessionStart {
     OnNextInput,
 }
 
+impl SessionStart {
+    /// Whether the engine starts the session by itself, at boot or once the
+    /// thread is free. A *next-input start* waits for an input instead.
+    pub fn is_unprompted(self) -> bool {
+        self != Self::OnNextInput
+    }
+}
+
 /// Why a session on a thread that had one before started fresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -136,6 +144,9 @@ pub enum FreshSessionReason {
     ResumeFailed,
     /// No resumable session was recorded for the thread's account.
     NoResumableSession,
+    /// The provider's safety systems blocked the previous session's last turn.
+    /// Resuming would replay the history that tripped the block.
+    ProviderBlocked,
 }
 
 /// Why a voice session ended.
@@ -206,7 +217,7 @@ pub enum HandoffConsent {
     /// The owner's device asked, or a caller carrying their standing
     /// instruction did.
     Owner,
-    /// The handoff spent an owner approval (ADR 0387 and 0493).
+    /// The handoff spent the retired single-use card (ADR 0387 and 0493).
     OwnerApproval,
     /// The handoff passed on the consent its predecessor carried.
     Carried,

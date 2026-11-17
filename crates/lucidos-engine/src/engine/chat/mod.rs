@@ -18,6 +18,7 @@ pub(crate) mod rung;
 mod spawn;
 mod title;
 
+pub(crate) use events::emit_routing_failure;
 pub(crate) use events::images_to_hashes;
 pub(crate) use events::make_message_received;
 pub(crate) use events::IMAGE_DESCRIPTION_PROMPT;

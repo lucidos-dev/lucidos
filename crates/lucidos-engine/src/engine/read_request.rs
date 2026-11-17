@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::engine::chat::agent_archive::agent_thread_actor;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventMeta, MessageOrigin, ThreadEvent};
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -127,8 +127,8 @@ pub(crate) enum ReplySeen {
 /// of the thread's `seen_version`. Records nothing when no request is pending
 /// for them, so a second device seeing the same reply adds no event.
 ///
-/// The team's sighting clears the request. A person's, on a team gateway,
-/// clears it for that person only (ADR 0623).
+/// The team's sighting clears the request. A user's, on a team gateway,
+/// clears it for that user only (ADR 0623).
 pub(crate) async fn record_reply_seen(
     pool: &PgPool,
     bus: &EventBus,
@@ -154,7 +154,7 @@ pub(crate) async fn record_reply_seen(
                     thread_id,
                     event: ThreadEvent::ThreadReplySeen {
                         seen_version,
-                        personal: matches!(reader, Reader::Person { .. }),
+                        personal: matches!(reader, Reader::User { .. }),
                     },
                     meta: EventMeta::with_actor(Some(actor)),
                 })

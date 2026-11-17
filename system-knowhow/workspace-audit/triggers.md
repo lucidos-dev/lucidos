@@ -20,6 +20,82 @@ scan tap-strings "[\\\"']*tap[\\\"']*[[:space:]]*:[[:space:]]*[\\\"']+(modal|non
 
 ## Checks
 
+- **Claimed caller threads treated as authority.** An `unattested_caller` may carry `claimed_thread_id` as a display hint.
+  Flag filters granting authority from it as **broken**; see `system-knowhow/thread-events.md` § Another workspace.
+
+- **Take-backs counted as delivery.** A device Stop emits `QueuedMessageRemoved` for pending human inputs that no recipient has consumed.
+  Check recipes against `system-knowhow/thread-events.md` before treating acceptance or removal as proof of delivery.
+  Automation cancellation leaves these inputs alone. Stop restoration is durable compose state in the same removal transaction, not a second user submission.
+
+- **Host-log consent treated as a trigger grant.** Check transfer recipes against `system-knowhow/lucidos-cli.md` § `lucidos diagnostic-log prepare-host-transfer`.
+  Flag recipes promising unattended transfers or reusing an earlier approval as **broken**.
+  Apps cannot invoke these routes; see `system-knowhow/js-sdk.md` § Not every endpoint is reachable.
+
+- **SDK bridge operations mistaken for event subscriptions.** `media.poster` is an app request, not a triggerable event.
+  Check subscriptions against `system-knowhow/thread-events.md`, rather than deriving event names from `system-knowhow/js-sdk.md` § `lucidos.media`.
+  Flag a subscription on the bridge operation as **broken**.
+
+- **Ceiling handoffs counted as waiting for input.** Check `SessionHandedOff` subscriptions against `system-knowhow/thread-events.md`.
+  Read `starts` rather than inferring it from `cause`: interrupted narratives use `after-this-turn`.
+  Flag recipes treating every ceiling handoff as `on-next-input` as **stale**.
+
+- **A ceiling crossing counted as prompt delivery.** Check `ContextCeilingReached` filters against `system-knowhow/thread-events.md`.
+  The event records the crossing; safe delivery can happen later.
+  Flag recipes treating it as proof that the agent read a handoff prompt as **stale**.
+
+- **Applied settings counted as user picks.** `ChatSettingsChanged` records user picks; `ChatTurnSettingsResolved` records turn admission.
+  Check subscription intent against `system-knowhow/thread-events.md` before treating automatic admission as a person changing the rung.
+
+- **Follow-ups counted as separate Codex turns.** A capable app-server accepts ordinary follow-ups within its active turn.
+  Check receipt and result assumptions against `system-knowhow/coding-agent-events.md`; urgent messages still interrupt.
+
+- **Permission restoration counted as fresh owner consent.** Check permission-event recipes against `system-knowhow/thread-events.md`.
+  Flag a recipe treating `PermissionRestored` as a new owner tap or an extension into a later turn as **broken**.
+
+- **Missing sandbox records treated as an opt-out.** Check session filters against `system-knowhow/thread-events.md` and `system-knowhow/agent-sandbox.md`.
+  Legacy `SessionStarted` events omit `sandbox`; absence cannot establish that the process ran unsandboxed.
+
+- **Memory failures counted per attempt.** `MemoryExtractionFailed` records one exhausted extraction operation, including a deadline expiry.
+  An empty facts array is successful. Check filters against `system-knowhow/thread-events.md`.
+
+- **Plan-only changes counted as code landings.** Filters on change events must inspect `content` when they distinguish planning from implementation.
+  Use plan kind and approval scope for planning stages, as documented in `system-knowhow/thread-events.md`.
+
+- **Billing observations counted as usage.** Check against `system-knowhow/coding-agent-events.md` § Billing evidence.
+  `CodingAgentBillingObserved` is passive evidence; sum usage from `ContextCaptured` only.
+  Unknown attribution must not inherit a provider from the model or current settings.
+  Restored Codex notifications retain every capture and token count, including repeats.
+  Their historical attribution cannot establish billing for new work.
+
+- **Subscriptions to side-question events.** Claude Code, Codex and Lucidos Agent side questions stay hidden from triggers and event waits.
+  Flag recipes waiting for those events as **broken**; see `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.
+
+- For trigger scripts that write the workspace database, apply `system-knowhow/workspace-audit/scripts`' origin-aware table-policy check.
+  Report a refused write once, under its trigger.
+
+- **Liveness treated as an event subscription.** Thread liveness is derived on read, rather than emitted as a thread event.
+  Read it through the SDK or CLI; see `system-knowhow/js-sdk.md` § `lucidos.threads`.
+
+- **Failure events mistaken for repair starts.** A main-check failure schedules repair work; it does not prove a session started.
+  Check repair subscriptions against `system-knowhow/thread-events.md`.
+  Flag automation treating a waiting repair as a running thread as **stale**.
+
+- **Question compose reports treated as fresh user input.** `UserQuestionAnswered` may carry the compose state left by atomic acceptance.
+  Consult `system-knowhow/thread-events.md`; the report is replay evidence, not a second answer or authority grant.
+
+- **Saved-draft origin mistaken for owner authority.** Review origin filters against `system-knowhow/thread-events.md` § Saved-draft origins.
+  `saved_draft` content has Human mode, but its submitting agent and trigger provenance remain distinct from a Device origin.
+  Flag recipes treating Human mode alone as an owner-opened turn or an unrestricted spawn grant as **broken**.
+  Keep the acceptance event and submitting thread identities when recording provenance; never replace them with a synthetic device.
+
+- **Thread adoption mistaken for a trigger grant.** A spent start permission adopts that thread, as `system-knowhow/glossary.md` § Unattested caller explains.
+  Feeding triggers still need their coding-agent grants, including triggers feeding adopted threads and saved-draft submitters.
+  Flag recipes treating the owner's start approval as a trigger grant as **broken**.
+
+- **A trigger retrying a provider billing refusal immediately.** Check against `system-knowhow/thread-events.md` § Provider spend-cap holds.
+  Background sends wait during an engine provider hold; coding-agent billing notices do not create those holds.
+  Flag recipes that clear the hold repeatedly as **drift**. Direct the owner to Settings → Providers after raising the cap.
+
 Model selectors in trigger-management apps follow `system-knowhow/js-sdk.md`'s
 `lucidos.ui.ModelPicker` contract. App selections do not change a trigger's stored configuration automatically.
 
@@ -58,6 +134,8 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   The engine now refuses a new subscription on a dead name, so this check finds rows armed before that.
 
+- **A subscription on a history-only event.** `OwnerApprovalRequested`, `OwnerApprovalSpent` and `UnattestedActSpent` still read in the `engine` bucket, but nothing emits them since ADR 0688. A trigger on one silently stopped firing. Severity: **broken**. Re-point it to `PermissionRequestPrepared`, `PermissionGranted` or `PermissionSpent`, as their rows in `system-knowhow/thread-events.md` describe.
+
 - **A durable wait or trigger subscription on snapshot progress.**
   `SnapshotProgress` is transient activity, not a persisted completion event.
   Flag a trigger's `on` list or a durable `await_event` waiting for it as
@@ -83,10 +161,10 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
   Compare each row with that live trigger's `mcp_servers` from `lucidos triggers list`. Report every server it used but does not list, with the fires that used it. Severity: **smell**, since each fire now fails that call loud, with a notification. This is the ADR 0214 migration check for ADR 0430.
 
-- **A trigger that starts coding agents without the coding-agent grant.** A trigger's runs may start a coding-agent thread only with that grant (`system-knowhow/triggers.md` § "Coding-agent grant"). Find each trigger whose runs have started one. The query follows each thread back to its cause, as the engine's check does, so top-level and CLI spawns count. It also follows the parent link, which older threads carry alone:
+- **A trigger that starts coding agents without the coding-agent grant.** A trigger's runs may start a coding-agent thread only with that grant (`system-knowhow/triggers.md` § "Coding-agent grant"). Find each trigger whose runs have started one. The query follows each thread back to its cause, as the engine's check does, so top-level and CLI spawns count. It follows a saved draft to the thread that submitted it. It also follows the parent link, which older threads carry alone:
 
   ```bash
-  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "WITH RECURSIVE origin AS (SELECT DISTINCT ON (thread_id) thread_id, payload->'origin' AS o, (payload->>'parent_thread_id')::uuid AS linkage FROM events WHERE event_type IN ('TriggerStarted', 'MessageReceived') AND payload ? 'origin' AND payload->'origin' != 'null'::jsonb ORDER BY thread_id, sequence), edge AS (SELECT thread_id, CASE o->>'kind' WHEN 'thread_link' THEN CASE WHEN o->>'direction' = 'parent' THEN coalesce(linkage, (o->>'thread_id')::uuid) END WHEN 'workspace' THEN (o->>'thread_id')::uuid WHEN 'api' THEN CASE WHEN o->>'mode' <> 'human' THEN (o->>'source_thread_id')::uuid END END AS caused_by FROM origin UNION SELECT thread_id, parent_thread_id FROM thread_summaries WHERE parent_thread_id IS NOT NULL), fire AS (SELECT thread_id, o->'reason'->>'trigger_id' AS trigger_id FROM origin WHERE o->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, o->>'emitting_trigger_id' FROM origin WHERE o->>'kind' = 'api' AND o ? 'emitting_trigger_id' UNION SELECT thread_id, payload->'origin'->'reason'->>'trigger_id' FROM events WHERE event_type = 'MessageReceived' AND payload->'origin'->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, trigger_id FROM thread_summaries WHERE trigger_id IS NOT NULL), tree AS (SELECT thread_id, trigger_id, 0 AS depth FROM fire UNION SELECT e.thread_id, t.trigger_id, t.depth + 1 FROM edge e JOIN tree t ON e.caused_by = t.thread_id WHERE t.depth < 16) SELECT t.trigger_id, count(DISTINCT t.thread_id), max(s.last_activity) FROM tree t JOIN thread_summaries s USING (thread_id) WHERE s.is_coding_agent GROUP BY 1"
+  psql "$LUCIDOS_DATABASE_URL" -At -F ' ' -c "WITH RECURSIVE origin AS (SELECT DISTINCT ON (thread_id) thread_id, payload->'origin' AS o, (payload->>'parent_thread_id')::uuid AS linkage FROM events WHERE event_type IN ('TriggerStarted', 'MessageReceived') AND payload ? 'origin' AND payload->'origin' != 'null'::jsonb ORDER BY thread_id, sequence), edge AS (SELECT thread_id, CASE o->>'kind' WHEN 'thread_link' THEN CASE WHEN o->>'direction' = 'parent' THEN coalesce(linkage, (o->>'thread_id')::uuid) END WHEN 'workspace' THEN (o->>'thread_id')::uuid WHEN 'api' THEN CASE WHEN o->>'mode' <> 'human' THEN (o->>'source_thread_id')::uuid END END AS caused_by FROM origin UNION SELECT thread_id, (payload->'origin'->>'submitted_by_thread_id')::uuid FROM events WHERE event_type IN ('MessageReceived', 'PromptInjected') AND payload->'origin'->>'kind' = 'saved_draft' UNION SELECT thread_id, parent_thread_id FROM thread_summaries WHERE parent_thread_id IS NOT NULL), fire AS (SELECT thread_id, o->'reason'->>'trigger_id' AS trigger_id FROM origin WHERE o->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, o->>'emitting_trigger_id' FROM origin WHERE o->>'kind' = 'api' AND o ? 'emitting_trigger_id' UNION SELECT thread_id, payload->'origin'->'reason'->>'trigger_id' FROM events WHERE event_type = 'MessageReceived' AND payload->'origin'->'reason'->>'kind' = 'scheduler' UNION SELECT thread_id, trigger_id FROM thread_summaries WHERE trigger_id IS NOT NULL), tree AS (SELECT thread_id, trigger_id, 0 AS depth FROM fire UNION SELECT e.thread_id, t.trigger_id, t.depth + 1 FROM edge e JOIN tree t ON e.caused_by = t.thread_id WHERE t.depth < 16) SELECT t.trigger_id, count(DISTINCT t.thread_id), max(s.last_activity) FROM tree t JOIN thread_summaries s USING (thread_id) WHERE s.is_coding_agent GROUP BY 1"
   ```
 
   Keep each row whose trigger is live with `coding_agent_grant` false in `lucidos triggers list`. For each one, read its `run.intent`, script and knowhow, and say what steers it. Name every outside source it reads, such as email, chat messages, web pages, issue trackers or webhooks, since that content steers its coding agents too. Link the trigger as `[Name](trigger:<id>)`, and tell the user to tick *Allow coding agents* there. Severity: **broken**, since each such run is now refused, with a notification.
@@ -132,6 +210,11 @@ Per the engine prompt's taxonomy section and the worked example in `docs/taxonom
 
 ## Remediation
 
+For widget-fit recipes, require an open eligible window or an explicitly selected fit-only renderer (`docs/widget-fit-renderer.md`).
+A trigger's source-thread origin may register a renderer; it cannot supply a browser or owner authority.
+Flag recipes treating a timeout or `not checked` as success as **broken**.
+`WidgetFitRequested` remains transient and cannot trigger another run.
+
 Fixes run only on request, as the root's § Remediation says. A fix gets the
 table for its finding, and the root's § Inline or a coding agent picks its
 route.
@@ -142,7 +225,7 @@ route.
 
 ### Granting a trigger its coding agents or side-effects
 
-**Route: the user only.** No agent may widen a trigger's grants, so never try the `triggers` tool, the CLI or the HTTP API. The report is the fix: one line per trigger with its link, what steers it, and a recommendation. Recommend against the coding-agent grant where outside content steers the trigger, and suggest an owner-started coding agent instead. An agent may narrow a side-effect grant the owner asks to drop.
+**Route: the user only.** No agent may widen a trigger's grants, so never try the `triggers` tool or a trigger update through the CLI or the HTTP API. The report is the fix: one line per trigger with its link, what steers it, and a recommendation. When the user asks you to grant, raise one batch (`system-knowhow/lucidos-cli.md` § "`lucidos permissions batch`"), which only their **Run all** runs. Recommend against the coding-agent grant where outside content steers the trigger, and suggest an owner-started coding agent instead. An agent may narrow a side-effect grant the owner asks to drop.
 
 ### Rewriting an old-form `tap`
 
@@ -163,3 +246,8 @@ Three rules the rewrite has to follow:
 - **Build the new sub-fields from the call's own sibling fields, and keep those siblings.** They are notification-level context. The §4 in-app matrix and the inbox modal both read them, even when the tap navigates elsewhere.
 - **Reuse the expression when a sibling is computed.** Hoist the app-resolution call into a local, then pass that local to both `app_id` and `to.app_id`. Calling it twice risks two different answers.
 - **Flag a missing sibling, never guess one.** The old form let the engine fill the id in at write time; the new one does not. A navigate with no thread id raises the error toast `Navigation target missing thread id` on tap. Leave a `MIGRATION REVIEW` comment naming the two ways out: supply `to.id`, or fall back to `{ kind: 'modal' }`. List every such site in the report's `## Remediation` section.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

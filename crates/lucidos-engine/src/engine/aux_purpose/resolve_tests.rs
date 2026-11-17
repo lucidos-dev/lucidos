@@ -22,6 +22,7 @@ struct StubRouter {
     seen: Mutex<Vec<(Option<String>, Option<Duration>)>>,
     /// The generation rule each request carried.
     rules: Mutex<Vec<GenerationRule>>,
+    forced_tools: Mutex<Vec<Option<String>>>,
     /// Marked on each refusal, as the router marks its own.
     ledger: NotServedLedger,
 }
@@ -39,6 +40,7 @@ impl StubRouter {
             refusing: Vec::new(),
             seen: Mutex::default(),
             rules: Mutex::default(),
+            forced_tools: Mutex::default(),
             ledger: NotServedLedger::default(),
         })
     }
@@ -51,6 +53,7 @@ impl StubRouter {
             refusing: models.to_vec(),
             seen: Mutex::default(),
             rules: Mutex::default(),
+            forced_tools: Mutex::default(),
             ledger: NotServedLedger::default(),
         })
     }
@@ -61,7 +64,7 @@ impl LlmProvider for StubRouter {
     async fn chat(
         &self,
         _messages: Vec<Message>,
-        _tools: Vec<ToolDefinition>,
+        tools: Vec<ToolDefinition>,
         selection: ModelSelection<'_>,
         _system_prompt: Option<&str>,
         _on_token: Option<TokenCallback>,
@@ -72,6 +75,10 @@ impl LlmProvider for StubRouter {
             selection.attempt_timeout,
         ));
         self.rules.lock().unwrap().push(selection.generation_rule);
+        self.forced_tools
+            .lock()
+            .unwrap()
+            .push(selection.forced_tool.map(str::to_string));
         if let Some(model) = selection.model.filter(|m| self.refusing.contains(m)) {
             let provider = self.configured[0];
             self.ledger.mark(provider, model);
@@ -81,7 +88,11 @@ impl LlmProvider for StubRouter {
             ));
         }
         Ok(LlmResponse {
-            content: Some("A summary.".to_string()),
+            content: Some(if tools.iter().any(|tool| tool.name == "submit_facts") {
+                "[]".to_string()
+            } else {
+                "A summary.".to_string()
+            }),
             usage: Some(crate::engine::ApiUsage {
                 input_tokens: 120,
                 output_tokens: 8,
@@ -102,6 +113,34 @@ impl LlmProvider for StubRouter {
     fn not_served_ledger(&self) -> Option<NotServedLedger> {
         Some(self.ledger.clone())
     }
+}
+
+#[tokio::test]
+async fn memory_extraction_does_not_force_an_always_thinking_successor() {
+    let (pool, db_name) = setup_test_db().await;
+    let registry: ModelRegistry = Arc::new(RwLock::new(load_from_db(&pool).await));
+    crate::core::PreferenceStore::set_row_for_test(
+        &pool,
+        prefs::MODEL_MEMORY.key(),
+        "claude-opus-4-6",
+    )
+    .await
+    .unwrap();
+    let router = StubRouter::holding(&[ProviderKind::Anthropic]);
+    let purpose = ContextPurpose::Memory;
+    let call = AuxCall::resolve(&pool, &registry, router.clone(), purpose).await;
+    assert_eq!(call.provider().default_model(), "claude-opus-4-6");
+    assert_eq!(call.running_model(), "claude-opus-5-5");
+    let capture = crate::engine::AuxCapture::discarding(purpose);
+    assert!(
+        crate::memory::extract_facts("Run the sandbox check.", None, None, &call, &capture)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(*router.forced_tools.lock().unwrap(), vec![None]);
+    pool.close().await;
+    teardown_test_db(&db_name).await;
 }
 
 /// An Anthropic-only install: no Vertex, no extractor. The summary still runs,

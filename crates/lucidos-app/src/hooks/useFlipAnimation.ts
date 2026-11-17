@@ -585,7 +585,7 @@ export function useFlipTransitions(
                 ], timing));
                 standIns.current.set(id, ghost);
             }
-            if (run.anchor && !isThreadRow(run.anchor)) {
+            if (run.anchor && !isThreadRow(run.anchor) && rowLeft !== null) {
                 newAnims.push(carryHairline(host, run.anchor, rollEnd, rowLeft,
                     reveal ? drift - roll : 0, reveal ? 0 : -(roll + drift), reveal, timing));
             }

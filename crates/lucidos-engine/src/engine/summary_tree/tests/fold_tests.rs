@@ -313,7 +313,7 @@ fn consecutive_turns_read_most_of_the_view_from_cache() {
             shares.insert((entries, turn), share);
         }
     }
-    log!("[SummaryTree] Uncached share of the thread view per turn:\n{report}");
+    log_legacy!("[SummaryTree] Uncached share of the thread view per turn:\n{report}");
     assert!(shares[&(10_000, 4)] <= 0.10, "{report}");
     assert!(shares[&(10_000, 30)] <= 0.40, "{report}");
 }

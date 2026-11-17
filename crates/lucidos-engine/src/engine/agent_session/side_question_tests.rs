@@ -10,7 +10,7 @@ fn row(source: &str, coding_agent: Option<&str>) -> Option<ThreadRow> {
 }
 
 #[test]
-fn claude_code_and_lucidos_threads_take_side_questions_and_codex_does_not() {
+fn all_agents_take_side_questions() {
     assert_eq!(
         agent_for(row("claude_code", Some("claude-code"))),
         Ok(SideQuestionAgent::ClaudeCode)
@@ -22,7 +22,7 @@ fn claude_code_and_lucidos_threads_take_side_questions_and_codex_does_not() {
     );
     assert_eq!(
         agent_for(row("claude_code", Some("codex"))),
-        Err(CODEX_UNSUPPORTED)
+        Ok(SideQuestionAgent::Codex)
     );
     assert_eq!(agent_for(row("chat", None)), Ok(SideQuestionAgent::Lucidos));
     assert_eq!(agent_for(None), Err(NO_SUCH_THREAD));
@@ -66,7 +66,7 @@ async fn event_count(pool: &sqlx::PgPool) -> i64 {
 }
 
 #[tokio::test]
-async fn a_codex_thread_is_refused_and_nothing_is_recorded() {
+async fn a_codex_thread_is_accepted_without_recording_during_admission() {
     let (pool, db_name) = setup_test_db().await;
     let codex = Uuid::new_v4();
     let claude = Uuid::new_v4();
@@ -76,7 +76,7 @@ async fn a_codex_thread_is_refused_and_nothing_is_recorded() {
 
     assert_eq!(
         check_thread(&pool, codex).await,
-        Err(SideQuestionFailure::Refused(CODEX_UNSUPPORTED))
+        Ok(SideQuestionAgent::Codex)
     );
     assert_eq!(
         check_thread(&pool, claude).await,
@@ -301,4 +301,125 @@ async fn recovery_fails_a_retry_a_restart_interrupted() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+/// Exercise session resolution, the runtime fork and the real auxiliary capture together.
+#[tokio::test]
+async fn codex_side_question_records_its_resolved_model_and_cost() {
+    use crate::llm::ProviderBuildContext;
+    use crate::test_support::test_db_url;
+    if !crate::test_support::in_engine_child(
+        "engine::agent_session::side_question::tests::codex_side_question_records_its_resolved_model_and_cost",
+    )
+    .await
+    {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let workspace = tempfile::tempdir().unwrap();
+    let script = workspace.path().join("codex-stub.sh");
+    let guard_reply = serde_json::json!({"id":6,"result":{"data":[{"errors":[],"hooks":[{
+        "eventName":"preToolUse","handlerType":"command",
+        "command":crate::runtime::codex_side_question::TOOL_GUARD_COMMAND,
+        "key":crate::runtime::codex_side_question::GUARD_KEY,"isManaged":false,
+        "matcher":"*","async":false,"enabled":true,"trustStatus":"trusted"
+    }]}]}})
+    .to_string()
+    .replace('\'', "'\"'\"'");
+    std::fs::write(&script, r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}' ;;
+    *'"method":"config/read"'*) printf '%s\n' '{"id":5,"result":{"config":{"mcp_servers":{}}}}' ;;
+    *'"id":7'*) printf '%s\n' '{"id":7,"result":{"data":[{"errors":[],"hooks":[]}]}}' ;;
+    *'"method":"hooks/list"'*) printf '%s\n' '__GUARD_REPLY__' ;;
+    *'"method":"thread/fork"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"fork"},"model":"gpt-5.5"}}' ;;
+    *'"method":"turn/start"'*)
+      printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn"}}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"fork","item":{"type":"agentMessage","id":"answer","text":"An answer"}}}'
+      printf '%s\n' '{"method":"thread/tokenUsage/updated","params":{"threadId":"fork","tokenUsage":{"last":{"inputTokens":100,"cachedInputTokens":20,"outputTokens":5}}}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"fork","turn":{"id":"turn","status":"completed"}}}' ;;
+  esac
+done
+"#.replace("__GUARD_REPLY__", &guard_reply)).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (key, value) in [
+        (
+            crate::core::prefs::AGENTS_UNSANDBOXED.spec.key,
+            "true".to_string(),
+        ),
+        (
+            crate::core::prefs::CODING_AGENT_CODEX_PATH.key(),
+            script.to_string_lossy().into_owned(),
+        ),
+    ] {
+        crate::core::preferences::PreferenceStore::set_row_for_test(&pool, key, &value)
+            .await
+            .unwrap();
+    }
+    let engine = LucidosEngine::new(
+        workspace.path().to_path_buf(),
+        &test_db_url(&db),
+        ProviderBuildContext {
+            default_model: "mock".into(),
+            model_is_mock: true,
+            vertex_project_id: String::new(),
+            vertex_location: crate::llm::vertex::location_handle(String::new()),
+            vertex_token_cache: None,
+            model_registry: Default::default(),
+            not_served: Default::default(),
+            claude_gateway_access: None,
+            chatgpt_plan_access: None,
+        },
+    )
+    .await
+    .unwrap();
+    let thread = Uuid::new_v4();
+    seed_thread(&pool, thread, "claude_code", "codex").await;
+    record(
+        &engine.event_bus,
+        thread,
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some("main".into()),
+            coding_agent: CodingAgent::Codex,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+            turn_end: None,
+        },
+        EventMeta::NONE,
+    )
+    .await
+    .unwrap();
+    let answer = engine
+        .answer_codex_side_question(
+            thread,
+            "question",
+            &[],
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+    assert_eq!(answer, "An answer");
+    let capture: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM events WHERE thread_id=$1 AND event_type='ContextCaptured'",
+    )
+    .bind(thread)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(capture["purpose"], "side_question");
+    assert_eq!(capture["model"], "gpt-5.5");
+    assert_eq!(capture["usage"]["input_tokens"], 100);
+    drop(engine);
+    pool.close().await;
+    teardown_test_db(&db).await;
 }

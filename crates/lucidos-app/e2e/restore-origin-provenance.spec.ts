@@ -10,9 +10,11 @@ const FAKE_CLAUDE = fileURLToPath(new URL('./fake-claude-code/claude.mjs', impor
 const PREF = 'coding_agent_claude_path';
 
 // A bare engine must refuse this proof: the harness must attach a registered
-// gateway identity. A private gateway cannot launch from a coding-agent worktree.
+// gateway identity. Only its own gateway gives one, and a local run has none
+// (ADR 0661).
 for (const selfRestore of [false, true]) {
   test(`an engine-spawned agent ${selfRestore ? 'refuses CLI self-restore' : 'proves its restore origin'} over its source socket`, async ({ page }) => {
+    test.skip(process.env.LUCIDOS_E2E_GATEWAY !== 'own', 'needs the gateway identity that LUCIDOS_E2E_GATEWAY=own gives');
     const workspace = process.env.E2E_WORKSPACE;
     expect(workspace, 'the disposable workspace exported by the e2e harness').toBeTruthy();
     clearAllThreads();

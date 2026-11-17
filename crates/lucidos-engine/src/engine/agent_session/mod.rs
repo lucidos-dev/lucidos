@@ -2,11 +2,13 @@ mod apply_now;
 pub(crate) mod background_task;
 pub(crate) mod child_reports;
 pub(crate) mod coding_agent_kind;
+pub(crate) mod confinement_run;
 mod continuity;
 mod external_edits;
 pub(crate) mod external_watchdog;
 mod input_ledger;
 mod io_helpers;
+pub(crate) use io_helpers::lost_followups_to_orphans;
 pub(crate) mod lifecycle;
 mod node_modules_setup;
 mod parsing;
@@ -54,8 +56,9 @@ pub(crate) use prompts::{
 };
 pub(crate) use reconstruct::prepend_reconstruction;
 pub(crate) use resume::{
-    change_description_fallback, latest_originating_event_id, lookup_latest_cc_session_id,
-    lookup_pinned_cc_config_dir, CC_ORIGINATING_EVENT_TYPES, CHAT_ORIGINATING_EVENT_TYPES,
+    blocking_policy, change_description_fallback, latest_originating_event_id,
+    lookup_latest_cc_session_id, lookup_pinned_cc_config_dir, CC_ORIGINATING_EVENT_TYPES,
+    CHAT_ORIGINATING_EVENT_TYPES,
 };
 pub(crate) use run_session::{link_node_modules, provision_generated_files};
 

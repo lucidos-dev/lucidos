@@ -252,7 +252,7 @@ async fn a_stand_down_on_a_running_child_sends_nothing() {
     teardown_test_db(&db_name).await;
 }
 
-/// Archiving a waiting child ends it, so the parent gets the canceled card,
+/// Archiving a child holding a wait ends it, so the parent gets the canceled card,
 /// even while the archive has not yet cancelled the child's wait.
 #[tokio::test]
 async fn archiving_a_waiting_child_sends_one_canceled_card() {
@@ -283,7 +283,7 @@ async fn archiving_a_waiting_child_sends_one_canceled_card() {
     teardown_test_db(&db_name).await;
 }
 
-/// A discard of a waiting child's change does not end the child: the wait
+/// A discard of the change on a child holding a wait does not end the child: the wait
 /// still wakes it, and that turn reports.
 #[tokio::test]
 async fn discarding_a_waiting_childs_change_sends_nothing() {
@@ -317,7 +317,9 @@ async fn a_failed_turn_holding_a_wait_still_reports() {
         thread_id: child_id,
         event: ThreadEvent::ResponseFailed {
             error: "the build broke".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: EventMeta::NONE,
     })

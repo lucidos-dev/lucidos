@@ -433,7 +433,7 @@ pub(crate) fn parse_context_ceiling(
         .ok_or_else(|| format!("a context ceiling is a string (got {value})"))
         .and_then(ContextCeiling::parse)
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[Triggers] Ignored context_ceiling on {}: {}",
                 trigger_id,
                 e
@@ -492,6 +492,26 @@ impl TriggerConfig {
         }
         self.holds_a_grant()
             && (next.run != self.run || next.on != self.on || servers(next) != servers(self))
+    }
+
+    /// The **definition digest** (ADR 0664): a hex SHA-256 of what this trigger
+    /// runs and when, namely `run`, `on`, the cron, its MCP servers and its
+    /// app. Consent to a grant binds to the digest the owner was shown.
+    /// Computed on read, so a trigger stored before digests has one too.
+    pub fn definition_digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let servers: std::collections::BTreeSet<&str> =
+            self.mcp_servers.iter().map(String::as_str).collect();
+        let definition = serde_json::json!({
+            "run": self.run,
+            "on": self.on,
+            "cron": self.schedule,
+            "mcp_servers": servers,
+            "app": self.owning_app_id(),
+        });
+        let canonical = crate::core::snapshot::manifest::canonical_json(&definition)
+            .expect("a trigger definition is plain JSON");
+        crate::api::hex::hex_lower(&Sha256::digest(canonical))
     }
 
     /// Stamp an update payload so it drops both grants.
@@ -569,7 +589,7 @@ impl TriggerConfig {
             .filter(|s| {
                 let ok = is_path_safe_trigger_slug(s);
                 if !ok {
-                    log!(
+                    log_legacy!(
                         "[Triggers] Ignored unsafe slug '{}' in TriggerCreated for {}",
                         s,
                         id
@@ -649,7 +669,7 @@ impl TriggerConfig {
     /// This trigger's timezone, falling back to UTC on an unparseable name.
     pub(crate) fn timezone_or_utc(&self) -> chrono_tz::Tz {
         self.timezone.parse().unwrap_or_else(|_| {
-            log!(
+            log_legacy!(
                 "[Triggers] Invalid timezone '{}' for trigger {}, using UTC",
                 self.timezone,
                 self.id
@@ -666,7 +686,7 @@ impl TriggerConfig {
             .filter_map(|expr| {
                 crate::engine::tools::scheduler::parse_standard_cron(expr)
                     .map_err(|e| {
-                        log!(
+                        log_legacy!(
                             "[Triggers] Corrupt cron expression '{}' in trigger {}: {}",
                             expr,
                             self.id,
@@ -802,7 +822,7 @@ impl TriggerConfig {
             if is_valid_trigger_slug(slug) {
                 self.slug = slug.to_string();
             } else {
-                log!(
+                log_legacy!(
                     "[Triggers] Ignored invalid slug '{}' in TriggerUpdated for {}",
                     slug,
                     self.id
@@ -905,7 +925,7 @@ impl TriggerConfig {
                     // An out-of-set tier is dropped rather than applied, like an
                     // invalid slug above: a bad event must never wedge the
                     // in-memory config into sending a tier no provider knows.
-                    Some(e) if !is_valid_reasoning_effort(&e) => log!(
+                    Some(e) if !is_valid_reasoning_effort(&e) => log_legacy!(
                         "[Triggers] Ignored invalid reasoning_effort '{}' in TriggerUpdated for {}",
                         e,
                         self.id

@@ -504,8 +504,8 @@ mod tests {
             running_threads: 0,
         };
         let (fixture_bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
-        let old_approval =
-            crate::api::owner_approval::tests::seed_snapshot_approval(&fixture_bus).await;
+        let old_grant =
+            crate::api::permission_requests::tests::seed_snapshot_grant(&fixture_bus).await;
         let old_cut = crate::scheduler::cut_fires::tests::seed_snapshot_cut(&fixture_bus).await;
         let old_running = uuid::Uuid::new_v4();
         fixture_bus
@@ -677,9 +677,9 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(restored_access, current_access);
-        crate::api::owner_approval::tests::assert_snapshot_approval_expired(
+        crate::api::permission_requests::tests::assert_snapshot_grant_expired(
             &fixture_bus,
-            old_approval,
+            old_grant,
         )
         .await;
         crate::scheduler::cut_fires::tests::assert_snapshot_cut_excluded(&pool, old_cut).await;
@@ -693,7 +693,7 @@ mod tests {
         let engine = std::sync::Arc::new(engine);
         engine.recover_orphaned_threads(&[]).await;
         crate::scheduler::assert_snapshot_catch_up_excluded(&engine).await;
-        let replayed: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE thread_id = $1 AND sequence > $2 AND event_type IN ('MessageReceived', 'TriggerStarted', 'OwnerApprovalSpent')")
+        let replayed: i64 = sqlx::query_scalar("SELECT count(*) FROM events WHERE thread_id = $1 AND sequence > $2 AND event_type IN ('MessageReceived', 'TriggerStarted', 'PermissionSpent')")
             .bind(old_running).bind(boundary.event_sequence).fetch_one(&pool).await.unwrap();
         assert_eq!(replayed, 0);
         let running: String =

@@ -4,9 +4,10 @@
 # Each reviewer <r> is a set of functions, called by the entry script:
 #
 #   omr_<r>_ready              probe the reviewer; on failure set OMR_WHY, return 1
-#   omr_<r>_run <base>         review <base>...HEAD; stdout and stderr are files
+#   omr_<r>_run <base> <head>  review <base>...<head>; stdout and stderr are files
 #   omr_<r>_show <out>         print the attempt's review for the .out record
-#   omr_<r>_verdict <exit> <out>  return 0 when the attempt holds a verdict
+#   omr_<r>_verdict <exit> <out>  return 0 when the attempt proves a read of the
+#                              patch; otherwise OMR_REJECTED may name why not
 #   omr_<r>_said <out>         what the reviewer itself said, one line
 #   omr_<r>_upstream <out> <err> <started>  the upstream cause, one line
 #
@@ -72,13 +73,16 @@ omr_decide() { # <hardened-by> <docs-only 0|1> <scope> <base> <fix-lines or "">
     fi
 }
 
-# Sends TERM to <pid> and every process below it.
+# Sends TERM to <pid> and every process below it, parents first. A shell that
+# outlives its child prints a job notice ("Terminated: 15") into the stderr the
+# reviewer's upstream status reads. The children are listed before the kill.
 omr_kill_tree() { # <pid>
-    local child
-    for child in $(pgrep -P "$1" 2> /dev/null); do
+    local children child
+    children=$(pgrep -P "$1" 2> /dev/null)
+    kill -TERM "$1" 2> /dev/null
+    for child in $children; do
         omr_kill_tree "$child"
     done
-    kill -TERM "$1" 2> /dev/null
 }
 
 # Runs <cmd> and kills its process tree after <secs>. The command stays in the
@@ -117,23 +121,110 @@ omr_one_line() {
     tr '\r\n' '  ' | sed 's/ *$//'
 }
 
-# --- Codex, through the companion the `codex` Claude Code plugin installs ---
+# --- The range under review, and the verdict both reviewers return ---
 
-OMR_CODEX_GENERIC="Reviewer failed to output a response."
+# The diff each reviewer reads, and the file list the proof check expects from
+# it. One spelling for all: Git's default quoting escapes a non-ASCII path, and
+# a rename shows two paths in a diff but one in a name-only list.
+OMR_DIFF=(git -c core.quotePath=false diff --no-renames)
+OMR_NAME_ONLY=("${OMR_DIFF[@]}" --name-only)
 
-# The companion collapses a failure of either check into one generic error. An
-# `npm install -g` of the CLI fails both for a few seconds, so ride it out.
-omr_codex_ready() {
-    local probe
-    OMR_CODEX_COMPANION=$(find "$HOME/.claude/plugins" -name codex-companion.mjs -path '*codex*' 2> /dev/null | sort | tail -1)
-    if [ -z "$OMR_CODEX_COMPANION" ]; then
-        omr_unavailable "plugin not installed"
+# Resolves the range once, so every attempt and the proof check see the same
+# commits. Sets OMR_BASE and OMR_HEAD, and writes the diff's file list to
+# $OMR_WORK/changed-files.
+omr_freeze_range() { # <base>
+    if ! OMR_BASE=$(git rev-parse --verify --quiet "$1^{commit}"); then
+        omr_unavailable "base \"$1\" is not a commit"
         return
     fi
-    echo "CODEX_COMPANION=$OMR_CODEX_COMPANION"
+    if ! OMR_HEAD=$(git rev-parse --verify --quiet "HEAD^{commit}"); then
+        omr_unavailable "HEAD is not a commit"
+        return
+    fi
+    "${OMR_NAME_ONLY[@]}" "$OMR_BASE...$OMR_HEAD" > "$OMR_WORK/changed-files" ||
+        omr_unavailable "git diff $OMR_BASE...$OMR_HEAD failed"
+}
+
+# One schema for both reviewers. `status` and `changed_files` are the proof
+# of read: a reviewer that could not open the diff cannot name its files.
+OMR_FINDINGS_SCHEMA='{"type":"object","additionalProperties":false,"properties":{"status":{"type":"string","enum":["reviewed","unable"]},"summary":{"type":"string"},"changed_files":{"type":"array","items":{"type":"string"}},"findings":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"file":{"type":"string"},"line":{"type":"integer"},"summary":{"type":"string"},"failure_scenario":{"type":"string"},"category":{"type":"string","enum":["correctness","compliance","cleanup"]}},"required":["file","line","summary","failure_scenario","category"]}}},"required":["status","summary","changed_files","findings"]}'
+
+# What every reviewer is told about the proof, so it means the same for both.
+omr_proof_ask() { # <base> <head>
+    echo "Set status to reviewed only after you have read the whole diff. Otherwise set it to unable, and say why in summary. List in changed_files every path the diff changes, exactly as \`${OMR_NAME_ONLY[*]} $1...$2\` prints it."
+}
+
+# Returns 0 only when <verdict> proves a read of the frozen range. Otherwise
+# sets OMR_REJECTED to the reason the status line quotes.
+omr_proves_read() { # <verdict JSON, or empty>
+    local mismatch
+    if ! printf '%s' "$1" | jq -e 'type == "object" and (.findings | type) == "array" and (.changed_files | type) == "array"' > /dev/null 2>&1; then
+        OMR_REJECTED="no structured verdict"
+        return 1
+    fi
+    if ! printf '%s' "$1" | jq -e '.status == "reviewed"' > /dev/null 2>&1; then
+        OMR_REJECTED="the reviewer said it could not review"
+        return 1
+    fi
+    if ! mismatch=$(printf '%s' "$1" | jq -r --rawfile want "$OMR_WORK/changed-files" '
+        ($want | split("\n") | map(select(. != "")) | unique) as $w
+        | (.changed_files | map(tostring | ltrimstr("./")) | unique) as $g
+        | (($w - $g | map("missing " + .)) + ($g - $w | map("unexpected " + .)))
+        | .[:4] | join(", ")' 2> /dev/null); then
+        OMR_REJECTED="could not compare its changed files with the diff"
+        return 1
+    fi
+    if [ -n "$mismatch" ]; then
+        OMR_REJECTED="its changed files do not match the diff: $mismatch"
+        return 1
+    fi
+}
+
+# The summary, then one line per finding, never a raw array.
+omr_show_verdict() { # <verdict JSON>
+    printf '%s' "$1" | jq -r '
+        def one_line: tostring | gsub("[\r\n]+"; " ");
+        "summary: \(.summary // "" | one_line)",
+        "status: \(.status // "none" | one_line), changed files named: \(.changed_files // [] | length)",
+        (if (.findings | type) != "array" then empty
+         elif (.findings | length) == 0 then "No findings."
+         else .findings[] | "\(.file):\(.line) [\(.category)] \(.summary): \(.failure_scenario)" | one_line
+         end)'
+}
+
+# --- Codex, through `codex exec` ---
+
+# Codex's own sandbox mode, from Codex's own answer. A seatbelt does not nest
+# (ADR 0645), so inside the Lucidos agent sandbox Codex runs with its own off,
+# as the engine's Codex sessions do. Outside one, a sandbox that cannot apply
+# fails closed. Sets OMR_CODEX_SANDBOX.
+omr_codex_pick_sandbox() {
+    local refused
+    if refused=$(codex sandbox -- true 2>&1); then
+        OMR_CODEX_SANDBOX=read-only
+        echo "CODEX_SANDBOX=$OMR_CODEX_SANDBOX"
+    elif [ "${LUCIDOS_AGENT_SANDBOXED:-}" = 1 ]; then
+        OMR_CODEX_SANDBOX=danger-full-access
+        echo "CODEX_SANDBOX=$OMR_CODEX_SANDBOX (Codex's own sandbox cannot nest in the Lucidos agent sandbox, which bounds this review instead, ADR 0645)"
+    else
+        omr_unavailable "Codex's sandbox cannot run here and no Lucidos sandbox wraps this review: $(printf '%s\n' "$refused" | grep -v '^[[:space:]]*$' | tail -1 | cut -c1-200)"
+    fi
+}
+
+omr_codex_ready() {
+    local probe
+    if ! command -v codex > /dev/null 2>&1; then
+        omr_unavailable "CLI not installed"
+        return
+    fi
+    if ! command -v jq > /dev/null 2>&1; then
+        omr_unavailable "jq not installed"
+        return
+    fi
     for probe in 1 2 3; do
-        if codex --version > /dev/null 2>&1 && codex app-server --help > /dev/null 2>&1; then
-            return 0
+        if codex --version > /dev/null 2>&1 && codex exec --help > /dev/null 2>&1; then
+            omr_codex_pick_sandbox
+            return
         fi
         if [ "$probe" != 3 ]; then
             echo "Codex CLI not answering (probe $probe of 3), an update may be rewriting it, retrying in ${OMR_PROBE_DELAY_S}s"
@@ -143,29 +234,75 @@ omr_codex_ready() {
     omr_unavailable "CLI not answering after 3 probes"
 }
 
-# Never the companion's `--background` flag, which `review` parses and ignores.
-omr_codex_run() { # <base>
-    node "$OMR_CODEX_COMPANION" review --scope branch --base "$1" --json
+# Each attempt reviews a fresh snapshot of the frozen head, so a write the
+# reviewer makes never reaches the branch under review. Approvals have no
+# channel here, so none are asked.
+omr_codex_run() { # <base> <head>
+    local tree="$OMR_WORK/codex-tree" schema="$OMR_WORK/findings-schema.json"
+    rm -rf "$tree" || return
+    git clone --quiet --shared --no-checkout "$(git rev-parse --show-toplevel)" "$tree" || return
+    git -C "$tree" checkout --quiet --detach "$2" || return
+    printf '%s\n' "$OMR_FINDINGS_SCHEMA" > "$schema" || return
+    printf '%s\n' "Review the change $1...$2 in this repository, a snapshot of the branch under review. Read its commit log (git log $1..$2) and its diff (${OMR_DIFF[*]} $1...$2). Follow .claude/skills/code-review/SKILL.md at effort high as the other-model reviewer: run its correctness angles and its verification, read any file you need, and change nothing. Return the findings that survive, with an empty list when none do. $(omr_proof_ask "$1" "$2")" |
+        codex exec -C "$tree" --sandbox "$OMR_CODEX_SANDBOX" -c 'approval_policy="never"' \
+            --ephemeral --json --output-schema "$schema" -
 }
 
+# Every JSON object in the event stream, one per line. Other lines are dropped.
+omr_codex_events() { # <out>
+    jq -R -c 'fromjson? | select(type == "object")' "$1" 2> /dev/null
+}
+
+# The reviewer's last message, as it wrote it.
+omr_codex_final_message() { # <out>
+    omr_codex_events "$1" |
+        jq -c 'select(.type == "item.completed" and (.item | type) == "object" and .item.type == "agent_message") | .item.text' |
+        tail -1 | jq -r '.'
+}
+
+# The last message as a JSON object, or nothing when it is not one.
+omr_codex_verdict_json() { # <out>
+    omr_codex_final_message "$1" | jq -c 'select(type == "object")' 2> /dev/null
+}
+
+# What the reviewer ran and what failed, then its verdict or its last words.
 omr_codex_show() { # <out>
-    cat "$1"
+    local verdict
+    if [ -z "$(omr_codex_events "$1" | head -1)" ]; then
+        cat "$1"
+        return
+    fi
+    omr_codex_events "$1" | jq -r '
+        def one_line: tostring | gsub("[\r\n]+"; " ");
+        if .type == "item.completed" and (.item | type) == "object" and .item.type == "command_execution" then
+            "ran: \(.item.command | one_line | .[:200]) (exit \(.item.exit_code // "none"))"
+        elif .type == "turn.failed" then "turn failed: \(.error.message // "" | one_line)"
+        elif .type == "error" then "error: \(.message // "" | one_line)"
+        else empty
+        end'
+    verdict=$(omr_codex_verdict_json "$1")
+    if [ -n "$verdict" ]; then
+        omr_show_verdict "$verdict"
+    else
+        echo "last message: $(omr_codex_final_message "$1" | omr_one_line | cut -c1-500)"
+    fi
 }
 
-# A reviewer that says nothing, or only the generic sentence, gave no verdict.
 omr_codex_verdict() { # <exit> <out>
-    local said
-    said=$(omr_codex_said "$2")
-    [ "$1" = 0 ] && [ -n "$said" ] && [ "$said" != "$OMR_CODEX_GENERIC" ]
+    [ "$1" = 0 ] && omr_proves_read "$(omr_codex_verdict_json "$2")"
 }
 
-# The JSON "stdout" field, even when empty, else the last line it printed.
+# The verdict's summary, else the last message, else the last line printed.
 omr_codex_said() { # <out>
-    if grep -E -q '"stdout": *"' "$1"; then
-        grep -E -o -m 1 '"stdout": *"[^"]*"' "$1" | sed -E 's/^"stdout": *"//; s/"$//'
+    local verdict
+    verdict=$(omr_codex_verdict_json "$1")
+    if [ -n "$verdict" ]; then
+        printf '%s' "$verdict" | jq -r '.summary // "" | tostring'
+    elif [ -n "$(omr_codex_events "$1" | head -1)" ]; then
+        omr_codex_final_message "$1"
     else
         omr_last_line "$1"
-    fi
+    fi | omr_one_line | cut -c1-240
 }
 
 # The newest sampling error Codex logged at or after <epoch>, from this
@@ -178,7 +315,7 @@ omr_codex_logged_sampling_error() { # <epoch> <out>
         if [ -z "$db" ] || [ "$f" -nt "$db" ]; then db=$f; fi
     done
     [ -n "$db" ] || return 0
-    thread=$(grep -E -o -m 1 '"threadId": *"[A-Za-z0-9-]+"' "$2" | sed -E 's/.*"([^"]+)"$/\1/')
+    thread=$(grep -E -o -m 1 '"thread_id": *"[A-Za-z0-9-]+"' "$2" | sed -E 's/.*"([^"]+)"$/\1/')
     sqlite3 -readonly "file:$db?mode=ro" \
         "select substr(feedback_log_body, instr(feedback_log_body, 'sampling_error='), 240)
          from logs where ts >= $1 and feedback_log_body like '%sampling_error=%'
@@ -186,23 +323,33 @@ omr_codex_logged_sampling_error() { # <epoch> <out>
          order by thread_id is null, id desc limit 1" 2> /dev/null
 }
 
-# The companion folds an upstream failure, like a 403 for an unreachable
-# model, into the generic sentence. The real cause is in the reviewer's
-# stderr, its JSON payload, or Codex's own log, in that order.
+# The real cause, in order: an HTTP status anywhere, the turn's own error, a
+# command that failed (a sandbox refusal lands here), Codex's log, stderr.
 omr_codex_upstream() { # <out> <err> <started>
     local found
     found=$(omr_http_status_line "$2" "$1")
+    [ -n "$found" ] || found=$(omr_codex_events "$1" | jq -r '
+        if .type == "turn.failed" then .error.message // empty
+        elif .type == "error" then .message // empty
+        else empty
+        end' | tail -1)
+    [ -n "$found" ] || found=$(omr_codex_events "$1" | jq -r '
+        select(.type == "item.completed" and (.item | type) == "object" and .item.type == "command_execution"
+            and (.item.exit_code // 0) != 0)
+        | (.item.aggregated_output // "" | split("\n") | map(select(test("\\S"))) | last) as $said
+        | select($said != null)
+        | "a command failed (exit \(.item.exit_code)): \($said)"' | head -1)
     [ -n "$found" ] || found=$(omr_codex_logged_sampling_error "$3" "$1")
     [ -n "$found" ] || found=$(omr_last_line "$2")
-    printf '%s\n' "${found:-none reported}" | omr_one_line
+    printf '%s\n' "${found:-none reported}" | omr_one_line | cut -c1-240
 }
 
 # --- Claude, through the `claude` CLI in print mode ---
 
 # Every flag is defined here, once (plan decision 7). The reviewer gets no
-# Bash: it reads the diff this script writes, so it cannot run a build.
+# Bash: it reads the diff this script writes, so it cannot run a build, and
+# no seatbelt of its own ever nests in the Lucidos sandbox.
 OMR_CLAUDE_DIFF=.lucidos/other-model-review.diff
-OMR_CLAUDE_FINDINGS_SCHEMA='{"type":"object","properties":{"findings":{"type":"array","items":{"type":"object","properties":{"file":{"type":"string"},"line":{"type":"integer"},"summary":{"type":"string"},"failure_scenario":{"type":"string"},"category":{"type":"string","enum":["correctness","compliance","cleanup"]}},"required":["file","line","summary","failure_scenario","category"]}}},"required":["findings"]}'
 OMR_CLAUDE_SYSTEM_DIRS=${HARDEN_REVIEW_CLAUDE_DIRS-/opt/homebrew/bin /usr/local/bin}
 
 # The engine's resolve_claude_binary order: the user's install, then the
@@ -241,15 +388,15 @@ omr_claude_ready() {
 
 # Never set or unset CLAUDE_CONFIG_DIR, and pass no --bare or
 # --setting-sources: each one breaks the inherited login (plan decision 8).
-omr_claude_run() { # <base>
+omr_claude_run() { # <base> <head>
     cd "$(git rev-parse --show-toplevel)" || return
     mkdir -p "$(dirname "$OMR_CLAUDE_DIFF")" || return
     {
-        git log --format='commit %H%n%n    %s%n' "$1..HEAD" &&
-            git diff "$1...HEAD"
+        git log --format='commit %H%n%n    %s%n' "$1..$2" &&
+            "${OMR_DIFF[@]}" "$1...$2"
     } > "$OMR_CLAUDE_DIFF" || return
-    "$OMR_CLAUDE_BIN" -p "Review the change in $OMR_CLAUDE_DIFF, which holds the commit log and the diff of $1...HEAD in this repository. Follow .claude/skills/code-review/SKILL.md at effort high as the other-model reviewer: run its correctness angles and its verification, read any file you need, and change nothing. Return the findings that survive as structured output, with an empty list when none do." \
-        --output-format json --json-schema "$OMR_CLAUDE_FINDINGS_SCHEMA" \
+    "$OMR_CLAUDE_BIN" -p "Review the change in $OMR_CLAUDE_DIFF, which holds the commit log and the diff of $1...$2 in this repository. Follow .claude/skills/code-review/SKILL.md at effort high as the other-model reviewer: run its correctness angles and its verification, read any file you need, and change nothing. Return the findings that survive as structured output, with an empty list when none do. $(omr_proof_ask "$1" "$2")" \
+        --output-format json --json-schema "$OMR_FINDINGS_SCHEMA" \
         --model opus --effort high \
         --tools Read,Grep,Glob --permission-mode dontAsk --permission-prompts none \
         --strict-mcp-config --no-session-persistence --max-budget-usd 5
@@ -259,34 +406,39 @@ omr_claude_is_result() { # <out>
     jq -e 'type == "object"' "$1" > /dev/null 2>&1
 }
 
-# The served model, the cost, then one line per finding, never a raw array.
+# The structured output of a result that is not an error, or nothing.
+omr_claude_verdict_json() { # <out>
+    jq -c 'select(type == "object" and .is_error == false) | .structured_output | select(type == "object")' "$1" 2> /dev/null
+}
+
+# The served model and the cost, then the verdict, never a raw array.
 omr_claude_show() { # <out>
+    local verdict
     if ! omr_claude_is_result "$1"; then
         cat "$1"
         return
     fi
-    jq -r '
-        def one_line: tostring | gsub("[\r\n]+"; " ");
-        "Claude reviewer: \((.modelUsage // {}) | keys | join(", ") | if . == "" then "model unknown" else . end), $\(.total_cost_usd // 0)",
-        (if (.structured_output.findings | type) == "array" then
-            if (.structured_output.findings | length) == 0 then "No findings."
-            else .structured_output.findings[] | "\(.file):\(.line) [\(.category)] \(.summary): \(.failure_scenario)" | one_line
-            end
-        else "result: \(.result // "" | one_line)"
-        end)' "$1"
+    jq -r '"Claude reviewer: \((.modelUsage // {}) | keys | join(", ") | if . == "" then "model unknown" else . end), $\(.total_cost_usd // 0)"' "$1"
+    verdict=$(omr_claude_verdict_json "$1")
+    if [ -n "$verdict" ]; then
+        omr_show_verdict "$verdict"
+    else
+        jq -r '"result: \(.result // "" | tostring | gsub("[\r\n]+"; " "))"' "$1"
+    fi
 }
 
 omr_claude_verdict() { # <exit> <out>
-    [ "$1" = 0 ] &&
-        jq -e '.is_error == false and (.structured_output.findings | type) == "array"' "$2" > /dev/null 2>&1
+    [ "$1" = 0 ] && omr_proves_read "$(omr_claude_verdict_json "$2")"
 }
 
+# The verdict's summary, else the result text, else the last line printed.
 omr_claude_said() { # <out>
     if omr_claude_is_result "$1"; then
-        jq -r '.result // "" | tostring' "$1" | omr_one_line | cut -c1-240
+        jq -r '(.structured_output.summary? // "" | tostring) as $s
+            | if $s != "" then $s else .result // "" | tostring end' "$1"
     else
-        omr_last_line "$1" | omr_one_line
-    fi
+        omr_last_line "$1"
+    fi | omr_one_line | cut -c1-240
 }
 
 # An HTTP status anywhere, else the result's own error flags, else stderr.
@@ -295,7 +447,7 @@ omr_claude_upstream() { # <out> <err> <started>
     found=$(omr_http_status_line "$2" "$1")
     [ -n "$found" ] || found=$(jq -r '
         if .is_error then "is_error, subtype \(.subtype // "none")"
-        elif (.structured_output.findings | type) != "array" then "no structured_output, subtype \(.subtype // "none")"
+        elif (.structured_output | type) != "object" then "no structured_output, subtype \(.subtype // "none")"
         else empty
         end' "$1" 2> /dev/null)
     [ -n "$found" ] || found=$(omr_last_line "$2")

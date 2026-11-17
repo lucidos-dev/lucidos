@@ -188,7 +188,7 @@ impl PendingSignIn {
         let account = ChatGptPlanAccountStore::get(pool)
             .await?
             .ok_or("the ChatGPT sign-in ended as it was stored")?;
-        crate::log!("[ChatGptPlan] Signed in");
+        crate::log_legacy!("[ChatGptPlan] Signed in");
         Ok(ChatGptPlanAccountInfo::from(&account))
     }
 

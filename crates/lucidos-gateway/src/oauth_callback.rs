@@ -43,10 +43,14 @@ pub const HANDOFF_ANSWERED_HEADER: &str = "x-lucidos-oauth-handoff";
 const FORWARDED_FIELDS: [&str; 5] = ["code", "state", "error", "error_description", "client_id"];
 
 /// How long the engine may take to settle a delivered callback.
-const ENGINE_TIMEOUT: Duration = Duration::from_secs(10);
+const ENGINE_TIMEOUT: Duration = lucidos_engine_socket::OAUTH_CALLBACK_HOP_TIMEOUT;
 
 /// How long a remote gateway may take, its own engine wait included.
-const RELAY_TIMEOUT: Duration = Duration::from_secs(15);
+const RELAY_TIMEOUT: Duration = ENGINE_TIMEOUT.saturating_add(Duration::from_secs(5));
+
+/// How long a peer gateway on this machine may take to answer a handed-off
+/// callback. The peer may relay it to a remote gateway, so it outlasts that.
+pub(crate) const HANDOFF_TIMEOUT: Duration = RELAY_TIMEOUT.saturating_add(Duration::from_secs(2));
 
 /// The largest page accepted from an engine.
 const MAX_PAGE_BYTES: usize = 64 * 1024;
@@ -89,7 +93,7 @@ pub async fn serve(addr: SocketAddr, state: GatewayState, handle: axum_server::H
     loop {
         match std::net::TcpListener::bind(addr) {
             Ok(listener) => {
-                crate::log!("[OAuth] callback listener on http://{addr}");
+                crate::log_legacy!("[OAuth] callback listener on http://{addr}");
                 reported = None;
                 let serving = crate::server::serve_listener(
                     listener,
@@ -100,13 +104,15 @@ pub async fn serve(addr: SocketAddr, state: GatewayState, handle: axum_server::H
                 // `Ok` is the shutdown handle firing.
                 match serving.await {
                     Ok(()) => return,
-                    Err(e) => crate::log!("[OAuth] callback listener on {addr} stopped ({e})"),
+                    Err(e) => {
+                        crate::log_legacy!("[OAuth] callback listener on {addr} stopped ({e})")
+                    }
                 }
             }
             Err(e) => {
                 if reported != Some(e.kind()) {
                     reported = Some(e.kind());
-                    crate::log!(
+                    crate::log_legacy!(
                         "[OAuth] cannot bind the callback port {addr} ({e}); retrying every {}s. \
                          Another Lucidos install on this machine may hold it, and hands \
                          callbacks on to this one",
@@ -255,13 +261,13 @@ async fn route_callback(
             }
         }
     }
-    crate::log!("[OAuth] no workspace on this machine claimed a callback");
+    crate::log_legacy!("[OAuth] no workspace on this machine claimed a callback");
     Delivery::Unclaimed.into_answer()
 }
 
 /// What this gateway's own engines made of a callback.
 enum Delivery {
-    /// An engine owned the `state`, and rendered this page.
+    /// An engine owned the `state`. Remote success uses this gateway's markup.
     Answered { status: StatusCode, page: String },
     /// No engine here took it. Every such answer is the same [`failure_page`],
     /// so a public caller cannot tell a workspace that exists from one that
@@ -338,7 +344,7 @@ async fn deliver_to_remote(state: &GatewayState, slug: &str, name: &str, query: 
     )
     .await;
     let Ok(response) = relayed else {
-        crate::log!(
+        crate::log_legacy!(
             "[OAuth] remote gateway '{name}' took over {RELAY_TIMEOUT:?} to take a callback"
         );
         return Delivery::Unclaimed;
@@ -348,11 +354,20 @@ async fn deliver_to_remote(state: &GatewayState, slug: &str, name: &str, query: 
         status,
         StatusCode::OK | StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND
     ) {
-        crate::log!(
+        crate::log_legacy!(
             "[OAuth] remote gateway '{name}' did not take a callback for '{slug}' ({status})"
         );
     }
-    Delivery::read(status, response.into_body()).await
+    // The callback endpoints render this page again, losing relay headers.
+    // Only our own markup may cross that second rendering boundary.
+    match status {
+        StatusCode::OK => Delivery::Answered {
+            status,
+            page: "<!doctype html><meta charset=\"utf-8\"><title>Authorization complete</title><p>Authorization complete. Return to Lucidos to continue.</p>".into(),
+        },
+        StatusCode::BAD_REQUEST => Delivery::Answered { status, page: failure_page() },
+        _ => Delivery::Unclaimed,
+    }
 }
 
 /// Deliver a callback to this gateway's engine for `slug`.
@@ -372,11 +387,11 @@ async fn deliver_to_engine(state: &GatewayState, slug: &str, query: &str) -> Del
     let upstream = match sent {
         Ok(Ok(upstream)) => upstream,
         Ok(Err(e)) => {
-            crate::log!("[OAuth] '{slug}' could not take a callback: {e}");
+            crate::log_legacy!("[OAuth] '{slug}' could not take a callback: {e}");
             return Delivery::Unclaimed;
         }
         Err(_) => {
-            crate::log!("[OAuth] '{slug}' took over {ENGINE_TIMEOUT:?} to take a callback");
+            crate::log_legacy!("[OAuth] '{slug}' took over {ENGINE_TIMEOUT:?} to take a callback");
             return Delivery::Unclaimed;
         }
     };

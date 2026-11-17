@@ -1308,21 +1308,27 @@ async fn forwards_query_param_auth_preserves_existing_query() {
 
 #[tokio::test]
 async fn upstream_5xx_passes_through() {
-    let (base, _slot) = spawn_recording_upstream(503, "down").await;
-    let url = format!("{}/x", base);
-    let resp = forward_request(
-        Method::GET,
-        &url,
-        &url,
-        HeaderMap::new(),
-        Vec::new(),
-        Bytes::new(),
-        Transport::Verified,
-        test_timeout(),
-    )
-    .await;
-    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body_text(resp).await, "down");
+    for status in [500, 503, 429] {
+        let (base, _slot) = spawn_recording_upstream(status, "down").await;
+        let url = format!("{}/x", base);
+        let resp = forward_request(
+            Method::GET,
+            &url,
+            &url,
+            HeaderMap::new(),
+            Vec::new(),
+            Bytes::new(),
+            Transport::Verified,
+            test_timeout(),
+        )
+        .await;
+        assert_eq!(resp.status().as_u16(), status);
+        assert!(resp
+            .extensions()
+            .get::<crate::api::internal_faults::ExternalFailure>()
+            .is_some());
+        assert_eq!(body_text(resp).await, "down");
+    }
 }
 
 /// Spawn an upstream that responds with `status` + `Location` header.
@@ -3254,57 +3260,13 @@ fn the_load_names_every_entry_it_will_not_vouch_for() {
     assert!(load.insecure[1].reason.contains("not loopback"));
 }
 
-/// A self-signed certificate and the private key for it, as PEM.
-///
-/// Built with the `openssl` crate rather than a new dev-dependency. The SAN is
-/// what makes the opted-in half meaningful. rustls refuses a certificate with
-/// no SAN before it weighs the signature, so without one both clients fail and
-/// the test proves nothing.
-fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
-    use openssl::asn1::Asn1Time;
-    use openssl::hash::MessageDigest;
-    use openssl::pkey::PKey;
-    use openssl::rsa::Rsa;
-    use openssl::x509::extension::SubjectAlternativeName;
-    use openssl::x509::{X509NameBuilder, X509};
-
-    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
-    let mut subject = X509NameBuilder::new().unwrap();
-    subject.append_entry_by_text("CN", "localhost").unwrap();
-    let subject = subject.build();
-
-    let mut builder = X509::builder().unwrap();
-    builder.set_version(2).unwrap();
-    builder.set_subject_name(&subject).unwrap();
-    builder.set_issuer_name(&subject).unwrap();
-    builder.set_pubkey(&key).unwrap();
-    builder
-        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
-        .unwrap();
-    builder
-        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
-        .unwrap();
-    let san = SubjectAlternativeName::new()
-        .ip("127.0.0.1")
-        .dns("localhost")
-        .build(&builder.x509v3_context(None, None))
-        .unwrap();
-    builder.append_extension(san).unwrap();
-    builder.sign(&key, MessageDigest::sha256()).unwrap();
-
-    (
-        builder.build().to_pem().unwrap(),
-        key.private_key_to_pem_pkcs8().unwrap(),
-    )
-}
-
 /// Serve one HTTPS request from a self-signed certificate, then stop. Returns
 /// the base URL. Deliberately hand-rolled: the assertion is about the TLS
 /// handshake, so the HTTP half only has to be enough for a 200.
 async fn spawn_self_signed_upstream() -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let (cert_pem, key_pem) = self_signed_pem();
+    let (cert_pem, key_pem) = crate::test_support::self_signed_pem();
     let cert = openssl::x509::X509::from_pem(&cert_pem).unwrap();
     let key = openssl::pkey::PKey::private_key_from_pem(&key_pem).unwrap();
     // A non-empty passphrase: macOS Security.framework refuses an empty one

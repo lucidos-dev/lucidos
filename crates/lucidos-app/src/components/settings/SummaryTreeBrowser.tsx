@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'preact/hooks';
 import { getSummaryTree, getSummaryTreeThreads, getRecallZoom, getRecallDate } from '../../api/client';
 import { summaryTreesVersion } from '../../store/store';
-import { operatorName, operators } from '../../store/actions/operators';
+import { gatewayUserName, gatewayUsers } from '../../store/actions/gatewayUsers';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { useVersionedRefresh } from '../../hooks/useVersionedRefresh';
@@ -73,7 +73,7 @@ function TreeLineRow({ line }: { line?: RecallLine }) {
   const span = line ? lineSpan(line.id) : null;
   const kinded = line ? entryKindOf(line.text) : null;
   const sender = kinded?.kind === 'prompt (human)' && line?.sender_device_id
-    ? operatorName(operators.value, line.sender_device_id)
+    ? gatewayUserName(gatewayUsers.value, line.sender_device_id)
     : null;
 
   const read = useCallback(async (): Promise<Opened> => {

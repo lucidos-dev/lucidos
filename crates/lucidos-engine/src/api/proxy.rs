@@ -635,7 +635,7 @@ pub(crate) async fn refuse_proxied_request(
     if !request.headers().contains_key(PROXY_ORIGIN_HEADER) {
         return next.run(request).await;
     }
-    log!(
+    log_legacy!(
         "[Proxy] Refusing {} {}: it came through a credentialed proxy",
         request.method(),
         request.uri().path()
@@ -1183,7 +1183,7 @@ async fn check_handshake_injects(
     // checked against it.
     match handshake_approvals::bind_injects_if_absent(workspace, script, injects) {
         Ok(BindOutcome::Bound) => {
-            log!(
+            log_legacy!(
                 "[Proxy] bound handshake script {} to inject {:?} (ADR 0144)",
                 script,
                 injects
@@ -1270,7 +1270,7 @@ async fn check_handshake_scope(
     // outcome carries whichever scope won and this one is checked against it.
     match handshake_approvals::bind_scope_if_absent(workspace, script, base_url) {
         Ok(BindOutcome::Bound) => {
-            log!(
+            log_legacy!(
                 "[Proxy] bound handshake script {} to {} (ADR 0144)",
                 script,
                 base_url
@@ -1377,7 +1377,7 @@ pub async fn forward_request(
                     // in the send arm, and it is the same timeout: a 504.
                     let is_timeout = e.is_timeout();
                     let safe_e = e.without_url();
-                    log!(
+                    log_legacy!(
                         "[Proxy] reading upstream body from {} failed: {}",
                         log_url,
                         safe_e
@@ -1397,7 +1397,7 @@ pub async fn forward_request(
                 }
             }
             confine_proxied_response(response.headers_mut());
-            response
+            super::internal_faults::external(response)
         }
         Err(e) => {
             // `reqwest::Error`'s Display and Debug impls embed the request URL,
@@ -1405,7 +1405,7 @@ pub async fn forward_request(
             // before logging or surfacing the error to the caller.
             let is_timeout = e.is_timeout();
             let safe_e = e.without_url();
-            log!("[Proxy] forward to {} failed: {}", log_url, safe_e);
+            log_legacy!("[Proxy] forward to {} failed: {}", log_url, safe_e);
             if is_timeout {
                 (
                     StatusCode::GATEWAY_TIMEOUT,
@@ -1460,7 +1460,7 @@ pub(crate) async fn reload_proxy_modules_into(
     let mut names: Vec<String> = new_modules.keys().cloned().collect();
     names.sort();
     *engine.proxy_modules().write().await = new_modules;
-    log!(
+    log_legacy!(
         "[Proxy] reloaded WASM auth modules ({}): {:?}",
         names.len(),
         names
@@ -1504,7 +1504,7 @@ pub(super) async fn proxy_modules_reload(
             Json(serde_json::json!({"loaded": names})).into_response()
         }
         Err(e) => {
-            log!("[Proxy] reload of WASM auth modules failed: {}", e);
+            log_legacy!("[Proxy] reload of WASM auth modules failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("reload failed: {e}"),
@@ -1939,7 +1939,7 @@ async fn follow_redirects(
     let mut hops = 0usize;
 
     let out_of_time = || {
-        log!("[Proxy] {} ran out of its {}s call budget", name, MAX_SECS);
+        log_legacy!("[Proxy] {} ran out of its {}s call budget", name, MAX_SECS);
         (
             StatusCode::GATEWAY_TIMEOUT,
             format!("proxy '{name}' ran past the {MAX_SECS}s limit on one proxied call"),
@@ -1953,7 +1953,7 @@ async fn follow_redirects(
         let target_url =
             build_contained_target_url(base_url, &current_path, current_query.as_deref()).map_err(
                 |reason| {
-                    log!("[Proxy] {} refused an upstream URL: {}", name, reason);
+                    log_legacy!("[Proxy] {} refused an upstream URL: {}", name, reason);
                     // Hop 0 is the caller's own path, so that is a 400. A later
                     // hop is the upstream misdirecting us, which is a 502.
                     let status = if hops == 0 {
@@ -2039,7 +2039,7 @@ async fn follow_redirects(
         }
 
         if hops >= MAX_REDIRECT_HOPS - 1 {
-            log!(
+            log_legacy!(
                 "[Proxy] {} hit redirect-hop cap ({}); refusing to follow further",
                 name,
                 MAX_REDIRECT_HOPS
@@ -2073,7 +2073,7 @@ async fn follow_redirects(
         if target_origin != initial_origin {
             // Names only — no full URLs in the log (a Location can carry a
             // credential in its query string).
-            log!(
+            log_legacy!(
                 "[Proxy] {} returned redirect to origin {}://{}:{:?} but auth was bound to {}://{}:{:?} — refused",
                 name,
                 target_origin.0,
@@ -2094,7 +2094,7 @@ async fn follow_redirects(
         // The `Location` is absolute on the origin and the next hop re-anchors
         // on the base, so what carries forward is the part below the prefix.
         current_path = redirect_path_within_base(base_url, target.path()).ok_or_else(|| {
-            log!(
+            log_legacy!(
                 "[Proxy] {} refused a redirect to '{}', outside its base path",
                 name,
                 target.path()

@@ -1,7 +1,8 @@
+import { openAppSearch } from '../store/actions/apps';
 import { useEffect } from 'preact/hooks';
 import { unfocusThread } from '../store/actions/threads';
 import { focusPromptNow, openAgentMenu } from '../components/chat/promptFocus';
-import { searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
+import { activeMenuItem, panelOverlay, searchEverywhereOpen, searchEverywhereAnchor, focusedPane, focusedThreadId, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isInteractiveTarget, isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack, topPanelOverlay } from '../store/overlayStack';
 import { nativeFullscreenElement } from '../store/appFullscreenHost';
@@ -103,6 +104,7 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
   closeThread: () => void runCloseCascade(),
   searchEverywhere: toggleSearchEverywhere,
   searchFiles: () => openFileSearch(),
+  searchApps: openAppSearch,
   openSettings: () => switchMenuItem('settings'),
   showShortcuts: () => openSettingsSubview('keyboard-shortcuts'),
   openNotifications: () => switchMenuItem('notifications'),
@@ -273,6 +275,8 @@ function escapePolicyHasWork(): boolean {
  *  key keeps its browser default, so Mod+F opens the browser's own find.
  *  `inContent` says the keydown came from a frame in the content pane. */
 const CLAIMS_ONLY_WHEN: Partial<Record<ShortcutId, (inContent: boolean) => boolean>> = {
+  searchApps: () => topPanelOverlay() === null && panelOverlay.value === null
+    && (activeMenuItem.value === 'apps' || activeMenuItem.value === 'plugins'),
   // Never under a modal: what it shows is not the pane behind it. An open bar
   // takes the chord from anywhere, since pressing it again closes the bar.
   findInView: (inContent) => topPanelOverlay() === null

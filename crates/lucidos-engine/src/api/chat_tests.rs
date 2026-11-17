@@ -1,4 +1,92 @@
 use super::*;
+use crate::engine::thread_events::ThreadEvent;
+
+#[tokio::test]
+async fn stop_restores_before_canceling_a_live_turn_and_still_cancels_on_restore_failure() {
+    use crate::engine::event_bus::OrdinarySubmissionIntent;
+    use crate::engine::thread_events::MessageOrigin;
+    use crate::engine::thread_queue::ThreadQueueRequest;
+    use crate::test_support::*;
+    if !in_engine_child("api::chat::tests::stop_restores_before_canceling_a_live_turn_and_still_cancels_on_restore_failure").await {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, workspace) = boot_mock_engine(&db).await;
+    let state = crate::api::permission_requests::tests::permission_test_state(
+        engine.clone(),
+        workspace.path().to_path_buf(),
+    )
+    .await;
+    let bus = &engine.event_bus;
+    crate::core::DeviceStore::register(&pool, bus, "stop-browser", None, None, None)
+        .await
+        .unwrap();
+    for full in [false, true] {
+        let thread = seed_chat_thread(bus, "active turn").await;
+        let message = Uuid::new_v4();
+        let actor = MessageOrigin::Device {
+            device_id: "stop-browser".into(),
+        };
+        let request: ThreadQueueRequest = serde_json::from_value(serde_json::json!({
+            "type":"agent-chat", "thread_id":thread, "event_id":message,
+            "message":"unread input", "mode":"human", "origin":actor,
+        }))
+        .unwrap();
+        let intent = OrdinarySubmissionIntent::new(thread, message, &request).unwrap();
+        bus.accept_ordinary_submission(request, actor, &bus.input_order, None, None, intent)
+            .await
+            .unwrap();
+        if full {
+            sqlx::query("UPDATE thread_summaries SET compose_text=$2 WHERE thread_id=$1")
+                .bind(thread)
+                .bind("x".repeat(crate::core::store::MAX_COMPOSE_TEXT_BYTES))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let (token, _injections, guard) = engine.try_register_thread(thread).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            super::super::actor::HEADER_DEVICE_ID,
+            "stop-browser".parse().unwrap(),
+        );
+        let Json(response) = cancel_chat(
+            State(state.clone()),
+            headers,
+            Query(CancelChatQuery {
+                thread_id: Some(thread.to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(response.canceled);
+        assert!(
+            token.is_cancelled(),
+            "the live runtime token must fire even when restoration fails"
+        );
+        assert_eq!(
+            response.take_back.failed_take_back_ids,
+            if full { vec![message] } else { vec![] }
+        );
+        let removed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE thread_id=$1 AND event_type='QueuedMessageRemoved'",
+        )
+        .bind(thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(removed, i64::from(!full));
+        if !full {
+            assert_eq!(
+                response.take_back.taken_back_messages[0].compose.text,
+                "unread input"
+            );
+        }
+        drop(guard);
+    }
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
 
 // ── subprocess_chat_legitimate ──────────────────────────────────────
 //
@@ -532,6 +620,7 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         thread_id: None,
         input_chain: None,
         input_seq: None,
+        compose_epoch: None,
         new_thread: None,
         conflict_change_id: None,
         repo_id: None,
@@ -1129,106 +1218,30 @@ async fn drain_orphan_queue_no_op_for_empty_initial() {
 }
 
 #[tokio::test]
-async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
+async fn the_removal_lookup_finds_only_its_own_tombstone() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
-    let injected_message_id = Uuid::new_v4();
+    let kept_message_id = Uuid::new_v4();
     let removed_message_id = Uuid::new_v4();
+    persist_message(&bus, thread_id, "kept", kept_message_id).await;
 
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
-        event: ThreadEvent::MessageReceived {
-            voice_session_id: None,
-            wake_mode: None,
-            text: "queued".into(),
-            user_image_hashes: vec![],
-            device_id: None,
-            image_description: None,
-            parent_thread_id: None,
-            spawning_event_id: None,
-            mode: ActorMode::Human,
-            model: None,
-            reasoning_effort: None,
-            provider: None,
-            origin: None,
+        event: ThreadEvent::QueuedMessageRemoved {
+            removed_message_id,
+            restore_to_compose: false,
+            compose: None,
         },
-        meta: EventMeta {
-            event_id: Some(injected_message_id),
-            ..EventMeta::NONE
-        },
-    })
-    .await
-    .expect("MessageReceived must persist");
-
-    bus.emit(crate::engine::event_bus::BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::PromptInjected {
-            text: "queued".into(),
-            mode: ActorMode::Human,
-            origin: None,
-            injected_message_id: Some(injected_message_id),
-            delivered_event_id: None,
-        },
-        meta: EventMeta {
-            request_event_id: Some(injected_message_id),
-            ..EventMeta::NONE
-        },
-    })
-    .await
-    .expect("PromptInjected must persist");
-
-    bus.emit(crate::engine::event_bus::BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::MessageReceived {
-            voice_session_id: None,
-            wake_mode: None,
-            text: "remove me".into(),
-            user_image_hashes: vec![],
-            device_id: None,
-            image_description: None,
-            parent_thread_id: None,
-            spawning_event_id: None,
-            mode: ActorMode::Human,
-            model: None,
-            reasoning_effort: None,
-            provider: None,
-            origin: None,
-        },
-        meta: EventMeta {
-            event_id: Some(removed_message_id),
-            ..EventMeta::NONE
-        },
-    })
-    .await
-    .expect("second MessageReceived must persist");
-
-    bus.emit(crate::engine::event_bus::BusEvent::Thread {
-        thread_id,
-        event: ThreadEvent::QueuedMessageRemoved { removed_message_id },
         meta: EventMeta::NONE,
     })
     .await
     .expect("QueuedMessageRemoved must persist");
 
-    assert!(
-        queued_message_already_injected(&pool, thread_id, injected_message_id)
-            .await
-            .expect("injected lookup must not type-error"),
-        "injected lookup must find the matching marker"
-    );
-    assert!(
-        queued_message_already_removed(&pool, thread_id, removed_message_id)
-            .await
-            .expect("removed lookup must not type-error"),
-        "removed lookup must find the matching marker"
-    );
-    assert!(
-        !queued_message_already_injected(&pool, thread_id, removed_message_id)
-            .await
-            .expect("non-match lookup must not type-error"),
-        "lookup must not match the wrong marker field"
-    );
+    let was_removed =
+        |message| crate::engine::consumption_claim::was_removed(&pool, thread_id, message);
+    assert!(was_removed(removed_message_id).await.unwrap());
+    assert!(!was_removed(kept_message_id).await.unwrap());
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -1326,7 +1339,7 @@ async fn announce_orphan_batch_revives_a_thread_the_cancel_left_idle() {
     announce_orphan_batch(
         &bus,
         thread_id,
-        &[orphan_naming(msg_b, "actually, just the totals")],
+        vec![orphan_naming(msg_b, "actually, just the totals")],
     )
     .await;
 
@@ -1376,7 +1389,7 @@ async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
         batch.push(orphan_naming(*id, &format!("follow-up {i}")));
     }
 
-    announce_orphan_batch(&bus, thread_id, &batch).await;
+    announce_orphan_batch(&bus, thread_id, batch).await;
 
     let rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT payload->>'injected_message_id', payload->>'request_event_id' FROM events \
@@ -1401,6 +1414,50 @@ async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
+/// An orphan the user took back after the chain filtered it is never
+/// announced, and the batch re-anchors on the first orphan still owed.
+#[tokio::test]
+async fn announce_orphan_batch_leaves_out_an_orphan_the_user_took_back() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let ids: Vec<Uuid> = (0..2).map(|_| Uuid::new_v4()).collect();
+    let mut batch = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        persist_message(&bus, thread_id, &format!("follow-up {i}"), *id).await;
+        batch.push(orphan_naming(*id, &format!("follow-up {i}")));
+    }
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::QueuedMessageRemoved {
+            removed_message_id: ids[0],
+            restore_to_compose: false,
+            compose: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .expect("QueuedMessageRemoved must persist");
+
+    let announced = announce_orphan_batch(&bus, thread_id, batch).await;
+
+    assert_eq!(
+        announced.iter().map(|o| o.event_id).collect::<Vec<_>>(),
+        vec![Some(ids[1])]
+    );
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT payload->>'injected_message_id', payload->>'request_event_id' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'PromptInjected'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("query");
+    assert_eq!(rows, vec![(ids[1].to_string(), ids[1].to_string())]);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 /// An empty batch cannot happen through `process_orphan_chain` (the caller has
 /// already read `first`), but the helper must not panic if one ever reaches it.
 #[tokio::test]
@@ -1409,7 +1466,7 @@ async fn announce_orphan_batch_is_a_noop_for_an_empty_batch() {
     let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
 
-    announce_orphan_batch(&bus, thread_id, &[]).await;
+    announce_orphan_batch(&bus, thread_id, Vec::new()).await;
 
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'PromptInjected'",
@@ -1525,7 +1582,7 @@ fn the_body_device_id_wins_and_a_blank_one_falls_through_to_the_header() {
 #[test]
 fn a_team_send_takes_the_authenticated_device_over_the_body() {
     use crate::api::actor::authenticated_device_id;
-    let h = headers_with(&[(super::super::actor::HEADER_DEVICE_ID, "kim-phone")]);
+    let h = crate::api::gateway_stamp::test_support::stamped_device_headers("kim-phone");
     assert_eq!(
         authenticated_device_id(Some("sam-phone"), &h),
         Some("kim-phone")
@@ -1538,16 +1595,14 @@ fn a_team_send_takes_the_authenticated_device_over_the_body() {
     assert_eq!(authenticated_device_id(Some(" "), &none), None);
 }
 
-/// The gateway sends its own token beside the device header. A device id in
-/// the header alone is recorded as that device, not as the engine's own
+/// The gateway sends its own token beside the stamped device header. A device
+/// id in the header alone is recorded as that device, not as the engine's own
 /// machinery. Its mode agrees with the request.
 #[test]
 fn a_header_only_device_behind_the_gateway_is_recorded_as_that_device() {
     let token = crate::api::local_auth::publish_test_local_token();
-    let h = headers_with(&[
-        (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
-        (super::super::actor::HEADER_DEVICE_ID, "dev-1"),
-    ]);
+    let mut h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    crate::api::gateway_stamp::test_support::insert_stamped_device(&mut h, "dev-1");
     let req = base_req(ActorMode::Human);
     let origin = build_message_origin(
         &h,
@@ -1650,4 +1705,282 @@ async fn an_integrated_spawn_in_human_mode_is_refused_by_name() {
         refusal.message
     );
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+#[test]
+fn ordinary_wire_intent_normalizes_aliases_and_retains_context_and_selections() {
+    let thread = Uuid::new_v4();
+    let event = Uuid::new_v4();
+    let raw = serde_json::json!({
+        "message": "original", "mode":"human", "thread_id":thread,
+        "message_id":event, "use_claude_code":true,
+        "image_hashes":["second","first","second"],
+        "file_context":{"path":"artifacts/example.md", "lines":[2,5]},
+        "model":null, "mentions":["person-example"], "agent_mentioned":true
+    });
+    let request: ChatRequest = serde_json::from_value(raw).unwrap();
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire["event_id"], event.to_string());
+    assert_eq!(wire["use_coding_agent"], true);
+    assert_eq!(
+        wire["image_hashes"],
+        serde_json::json!(["second", "first", "second"])
+    );
+    assert_eq!(wire["file_context"]["lines"], serde_json::json!([2, 5]));
+    assert!(wire["model"].is_null());
+    assert_eq!(wire["mentions"], serde_json::json!(["person-example"]));
+    assert_eq!(wire["agent_mentioned"], true);
+    let canonical: ChatRequest = serde_json::from_value(wire).unwrap();
+    assert_eq!(
+        crate::engine::event_bus::OrdinarySubmissionIntent::new(thread, event, &request).unwrap(),
+        crate::engine::event_bus::OrdinarySubmissionIntent::new(thread, event, &canonical).unwrap()
+    );
+}
+
+/// A coding-agent orphan keeps its kind: a message re-runs as a message, so
+/// the run names it, and a re-entry stays a re-entry.
+#[test]
+fn a_coding_agent_orphan_re_runs_as_the_input_it_was() {
+    use crate::engine::InjectedPromptKind;
+    let id = Uuid::new_v4();
+    let starter = |kind| coding_agent_orphan_starter(&kind).map(|starter| starter(id));
+    assert_eq!(
+        starter(InjectedPromptKind::UserText),
+        Some(PreEmittedOrigin::Message(id))
+    );
+    assert_eq!(
+        starter(InjectedPromptKind::ReentryFromEngine),
+        Some(PreEmittedOrigin::EngineReentry(id))
+    );
+    assert_eq!(
+        starter(InjectedPromptKind::ReentryFromWait),
+        Some(PreEmittedOrigin::WaitReentry(id))
+    );
+    assert_eq!(starter(InjectedPromptKind::SpokenAside), None);
+    assert_eq!(starter(InjectedPromptKind::SpokenContinuation), None);
+}
+
+/// A human follow-up drained from a coding-agent run, as the orphan chain
+/// receives it.
+fn human_orphan(text: &str, message_id: Uuid) -> InjectedPrompt {
+    InjectedPrompt {
+        text: text.into(),
+        event_id: Some(message_id),
+        mode: ActorMode::Human,
+        spawning_event_id: None,
+        images: None,
+        origin: None,
+        kind: crate::engine::InjectedPromptKind::UserText,
+    }
+}
+
+async fn count_thread_events(pool: &sqlx::PgPool, thread_id: Uuid, event_type: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM events WHERE aggregate_id = $1 AND event_type = $2")
+        .bind(thread_id.to_string())
+        .bind(event_type)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The reported incident. A run ended without reading a follow-up, and the
+/// orphan chain re-ran it as a Lucidos Agent turn on the coding-agent thread.
+/// That turn routed the coding agent's model through the chat registry. The
+/// follow-up must reach the coding agent instead, as the user's message.
+#[test]
+fn a_coding_agent_threads_orphan_reaches_its_coding_agent() {
+    crate::test_support::run_on_engine_runtime(
+        "api::chat::tests::a_coding_agent_threads_orphan_reaches_its_coding_agent",
+        coding_agent_orphan_case,
+    );
+}
+
+async fn coding_agent_orphan_case() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (engine, _workspace) = crate::test_support::boot_mock_engine(&db).await;
+    let thread_id = crate::test_support::seed_coding_thread(&engine.event_bus, None).await;
+    let message_id = engine
+        .event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::test_support::message_received("carry on"),
+            meta: crate::engine::thread_events::EventMeta {
+                channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .event_id;
+    let second_id = engine
+        .event_bus
+        .emit(crate::engine::event_bus::BusEvent::Thread {
+            thread_id,
+            event: crate::test_support::message_received("then check"),
+            meta: crate::engine::thread_events::EventMeta {
+                channel: Some(crate::engine::thread_events::EventChannel::ClaudeCode),
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap()
+        .unwrap()
+        .event_id;
+    let (session, mut msg_rx) = crate::engine::AgentSession::for_test();
+    engine
+        .agent_sessions
+        .lock()
+        .await
+        .insert(thread_id, session);
+
+    process_orphan_chain(
+        engine.clone(),
+        thread_id,
+        vec![
+            human_orphan("carry on", message_id),
+            human_orphan("then check", second_id),
+        ],
+    )
+    .await;
+
+    let input = msg_rx
+        .try_recv()
+        .expect("the coding agent's session receives the follow-up");
+    assert_eq!(input.origin_event_id, Some(message_id));
+    assert!(
+        input.kind.writes_prompt_sent(),
+        "the run names the message in a CodingAgentPromptSent, got {:?}",
+        input.kind
+    );
+    let second = msg_rx
+        .try_recv()
+        .expect("the rest of the batch queues in the same run");
+    assert_eq!(second.text, "then check");
+    assert_eq!(second.origin_event_id, Some(second_id));
+    assert!(second.kind.writes_prompt_sent());
+    assert!(msg_rx.try_recv().is_err(), "each input queues once");
+    let sessions = engine.agent_sessions.lock().await;
+    let session = sessions.get(&thread_id).unwrap();
+    assert!(session.unforwarded_inputs.contains(&message_id));
+    assert!(session.unforwarded_inputs.contains(&second_id));
+    drop(sessions);
+    for chat_event in [
+        "ResponseGenerated",
+        "ResponseFailed",
+        "ContextCaptured",
+        "PromptInjected",
+    ] {
+        assert_eq!(
+            count_thread_events(&pool, thread_id, chat_event).await,
+            0,
+            "no Lucidos Agent turn runs on a coding-agent thread: found {chat_event}"
+        );
+    }
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+/// A thread whose lane cannot be read runs no turn at all. The Lucidos Agent
+/// is never the fallback: on a coding-agent thread it would spend a chat
+/// credential and answer in the coding agent's place.
+#[test]
+fn an_unknown_lane_runs_no_turn_and_says_so() {
+    crate::test_support::run_on_engine_runtime(
+        "api::chat::tests::an_unknown_lane_runs_no_turn_and_says_so",
+        unknown_lane_case,
+    );
+}
+
+async fn unknown_lane_case() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (engine, _workspace) = crate::test_support::boot_mock_engine(&db).await;
+    let thread_id = Uuid::new_v4();
+
+    process_orphan_chain(
+        engine.clone(),
+        thread_id,
+        vec![human_orphan("carry on", Uuid::new_v4())],
+    )
+    .await;
+
+    for chat_event in ["ResponseGenerated", "ContextCaptured", "PromptInjected"] {
+        assert_eq!(
+            count_thread_events(&pool, thread_id, chat_event).await,
+            0,
+            "an unknown lane runs no Lucidos Agent turn: found {chat_event}"
+        );
+    }
+    assert_eq!(
+        count_thread_events(&pool, thread_id, "ResponseFailed").await,
+        1,
+        "the refusal is visible on the thread"
+    );
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+/// Every caller gets the thread's lane, not only the orphan chain. A caller
+/// that passes no lane still reaches the coding agent on its thread.
+#[test]
+fn a_caller_without_a_lane_reaches_the_threads_coding_agent() {
+    crate::test_support::run_on_engine_runtime(
+        "api::chat::tests::a_caller_without_a_lane_reaches_the_threads_coding_agent",
+        caller_without_a_lane_case,
+    );
+}
+
+async fn caller_without_a_lane_case() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (engine, _workspace) = crate::test_support::boot_mock_engine(&db).await;
+    let thread_id = crate::test_support::seed_coding_thread(&engine.event_bus, None).await;
+    let (session, mut msg_rx) = crate::engine::AgentSession::for_test();
+    engine
+        .agent_sessions
+        .lock()
+        .await
+        .insert(thread_id, session);
+
+    engine
+        .process_message_with_steps(
+            "carry on",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None, // use_coding_agent: the caller names no lane
+            None,
+            Some(thread_id),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ActorMode::Human,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            crate::engine::FollowUpUrgency::Normal,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let input = msg_rx
+        .try_recv()
+        .expect("the coding agent's session receives the message");
+    assert_eq!(input.text, "carry on");
+    for chat_event in ["ResponseGenerated", "ResponseFailed", "ContextCaptured"] {
+        assert_eq!(
+            count_thread_events(&pool, thread_id, chat_event).await,
+            0,
+            "no Lucidos Agent turn runs on a coding-agent thread: found {chat_event}"
+        );
+    }
+    crate::test_support::teardown_test_db(&db).await;
 }

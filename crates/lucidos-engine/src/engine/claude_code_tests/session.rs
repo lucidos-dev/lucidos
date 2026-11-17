@@ -736,28 +736,6 @@ fn an_in_session_discard_refuses_a_stopping_session_and_a_missing_worktree() {
     );
 }
 
-/// Only the run loop writes the shared `is_waiting`, and it keeps its own
-/// local copy in step. A write from outside desyncs the two. A Discard once
-/// wrote `true` on a mid-turn session. Until the next `Result`, Stop then
-/// answered "already waiting", redirects stopped arming and the watchdog
-/// skipped the session.
-#[test]
-fn only_the_run_loop_writes_the_session_phase() {
-    let writers: Vec<String> = crate::test_support::source_scan::production_sources()
-        .into_iter()
-        .filter(|(_, src)| src.contains(".is_waiting = "))
-        .map(|(path, _)| path)
-        .collect();
-    assert_eq!(
-        writers,
-        vec![
-            "engine/agent_session/lifecycle.rs".to_string(),
-            "engine/agent_session/run_session/run.rs".to_string(),
-        ],
-        "`mark_turn_boundary` and the run loop are the only writers"
-    );
-}
-
 #[test]
 fn is_engine_injected_path_matches_excluded_paths_only() {
     assert!(super::is_engine_injected_path(".lucidos-workspace"));
@@ -870,4 +848,28 @@ fn run_merge_session_tier2_routes_through_start_merge_and_get_prompt() {
          so the panel shows real numbers. Body was:\n{}",
         body
     );
+}
+
+mod guard_tests {
+    /// Only the run loop writes the shared `is_waiting`, and it keeps its own
+    /// local copy in step. A write from outside desyncs the two. A Discard once
+    /// wrote `true` on a mid-turn session. Until the next `Result`, Stop then
+    /// answered "already waiting", redirects stopped arming and the watchdog
+    /// skipped the session.
+    #[test]
+    fn only_the_run_loop_writes_the_session_phase() {
+        let writers: Vec<String> = crate::test_support::source_scan::production_sources()
+            .into_iter()
+            .filter(|(_, src)| src.contains(".is_waiting = "))
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(
+            writers,
+            vec![
+                "engine/agent_session/lifecycle.rs".to_string(),
+                "engine/agent_session/run_session/run.rs".to_string(),
+            ],
+            "`mark_turn_boundary` and the run loop are the only writers"
+        );
+    }
 }

@@ -235,7 +235,9 @@ impl LucidosEngine {
         .bind(thread_id)
         .fetch_optional(&self.pool)
         .await
-        .inspect_err(|e| crate::log!("[EventWait] Agent read failed for thread {thread_id}: {e}"))
+        .inspect_err(|e| {
+            crate::log_legacy!("[EventWait] Agent read failed for thread {thread_id}: {e}")
+        })
         .ok()?;
         match row? {
             (false, _) => Some(WaitAgent::Lucidos),
@@ -333,7 +335,7 @@ impl LucidosEngine {
                 // A cap that cannot be evaluated must not silently become no
                 // cap: an unreadable event store is exactly when a runaway
                 // loop would do the most damage.
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Subscription-count read failed for thread {thread_id}: {e}"
                 );
                 Some(format!(
@@ -369,7 +371,7 @@ impl LucidosEngine {
                     // Not an empty set: without the exclusion the lookback would
                     // re-report an event this thread was already handed, so an
                     // unreadable exclusion means no report at all.
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Lookback delivered-set read failed for thread {}: {e}",
                         wait.thread_id
                     );
@@ -389,7 +391,7 @@ impl LucidosEngine {
             Ok(found) if found.is_empty() => None,
             Ok(found) => Some(found),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Lookback scan failed for thread {}: {e}",
                     wait.thread_id
                 );
@@ -418,7 +420,7 @@ pub(super) async fn read_watermark(
     thread_id: Uuid,
 ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
     Ok(committed_event_horizon(pool).await.inspect_err(|e| {
-        crate::log!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
+        crate::log_legacy!("[EventWait] Watermark read failed for thread {thread_id}: {e}");
     })?)
 }
 
@@ -482,13 +484,13 @@ pub(super) async fn persist_wait(
     })
     .await
     .inspect_err(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] EventWaitStarted emit failed for thread {}: {e}",
             wait.thread_id
         );
     })?;
 
-    crate::log!(
+    crate::log_legacy!(
         "[EventWait] Thread {} subscribed to {:?} for {}s (wait {})",
         wait.thread_id,
         wait.on.iter().map(|s| &s.event_type).collect::<Vec<_>>(),

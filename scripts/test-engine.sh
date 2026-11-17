@@ -43,6 +43,9 @@
 #
 # Env:
 #   LUCIDOS_TEST_PG_PORT         host port for the test container (default 5510)
+#   LUCIDOS_TEST_DATABASE_URL    an external Postgres with pgvector instead of the
+#                                container: a macOS CI runner has no Docker. No
+#                                container is touched, and the sweep runs there.
 #   LUCIDOS_TEST_RUN_LIMIT_SECS  stop a run that outlives this, compile included
 #                                (default RUN_LIMIT_DEFAULT_SECS below). A hung
 #                                test then exits 124 and frees its build slot.
@@ -76,10 +79,20 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-if ! docker info >/dev/null 2>&1; then
+EXTERNAL_URL="${LUCIDOS_TEST_DATABASE_URL:-}"
+if [ -z "$EXTERNAL_URL" ] && ! docker info >/dev/null 2>&1; then
     echo "ERROR: Docker is not running. Start Docker Desktop and retry." >&2
     exit 1
 fi
+
+# One statement on the test server's postgres database, tuples only.
+test_psql() { # <sql>
+    if [ -n "$EXTERNAL_URL" ]; then
+        psql "$EXTERNAL_URL" -X -q -tAc "$1"
+    else
+        docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc "$1"
+    fi
+}
 
 # The container holds only throwaway databases, so it skips paying for crash
 # safety: a crash loses nothing anyone keeps. All three settings reload without
@@ -94,15 +107,13 @@ done
 drop_durability() {
     local setting changed=0
     for setting in $NO_DURABILITY_SETTINGS; do
-        if [ "$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc "SHOW $setting")" != "off" ]; then
-            docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
-                "ALTER SYSTEM SET $setting = off" >/dev/null
+        if [ "$(test_psql "SHOW $setting")" != "off" ]; then
+            test_psql "ALTER SYSTEM SET $setting = off" >/dev/null
             changed=1
         fi
     done
     if [ "$changed" = "1" ]; then
-        docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
-            "SELECT pg_reload_conf()" >/dev/null
+        test_psql "SELECT pg_reload_conf()" >/dev/null
         echo "[test-db] turned off $NO_DURABILITY_SETTINGS on $PG_CONTAINER"
     fi
 }
@@ -191,8 +202,7 @@ ensure_test_pg() {
 # connections. A DROP that races a fresh connection simply errors and is skipped.
 sweep_orphan_test_dbs() {
     local dbs
-    dbs="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
-        "SELECT d.datname FROM pg_database d
+    dbs="$(test_psql "SELECT d.datname FROM pg_database d
          WHERE d.datname LIKE 'lucidos_test_%'
            AND NOT EXISTS (
              SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname
@@ -203,8 +213,7 @@ sweep_orphan_test_dbs() {
         [ -z "$db" ] && continue
         # DROP DATABASE cannot run inside a transaction block, so it gets its own
         # psql -c (a multi-statement -c string is wrapped in one implicit tx).
-        if docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc \
-            "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1; then
+        if test_psql "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1; then
             count=$((count + 1))
         fi
     done <<< "$dbs"
@@ -212,11 +221,17 @@ sweep_orphan_test_dbs() {
     return 0
 }
 
-ensure_test_pg
+if [ -n "$EXTERNAL_URL" ]; then
+    export TEST_DATABASE_URL="$EXTERNAL_URL"
+else
+    ensure_test_pg
+    export TEST_DATABASE_URL="postgres://$PG_USER:$TEST_PG_PASSWORD@localhost:$PG_PORT/postgres"
+    echo "[test-db] TEST_DATABASE_URL=$TEST_DATABASE_URL"
+fi
 
 # The preflight tests dump through the host's pg_dump, which refuses a server
 # newer than itself. Say so here rather than as three failed tests.
-SERVER_VERSION="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d postgres -tAc 'SHOW server_version')"
+SERVER_VERSION="$(test_psql 'SHOW server_version')"
 CLIENT_VERSION="$(pg_dump --version 2>/dev/null || true)"
 if ! pg_client_covers_server "$CLIENT_VERSION" "$SERVER_VERSION"; then
     echo "ERROR: the host pg_dump (${CLIENT_VERSION:-not found}) is older than the test server ($SERVER_VERSION)." >&2
@@ -229,9 +244,6 @@ fi
 # the next invocation's sweep. Registered after ensure_test_pg so the container
 # is guaranteed to exist when the trap fires.
 trap sweep_orphan_test_dbs EXIT
-
-export TEST_DATABASE_URL="postgres://$PG_USER:$TEST_PG_PASSWORD@localhost:$PG_PORT/postgres"
-echo "[test-db] TEST_DATABASE_URL=$TEST_DATABASE_URL"
 
 cd "$PROJECT_DIR"
 

@@ -695,7 +695,7 @@ async fn stamp_refused(
         return;
     }
     if let Err(e) = WebhookStore::record_refused(&state.pool, hook.id, refusal).await {
-        crate::log!("[Webhook] '{}' could not stamp a refusal: {e}", hook.name);
+        crate::log_legacy!("[Webhook] '{}' could not stamp a refusal: {e}", hook.name);
     }
 }
 
@@ -706,7 +706,7 @@ async fn stamp_refused(
 /// second event.
 async fn stamp_accepted(state: &AppState, hook: &Webhook) {
     if let Err(e) = WebhookStore::record_accepted(&state.pool, hook.id).await {
-        crate::log!("[Webhook] '{}' could not stamp an accept: {e}", hook.name);
+        crate::log_legacy!("[Webhook] '{}' could not stamp an accept: {e}", hook.name);
     }
 }
 
@@ -763,7 +763,7 @@ async fn deliver(
         // accepts no deliveries, and saying which is a probe oracle.
         Ok(None) => return refused(),
         Err(e) => {
-            crate::log!("[Webhook] could not load {id}: {e}");
+            crate::log_legacy!("[Webhook] could not load {id}: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": "internal error" })),
@@ -784,7 +784,7 @@ async fn deliver(
     // express, so it is refused before the lossy conversion that would
     // otherwise change what gets verified.
     let Ok(body_str) = std::str::from_utf8(&body) else {
-        crate::log!("[Webhook] '{}' refused: body is not UTF-8", hook.name);
+        crate::log_legacy!("[Webhook] '{}' refused: body is not UTF-8", hook.name);
         stamp_refused(&state, &hook, &headers, DeliveryRefusal::BodyNotUtf8).await;
         return refused();
     };
@@ -795,7 +795,7 @@ async fn deliver(
         // credential is missing and send the sender a 401 it must not retry.
         // Never accepted unsigned either way.
         Err((status, reason)) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Webhook] '{}' credential lookup failed: {reason}",
                 hook.name
             );
@@ -824,7 +824,7 @@ async fn deliver(
     };
 
     if let Err(refusal) = webhooks::verify(&hook, &presented, secret.as_deref()) {
-        crate::log!("[Webhook] '{}' refused: {}", hook.name, refusal.reason());
+        crate::log_legacy!("[Webhook] '{}' refused: {}", hook.name, refusal.reason());
         stamp_refused(&state, &hook, &headers, refusal).await;
         return refused();
     }
@@ -833,7 +833,7 @@ async fn deliver(
     // emit nothing, so no trigger fires on it.
     if let Some(challenge) = webhooks::slack_url_verification(&hook, body_str) {
         stamp_accepted(&state, &hook).await;
-        crate::log!("[Webhook] '{}' answered Slack's URL check", hook.name);
+        crate::log_legacy!("[Webhook] '{}' answered Slack's URL check", hook.name);
         return (
             StatusCode::OK,
             Json(serde_json::json!({ "challenge": challenge })),
@@ -885,7 +885,7 @@ async fn deliver(
     match emitted {
         Ok(DeliveryOutcome::Emitted(event_id)) => {
             stamp_accepted(&state, &hook).await;
-            crate::log!(
+            crate::log_legacy!(
                 "[Webhook] '{}' fired {} ({})",
                 hook.name,
                 hook.event_type,
@@ -898,7 +898,7 @@ async fn deliver(
                 .into_response()
         }
         Ok(DeliveryOutcome::Duplicate(event_id)) => {
-            crate::log!("[Webhook] '{}' ignored a resend", hook.name);
+            crate::log_legacy!("[Webhook] '{}' ignored a resend", hook.name);
             // A resend verified and landed. Only the second event is
             // dropped, so the ingress carried this delivery in full.
             stamp_accepted(&state, &hook).await;
@@ -906,7 +906,7 @@ async fn deliver(
         }
         Err(e) => {
             // Nothing was written, so the sender's retry is a real retry.
-            crate::log!("[Webhook] '{}' could not emit: {e}", hook.name);
+            crate::log_legacy!("[Webhook] '{}' could not emit: {e}", hook.name);
             emit_failed()
         }
     }

@@ -262,6 +262,8 @@ async fn user_question_lifecycle_propagates_count() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -284,6 +286,7 @@ async fn user_question_lifecycle_propagates_count() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "tu-1".into(),
             quiet: false,
             answer: AnswerKind::FreeText {

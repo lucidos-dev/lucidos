@@ -57,7 +57,7 @@ pub(crate) async fn anchor_is_child_report(pool: &sqlx::PgPool, anchor: Uuid) ->
     {
         Ok(event_type) => event_type.as_deref() == Some(CHILD_REPORT),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[HeldDeliveries] anchor {} unreadable, running the re-entry: {}",
                 anchor,
                 e
@@ -129,7 +129,7 @@ pub(crate) async fn held_deliveries(
     {
         Ok(rows) => rows,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[HeldDeliveries] read failed for thread {}: {}. The resume carries no \
                  held wait delivery",
                 thread_id,

@@ -298,7 +298,7 @@ describe('resolvedChoice', () => {
   // An orphan sweep, a restart or a superseding message closed it. Nobody
   // pressed Deny, so no button may read as pressed (plan invariant 11).
   it('marks no choice on a refusal the engine wrote', () => {
-    expect(resolvedChoice({ allowed: false, reason: 'Coding agent terminated before answering: request expired' })).toBeNull();
+    expect(resolvedChoice({ allowed: false, reason: 'Interrupted by an engine restart before anyone answered' })).toBeNull();
     expect(resolvedChoice({ allowed: false, reason: 'Superseded by a new message' })).toBeNull();
   });
 

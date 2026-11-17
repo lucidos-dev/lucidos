@@ -48,7 +48,7 @@ impl CodingAgentChangeOps for LucidosEngine {
             let mut spawn_claim = match engine.claim_thread_or_refuse(thread_id).await {
                 Ok(claim) => claim,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] No merge session for change {}: {}",
                         change_id,
                         e
@@ -64,14 +64,14 @@ impl CodingAgentChangeOps for LucidosEngine {
             let change = match engine.changes().get_by_id(change_id).await {
                 Ok(Some(c)) => c,
                 Ok(None) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] Change {} not found for spawn_merge_session",
                         change_id
                     );
                     return;
                 }
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] get_by_id({}) failed: {} — skipping merge spawn",
                         change_id,
                         e
@@ -105,7 +105,7 @@ impl CodingAgentChangeOps for LucidosEngine {
             {
                 Ok(id) => id,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] Failed to emit merge prompt for thread {}: {}",
                         thread_id,
                         e
@@ -117,7 +117,9 @@ impl CodingAgentChangeOps for LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: format!("Failed to emit prompt: {}", e),
+                                    spend_cap: None,
                                     agent_exit: None,
+                                    provider_error: None,
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
@@ -159,14 +161,14 @@ impl CodingAgentChangeOps for LucidosEngine {
                 .await;
             match result {
                 Ok(_) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] Claude Code session completed for change {}",
                         change_id
                     );
                     engine.broadcast_changes_updated().await;
                 }
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[MergeConflict] Claude Code session failed for change {}: {}",
                         change_id,
                         e

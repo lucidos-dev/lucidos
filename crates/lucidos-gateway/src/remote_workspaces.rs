@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::extract::State;
 use axum::middleware;
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Serialize;
 
 use crate::gateway_protocol::{ListedWorkspace, GATEWAY_API_PREFIX, WORKSPACES_PATH};
@@ -76,15 +76,50 @@ pub fn router() -> Router<GatewayState> {
         .route_layer(middleware::from_fn(crate::control::control_authz))
 }
 
-async fn list(State(state): State<GatewayState>) -> Json<Vec<RemoteGatewayListing>> {
+async fn list(
+    State(state): State<GatewayState>,
+    device: Option<Extension<crate::auth::AuthenticatedDevice>>,
+) -> Json<Vec<RemoteGatewayListing>> {
+    let device = device.map(|Extension(d)| d);
     let client = state.peer_connection().client();
     let listings = state.remote_gateways().list().into_iter().map(|gateway| {
         let client = client.clone();
         let state = state.clone();
+        let device = device.clone();
         async move {
+            let deadline = tokio::time::Instant::now() + LIST_TIMEOUT;
             let listing = match client {
                 Some(client) => match fetch(&client, &gateway).await {
-                    Ok(workspaces) => {
+                    Ok(mut workspaces) => {
+                        // The remote protocol's cached counts describe the team.
+                        // Ask each inbox as the caller instead, without caching it.
+                        futures::future::join_all(workspaces.iter_mut().map(|workspace| {
+                            let device = device.as_ref();
+                            let client = &client;
+                            let state = &state;
+                            let gateway = &gateway;
+                            async move {
+                                workspace.unread_count = None;
+                                if workspace.health == crate::stack::Health::Healthy {
+                                    if let Some(device) = device {
+                                        workspace.unread_count = tokio::time::timeout_at(
+                                            deadline,
+                                            inbox_count(
+                                                state,
+                                                client,
+                                                gateway,
+                                                &workspace.id,
+                                                device,
+                                            ),
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                    }
+                                }
+                            }
+                        }))
+                        .await;
                         state.remote_gateways().last_seen.lock().unwrap().insert(
                             format!("{}@{}", gateway.pairing_id, gateway.address),
                             chrono::Utc::now().to_rfc3339(),
@@ -177,6 +212,45 @@ async fn fetch(
             format!("{} answered HTTP {}", gateway.address, status.as_u16()),
         )),
     }
+}
+
+/// Read the inbox through the same signed relay as opening the workspace.
+/// Failure means unknown, never a fallback to the advertised shared count.
+async fn inbox_count(
+    state: &GatewayState,
+    client: &crate::peer_connection::PeerConnection,
+    gateway: &RemoteGateway,
+    slug: &str,
+    device: &crate::auth::AuthenticatedDevice,
+) -> Option<u64> {
+    if !crate::registry::is_valid_id(slug) {
+        return None;
+    }
+    let (_, headers) = crate::relay::signed_claim_headers(
+        state,
+        &gateway.credential,
+        format!("/{slug}@{}/", gateway.name),
+        Some(device.clone()),
+    )?;
+    let path = format!(
+        "{GATEWAY_API_PREFIX}{}/{slug}/api/v1/notifications?limit=0",
+        crate::relay::RELAY_PATH
+    );
+    let response = client
+        .request(gateway, reqwest::Method::GET, &path)
+        .ok()?
+        .headers(headers)
+        .timeout(LIST_TIMEOUT)
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    serde_json::from_slice::<serde_json::Value>(&response.bytes().await.ok()?)
+        .ok()?
+        .get("unread_count")?
+        .as_u64()
 }
 
 #[cfg(test)]

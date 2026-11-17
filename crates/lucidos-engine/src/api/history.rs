@@ -41,7 +41,7 @@ pub(super) async fn global_events(State(state): State<AppState>, headers: Header
         match r {
             Ok(emitted) => emitted.to_sse_json(),
             Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
-                log!("[SSE] Event stream lagged by {} events", n);
+                log_legacy!("[SSE] Event stream lagged by {} events", n);
                 lagged_event_json(n)
             }
         }
@@ -263,6 +263,7 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
     let latest_engine_version = read_engine_version();
     let latest_tauri_app_version = read_app_version();
     let database = state.engine.database_health();
+    let agent_sandbox_unavailable = crate::runtime::agent_sandbox::unavailable_reason().await;
     let body = Json(serde_json::json!({
         // Deliberately still "ok" (and a 200) when `database_reachable` is false:
         // this half is about the engine PROCESS, which is answering. Failing the
@@ -270,9 +271,13 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
         // condition respawning cannot fix, and ADR 0014 forbids culling an alive
         // engine. See `engine::db_health` and ADR 0037.
         "status": status,
+        "workspace_client": lucidos_gateway_stamp::workspace_client::ClientContract::engine(),
         "workspace": workspace_name,
         "workspace_path": state.workspace_path.to_string_lossy(),
         "started_at": state.started_at.to_rfc3339(),
+        // A gateway spawned this engine, so a restarted gateway takes it back
+        // as its own and re-keys it (`api::gateway_stamp`).
+        "started_by_gateway": crate::api::gateway_stamp::started_by_gateway(),
         // Is the workspace database answering? An engine outlives its database,
         // and a client that cannot tell holds a black boot splash and reports
         // the outage once per failed load. Read from an atomic the background
@@ -303,6 +308,14 @@ pub(super) async fn health(State(state): State<AppState>) -> (StatusCode, Json<s
         // "don't filter" (mock / no routing); an array enumerates live backends.
         // Reflects a runtime credential swap (read from the live provider).
         "configured_providers": state.engine.configured_providers(),
+        // Why agent-steered spawns cannot run sandboxed on this machine, or
+        // null when they can. The client pairs it with `agents_unsandboxed`
+        // for the standing sandbox banner (ADR 0645).
+        "agent_sandbox_unavailable": agent_sandbox_unavailable,
+        // True when the sandbox runs but cannot stop an agent emptying a
+        // protected file: Linux below Landlock ABI 3 (ADR 0645).
+        "agent_sandbox_truncation_unguarded":
+            crate::runtime::agent_sandbox::truncation_unguarded().await,
     }));
     (code, body)
 }
@@ -387,7 +400,7 @@ pub(super) async fn restart_engine(
     // THIS call stashed, so a concurrent notify's actor is never dropped for us.
     if outcome.is_err() && stashed {
         state.engine.take_restart_actor();
-        log!("[Restart] Respawn request failed, cleared the stashed restart actor");
+        log_legacy!("[Restart] Respawn request failed, cleared the stashed restart actor");
     }
     outcome
 }
@@ -428,7 +441,7 @@ async fn respawn_this_engine(
     // it via `web-dev.sh --engine-only`. Apply already rebuilt the binary, so the
     // build step here is a fast near-noop; the respawn is what matters.
     let script = crate::paths::script("web-dev.sh").map_err(|e| {
-        log!("[Restart] {}", e);
+        log_legacy!("[Restart] {}", e);
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -436,7 +449,7 @@ async fn respawn_this_engine(
     })?;
     let ws = state.workspace_path.to_string_lossy().to_string();
     let log_path = state.workspace_path.join(".lucidos/engine.log");
-    log!(
+    log_legacy!(
         "[Restart] Running {} --engine-only -w {}",
         script.display(),
         ws
@@ -479,7 +492,7 @@ async fn respawn_this_engine(
             }
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Restart] Failed to open log file for restart: {} — spawning with no output",
                 e
             );
@@ -491,7 +504,7 @@ async fn respawn_this_engine(
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             let msg = format!("Failed to spawn {}: {}", script.display(), e);
-            log!("[Restart] {}", msg);
+            log_legacy!("[Restart] {}", msg);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": msg })),
@@ -550,6 +563,89 @@ async fn read_build_log(path: &std::path::Path) -> Result<String, (StatusCode, S
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// `GET /api/v1/engine/diagnostic-log`: a bounded query over this engine's
+/// own sanitized `log!` lines, for its own agents only (ADR 0667).
+async fn engine_diagnostic_log(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Result<impl IntoResponse, ApiError> {
+    /// Scans in flight. Each holds the whole matching window in memory.
+    static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let source = DiagnosticLogSource {
+        dir: crate::diagnostic_log::dir_for(&state.workspace_path),
+        started: crate::diagnostic_log::started(),
+        scans: &SCANS,
+    };
+    let result = query_diagnostic_log(&headers, raw.as_deref(), source).await?;
+    Ok(([(header::CACHE_CONTROL, "no-store")], Json(result)))
+}
+
+/// Where a diagnostic log query reads, and what bounds its concurrency.
+struct DiagnosticLogSource {
+    dir: std::path::PathBuf,
+    started: bool,
+    scans: &'static tokio::sync::Semaphore,
+}
+
+/// Only an agent subprocess this engine minted a token for may read, and
+/// never through an app frame's stamp.
+pub(super) fn diagnostic_log_reader_allowed(headers: &HeaderMap) -> bool {
+    !headers.contains_key(super::app_reach::APP_ID_HEADER)
+        && matches!(
+            super::actor::subprocess_origin(headers),
+            super::actor::SubprocessOrigin::Subprocess { .. }
+        )
+}
+
+async fn query_diagnostic_log(
+    headers: &HeaderMap,
+    raw: Option<&str>,
+    source: DiagnosticLogSource,
+) -> Result<crate::diagnostic_log::query::QueryResult, ApiError> {
+    use crate::diagnostic_log::query;
+    if !diagnostic_log_reader_allowed(headers) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "The diagnostic log answers only this workspace's agents.",
+        )
+        .with_reason("diagnostic_log_agent_only"));
+    }
+    let query = query::parse(raw, chrono::Utc::now())
+        .map_err(|e| ApiError::bad_request(e).with_reason("diagnostic_log_bad_query"))?;
+    let unavailable = |detail: String| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("The diagnostic log is unavailable: {detail}"),
+        )
+        .with_reason("diagnostic_log_unavailable")
+    };
+    if !source.started {
+        return Err(unavailable("this engine never started it".into()));
+    }
+    let permit = source.scans.try_acquire().map_err(|_| {
+        ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Two diagnostic log queries are already running. Try again shortly.",
+        )
+        .with_reason("diagnostic_log_busy")
+    })?;
+    let summary = query.summary();
+    let dir = source.dir;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        query::run(&dir, &query)
+    })
+    .await
+    .map_err(|e| unavailable(e.to_string()))?
+    .map_err(|e| unavailable(e.to_string()))?;
+    log_legacy!(
+        "[DiagnosticLog] Served {} lines ({summary})",
+        result.returned
+    );
+    Ok(result)
+}
+
 /// `GET /api/v1/engine/changelog`: every published release's notes, newest
 /// first, for the *What's New* panel (Settings > System).
 ///
@@ -569,16 +665,31 @@ pub(super) async fn engine_changelog() -> Json<serde_json::Value> {
     }))
 }
 
-/// `POST /api/v1/engine/rebuild` kicks off the dev background engine rebuild,
-/// the escape hatch behind the frontend "Rebuild & Switch" affordance. A wedged
-/// workspace (source behind HEAD with a stale binary) can then produce the new
-/// binary without a manual `web-dev.sh -b`. It RESTARTS a build in flight,
-/// unlike an Apply, which joins one: this is the user's escape from a hung
-/// build (`restart_background_rebuild`, ADR 0412). No-op packaged, and 202
-/// regardless, so the caller is not error-handling a no-op. The resulting
-/// `version-status` `build_state` transitions drive the UI.
-pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode {
-    state.engine.restart_background_rebuild();
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(super) enum RebuildMode {
+    Join,
+    #[default]
+    Restart,
+}
+
+#[derive(Default, Deserialize)]
+pub(super) struct RebuildQuery {
+    #[serde(default)]
+    mode: RebuildMode,
+}
+
+/// Build source without switching. `mode=join` preserves the build in flight;
+/// omitting it retains the explicit restart escape hatch (ADR 0412).
+/// No-op packaged. Version-status and SSE report progress and readiness.
+pub(super) async fn engine_rebuild(
+    State(state): State<AppState>,
+    Query(query): Query<RebuildQuery>,
+) -> StatusCode {
+    match query.mode {
+        RebuildMode::Join => state.engine.join_or_start_background_rebuild(),
+        RebuildMode::Restart => state.engine.restart_background_rebuild(),
+    }
     StatusCode::ACCEPTED
 }
 
@@ -587,7 +698,7 @@ pub(super) async fn engine_rebuild(State(state): State<AppState>) -> StatusCode 
 /// kills the old engine and spawns a fresh one on the same loopback port. The
 /// frontend tolerates the brief network rejection after the 2xx.
 ///
-/// Supports BOTH protocols. [`net_config::peer_scheme_order`] puts the resolved
+/// Supports BOTH protocols. [`net_config::gateway_scheme_order`] puts the gateway's
 /// scheme first and the other one as a fallback, so a mismatch still restarts.
 /// A non-2xx RESPONSE is a real gateway error and returns immediately: only a
 /// failure to REACH the gateway falls through to the other scheme. Accepts the
@@ -603,7 +714,7 @@ async fn restart_via_gateway(
         Ok(c) => c,
         Err(e) => {
             let msg = format!("gateway restart client build failed: {e}");
-            log!("[Restart] {}", msg);
+            log_legacy!("[Restart] {}", msg);
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": msg })),
@@ -611,20 +722,20 @@ async fn restart_via_gateway(
         }
     };
 
-    let schemes = crate::net_config::peer_scheme_order();
+    let schemes = crate::net_config::gateway_scheme_order();
     let mut last_err: Option<String> = None;
     for (i, scheme) in schemes.iter().enumerate() {
         let url = format!(
             "{scheme}://127.0.0.1:{gateway_port}/~/api/v1/control/workspaces/{workspace_id}/restart"
         );
-        log!("[Restart] Gateway mode: POST {}", url);
+        log_legacy!("[Restart] Gateway mode: POST {}", url);
         match client.post(&url).send().await {
             Ok(resp) if resp.status().is_success() => return Ok(StatusCode::OK),
             Ok(resp) => {
                 // The gateway answered but rejected the request — a real error,
                 // not a protocol mismatch. Don't retry the other scheme.
                 let msg = format!("gateway restart returned {}", resp.status());
-                log!("[Restart] {}", msg);
+                log_legacy!("[Restart] {}", msg);
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": msg })),
@@ -636,7 +747,7 @@ async fn restart_via_gateway(
                 // up.
                 let msg = format!("gateway restart request failed: {e}");
                 let more = i + 1 < schemes.len();
-                log!(
+                log_legacy!(
                     "[Restart] {}{}",
                     msg,
                     if more { ", retrying other scheme" } else { "" }
@@ -664,7 +775,7 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
     // user whose launchd domain the service was bootstrapped into (us).
     let uid = unsafe { libc::getuid() };
     let target = format!("gui/{uid}/{LAUNCH_AGENT_LABEL}");
-    log!("[Restart] Packaged mode: launchctl kickstart -k {}", target);
+    log_legacy!("[Restart] Packaged mode: launchctl kickstart -k {}", target);
     match std::process::Command::new("launchctl")
         .args(["kickstart", "-k", &target])
         .spawn()
@@ -672,73 +783,13 @@ fn restart_via_launchd() -> Result<StatusCode, (StatusCode, Json<serde_json::Val
         Ok(_) => Ok(StatusCode::OK),
         Err(e) => {
             let msg = format!("Failed to restart service via launchctl: {e}");
-            log!("[Restart] {}", msg);
+            log_legacy!("[Restart] {}", msg);
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": msg })),
             ))
         }
     }
-}
-
-/// List all Lucidos workspaces by calling `status.sh --json`, the current one
-/// included. A page served straight off an engine port reads it to reach a
-/// peer workspace on its own port. Times out after 10s, so an unresponsive
-/// Docker or target engine cannot block the request.
-///
-/// Every failure is an error response, never an empty list: an empty list
-/// reads as a machine with no workspaces, which hides a broken script.
-pub(super) async fn list_workspaces() -> Result<Json<serde_json::Value>, ApiError> {
-    let script = crate::paths::script("status.sh")
-        .map_err(|e| workspace_list_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    read_workspace_list(&script, std::time::Duration::from_secs(10))
-        .await
-        .map(Json)
-}
-
-async fn read_workspace_list(
-    script: &std::path::Path,
-    timeout: std::time::Duration,
-) -> Result<serde_json::Value, ApiError> {
-    let internal = |msg: String| workspace_list_error(StatusCode::INTERNAL_SERVER_ERROR, msg);
-    let run = tokio::process::Command::new(script)
-        .arg("--json")
-        .kill_on_drop(true)
-        .output();
-    let output = match tokio::time::timeout(timeout, run).await {
-        Ok(Ok(output)) => output,
-        Ok(Err(e)) => return Err(internal(format!("could not run status.sh: {e}"))),
-        Err(_) => {
-            return Err(workspace_list_error(
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("status.sh timed out after {}s", timeout.as_secs_f32()),
-            ))
-        }
-    };
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let last_line = stderr.lines().rev().find(|l| !l.trim().is_empty());
-        let detail = last_line.unwrap_or("no stderr").trim();
-        let detail = &detail[..detail.floor_char_boundary(300)];
-        let exit = output
-            .status
-            .code()
-            .map_or_else(|| "a signal".to_string(), |c| format!("exit {c}"));
-        return Err(internal(format!("status.sh failed ({exit}): {detail}")));
-    }
-    let list: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .map_err(|e| internal(format!("status.sh printed unparseable JSON: {e}")))?;
-    if !list["workspaces"].is_array() {
-        return Err(internal(
-            "status.sh printed JSON with no \"workspaces\" array".to_string(),
-        ));
-    }
-    Ok(list)
-}
-
-fn workspace_list_error(status: StatusCode, detail: String) -> ApiError {
-    log!("[Workspaces] {}", detail);
-    ApiError::new(status, format!("Could not list workspaces: {detail}"))
 }
 
 /// Get conversation history up to a specific event
@@ -1146,7 +1197,7 @@ fn emit_chain_and_trigger(headers: &HeaderMap) -> (u32, Option<String>) {
 /// Routes for the engine-level surfaces this module's handlers own:
 /// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
 /// `/session/messages`, the `/engine/*` routes (version-status,
-/// changelog, rebuild, build-log), and the `/events*` surface (global SSE stream +
+/// changelog, rebuild, build-log, diagnostic-log), and the `/events*` surface (global SSE stream +
 /// event-store queries).
 ///
 /// Four `/events/:event_id/*` routes join them: `context`, `tool-result`,
@@ -1160,7 +1211,11 @@ pub(super) fn router() -> Router<AppState> {
         .route("/engine/changelog", get(engine_changelog))
         .route("/engine/rebuild", post(engine_rebuild))
         .route("/engine/build-log", get(engine_build_log))
-        .route("/workspaces", get(list_workspaces))
+        .route("/engine/diagnostic-log", get(engine_diagnostic_log))
+        .route(
+            "/engine/diagnostic-snapshot",
+            get(super::diagnostic_snapshot::snapshot),
+        )
         .route("/events", get(global_events))
         .route("/history", get(get_history))
         .route("/messages", get(get_recent_messages))
@@ -1191,6 +1246,24 @@ pub(super) fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn rebuild_query_defaults_to_restart_and_accepts_join() {
+        let query = |uri: &str| Query::<RebuildQuery>::try_from_uri(&uri.parse().unwrap());
+        assert!(matches!(
+            query("/engine/rebuild").unwrap().mode,
+            RebuildMode::Restart
+        ));
+        assert!(matches!(
+            query("/engine/rebuild?mode=join").unwrap().mode,
+            RebuildMode::Join
+        ));
+        assert!(matches!(
+            query("/engine/rebuild?mode=restart").unwrap().mode,
+            RebuildMode::Restart
+        ));
+        assert!(query("/engine/rebuild?mode=invalid").is_err());
+    }
+
     #[tokio::test]
     async fn build_log_is_bounded_and_missing_output_is_explicit() {
         let dir = tempfile::tempdir().unwrap();
@@ -1205,6 +1278,106 @@ mod tests {
         let text = read_build_log(&path).await.unwrap();
         assert_eq!(text.len(), usize::try_from(BUILD_LOG_BYTES).unwrap());
         assert!(text.ends_with("publish failed"));
+    }
+
+    fn diagnostic_headers(pairs: &[(&'static str, String)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(*name, value.parse().unwrap());
+        }
+        headers
+    }
+
+    /// A token this engine minted, exactly as a spawn hands it out.
+    fn agent_token() -> String {
+        super::super::actor::init_agent_origin_secret("subprocess-test-secret".to_string());
+        super::super::actor::mint_agent_origin_token(None, 0, None).expect("secret installed")
+    }
+
+    /// The refusal a query met, as status and reason slug.
+    async fn diagnostic_refusal(
+        headers: &HeaderMap,
+        raw: Option<&str>,
+        dir: std::path::PathBuf,
+        started: bool,
+        scans: &'static tokio::sync::Semaphore,
+    ) -> (StatusCode, Option<&'static str>) {
+        let source = DiagnosticLogSource {
+            dir,
+            started,
+            scans,
+        };
+        let refusal = query_diagnostic_log(headers, raw, source)
+            .await
+            .expect_err("the query is refused");
+        (refusal.status, refusal.reason)
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_answers_only_this_engines_agents() {
+        static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let dir = tempfile::tempdir().unwrap();
+        let token = super::super::actor::HEADER_AGENT_ORIGIN_TOKEN;
+        let app = super::super::app_reach::APP_ID_HEADER;
+        let refused = [
+            diagnostic_headers(&[]),
+            diagnostic_headers(&[(token, "-.0.-.deadbeef".to_string())]),
+            diagnostic_headers(&[(app, "habit-tracker".to_string())]),
+            diagnostic_headers(&[(token, agent_token()), (app, "habit-tracker".to_string())]),
+        ];
+        for headers in &refused {
+            assert_eq!(
+                diagnostic_refusal(headers, None, dir.path().into(), true, &SCANS).await,
+                (StatusCode::FORBIDDEN, Some("diagnostic_log_agent_only")),
+                "{headers:?}"
+            );
+        }
+        let agent = diagnostic_headers(&[(token, agent_token())]);
+        let source = DiagnosticLogSource {
+            dir: dir.path().into(),
+            started: true,
+            scans: &SCANS,
+        };
+        let answer = query_diagnostic_log(&agent, Some("since=2h"), source)
+            .await
+            .expect("an agent of this engine gets an answer");
+        assert_eq!(answer.returned, 0);
+    }
+
+    #[tokio::test]
+    async fn diagnostic_log_refusals_carry_their_reason() {
+        static SCANS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        static FULL: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(0);
+        let dir = tempfile::tempdir().unwrap();
+        let agent = diagnostic_headers(&[(
+            super::super::actor::HEADER_AGENT_ORIGIN_TOKEN,
+            agent_token(),
+        )]);
+        assert_eq!(
+            diagnostic_refusal(&agent, Some("since=8d"), dir.path().into(), true, &SCANS).await,
+            (StatusCode::BAD_REQUEST, Some("diagnostic_log_bad_query"))
+        );
+        assert_eq!(
+            diagnostic_refusal(&agent, None, dir.path().into(), false, &SCANS).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("diagnostic_log_unavailable")
+            )
+        );
+        assert_eq!(
+            diagnostic_refusal(&agent, None, dir.path().into(), true, &FULL).await,
+            (StatusCode::TOO_MANY_REQUESTS, Some("diagnostic_log_busy"))
+        );
+        let outside = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("diagnostic-log");
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        assert_eq!(
+            diagnostic_refusal(&agent, None, linked, true, &SCANS).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some("diagnostic_log_unavailable")
+            )
+        );
     }
 
     /// Real construction and handlers, isolated from the user's HOME and keys.
@@ -1290,8 +1463,13 @@ mod tests {
             pending_oauth_flows: Default::default(),
             reveal_tokens: Default::default(),
             call_tickets: Default::default(),
+            door_router: Default::default(),
         };
         let (status, Json(body)) = health(State(state.clone())).await;
+        let contract: lucidos_gateway_stamp::workspace_client::ClientContract =
+            serde_json::from_value(body["workspace_client"].clone()).unwrap();
+        assert!(contract.supports_engine());
+        assert!(!contract.supports_gateway());
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["llm_configured"], false);
         let thread = uuid::Uuid::new_v4();
@@ -1433,107 +1611,6 @@ mod tests {
         }
     }
 
-    /// A stub `status.sh` with the given body, executable, in its own dir.
-    ///
-    /// A child process installs the executable, so this process never holds a
-    /// write fd on it. A parallel test's fork would inherit such an fd, and
-    /// Linux then refuses the exec with "Text file busy".
-    fn stub_status_script(body: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("status.src");
-        std::fs::write(&source, format!("#!/bin/sh\n{body}\n")).unwrap();
-        let path = dir.path().join("status.sh");
-        let installed = std::process::Command::new("install")
-            .args(["-m", "755"])
-            .arg(&source)
-            .arg(&path)
-            .status()
-            .unwrap();
-        assert!(installed.success());
-        (dir, path)
-    }
-
-    /// Forking threads must not make a freshly written stub unrunnable.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_stub_runs_while_other_threads_fork() {
-        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let forkers: Vec<_> = (0..3)
-            .map(|_| {
-                let stop = stop.clone();
-                std::thread::spawn(move || {
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        let _ = std::process::Command::new("true").status();
-                    }
-                })
-            })
-            .collect();
-        for _ in 0..100 {
-            let list = list_from(r#"echo '{"workspaces":[]}'"#).await;
-            assert!(list.is_ok(), "{:?}", list.err().map(|e| e.message));
-        }
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        for f in forkers {
-            f.join().unwrap();
-        }
-    }
-
-    async fn list_from(body: &str) -> Result<serde_json::Value, ApiError> {
-        let (_dir, path) = stub_status_script(body);
-        read_workspace_list(&path, std::time::Duration::from_secs(5)).await
-    }
-
-    #[tokio::test]
-    async fn a_workspace_list_passes_through() {
-        let list = list_from(r#"echo '{"workspaces":[{"name":"dev"}]}'"#)
-            .await
-            .unwrap();
-        assert_eq!(list["workspaces"][0]["name"], "dev");
-    }
-
-    /// A broken status script must not read as a machine with no workspaces.
-    #[tokio::test]
-    async fn a_failing_status_script_is_an_error_not_an_empty_list() {
-        let err = list_from("echo 'jq: command not found' >&2; exit 127")
-            .await
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert!(err.message.contains("exit 127"), "{}", err.message);
-        assert!(
-            err.message.contains("jq: command not found"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[tokio::test]
-    async fn unparseable_or_misshapen_output_is_an_error() {
-        for body in ["echo 'not json'", r#"echo '{"other":1}'"#] {
-            let err = list_from(body).await.unwrap_err();
-            assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-        }
-    }
-
-    #[tokio::test]
-    async fn a_missing_status_script_is_an_error() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = read_workspace_list(
-            &dir.path().join("status.sh"),
-            std::time::Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    #[tokio::test]
-    async fn a_hung_status_script_times_out_as_an_error() {
-        let (_dir, path) = stub_status_script("sleep 30");
-        let err = read_workspace_list(&path, std::time::Duration::from_millis(200))
-            .await
-            .unwrap_err();
-        assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
-    }
-
     /// A draining engine must not read as healthy, or a gateway adopts it.
     #[test]
     fn an_engine_in_teardown_reports_unavailable() {
@@ -1671,50 +1748,6 @@ mod tests {
             wire,
             format!("event: {SSE_KEEPALIVE_EVENT}\ndata:\n\n").into_bytes()
         );
-    }
-
-    /// Regression: `read_app_version` must read fresh from disk on every call.
-    /// A cached value makes a version bump from an applied change invisible to
-    /// the health endpoint until an engine restart.
-    ///
-    /// One test rather than three, because all three mutate the same file.
-    #[test]
-    fn read_app_version_reads_fresh_from_disk() {
-        let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let version_file = engine_dir
-            .parent()
-            .unwrap()
-            .join("lucidos-app")
-            .join("VERSION");
-        let original = std::fs::read_to_string(&version_file).ok();
-
-        // Drop guard ensures cleanup even if an assertion panics.
-        struct Restore(std::path::PathBuf, Option<String>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(content) => {
-                        let _ = std::fs::write(&self.0, content);
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&self.0);
-                    }
-                }
-            }
-        }
-        let _guard = Restore(version_file.clone(), original);
-
-        // Picks up initial write.
-        std::fs::write(&version_file, "1.0.0-test\n").unwrap();
-        assert_eq!(read_app_version(), "1.0.0-test");
-
-        // Picks up version bump without restart.
-        std::fs::write(&version_file, "2.0.0-test\n").unwrap();
-        assert_eq!(read_app_version(), "2.0.0-test");
-
-        // Returns "unknown" when the file is missing.
-        std::fs::remove_file(&version_file).unwrap();
-        assert_eq!(read_app_version(), "unknown");
     }
 
     /// Regression (ADR 0014): an engine built from a source checkout must report
@@ -1861,37 +1894,85 @@ mod tests {
         assert_eq!(parsed["data"]["count"], 42);
     }
 
-    /// read_engine_version reads the engine VERSION from disk on each call,
-    /// allowing the health endpoint to detect newer engine versions on disk
-    /// without an engine restart.
-    #[test]
-    fn read_engine_version_reads_fresh_from_disk() {
-        let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let version_file = engine_dir.join("VERSION");
-        let original = std::fs::read_to_string(&version_file).ok();
+    mod guard_tests {
+        use super::*;
 
-        struct Restore(std::path::PathBuf, Option<String>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(content) => {
-                        let _ = std::fs::write(&self.0, content);
-                    }
-                    None => {
-                        let _ = std::fs::remove_file(&self.0);
+        /// Regression: `read_app_version` must read fresh from disk on every call.
+        /// A cached value makes a version bump from an applied change invisible to
+        /// the health endpoint until an engine restart.
+        ///
+        /// One test rather than three, because all three mutate the same file.
+        #[test]
+        fn read_app_version_reads_fresh_from_disk() {
+            let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let version_file = engine_dir
+                .parent()
+                .unwrap()
+                .join("lucidos-app")
+                .join("VERSION");
+            let original = std::fs::read_to_string(&version_file).ok();
+
+            // Drop guard ensures cleanup even if an assertion panics.
+            struct Restore(std::path::PathBuf, Option<String>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    match &self.1 {
+                        Some(content) => {
+                            let _ = std::fs::write(&self.0, content);
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(&self.0);
+                        }
                     }
                 }
             }
+            let _guard = Restore(version_file.clone(), original);
+
+            // Picks up initial write.
+            std::fs::write(&version_file, "1.0.0-test\n").unwrap();
+            assert_eq!(read_app_version(), "1.0.0-test");
+
+            // Picks up version bump without restart.
+            std::fs::write(&version_file, "2.0.0-test\n").unwrap();
+            assert_eq!(read_app_version(), "2.0.0-test");
+
+            // Returns "unknown" when the file is missing.
+            std::fs::remove_file(&version_file).unwrap();
+            assert_eq!(read_app_version(), "unknown");
         }
-        let _guard = Restore(version_file.clone(), original);
 
-        std::fs::write(&version_file, "2026.04.13.1\n").unwrap();
-        assert_eq!(read_engine_version(), "2026.04.13.1");
+        /// read_engine_version reads the engine VERSION from disk on each call,
+        /// allowing the health endpoint to detect newer engine versions on disk
+        /// without an engine restart.
+        #[test]
+        fn read_engine_version_reads_fresh_from_disk() {
+            let engine_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let version_file = engine_dir.join("VERSION");
+            let original = std::fs::read_to_string(&version_file).ok();
 
-        std::fs::write(&version_file, "2026.04.13.2\n").unwrap();
-        assert_eq!(read_engine_version(), "2026.04.13.2");
+            struct Restore(std::path::PathBuf, Option<String>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    match &self.1 {
+                        Some(content) => {
+                            let _ = std::fs::write(&self.0, content);
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(&self.0);
+                        }
+                    }
+                }
+            }
+            let _guard = Restore(version_file.clone(), original);
 
-        std::fs::remove_file(&version_file).unwrap();
-        assert_eq!(read_engine_version(), "unknown");
+            std::fs::write(&version_file, "2026.04.13.1\n").unwrap();
+            assert_eq!(read_engine_version(), "2026.04.13.1");
+
+            std::fs::write(&version_file, "2026.04.13.2\n").unwrap();
+            assert_eq!(read_engine_version(), "2026.04.13.2");
+
+            std::fs::remove_file(&version_file).unwrap();
+            assert_eq!(read_engine_version(), "unknown");
+        }
     }
 }

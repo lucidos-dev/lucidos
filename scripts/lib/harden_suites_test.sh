@@ -15,14 +15,18 @@
 # default wait budget; a run still setting up; start refusals; stop reaching
 # a grandchild and sparing a recycled pid; the run staying in the caller's
 # process group; a slow, a failing and a stopped touched-spec selection; the
-# WebKit specs sent to GitHub or run here on macOS, after the local specs; the tests a failed log names; a retry round of
-# what failed, and the full run it still owes; carried touched-spec verdicts; the timings JSON; test-only
+# WebKit specs sent to GitHub beside the local specs; the tests a failed log names; a retry round of
+# what failed, and conservative test-only completion; carried touched-spec verdicts; the timings JSON; test-only
 # includes selecting their test rather than the crate; a dead engine filter;
 # the crate graph, the owners of each path and the crates a diff reaches, with
-# the suites and commands that follow them; the TEST_CRATES pin.
+# the suites and commands that follow them; the TEST_CRATES pin; the
+# confinement suite's real command never passing a run that did not happen.
 #
 # Run: ./scripts/lib/harden_suites_test.sh
 set -u
+
+# Pure selection fixtures start uncovered even inside a covered parent round.
+export HS_MAIN_CHECK_COVERED=""
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/harden_suites.sh
@@ -72,8 +76,50 @@ CHECKOUT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 expect_eq "no file in this checkout turns the allowlist off" "" \
     "$(hs_read_check "$CHECKOUT" | tr '\n' ' ' | sed 's/ $//')"
 
+echo "conservative retry history"
+HISTORY="$TMP/history"
+git init -q "$HISTORY"
+git -C "$HISTORY" config user.email test@example.com
+git -C "$HISTORY" config user.name Test
+git -C "$HISTORY" commit -qm initial --allow-empty
+echo "import './fixture.test.ts'" > "$HISTORY/consumer.ts"
+echo fixture > "$HISTORY/fixture.test.ts"
+git -C "$HISTORY" add .
+git -C "$HISTORY" commit -qm consumer
+history_base="$(git -C "$HISTORY" rev-parse HEAD)"
+for path in fixture.test.ts helpers/helper.test.ts config.json product.rs; do
+    mkdir -p "$HISTORY/$(dirname "$path")"
+    echo changed > "$HISTORY/$path"
+    git -C "$HISTORY" add .
+    git -C "$HISTORY" commit -qm change
+    hs_retry_test_only "$HISTORY" "$history_base" > "$TMP/history.out"
+    expect_eq "rejects $path" 1 "$?"
+    history_base="$(git -C "$HISTORY" rev-parse HEAD)"
+done
+echo source > "$HISTORY/product.rs"
+git -C "$HISTORY" commit -qam source
+git -C "$HISTORY" revert --no-edit HEAD >/dev/null
+hs_retry_test_only "$HISTORY" "$history_base" > /dev/null
+expect_eq "reverted source still requires full round" 1 "$?"
+hs_retry_test_only "$HISTORY" missing > /dev/null
+expect_eq "missing baseline requires full round" 1 "$?"
+history_base="$(git -C "$HISTORY" rev-parse HEAD)"
+ln -s product.rs "$HISTORY/linked.test.ts"
+git -C "$HISTORY" add .
+git -C "$HISTORY" commit -qm symlink
+hs_retry_test_only "$HISTORY" "$history_base" > /dev/null
+expect_eq "test-named symlink requires full round" 1 "$?"
+(
+    git() {
+        case "$*" in *'^@'*) return 1 ;; esac
+        command git "$@"
+    }
+    hs_retry_test_only "$HISTORY" "$history_base" > /dev/null
+)
+expect_eq "unreadable parents require full round" 1 "$?"
+
 echo "generated knowhow freshness"
-for s in ts vitest knowhow-generated; do
+for s in ts vitest knowhow-generated first-paint; do
     expect_eq "$s leaves the cargo lane" "1" "$(hs_is_cargo_suite "$s"; echo $?)"
     expect_eq "$s waits for the codegen step" "0" "$(hs_waits_for_codegen "$s"; echo $?)"
     cmd="$(hs_suite_command "$s" normal "$TMP")"
@@ -89,7 +135,7 @@ expect_eq "engine waits for no codegen step" "1" "$(hs_waits_for_codegen engine;
 expect_eq "a selection with ts needs the codegen step" "0" "$(hs_needs_codegen "engine
 ts"; echo $?)"
 expect_eq "a selection without a reader needs no codegen step" "1" "$(hs_needs_codegen "engine
-first-paint"; echo $?)"
+harden-scope"; echo $?)"
 expect_eq "the codegen step runs codegen" "./scripts/codegen.sh" "$(hs_suite_command codegen-step normal "$TMP")"
 expect_has "fast docs still run freshness" "knowhow-generated" "$(printf '%s\n' docs/a.md | hs_select_suites '' '' '' '' fast)"
 expect_has "freshness runs even for docs" "knowhow-generated" "$(printf '%s\n' docs/a.md | hs_select_suites)"
@@ -114,16 +160,16 @@ printf '%s\n' crates/lucidos-engine/src/api \
     crates/lucidos-engine/src/engine/event_bus_system_event.rs .claude/rules/frontend.md > "$TMP/vitest-inputs"
 # A workspace graph shaped like the real one, as `start` records it: the engine
 # has two dependents, and the gateway, app and CLI have none.
-printf 'lucidos-app\tcrates/lucidos-app\tlucidos-home\nlucidos-capabilities\tcrates/lucidos-capabilities\t\nlucidos-cli\tcrates/lucidos-cli\tlucidos-capabilities lucidos-home\nlucidos-e2e\tcrates/lucidos-e2e\tlucidos-engine lucidos-local-token\nlucidos-engine\tcrates/lucidos-engine\tlucidos-home lucidos-local-token\nlucidos-eval\tcrates/lucidos-eval\tlucidos-engine lucidos-local-token\nlucidos-gateway\tcrates/lucidos-gateway\tlucidos-home\nlucidos-home\tcrates/lucidos-home\t\nlucidos-local-token\tcrates/lucidos-local-token\tlucidos-home\n' > "$TMP/sel-graph"
+printf 'lucidos-agent-sandbox\tcrates/lucidos-agent-sandbox\t\nlucidos-app\tcrates/lucidos-app\tlucidos-home\nlucidos-capabilities\tcrates/lucidos-capabilities\t\nlucidos-cli\tcrates/lucidos-cli\tlucidos-capabilities lucidos-home\nlucidos-e2e\tcrates/lucidos-e2e\tlucidos-engine lucidos-local-token\nlucidos-engine\tcrates/lucidos-engine\tlucidos-agent-sandbox lucidos-home lucidos-local-token\nlucidos-eval\tcrates/lucidos-eval\tlucidos-engine lucidos-local-token\nlucidos-gateway\tcrates/lucidos-gateway\tlucidos-home\nlucidos-home\tcrates/lucidos-home\t\nlucidos-local-token\tcrates/lucidos-local-token\tlucidos-home\n' > "$TMP/sel-graph"
 printf 'CHANGELOG.md\tcrates/lucidos-engine\n' > "$TMP/sel-owners"
-ALL_SUITES="lint crates gateway cli app-lib eval engine"
+ALL_SUITES="lint-static lint-rust crates gateway cli app-lib eval engine confinement"
 select_cfg() { # [drift-file] [tier]
     hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "${1:-}" "${2:-}" "" "" "$TMP/sel-graph" "$TMP/sel-owners" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//'
 }
 select_for() { printf '%s\n' "$@" | select_cfg; }
-expect_eq "an engine edit" "lint eval engine" "$(select_for crates/lucidos-engine/src/a.rs)"
+expect_eq "an engine edit" "lint-static lint-rust eval engine" "$(select_for crates/lucidos-engine/src/a.rs)"
 expect_eq "Cargo.lock" "$ALL_SUITES" "$(select_for Cargo.lock)"
-expect_eq "Cargo.toml" "lint eval engine" "$(select_for crates/lucidos-engine/Cargo.toml)"
+expect_eq "Cargo.toml" "lint-static lint-rust eval engine" "$(select_for crates/lucidos-engine/Cargo.toml)"
 # The files that configure every build, and the fail-safe cases, select every
 # crate and lint the whole workspace.
 for p in Cargo.lock Cargo.toml .cargo/config.toml rust-toolchain.toml clippy.toml Makefile crates/vendor/x/src/lib.rs; do
@@ -134,33 +180,33 @@ expect_eq "an empty graph selects every crate" "$ALL_SUITES" \
     "$(printf '%s\n' crates/lucidos-gateway/src/a.rs | hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" "$TMP/vitest-inputs" "" "" "" "" /dev/null /dev/null | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "a missing graph selects every crate" "$ALL_SUITES" \
     "$(printf '%s\n' crates/lucidos-gateway/src/a.rs | hs_select_suites "$TMP/inputs" "" "" "" "" "" "" /nonexistent /nonexistent | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
-expect_eq "a gateway edit skips the engine and every other crate" "lint gateway" "$(select_for crates/lucidos-gateway/src/a.rs)"
-expect_eq "a small crate edit tests the small crates and the CLI above it" "lint crates cli" "$(select_for crates/lucidos-capabilities/Cargo.toml)"
-expect_eq "a shared crate reaches every crate that depends on it" "lint crates gateway cli app-lib eval engine" \
+expect_eq "a gateway edit skips the engine and every other crate" "lint-static lint-rust gateway" "$(select_for crates/lucidos-gateway/src/a.rs)"
+expect_eq "a small crate edit tests the small crates and the CLI above it" "lint-static lint-rust crates cli" "$(select_for crates/lucidos-capabilities/Cargo.toml)"
+expect_eq "a shared crate reaches every crate that depends on it" "lint-static lint-rust crates gateway cli app-lib eval engine" \
     "$(select_for crates/lucidos-home/src/a.rs)"
-expect_eq "an eval edit tests the eval crate alone" "lint eval" "$(select_for crates/lucidos-eval/src/a.rs)"
-expect_eq "an e2e edit lints and runs no suite" "lint" "$(select_for crates/lucidos-e2e/tests/a.rs)"
+expect_eq "an eval edit tests the eval crate alone" "lint-static lint-rust eval" "$(select_for crates/lucidos-eval/src/a.rs)"
+expect_eq "an e2e edit lints and runs no suite" "lint-static lint-rust" "$(select_for crates/lucidos-e2e/tests/a.rs)"
 expect_eq "ORT download policy" "$ALL_SUITES ort-download" "$(select_for crates/vendor/ort-sys/build.rs)"
-expect_eq "ORT mirror tests" "shell-lint ort-download" "$(select_for scripts/lib/onnxruntime_mirror_test.sh)"
+expect_eq "ORT mirror tests" "lint-static ort-download" "$(select_for scripts/lib/onnxruntime_mirror_test.sh)"
 
-expect_eq ".shellcheckrc" "shell-lint" "$(select_for .shellcheckrc)"
-expect_eq "an app compile input runs the app tests, and the gateway pins it" "lint gateway app-lib first-paint" "$(select_for crates/lucidos-app/tauri.conf.json)"
-expect_eq "migration" "lint eval engine" "$(select_for crates/lucidos-engine/migrations/1_x.sql)"
-expect_eq "app crate" "lint app-lib" "$(select_for crates/lucidos-app/src/lib.rs)"
-expect_eq "cli crate" "lint cli" "$(select_for crates/lucidos-cli/src/main.rs)"
-expect_eq "a CLI include runs the CLI tests" "lint cli eval engine" \
+expect_eq ".shellcheckrc" "lint-static" "$(select_for .shellcheckrc)"
+expect_eq "an app compile input runs the app tests, and the gateway pins it" "lint-static lint-rust gateway app-lib first-paint" "$(select_for crates/lucidos-app/tauri.conf.json)"
+expect_eq "migration" "lint-static lint-rust eval engine" "$(select_for crates/lucidos-engine/migrations/1_x.sql)"
+expect_eq "app crate" "lint-static lint-rust app-lib" "$(select_for crates/lucidos-app/src/lib.rs)"
+expect_eq "cli crate" "lint-static lint-rust cli" "$(select_for crates/lucidos-cli/src/main.rs)"
+expect_eq "a CLI include runs the CLI tests" "lint-static lint-rust cli eval engine" \
     "$(select_for crates/lucidos-engine/src/runtime/cc_menu_options.json)"
-expect_eq "no cli-inputs file" "lint eval engine" \
+expect_eq "no cli-inputs file" "lint-static lint-rust eval engine" \
     "$(printf '%s\n' crates/lucidos-engine/src/runtime/cc_menu_options.json | hs_select_suites "$TMP/inputs" "" "" "" "" "" "" "$TMP/sel-graph" "$TMP/sel-owners" | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//')"
-expect_eq "a compiled-in markdown file" "lint eval engine" "$(select_for CHANGELOG.md)"
+expect_eq "a compiled-in markdown file" "lint-static lint-rust eval engine" "$(select_for CHANGELOG.md)"
 expect_eq "no compile-inputs file" "" "$(printf '%s\n' CHANGELOG.md | hs_select_suites | sed '/^knowhow-generated$/d' | tr '\n' ' ')"
-expect_eq "a capability manifest change runs the CLI tests" "lint crates cli" \
+expect_eq "a capability manifest change runs the CLI tests" "lint-static lint-rust crates cli" \
     "$(select_for crates/lucidos-capabilities/src/lib.rs)"
 printf 'drift\n' > "$TMP/drift"
-expect_eq "generated drift runs the TS suite" "lint eval engine ts" \
+expect_eq "generated drift runs the TS suite" "lint-static lint-rust eval engine ts" \
     "$(printf '%s\n' crates/lucidos-engine/src/x.rs | select_cfg "$TMP/drift")"
 : > "$TMP/no-drift"
-expect_eq "no generated drift leaves the TS suite out" "lint eval engine" \
+expect_eq "no generated drift leaves the TS suite out" "lint-static lint-rust eval engine" \
     "$(printf '%s\n' crates/lucidos-engine/src/x.rs | select_cfg "$TMP/no-drift")"
 
 echo "generated drift"
@@ -196,72 +242,160 @@ expect_eq "a new fingerprint with the same output is no drift" "" \
 expect_eq "a new fingerprint renders the branch" "rendered" "$(cat "$TMP/render-log")"
 expect_eq "a changed output is drift" "drift" "$(drift_for f1 f2 "$TMP/render-base" "$TMP/render-other")"
 expect_eq "no rendering for the base is drift" "drift" "$(drift_for f1 f2 "$TMP/absent" "$TMP/render-same")"
-expect_eq "shell" "shell-lint" "$(select_for scripts/foo.sh)"
+expect_eq "shell" "lint-static" "$(select_for scripts/foo.sh)"
 expect_eq "Makefile" "$ALL_SUITES" "$(select_for Makefile)"
-expect_eq "installer" "shell-lint gateway install" "$(select_for install.sh)"
-expect_eq "installer: service.sh" "shell-lint gateway install" "$(select_for scripts/lib/service.sh)"
+expect_eq "installer" "lint-static gateway install" "$(select_for install.sh)"
+expect_eq "installer: service.sh" "lint-static gateway install" "$(select_for scripts/lib/service.sh)"
 for f in uninstall.sh scripts/lib/stage_runtime.sh \
     scripts/lib/stage_runtime_test.sh scripts/lib/stage_runtime_linux_smoke.sh \
     scripts/build-headless.sh scripts/lib/install_test.sh \
     scripts/lib/headless_tarball.sh scripts/lib/install_common.sh; do
-    expect_eq "installer: $f" "shell-lint install" "$(select_for "$f")"
+    expect_eq "installer: $f" "lint-static install" "$(select_for "$f")"
 done
 for f in scripts/lib/stage_runtime_linux.py scripts/lib/stage_runtime_linux_test.py; do
     expect_eq "Linux closure: $f" "install" "$(select_for "$f")"
 done
-expect_eq "a script both crates pin" "shell-lint gateway engine-filtered" \
+expect_eq "a script both crates pin" "lint-static gateway engine-filtered" \
     "$(select_for scripts/lib/workspace_constants.sh)"
-expect_eq "a script the engine pins" "shell-lint engine-filtered" "$(select_for scripts/status.sh)"
-expect_eq "a gateway edit subsumes the gateway pins" "lint gateway install" \
+expect_eq "a script the engine pins" "lint-static engine-filtered" "$(select_for scripts/status.sh)"
+expect_eq "a gateway edit subsumes the gateway pins" "lint-static lint-rust gateway install" \
     "$(select_for install.sh crates/lucidos-gateway/src/a.rs)"
-expect_eq "release script" "shell-lint release" "$(select_for scripts/release.sh)"
-expect_eq "preferences" "lint app-lib ts first-paint" "$(select_for crates/lucidos-app/src/store/actions/preferences.ts)"
-expect_eq "proc tree" "shell-lint harden-suites" "$(select_for scripts/lib/proc_tree.sh)"
-expect_eq "release" "shell-lint release" "$(select_for scripts/lib/release_draft.sh)"
-expect_eq "self" "shell-lint harden-suites" "$(select_for scripts/lib/harden_suites.sh)"
+expect_eq "release script" "lint-static release" "$(select_for scripts/release.sh)"
+expect_eq "Beta state selects its release tests" "release" "$(select_for scripts/lib/release_channel_state.py)"
+expect_eq "feed composer selects its release tests" "release" "$(select_for scripts/lib/update_channel_feed.cjs)"
+expect_eq "preferences" "lint-static lint-rust app-lib ts first-paint" "$(select_for crates/lucidos-app/src/store/actions/preferences.ts)"
+expect_eq "proc tree" "lint-static harden-suites" "$(select_for scripts/lib/proc_tree.sh)"
+expect_eq "release" "lint-static release" "$(select_for scripts/lib/release_draft.sh)"
+expect_eq "self" "lint-static harden-suites" "$(select_for scripts/lib/harden_suites.sh)"
 expect_eq "fast tier keeps estimate guards" "rung-estimates" "$(hs_fast_tier_suite rung-estimates)"
 expect_eq "rung estimator tests" "rung-estimates" "$(select_for .claude/skills/update-lucidos-models/test_estimate_rungs.py)"
 expect_eq "rung input refresh" "rung-estimates" "$(select_for docs/plans/rung-estimate-inputs/aa_coding.csv)"
 expect_has "rung suite runs Python regressions" "unittest discover" "$(hs_suite_command rung-estimates normal "$TMP")"
-expect_eq "harden scope" "shell-lint harden-scope" "$(select_for scripts/harden-scope.sh)"
-expect_eq "harden scope test" "shell-lint harden-scope" "$(select_for scripts/lib/harden_scope_test.sh)"
-expect_eq "harden other-model review" "shell-lint harden-other-model-review" \
+expect_eq "harden scope" "lint-static harden-scope" "$(select_for scripts/harden-scope.sh)"
+expect_eq "harden scope test" "lint-static harden-scope" "$(select_for scripts/lib/harden_scope_test.sh)"
+expect_eq "harden other-model review" "lint-static harden-other-model-review" \
     "$(select_for scripts/harden-other-model-review.sh)"
-expect_eq "harden other-model review lib" "shell-lint harden-other-model-review" \
+expect_eq "harden other-model review lib" "lint-static harden-other-model-review" \
     "$(select_for scripts/lib/other_model_review.sh)"
-expect_eq "harden other-model review test" "shell-lint harden-other-model-review" \
+expect_eq "harden other-model review test" "lint-static harden-other-model-review" \
     "$(select_for scripts/lib/harden_other_model_review_test.sh)"
+expect_eq "the sandbox crate runs the confinement tests" "lint-static lint-rust crates eval engine confinement" \
+    "$(select_for crates/lucidos-agent-sandbox/src/lib.rs)"
+for f in crates/lucidos-engine/src/runtime/agent_sandbox.rs crates/lucidos-engine/src/runtime/agent_sandbox_tests.rs \
+    crates/lucidos-engine/src/runtime/python.rs crates/lucidos-engine/src/runtime/browser/session.rs \
+    crates/lucidos-engine/src/runtime/browser/mod.rs; do
+    expect_eq "engine sandbox wiring: $f" "lint-static lint-rust eval engine confinement" "$(select_for "$f")"
+done
+expect_eq "another engine runtime file skips the confinement tests" "lint-static lint-rust eval engine" \
+    "$(select_for crates/lucidos-engine/src/runtime/python_tests.rs)"
+for f in scripts/confinement-tests.sh scripts/lib/confinement_tests_test.sh; do
+    expect_eq "the confinement runner: $f" "lint-static confinement" "$(select_for "$f")"
+done
 expect_eq "ts" "ts first-paint" "$(select_for crates/lucidos-app/src/a.ts)"
 expect_eq "css" "vite first-paint" "$(select_for crates/lucidos-app/src/a.css)"
-expect_eq "sdk iframe css" "lint eval engine vitest" "$(select_for crates/lucidos-engine/src/api/sdk_iframe.css)"
-expect_eq "a Rust file a Vitest test reads" "lint eval engine vitest" \
+expect_eq "sdk iframe css" "lint-static lint-rust eval engine vitest" "$(select_for crates/lucidos-engine/src/api/sdk_iframe.css)"
+expect_eq "a Rust file a Vitest test reads" "lint-static lint-rust eval engine vitest" \
     "$(select_for crates/lucidos-engine/src/engine/event_bus_system_event.rs)"
-expect_eq "a Rust file no Vitest test reads" "lint eval engine" "$(select_for crates/lucidos-engine/src/engine/other.rs)"
+expect_eq "a Rust file no Vitest test reads" "lint-static lint-rust eval engine" "$(select_for crates/lucidos-engine/src/engine/other.rs)"
 expect_eq "a rule a Vitest test reads" "vitest" "$(select_for .claude/rules/frontend.md)"
-expect_eq "a deleted file under a named directory" "lint eval engine vitest" \
+expect_eq "a deleted file under a named directory" "lint-static lint-rust eval engine vitest" \
     "$(select_for crates/lucidos-engine/src/api/gone.rs)"
-expect_eq "ts already runs Vitest" "lint eval engine ts first-paint" \
+expect_eq "ts already runs Vitest" "lint-static lint-rust eval engine ts first-paint" \
     "$(select_for crates/lucidos-engine/src/engine/event_bus_system_event.rs crates/lucidos-app/src/a.ts)"
+
+echo "the main-check setting"
+for v in here another-host; do
+    if hs_main_check_covers "$v"; then pass "$v covers the round"; else fail "$v covers the round"; fi
+done
+for v in off "" fast unknown; do
+    if hs_main_check_covers "$v"; then fail "'$v' must not cover the round"; else pass "'$v' keeps the full round"; fi
+done
+
+echo "a round a main check covers"
+# A touched spec file, so the e2e suites can be selected at all.
+printf 'chat.spec.ts\n' > "$TMP/sel-touched"
+select_with() { # <covered: 0|1> <path>...
+    local covered=$1
+    shift
+    printf '%s\n' "$@" | HS_MAIN_CHECK_COVERED="${covered#0}" hs_select_suites "$TMP/inputs" "$TMP/cli-inputs" \
+        "$TMP/vitest-inputs" "" "" "$TMP/sel-touched" "" "$TMP/sel-graph" "$TMP/sel-owners" \
+        | sed '/^knowhow-generated$/d' | tr '\n' ' ' | sed 's/ $//'
+}
+select_covered() { select_with 1 "$@"; }
+expect_eq "covered: an engine edit runs the guard and touched-module tests" \
+    "lint-static lint-rust engine-touched" "$(select_covered crates/lucidos-engine/src/a.rs)"
+expect_eq "covered: a gateway edit leaves the gateway suite to the main check" \
+    "lint-static lint-rust engine-touched" "$(select_covered crates/lucidos-gateway/src/a.rs)"
+expect_eq "covered: a small crate the diff touches runs its own suite" \
+    "lint-static lint-rust crates engine-touched" "$(select_covered crates/lucidos-capabilities/src/lib.rs)"
+expect_eq "covered: a docs edit still runs the guard tests" \
+    "engine-touched" "$(select_covered docs/a.md)"
+expect_eq "covered: the frontend runs no touched spec" \
+    "engine-touched ts first-paint" "$(select_covered crates/lucidos-app/src/a.ts)"
+expect_eq "covered: the release suite stays, since the mirror strips its subject" \
+    "lint-static engine-touched release" "$(select_covered scripts/release.sh)"
+expect_eq "covered: a changed script library runs its own test" \
+    "lint-static engine-touched script-libs" "$(select_covered scripts/lib/flock.sh)"
+expect_eq "covered: the confinement suite stays" \
+    "lint-static lint-rust engine-touched confinement" "$(select_covered crates/lucidos-engine/src/runtime/python.rs)"
+
+# I2: whatever a covered round drops, the main check runs.
+for p in crates/lucidos-engine/src/a.rs crates/lucidos-gateway/src/a.rs crates/lucidos-capabilities/src/lib.rs \
+    crates/lucidos-cli/src/main.rs crates/lucidos-app/src/lib.rs crates/lucidos-eval/src/a.rs Cargo.lock \
+    crates/lucidos-app/src/a.ts system-knowhow/a.md scripts/status.sh scripts/lib/flock.sh scripts/release.sh \
+    install.sh crates/lucidos-engine/src/runtime/python.rs docs/a.md; do
+    lost=""
+    for s in $(select_with 0 "$p"); do
+        case " $(select_covered "$p") $HS_MAIN_CHECK_RUNS " in
+            *" $s "*) ;;
+            *) lost="$lost $s" ;;
+        esac
+    done
+    expect_eq "covered: $p drops only what the main check runs" "" "$lost"
+done
+for s in $HS_MAIN_CHECK_CRATE_SUITES; do
+    case " $HS_MAIN_CHECK_RUNS " in
+        *" $s "*) pass "the main check's crates job runs $s" ;;
+        *) fail "the crates job runs $s, but the covered round does not count on it" ;;
+    esac
+done
+
+echo "the engine module filters"
+module_filters() { printf '%s\n' "$@" | hs_engine_module_filters; }
+expect_eq "a module file" "engine::git_ops::restart_detection" \
+    "$(module_filters crates/lucidos-engine/src/engine/git_ops/restart_detection.rs)"
+expect_eq "a mod.rs names its directory" "engine::git_ops" "$(module_filters crates/lucidos-engine/src/engine/git_ops/mod.rs)"
+expect_eq "a _tests sibling names the module it tests" "engine::change_ops" \
+    "$(module_filters crates/lucidos-engine/src/engine/change_ops_tests.rs)"
+expect_eq "a file in a _tests directory names the module it tests" "engine::git_ops" \
+    "$(module_filters crates/lucidos-engine/src/engine/git_ops_tests/branch_queries.rs)"
+expect_eq "an api file" "api::history" "$(module_filters crates/lucidos-engine/src/api/history.rs)"
+expect_eq "the crate root names no module" "" "$(module_filters crates/lucidos-engine/src/lib.rs)"
+expect_eq "a migration names the migration tests" "migration_tests" \
+    "$(module_filters crates/lucidos-engine/migrations/1_x.sql)"
+expect_eq "other paths name nothing, and a module is named once" "api::history" \
+    "$(module_filters crates/lucidos-gateway/src/a.rs crates/lucidos-engine/src/api/history.rs crates/lucidos-engine/src/api/history_tests.rs)"
 
 echo "fast tier selection (an integrated sub-thread)"
 select_fast() { printf '%s\n' "$@" | select_cfg "" fast; }
-expect_eq "fast: an engine edit runs the lint, not the engine suite" "lint" "$(select_fast crates/lucidos-engine/src/a.rs)"
-expect_eq "fast: the app crate drops its tests" "lint" "$(select_fast crates/lucidos-app/src/lib.rs)"
-expect_eq "fast: the cli crate drops its tests" "lint" "$(select_fast crates/lucidos-cli/src/main.rs)"
+expect_eq "fast: an engine edit runs the lint, not the engine suite" "lint-static lint-rust" "$(select_fast crates/lucidos-engine/src/a.rs)"
+expect_eq "fast: the app crate drops its tests" "lint-static lint-rust" "$(select_fast crates/lucidos-app/src/lib.rs)"
+expect_eq "fast: the cli crate drops its tests" "lint-static lint-rust" "$(select_fast crates/lucidos-cli/src/main.rs)"
 expect_eq "fast: ts keeps tsc, Vitest and vite build, drops first-paint" "ts" "$(select_fast crates/lucidos-app/src/a.ts)"
 expect_eq "fast: css keeps vite build" "vite" "$(select_fast crates/lucidos-app/src/a.css)"
 expect_eq "fast: a rule a Vitest test reads keeps Vitest" "vitest" "$(select_fast .claude/rules/frontend.md)"
-expect_eq "fast: shell keeps the shell lint" "shell-lint" "$(select_fast scripts/foo.sh)"
-expect_eq "fast: the installer drops its suites" "shell-lint" "$(select_fast install.sh)"
-expect_eq "fast: the release path drops its suites" "shell-lint" "$(select_fast scripts/release.sh)"
-expect_eq "fast: an engine pin drops the filtered engine tests" "shell-lint" "$(select_fast scripts/status.sh)"
+expect_eq "fast: shell keeps the shell lint" "lint-static" "$(select_fast scripts/foo.sh)"
+expect_eq "fast: the installer drops its suites" "lint-static" "$(select_fast install.sh)"
+expect_eq "fast: the release path drops its suites" "lint-static" "$(select_fast scripts/release.sh)"
+expect_eq "fast: an engine pin drops the filtered engine tests" "lint-static" "$(select_fast scripts/status.sh)"
 expect_eq "fast: knowhow drops the filtered engine tests" "" "$(select_fast system-knowhow/a.md)"
-expect_eq "fast: the script tests stay" "shell-lint harden-scope" "$(select_fast scripts/harden-scope.sh)"
-expect_eq "fast: mixed engine and ts" "lint ts" \
+expect_eq "fast: the script tests stay" "lint-static harden-scope" "$(select_fast scripts/harden-scope.sh)"
+expect_eq "fast: the confinement tests wait for the parent" "lint-static lint-rust" "$(select_fast crates/lucidos-agent-sandbox/src/lib.rs)"
+expect_eq "fast: mixed engine and ts" "lint-static lint-rust ts" \
     "$(select_fast crates/lucidos-engine/src/a.rs crates/lucidos-app/src/a.ts)"
-expect_eq "full is the default tier" "lint eval engine" \
+expect_eq "full is the default tier" "lint-static lint-rust eval engine" \
     "$(printf '%s\n' crates/lucidos-engine/src/a.rs | select_cfg "")"
-expect_eq "fast: generated drift keeps the TS suite" "lint ts" \
+expect_eq "fast: generated drift keeps the TS suite" "lint-static lint-rust ts" \
     "$(printf '%s\n' crates/lucidos-engine/src/a.rs | select_cfg "$TMP/drift" fast)"
 expect_eq "an unknown tier is the full tier" "full" "$(hs_normalize_tier banana)"
 expect_eq "fast normalizes to fast" "fast" "$(hs_normalize_tier fast)"
@@ -276,15 +410,15 @@ VI_CONFIGURED="$(GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=grep.lineNumber GIT_CONFIG_
     GIT_CONFIG_KEY_1=grep.column GIT_CONFIG_VALUE_1=true hs_vitest_inputs "$CHECKOUT")"
 expect_eq "a git config cannot change the scan" "$VI" "$VI_CONFIGURED"
 expect_eq "ts subsumes css" "ts first-paint" "$(select_for crates/lucidos-app/src/a.ts crates/lucidos-app/src/a.css)"
-expect_eq "locale" "lint app-lib ts first-paint" \
+expect_eq "locale" "lint-static lint-rust app-lib ts first-paint" \
     "$(select_for crates/lucidos-app/src/components/settings/LocaleSection.tsx)"
 expect_eq "knowhow" "engine-filtered" "$(select_for system-knowhow/a.md)"
-expect_eq "an engine edit subsumes filters" "lint eval engine" "$(select_for system-knowhow/a.md crates/lucidos-engine/src/a.rs)"
+expect_eq "an engine edit subsumes filters" "lint-static lint-rust eval engine" "$(select_for system-knowhow/a.md crates/lucidos-engine/src/a.rs)"
 expect_eq "docs only" "" "$(select_for docs/a.md docs/b.md)"
 expect_eq "an SDK source" "ts first-paint" "$(select_for packages/lucidos-sdk/src/a.ts)"
 expect_eq "the lockfile" "first-paint" "$(select_for package-lock.json)"
 expect_eq "a system widget" "first-paint" "$(select_for system-widgets/a/index.html)"
-expect_eq "an app Rust file is no first-paint input" "lint app-lib" "$(select_for crates/lucidos-app/src/a.rs)"
+expect_eq "an app Rust file is no first-paint input" "lint-static lint-rust app-lib" "$(select_for crates/lucidos-app/src/a.rs)"
 # The row must cover every root the growth check reads, so read them from it.
 FP_ROOTS="$(sed -n "s/^export const ARCHIVE_PATHS = \[\(.*\)\];$/\1/p" "$CHECKOUT/crates/lucidos-app/first-paint-growth.mjs" | tr -d "' " | tr ',' ' ')"
 expect_has "the growth check's roots were read" "crates/lucidos-app" "$FP_ROOTS"
@@ -415,6 +549,24 @@ expect_eq "a test fn names itself" "test reads_it_too,test reads_the_test_doc" "
 expect_eq "a const inside a test fn is the test's" "test a_const_in_a_test_fn" "$(site_of fn-const.md)"
 expect_eq "a mixed path keeps both sites" "prod ,test reads_it_too" "$(site_of mixed.md)"
 expect_eq "a test outside the lib target counts as production" "prod a_bin_target_test" "$(site_of bin-test.md)"
+
+# The 400-byte lookahead window after an include may end inside a multibyte
+# character. Two pads put the cut on either byte of a two-byte one.
+MB="$TMP/multibyte"
+mkdir -p "$MB/crates/lucidos-engine/src"
+: > "$MB/crates/lucidos-engine/Cargo.toml"
+accents="$(printf '\303\251%.0s' $(seq 300))"
+for pad in 3 4; do
+    printf '#[test]\nfn pad_%s() {\n    let _ = include_str!("pad-%s.md");\n    //%*s%s\n}\n' \
+        "$pad" "$pad" "$((pad - 2))" '' "$accents" > "$MB/crates/lucidos-engine/src/pad_$pad.rs"
+done
+git -C "$MB" init -q && git -C "$MB" add -A
+# Any UTF-8 locale the host lists, since a Linux host may lack en_US.UTF-8.
+utf8="$(locale -a 2> /dev/null | grep -i -m 1 -E 'utf-?8$' || echo C)"
+mb_out="$(LC_ALL="$utf8" hs_include_sites "$MB" 2> "$TMP/multibyte.err" | cut -f1-3 | tr '\t' ' ' | tr '\n' ',')"
+expect_eq "a multibyte character in the window warns nothing" "" "$(cat "$TMP/multibyte.err")"
+expect_eq "a multibyte character in the window keeps the include" \
+    "crates/lucidos-engine/src/pad-3.md test pad_3,crates/lucidos-engine/src/pad-4.md test pad_4," "$mb_out"
 hs_test_inputs "$INC" > "$TMP/test-inputs"
 expect_eq "only test-only paths in suites of their own are test inputs" \
     "docs/cli-test.md cli | docs/fn-const.md engine-filtered a_const_in_a_test_fn | docs/test-only.md engine-filtered reads_it_too | docs/test-only.md engine-filtered reads_the_test_doc" \
@@ -442,7 +594,7 @@ hs_test_inputs "$CHECKOUT" > "$TMP/checkout-test-inputs"
 plugins_selection="$(printf '%s\n' crates/lucidos-app/src/components/plugins/PluginDetailPage.tsx system-knowhow/plugins.md \
     | hs_select_suites "$TMP/checkout-inputs" '' '' '' '' '' "$TMP/checkout-test-inputs")"
 expect_eq "plugins.md no longer selects the lint or the engine suite" "" \
-    "$(printf '%s\n' "$plugins_selection" | grep -x -e lint -e engine)"
+    "$(printf '%s\n' "$plugins_selection" | grep -x -e lint-rust -e engine)"
 expect_has "it selects the filtered engine run" "engine-filtered" "$plugins_selection"
 expect_has "and the TS suite" "ts" "$plugins_selection"
 expect_has "the plugins.md test fns are filters" "the_plugins_knowhow_states_the_limits" \
@@ -579,28 +731,72 @@ cp "$TMP/sel-owners" "$CMD_STATE/compile-owners"
 : > "$CMD_STATE/test-inputs"
 paths_are() { printf '%s\n' "$@" > "$CMD_STATE/paths"; }
 paths_are crates/lucidos-gateway/src/a.rs
-expect_eq "a gateway edit lints the gateway alone" "make lint CLIPPY_SCOPE='-p lucidos-gateway'" "$(command_for lint normal)"
+expect_eq "a gateway edit lints the gateway alone" "make lint-rust CLIPPY_SCOPE='-p lucidos-gateway'" "$(command_for lint-rust normal)"
 paths_are crates/lucidos-engine/src/a.rs
-expect_eq "an engine edit lints its dependents too" "make lint CLIPPY_SCOPE='-p lucidos-e2e -p lucidos-engine -p lucidos-eval'" "$(command_for lint normal)"
+expect_eq "an engine edit lints its dependents too" "make lint-rust CLIPPY_SCOPE='-p lucidos-e2e -p lucidos-engine -p lucidos-eval'" "$(command_for lint-rust normal)"
 paths_are crates/lucidos-home/src/a.rs
 expect_eq "a leaf-dependency edit lints each crate that reaches it" \
-    "make lint CLIPPY_SCOPE='-p lucidos-app -p lucidos-cli -p lucidos-e2e -p lucidos-engine -p lucidos-eval -p lucidos-gateway -p lucidos-home -p lucidos-local-token'" "$(command_for lint normal)"
-paths_are crates/lucidos-home/src/a.rs crates/lucidos-capabilities/src/a.rs
-expect_eq "reaching every member lints the workspace" "make lint" "$(command_for lint normal)"
+    "make lint-rust CLIPPY_SCOPE='-p lucidos-app -p lucidos-cli -p lucidos-e2e -p lucidos-engine -p lucidos-eval -p lucidos-gateway -p lucidos-home -p lucidos-local-token'" "$(command_for lint-rust normal)"
+paths_are crates/lucidos-home/src/a.rs crates/lucidos-capabilities/src/a.rs crates/lucidos-agent-sandbox/src/a.rs
+expect_eq "reaching every member lints the workspace" "make lint-rust" "$(command_for lint-rust normal)"
 for p in Cargo.lock Cargo.toml .cargo/config.toml rust-toolchain.toml clippy.toml Makefile crates/vendor/x/src/lib.rs; do
     paths_are "$p"
-    expect_eq "$p lints the workspace" "make lint" "$(command_for lint normal)"
+    expect_eq "$p lints the workspace" "make lint-rust" "$(command_for lint-rust normal)"
     expect_eq "$p tests every small crate" "make test-crates" "$(command_for crates normal)"
 done
 paths_are
-expect_eq "a state with no reach lints the workspace" "make lint" "$(command_for lint normal)"
+expect_eq "a state with no reach lints the workspace" "make lint-rust" "$(command_for lint-rust normal)"
 paths_are crates/lucidos-capabilities/src/a.rs
 expect_eq "a small crate edit tests that crate" "cargo test --locked -p lucidos-capabilities" "$(command_for crates normal)"
 paths_are crates/lucidos-home/src/a.rs
 expect_eq "the small crates a diff reaches are tested" "cargo test --locked -p lucidos-home -p lucidos-local-token" "$(command_for crates normal)"
 expect_eq "the eval suite runs the eval crate" "cargo test --locked -p lucidos-eval" "$(command_for eval normal)"
-expect_eq "a shell-only diff runs the cheap linters" "make lint-shell lint-eval lint-knowhow lint-fmt" "$(command_for shell-lint normal)"
-if hs_is_cargo_suite lint; then pass "lint shares the cargo lane"; else fail "lint shares the cargo lane"; fi
+expect_eq "a shell-only diff runs the static linters" "make lint-static" "$(command_for lint-static normal)"
+# /harden runs make lint as its two halves, so a check added to `lint` alone
+# would never run in a round.
+expect_eq "make lint is exactly its two halves" "lint-static lint-rust" \
+    "$(sed -n 's/^lint: *//p' "$SCRIPT_DIR/../../Makefile")"
+# lint-static runs beside the cargo lane, so nothing it reaches may run cargo.
+static_targets="$(sed -n 's/^lint-static: *//p' "$SCRIPT_DIR/../../Makefile")"
+static_cargo=""
+for t in $static_targets; do
+    sed -n "/^$t:/,/^\$/p" "$SCRIPT_DIR/../../Makefile" | grep -q -w cargo && static_cargo="$static_cargo $t"
+    while IFS= read -r f; do
+        grep -v '^[[:space:]]*#' "$SCRIPT_DIR/../../$f" | grep -q -E '(^|[;&|(]|\$\()[[:space:]]*cargo[[:space:]]' \
+            && static_cargo="$static_cargo $f"
+    done <<EOF
+$(sed -n "/^$t:/,/^\$/p" "$SCRIPT_DIR/../../Makefile" | grep -o 'scripts/[a-z0-9_-]*\.sh')
+EOF
+done
+expect_eq "lint-static runs no cargo" "" "$static_cargo"
+if hs_is_cargo_suite lint-rust; then pass "lint-rust shares the cargo lane"; else fail "lint-rust shares the cargo lane"; fi
+if hs_is_cargo_suite lint-static; then fail "lint-static runs beside the cargo lane"; else pass "lint-static runs beside the cargo lane"; fi
+if hs_is_cargo_suite confinement; then pass "confinement shares the cargo lane"; else fail "confinement shares the cargo lane"; fi
+expect_eq "the confinement suite asks no owner" \
+    "bash scripts/lib/confinement_tests_test.sh && ./scripts/confinement-tests.sh --hold-secs 0 --commit $(cat "$CMD_STATE/start-sha")" "$(command_for confinement normal)"
+
+echo "the confinement suite never passes on a run that did not happen"
+# The suite's real command, from the real tree, inside a coding-agent thread on
+# a macOS host whose seatbelt cannot nest. Stubs on PATH stand in for uname,
+# sandbox-exec, cargo and the CLI, which answers as the engine route would.
+CONF_STUBS="$TMP/confinement-bin"
+mkdir -p "$CONF_STUBS"
+printf '#!/bin/bash\necho Darwin\n' > "$CONF_STUBS/uname"
+printf '#!/bin/bash\nexit 71\n' > "$CONF_STUBS/sandbox-exec"
+printf '#!/bin/bash\nexit 0\n' > "$CONF_STUBS/cargo"
+chmod +x "$CONF_STUBS"/*
+confinement_suite_rc() { # <cli-output> <cli-exit>
+    printf '#!/bin/bash\necho "$*" > "%s/lucidos.args"\necho "%s"\nexit %s\n' "$CONF_STUBS" "$1" "$2" > "$CONF_STUBS/lucidos"
+    chmod +x "$CONF_STUBS/lucidos"
+    (cd "$SCRIPT_DIR/../.." && env -u LUCIDOS_AGENT_SANDBOXED LUCIDOS_THREAD_ID=thread-1 PATH="$CONF_STUBS:$PATH" \
+        bash -c "$(command_for confinement normal)" > /dev/null 2>&1)
+    echo $?
+}
+expect_eq "no grant: the not-run exit" 75 "$(confinement_suite_rc "no permission covers this thread (unpermitted)" 75)"
+expect_eq "the suite asks for no card" "confinement-tests run --hold-secs 0" "$(cat "$CONF_STUBS/lucidos.args")"
+expect_eq "a closed card: the not-run exit" 75 "$(confinement_suite_rc "the owner denied the card (closed)" 75)"
+expect_eq "a refusal fails" 1 "$(confinement_suite_rc "an inherited engine refuses" 1)"
+expect_eq "a granted run passes with the task" 0 "$(confinement_suite_rc "the task exited 0" 0)"
 expect_has "driver names both modules" \
     "runtime::codex::driver_tests runtime::codex_app_server::driver_tests" \
     "$(command_for driver early)"
@@ -627,7 +823,7 @@ expect_eq "a spec change alone selects it" "ts first-paint e2e-touched" \
     "$(select_touched "$TMP/touched" full crates/lucidos-app/e2e/chat.spec.ts)"
 expect_eq "no touched spec selects none" "ts first-paint" \
     "$(select_touched "$TMP/touched-none" full crates/lucidos-app/src/a.ts)"
-expect_eq "a backend-only diff selects no e2e" "lint eval engine" \
+expect_eq "a backend-only diff selects no e2e" "lint-static lint-rust eval engine" \
     "$(select_touched "$TMP/touched-none" full crates/lucidos-engine/src/a.rs)"
 expect_eq "the fast tier leaves the specs to the parent" "ts" \
     "$(select_touched "$TMP/touched" fast crates/lucidos-app/src/a.ts)"
@@ -636,10 +832,11 @@ expect_eq "each touched spec is one -f" "./scripts/e2e-browser.sh -f chat.spec.t
     "$(command_for e2e-touched normal)"
 if hs_is_cargo_suite e2e-touched; then fail "e2e-touched gets its own lane"; else pass "e2e-touched gets its own lane"; fi
 
-echo "the touched specs mobile-webkit runs go to GitHub, or run here on macOS"
+echo "the touched specs mobile-webkit runs go to GitHub on every host"
 for os in Linux Darwin; do
-    printf '#!/bin/bash\necho %s\n' "$os" > "$TMP/uname-$os.sh"
-    chmod +x "$TMP/uname-$os.sh"
+    mkdir -p "$TMP/host-$os"
+    printf '#!/bin/bash\necho %s\n' "$os" > "$TMP/host-$os/uname"
+    chmod +x "$TMP/host-$os/uname"
 done
 printf '%s\n' chat.spec.ts nav-mobile.spec.ts rail-all.spec.ts > "$TMP/touched-phone"
 expect_eq "a phone spec selects the WebKit suite too" "ts first-paint e2e-touched e2e-touched-webkit" \
@@ -651,21 +848,15 @@ expect_eq "only the specs mobile-webkit runs" "nav-mobile.spec.ts rail-all.spec.
 cp "$TMP/touched-phone" "$CMD_STATE/touched-specs"
 expect_eq "a Linux host sends the WebKit suite to GitHub, pinned to the start commit" \
     "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f nav-mobile.spec.ts -f rail-all.spec.ts" \
-    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
-expect_eq "a macOS host runs the WebKit suite itself, on the e2e profile" \
-    "ENGINE_CARGO_PROFILE=e2e ./scripts/e2e-browser.sh --webkit -f nav-mobile.spec.ts -f rail-all.spec.ts" \
-    "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)"
-case "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)" in
-    *--github*) fail "a macOS host never passes --github" ;;
-    *) pass "a macOS host never passes --github" ;;
-esac
-if HS_UNAME_CMD="$TMP/uname-Darwin.sh" hs_runs_webkit_here; then pass "macOS runs WebKit here"; else fail "macOS runs WebKit here"; fi
-if HS_UNAME_CMD="$TMP/uname-Linux.sh" hs_runs_webkit_here; then fail "Linux sends WebKit to GitHub"; else pass "Linux sends WebKit to GitHub"; fi
+    "$(PATH="$TMP/host-Linux:$PATH" command_for e2e-touched-webkit normal)"
+expect_eq "a macOS host sends the WebKit suite to GitHub, pinned to the start commit" \
+    "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f nav-mobile.spec.ts -f rail-all.spec.ts" \
+    "$(PATH="$TMP/host-Darwin:$PATH" command_for e2e-touched-webkit normal)"
 expect_eq "the local suite still runs every touched spec" \
     "./scripts/e2e-browser.sh -f chat.spec.ts -f nav-mobile.spec.ts -f rail-all.spec.ts" \
     "$(command_for e2e-touched normal)"
 if hs_is_cargo_suite e2e-touched-webkit; then fail "e2e-touched-webkit gets its own lane"; else pass "e2e-touched-webkit gets its own lane"; fi
-expect_eq "the project rule selects the harden-suites tests" "shell-lint harden-suites" \
+expect_eq "the project rule selects the harden-suites tests" "lint-static harden-suites" \
     "$(select_for scripts/lib/e2e_projects.sh)"
 
 echo "a retried suite runs only what failed"
@@ -679,9 +870,9 @@ echo rail-all.spec.ts > "$CMD_STATE/e2e-touched.retry"
 expect_eq "the local specs that failed" "./scripts/e2e-browser.sh -f rail-all.spec.ts" "$(command_for e2e-touched normal)"
 echo rail-all.spec.ts > "$CMD_STATE/e2e-touched-webkit.retry"
 expect_eq "the WebKit specs that failed, on Linux" "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
-    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
-expect_eq "the WebKit specs that failed, on macOS" "ENGINE_CARGO_PROFILE=e2e ./scripts/e2e-browser.sh --webkit -f rail-all.spec.ts" \
-    "$(HS_UNAME_CMD="$TMP/uname-Darwin.sh" command_for e2e-touched-webkit normal)"
+    "$(PATH="$TMP/host-Linux:$PATH" command_for e2e-touched-webkit normal)"
+expect_eq "the WebKit specs that failed, on macOS" "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
+    "$(PATH="$TMP/host-Darwin:$PATH" command_for e2e-touched-webkit normal)"
 echo whatever > "$CMD_STATE/ts.retry"
 expect_eq "a suite with no named tests reruns whole" \
     "cd crates/lucidos-app && npx tsc --noEmit && npm test --ignore-scripts && npx vite build" "$(command_for ts normal)"
@@ -764,7 +955,7 @@ expect_eq "the specs it runs are recorded for the verdict" "nav-mobile.spec.ts r
     "$(tr '\n' ' ' < "$CMD_STATE/e2e-touched.specs" | sed 's/ $//')"
 expect_eq "the WebKit suite drops its own carried spec" \
     "./scripts/e2e-browser.sh --github --webkit --commit abc123 -f rail-all.spec.ts" \
-    "$(HS_UNAME_CMD="$TMP/uname-Linux.sh" command_for e2e-touched-webkit normal)"
+    "$(PATH="$TMP/host-Darwin:$PATH" command_for e2e-touched-webkit normal)"
 printf '%s\n' "e2e-touched chat.spec.ts abc1234567" "e2e-touched nav-mobile.spec.ts abc1234567" "e2e-touched rail-all.spec.ts abc1234567" > "$CMD_STATE/carried"
 expect_has "every spec carried runs nothing" "carried" "$(command_for e2e-touched normal)"
 if [ -f "$CMD_STATE/e2e-touched.all-carried" ]; then pass "every spec carried is marked"; else fail "every spec carried is marked"; fi
@@ -777,6 +968,24 @@ echo chat.spec.ts > "$CMD_STATE/e2e-touched.retry"
 expect_eq "a retry round carries nothing" "./scripts/e2e-browser.sh -f chat.spec.ts" "$(command_for e2e-touched normal)"
 if [ -f "$CMD_STATE/e2e-touched.all-carried" ]; then fail "a retry round is never marked carried"; else pass "a retry round is never marked carried"; fi
 rm -f "$CMD_STATE"/*.retry "$CMD_STATE/carried" "$CMD_STATE"/*.specs "$CMD_STATE"/*.all-carried
+
+echo "empty explicit selections run nothing"
+: > "$CMD_STATE/touched-specs"
+for s in e2e-touched e2e-touched-webkit; do
+    expect_lacks "$s with no specs starts no browser run" 'e2e-browser.sh' "$(command_for "$s" normal)"
+done
+echo crates/lucidos-engine/src/a.rs > "$CMD_STATE/paths"
+cmd="$(command_for script-libs normal)"
+bash -c "$cmd"
+expect_eq "script-libs with no matching library succeeds" 0 "$?"
+for s in gateway script-libs e2e-touched codegen; do
+    hs_is_suite "$s"
+    expect_eq "$s remains a public suite" 0 "$?"
+done
+HS_STUB_CMD=/usr/bin/true hs_is_suite nonexistent 2> /dev/null
+expect_eq "command stubs cannot validate unknown names" 1 "$?"
+hs_is_suite codegen-step 2> /dev/null
+expect_eq "the internal step is not a public suite" 1 "$?"
 
 echo "the tests a failed suite names"
 cat > "$TMP/cargo.log" << 'EOF'
@@ -821,13 +1030,36 @@ echo "the retry plan"
 RETRY_ROOT="$TMP/retry-root"
 mkdir -p "$RETRY_ROOT/crates/lucidos-app/e2e" "$TMP/retry-state"
 touch "$RETRY_ROOT/crates/lucidos-app/e2e/chat.spec.ts"
+echo chat.spec.ts > "$TMP/current-specs"
 plan="$(printf '%s\n' "engine engine::a::tests::x" "ts" "e2e-touched chat.spec.ts" "e2e-touched gone.spec.ts" \
-    "e2e-touched-webkit gone-all.spec.ts" "engine engine::b::tests::y" | hs_retry_plan "$RETRY_ROOT" "$TMP/retry-state")"
+    "e2e-touched-webkit gone-all.spec.ts" "engine engine::b::tests::y" | hs_retry_plan "$RETRY_ROOT" "$TMP/retry-state" "$TMP/current-specs")"
 expect_eq "each suite once, a suite whose specs are gone dropped" "engine ts e2e-touched" "$(printf '%s' "$plan" | tr '\n' ' ' | sed 's/ $//')"
 expect_eq "the engine tests to rerun" "engine::a::tests::x engine::b::tests::y" \
     "$(tr '\n' ' ' < "$TMP/retry-state/engine.retry" | sed 's/ $//')"
 expect_eq "a gone spec is dropped" "chat.spec.ts" "$(cat "$TMP/retry-state/e2e-touched.retry")"
 if [ -f "$TMP/retry-state/ts.retry" ]; then fail "a whole suite has no retry list"; else pass "a whole suite has no retry list"; fi
+for records in 'engine engine::a::tests::x|engine' 'engine|engine engine::a::tests::x'; do
+    mkdir -p "$TMP/whole-engine-state"
+    rm -f "$TMP/whole-engine-state"/*
+    plan="$(printf '%s' "$records" | tr '|' '\n'; echo)"
+    plan="$(printf '%s\n' "$plan" | hs_retry_plan "$RETRY_ROOT" "$TMP/whole-engine-state")"
+    expect_eq "a whole-engine obligation dominates named failures" engine "$plan"
+    if [ -f "$TMP/whole-engine-state/engine.retry" ]; then
+        fail "a whole-engine obligation cannot keep a test filter"
+    else
+        pass "a whole-engine obligation cannot keep a test filter"
+    fi
+done
+mkdir -p "$TMP/whole-browser-state"
+plan="$(printf '%s\n' 'e2e-touched' | hs_retry_plan "$RETRY_ROOT" "$TMP/whole-browser-state" "$TMP/current-specs")"
+expect_eq "an unfinished browser suite remains selected" e2e-touched "$plan"
+expect_eq "a whole browser obligation expands to current specs" chat.spec.ts \
+    "$(cat "$TMP/whole-browser-state/e2e-touched.retry" 2>/dev/null)"
+mkdir -p "$TMP/obsolete-state"
+plan="$(printf '%s\n' 'e2e-touched chat.spec.ts' 'engine engine::a::tests::x' | hs_retry_plan "$RETRY_ROOT" "$TMP/obsolete-state" /dev/null)"
+expect_eq "an existing spec no longer selected is dropped, engine retries remain" "engine" "$plan"
+printf '%s\n' 'e2e-touched chat.spec.ts' | hs_retry_plan "$RETRY_ROOT" "$TMP/obsolete-state" "$TMP/missing-specs" > /dev/null 2>&1
+expect_eq "a missing selection fails closed" 1 "$?"
 # A record an earlier script left names `rust`, which no suite runs now.
 mkdir -p "$TMP/stale-state"
 plan="$(printf '%s\n' "rust engine::a::tests::x" "rust" "ts" | hs_retry_plan "$RETRY_ROOT" "$TMP/stale-state")"
@@ -835,7 +1067,7 @@ expect_eq "a record naming a retired suite is dropped" "ts" "$(printf '%s' "$pla
 if [ -f "$TMP/stale-state/rust.retry" ]; then fail "a retired suite keeps no retry list"; else pass "a retired suite keeps no retry list"; fi
 plan="$(printf '%s\n' "rust engine::a::tests::x" | hs_retry_plan "$RETRY_ROOT" "$TMP/stale-state")"
 expect_eq "a record of retired suites alone leaves nothing to retry" "" "$plan"
-expect_eq "the selector's own files select the harden-suites tests" "shell-lint harden-suites" \
+expect_eq "the selector's own files select the harden-suites tests" "lint-static harden-suites" \
     "$(select_for scripts/lib/touched_specs.sh)"
 
 echo "every workspace crate's tests run in a suite"
@@ -934,17 +1166,31 @@ export HS_MEMORY_GATE_CMD="$STUB_DIR/gate.sh"
 hs() { (cd "$REPO" && bash "$CLI" "$@"); }
 reset_stub() { rm -f "$STUB_DIR"/*.rc "$STUB_DIR"/*.sleep "$STUB_DIR"/*.child "$STUB_DIR"/*.ran \
     "$STUB_DIR"/*.pgid "$STUB_DIR"/*.childpid "$STUB_DIR"/*.killlane "$STUB_DIR"/driver.notests "$STUB_DIR"/gate.calls "$STUB_DIR"/*.say \
-    "$STUB_DIR"/select.fail "$STUB_DIR"/select.out "$STUB_DIR"/events "$TMP"/repo*/.lucidos/harden-retry "$TMP"/repo*/.lucidos/harden-carried; }
+    "$STUB_DIR"/select.fail "$STUB_DIR"/select.out "$STUB_DIR"/select.hold "$STUB_DIR"/events "$TMP"/repo*/.lucidos/harden-retry "$TMP"/repo*/.lucidos/harden-retry-base "$TMP"/repo*/.lucidos/harden-carried "$TMP"/repo*/.lucidos/harden-included-suites; }
 commit_file() { # <relpath> <content>
     mkdir -p "$REPO/$(dirname "$1")"
     echo "$2" > "$REPO/$1"
     git -C "$REPO" add -- "$1" && git -C "$REPO" commit -qm "$1"
 }
 
+echo "start runs suites when a macOS seatbelt cannot nest"
+PREFLIGHT_STUBS="$TMP/preflight-bin"
+mkdir -p "$PREFLIGHT_STUBS"
+printf '#!/bin/bash\necho Darwin\n' > "$PREFLIGHT_STUBS/uname"
+printf '#!/bin/bash\nexit 71\n' > "$PREFLIGHT_STUBS/sandbox-exec"
+chmod +x "$PREFLIGHT_STUBS/uname" "$PREFLIGHT_STUBS/sandbox-exec"
+PATH="$PREFLIGHT_STUBS:$PATH" hs start > "$TMP/out" 2>&1
+expect_eq "a refused seatbelt never refuses start" 0 "$?"
+out="$(hs wait --budget 20)"
+expect_eq "suites complete after the refused seatbelt" 0 "$?"
+expect_has "the engine suite ran" "engine PASS" "$out"
+expect_has "the TypeScript suite ran" "ts PASS" "$out"
+reset_stub
+
 echo "early run, clean"
 hs start --early > "$TMP/out" 2>&1
 expect_eq "start exits 0 once its suites ran" 0 "$?"
-expect_has "selects lint, engine and ts" "Suites (early): lint engine ts" "$(cat "$TMP/out")"
+expect_has "selects lint, engine and ts" "Suites (early): lint-static lint-rust engine ts" "$(cat "$TMP/out")"
 out="$(hs wait --budget 20)"
 rc=$?
 expect_eq "wait exit" 0 "$rc"
@@ -955,7 +1201,7 @@ expect_eq "run shares the caller's process group" "$(ps -o pgid= -p $$ | tr -d '
 
 expect_eq "the gate was asked before the codegen step and each cargo suite only" \
     "the /harden codegen step
-the /harden lint suite
+the /harden lint-rust suite
 the /harden engine suite
 the /harden driver suite" "$(cat "$STUB_DIR/gate.calls")"
 
@@ -964,7 +1210,7 @@ the /harden driver suite" "$(cat "$STUB_DIR/gate.calls")"
 lane_overlaps() { # <events-file>
     awk '
         { kind = $1; s = $2 }
-        s == "codegen-step" || s == "lint" || s == "engine" || s == "driver" {
+        s == "codegen-step" || s == "lint-rust" || s == "engine" || s == "driver" || s == "gateway" {
             if (kind == "start") { if (open != "") print open " overlaps " s; open = s }
             else if (open == s) open = ""
         }
@@ -977,6 +1223,63 @@ lane_overlaps() { # <events-file>
 expect_eq "the codegen step ran once" "1" "$(grep -c -x 'start codegen-step' "$STUB_DIR/events")"
 expect_eq "no lane entry overlaps another, and readers start after codegen" "" "$(lane_overlaps "$STUB_DIR/events")"
 expect_eq "the codegen step leads the lane" "start codegen-step" "$(grep -E '^start (codegen-step|engine)$' "$STUB_DIR/events" | head -1)"
+
+echo "explicit suites add coverage and survive retry and full rounds"
+reset_stub
+echo here > "$STUB_DIR/lucidos.answer"
+printf '%s\n' 'running 1 test' 'test guard_tests::fixture ... ok' > "$STUB_DIR/engine-touched.say"
+echo 1 > "$STUB_DIR/gateway.rc"
+hs start --early --include-suite gateway --include-suite gateway > "$TMP/out" 2>&1
+expect_eq "repeatable includes are accepted" 0 "$?"
+expect_eq "included cargo suite executes once" 1 "$(cat "$STUB_DIR/gateway.ran" 2>/dev/null | wc -l | tr -d ' ')"
+expect_eq "included cargo work shares the serial lane" "" "$(lane_overlaps "$STUB_DIR/events")"
+expect_has "automatic suites remain selected" lint-rust "$(cat "$REPO/.lucidos/harden-suites/suites")"
+expect_eq "request evidence is deduplicated" gateway "$(cat "$REPO/.lucidos/harden-suites/included-suites" 2>/dev/null)"
+out="$(hs wait --budget 20)"
+expect_eq "an included failure fails the verdict" 1 "$?"
+expect_has "included suite has its own verdict" 'gateway FAIL' "$out"
+rm -f "$STUB_DIR/gateway.rc"
+commit_file crates/lucidos-engine/src/include_source.rs 'fn included() {}'
+hs start > /dev/null 2>&1
+out="$(hs wait --budget 20)"
+expect_eq "source changes after included failure require a full round" 2 "$?"
+expect_has "retry retains requests" gateway "$(cat "$REPO/.lucidos/harden-suites/included-suites" 2>/dev/null)"
+hs start > /dev/null 2>&1
+out="$(hs wait --budget 20)"
+expect_eq "ordinary full start retains required coverage and passes" 0 "$?"
+expect_has "included suite still runs with a covering main check" 'gateway PASS' "$out"
+before="$(cat "$REPO/.lucidos/harden-suites/start-sha")"
+echo retained > "$REPO/.lucidos/harden-suites/evidence-sentinel"
+hs start --include-suite nonexistent > "$TMP/out" 2>&1
+expect_eq "unknown suite refused even with command stubs" 1 "$?"
+expect_has "invalid name is explained" 'unknown suite' "$(cat "$TMP/out")"
+expect_eq "invalid request leaves evidence intact" "$before" "$(cat "$REPO/.lucidos/harden-suites/start-sha")"
+expect_eq "invalid request never replaces the run directory" retained "$(cat "$REPO/.lucidos/harden-suites/evidence-sentinel")"
+hs start --include-suite > /dev/null 2>&1
+expect_eq "missing include argument is refused" 1 "$?"
+rm -f "$STUB_DIR/lucidos.answer"
+hs start --include-suite gateway > /dev/null 2>&1
+expect_eq "uncovered selection also runs the include once per start" 4 "$(wc -l < "$STUB_DIR/gateway.ran" | tr -d ' ')"
+hs wait --budget 20 > /dev/null
+expect_eq "uncovered include verdict passes" 0 "$?"
+HARDEN_TIER=fast hs start --include-suite gateway > /dev/null 2>&1
+expect_has "fast tier preserves explicit cargo coverage" gateway "$(cat "$REPO/.lucidos/harden-suites/suites")"
+hs wait --budget 20 > /dev/null
+expect_eq "fast include verdict passes" 0 "$?"
+echo gateway > "$REPO/.lucidos/harden-retry"
+hs start --include-suite cli --include-suite gateway > "$TMP/out" 2>&1
+expect_lacks "a new include replaces retry selection with a full round" 'a retry of what failed' "$(cat "$TMP/out")"
+expect_has "distinct include requests both survive" cli "$(cat "$REPO/.lucidos/harden-suites/included-suites")"
+out="$(hs wait --budget 20)"
+expect_eq "new requirements pass only after the full round" 0 "$?"
+expect_has "the newly included suite ran" 'cli PASS' "$out"
+rm -f "$STUB_DIR/ts.ran" "$STUB_DIR/driver.ran"
+hs start --early --include-suite ts --include-suite driver > /dev/null 2>&1
+hs wait --budget 20 > /dev/null
+expect_eq "automatic and explicit requests execute once" ran "$(cat "$STUB_DIR/ts.ran")"
+expect_eq "an explicit early driver executes once after the lane" ran "$(cat "$STUB_DIR/driver.ran")"
+git -C "$REPO" reset -q --hard HEAD~1
+rm -f "$REPO/.lucidos/harden-suites/included-suites"
 
 echo "a slow codegen step holds its readers and the lane"
 reset_stub
@@ -1020,7 +1323,8 @@ expect_has "names the gate" "engine VOID refused by the build memory gate" "$out
 expect_has "a refused codegen step voids its readers" "ts VOID refused by the build memory gate" "$out"
 if [ -f "$STUB_DIR/engine.ran" ]; then fail "the engine suite ran on a refused gate"; else pass "the engine suite never ran"; fi
 if [ -f "$STUB_DIR/codegen-step.ran" ]; then fail "codegen ran on a refused gate"; else pass "codegen never ran"; fi
-if [ -f "$STUB_DIR/first-paint.ran" ]; then pass "a non-cargo suite still ran"; else fail "the first-paint suite did not run"; fi
+expect_has "a refused codegen step voids first-paint" "first-paint VOID refused by the build memory gate" "$out"
+if [ -f "$STUB_DIR/lint-static.ran" ]; then pass "a non-cargo suite still ran"; else fail "the lint-static suite did not run"; fi
 rm -f "$STUB_DIR/gate.rc"
 hs start --early > /dev/null 2>&1
 hs wait --budget 20 > /dev/null
@@ -1101,6 +1405,87 @@ out="$(hs wait --budget 20)"
 expect_eq "failing ts: FAIL" 1 "$?"
 expect_has "names ts" "ts FAIL" "$out"
 
+echo "a failing suite is reported while a slow one still runs"
+reset_stub
+echo here > "$STUB_DIR/lucidos.answer"
+printf 'running 1 test\ntest guard_tests::example ... ok\n' > "$STUB_DIR/engine-touched.say"
+echo 1 > "$STUB_DIR/ts.rc"
+echo 30 > "$STUB_DIR/engine-touched.sleep"
+hs start > /dev/null 2>&1 &
+BG=$!
+for _ in $(seq 1 100); do [ -f "$STUB_DIR/engine-touched.ran" ] && break; sleep 0.2; done
+started=$SECONDS
+out="$(hs wait --budget 25)"
+rc=$?
+expect_eq "the early failure: FAIL" 1 "$rc"
+if [ $((SECONDS - started)) -lt 20 ]; then pass "wait returned before the slow suite ended"; else fail "wait waited for the slow suite"; fi
+expect_has "names ts" "ts FAIL" "$out"
+expect_has "names the suite still running" "engine-touched RUNNING" "$out"
+expect_has "says how to stop the rest" "harden-suites.sh stop" "$out"
+expect_has "the unfinished suite remains owed whole" "engine-touched" "$(cat "$REPO/.lucidos/harden-retry")"
+expect_eq "the full-round baseline survives unfinished work" "$(cat "$REPO/.lucidos/harden-suites/start-sha")" \
+    "$(cat "$REPO/.lucidos/harden-retry-base" 2>/dev/null)"
+hs stop > /dev/null
+wait "$BG" 2> /dev/null
+commit_file crates/lucidos-app/src/interrupted.test.ts "test('fixed', () => {});"
+rm -f "$STUB_DIR/ts.rc" "$STUB_DIR/engine-touched.ran"
+hs start > /dev/null 2>&1 &
+BG=$!
+for _ in $(seq 1 100); do
+    [ -f "$STUB_DIR/engine-touched.ran" ] && [ -f "$REPO/.lucidos/harden-suites/ts.exit" ] && break
+    sleep 0.2
+done
+out="$(hs verdict)"
+expect_eq "passing ts with engine-touched still running cannot certify" 3 "$?"
+expect_has "ts has completed in the retry" "ts PASS" "$out"
+if [ -f "$REPO/.lucidos/harden-suites/engine-touched.retry" ]; then
+    fail "unfinished engine-touched must rerun whole"
+else
+    pass "unfinished engine-touched must rerun whole"
+fi
+hs stop > /dev/null
+wait "$BG" 2> /dev/null
+hs verdict > /dev/null
+expect_eq "the stopped retry still owes engine-touched" 2 "$?"
+rm -f "$STUB_DIR/engine-touched.sleep"
+echo 1 > "$STUB_DIR/engine-touched.rc"
+hs start > /dev/null 2>&1
+out="$(hs wait --budget 20)"
+expect_eq "passing ts cannot discharge the interrupted engine-touched" 1 "$?"
+expect_has "the engine-touched actually reran" "engine-touched FAIL" "$out"
+expect_eq "only the unfinished engine-touched is still owed" "engine-touched" "$(cat "$REPO/.lucidos/harden-retry")"
+rm -f "$STUB_DIR/engine-touched.rc"
+hs start > /dev/null 2>&1
+hs wait --budget 20 > /dev/null
+expect_eq "finishing all obligations certifies the test-only fix" 0 "$?"
+expect_eq "completed lint is retained across repeated retries" 1 "$(wc -l < "$STUB_DIR/lint-static.ran" | tr -d ' ')"
+
+rm -f "$STUB_DIR/lucidos.answer"
+
+echo "missing coverage without a failed suite remains owed"
+reset_stub
+hs start > /dev/null 2>&1
+rm "$REPO/.lucidos/harden-suites/engine.exit"
+hs verdict > /dev/null
+expect_eq "missing exit requires a rerun" 2 "$?"
+expect_eq "missing exit is recorded as a whole-suite obligation" engine "$(cat "$REPO/.lucidos/harden-retry" 2>/dev/null)"
+hs start > /dev/null 2>&1
+hs wait --budget 20 > /dev/null
+expect_eq "the missing suite can complete the original round" 0 "$?"
+expect_eq "missing-only recovery retains completed lint" 1 "$(wc -l < "$STUB_DIR/lint-static.ran" | tr -d ' ')"
+
+echo "a confinement run that did not happen reads FAIL"
+reset_stub
+echo 75 > "$STUB_DIR/confinement.rc"
+commit_file crates/lucidos-engine/src/runtime/python.rs "fn python() {}"
+hs start --early > "$TMP/out" 2>&1
+expect_has "selects the confinement suite" "confinement" "$(grep 'Suites (early)' "$TMP/out")"
+out="$(hs wait --budget 20)"
+expect_eq "the not-run exit: FAIL" 1 "$?"
+expect_has "names confinement" "confinement FAIL" "$out"
+# The later rounds expect the branch without that commit.
+git -C "$REPO" reset -q --hard HEAD~1
+
 echo "a failed round reruns what failed first, then the full set"
 reset_stub
 printf '%s\n' "     Running unittests src/lib.rs (target/debug/deps/lucidos_engine-0a1b2c3d4e5f6789)" \
@@ -1145,11 +1530,32 @@ rm -f "$STUB_DIR/ts.rc"
 hs start > "$TMP/out" 2>&1
 expect_has "the retry runs only ts" "Suites (normal, a retry of what failed): ts" "$(cat "$TMP/out")"
 out="$(hs wait --budget 20)"
-expect_eq "a retry that passes never passes the harden" 2 "$?"
-expect_has "says the full set runs next" "What failed now passes" "$out"
+expect_eq "no-commit retry completes the harden" 0 "$?"
+expect_has "records the no-commit classification" "no commits (test-only)" "$out"
 if [ -f "$REPO/.lucidos/harden-retry" ]; then fail "a passing retry clears the record"; else pass "a passing retry clears the record"; fi
+for kind in test source; do
+    reset_stub
+    echo 1 > "$STUB_DIR/ts.rc"
+    hs start > /dev/null 2>&1
+    baseline="$(cat "$REPO/.lucidos/harden-suites/start-sha")"
+    hs wait --budget 20 > /dev/null
+    expect_eq "$kind initial failure" 1 "$?"
+    if [ "$kind" = test ]; then
+        commit_file crates/lucidos-app/src/example.test.ts "test('example', () => {});"
+        expected=0
+    else
+        commit_file crates/lucidos-engine/src/retry_source.rs "fn changed() {}"
+        expected=2
+    fi
+    rm -f "$STUB_DIR/ts.rc"
+    hs start > /dev/null 2>&1
+    out="$(hs wait --budget 20)"
+    expect_eq "$kind commit retry verdict" "$expected" "$?"
+    expect_has "$kind verdict records baseline range" "retry range: $baseline.." "$out"
+done
+
 hs start > "$TMP/out" 2>&1
-expect_has "then the full set runs" "Suites (normal): lint engine ts" "$(cat "$TMP/out")"
+expect_has "then the full set runs" "Suites (normal): lint-static lint-rust engine ts" "$(cat "$TMP/out")"
 hs wait --budget 20 > /dev/null
 expect_eq "and passes" 0 "$?"
 rm -f "$STUB_DIR/engine.say"
@@ -1271,10 +1677,10 @@ echo "a fast-tier run (an integrated sub-thread)"
 reset_stub
 HARDEN_TIER=fast hs start --early > "$TMP/out" 2>&1
 expect_has "says the tier and runs the lint in place of the engine suite" \
-    "Suites (early, fast tier): lint ts" "$(cat "$TMP/out")"
+    "Suites (early, fast tier): lint-static lint-rust ts" "$(cat "$TMP/out")"
 out="$(hs wait --budget 20)"
 expect_eq "fast run: PASS" 0 "$?"
-expect_has "the lint passes" "lint PASS" "$out"
+expect_has "the lint passes" "lint-rust PASS" "$out"
 case "$out" in
     *driver* | *"engine "*) fail "a fast run runs no engine suite" ;;
     *) pass "a fast run runs no engine suite" ;;
@@ -1287,7 +1693,7 @@ reset_stub
 echo full > "$STUB_DIR/lucidos.answer"
 HARDEN_TIER=fast hs start --early > "$TMP/out" 2>&1
 expect_has "a full branch keeps its suites whatever HARDEN_TIER says" \
-    "Suites (early): lint engine ts" "$(cat "$TMP/out")"
+    "Suites (early): lint-static lint-rust engine ts" "$(cat "$TMP/out")"
 hs wait --budget 20 > /dev/null
 rm -f "$STUB_DIR/lucidos.answer"
 expect_eq "engine fast" fast "$(hs_resolve_tier fast full)"
@@ -1369,6 +1775,7 @@ commit_file "$PINNED" "$(printf 'include_str!("x");\n"see docs/plans/y.md"\n"and
 expect_eq "a pinned file over its count trips" "$PINNED 2" "$(read_hits)"
 
 echo "a docs-only diff selects freshness"
+reset_stub
 git -C "$REPO" checkout -q -b docs-only main
 commit_file docs/readme-extra.md words
 out="$(hs start --early 2>&1)"
@@ -1378,9 +1785,10 @@ expect_eq "docs freshness: PASS" 0 "$?"
 commit_file crates/lucidos-engine/src/fix.rs "fn fix() {}"
 out="$(hs verdict)"
 expect_eq "a fix that widens the selection: RERUN" 2 "$?"
-expect_has "names the new selection" "selection VOID the diff now selects: lint engine" "$out"
+expect_has "names the new selection" "selection VOID the diff now selects: lint-static lint-rust engine" "$out"
 
 echo "an edit to a compiled-in file selects Rust with no build"
+reset_stub
 git -C "$REPO" checkout -q main
 mkdir -p "$REPO/crates/lucidos-engine/src/engine"
 commit_file crates/lucidos-engine/Cargo.toml ""
@@ -1389,7 +1797,7 @@ commit_file CHANGELOG.md "v1"
 git -C "$REPO" checkout -q -b changelog-only
 commit_file CHANGELOG.md "v2"
 out="$(hs start --early 2>&1)"
-expect_has "the changelog edit selects engine" "Suites (early): lint engine" "$out"
+expect_has "the changelog edit selects engine" "Suites (early): lint-static lint-rust engine" "$out"
 hs stop > /dev/null
 
 echo "touched browser specs, through the CLI"
@@ -1411,7 +1819,7 @@ echo "fn a() { 1; }" > "$REPO2/crates/lucidos-engine/src/a.rs"
 git -C "$REPO2" commit -qam backend
 reset_stub
 hs2 start > "$TMP/out" 2>&1
-expect_has "a backend-only branch selects no e2e" "Suites (normal): lint engine" "$(cat "$TMP/out")"
+expect_has "a backend-only branch selects no e2e" "Suites (normal): lint-static lint-rust engine" "$(cat "$TMP/out")"
 if grep -q e2e-touched "$TMP/out"; then fail "a backend-only branch selected e2e"; else pass "a backend-only branch selected no e2e"; fi
 echo 'export const label = "Open canvas";' > "$REPO2/crates/lucidos-app/src/a.ts"
 git -C "$REPO2" commit -qam rename
@@ -1449,11 +1857,19 @@ hs2 verdict > /dev/null
 expect_eq "a later frontend edit voids it" 2 "$?"
 
 echo "a slow touched-spec selection"
-# The selector stub stands in for ts_touched_specs: it sleeps for select.sleep
-# seconds, fails when select.fail exists, else prints select.out.
+# The selector stub waits for release or select.sleep, then prints select.out.
+# select.fail simulates a failed selection.
 cat > "$STUB_DIR/select.sh" << 'EOF4'
 #!/bin/bash
 d=$(dirname "$0")
+deadline=$((SECONDS + 120))
+while [ -f "$d/select.hold" ]; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo 'selector fixture was not released' >&2
+        exit 1
+    fi
+    sleep 0.1
+done
 [ -f "$d/select.sleep" ] && sleep "$(cat "$d/select.sleep")"
 [ -f "$d/select.fail" ] && exit 1
 cat "$d/select.out" 2> /dev/null
@@ -1464,8 +1880,8 @@ export HS_TOUCHED_SPECS_CMD="$STUB_DIR/select.sh"
 STATE2="$REPO2/.lucidos/harden-suites"
 reset_stub
 echo board.spec.ts > "$STUB_DIR/select.out"
-echo 3 > "$STUB_DIR/select.sleep"
-hs2 start > "$TMP/out" 2>&1 &
+touch "$STUB_DIR/select.hold"
+hs2 start --include-suite gateway --include-suite e2e-touched > "$TMP/out" 2>&1 &
 BG=$!
 for _ in $(seq 1 50); do [ -f "$STUB_DIR/engine.ran" ] && break; sleep 0.1; done
 if [ -f "$STUB_DIR/engine.ran" ]; then pass "a cargo suite starts while the selection runs"; else fail "a cargo suite starts while the selection runs"; fi
@@ -1474,17 +1890,59 @@ if [ -f "$STATE2/suites" ]; then fail "the suites file waits for the selection";
 out="$(hs2 verdict)"
 expect_eq "a run still selecting is never a verdict" 3 "$?"
 expect_has "says it is setting up" "the run is still setting up" "$out"
+rm "$STUB_DIR/select.hold"
 wait $BG
-expect_has "the full selection is announced" "Suites (normal): lint engine ts first-paint e2e-touched" "$(cat "$TMP/out")"
+expect_has "the full selection is announced" "Suites (normal): lint-static lint-rust engine ts first-paint e2e-touched" "$(cat "$TMP/out")"
 if [ -f "$STUB_DIR/e2e-touched.ran" ]; then pass "e2e-touched starts once the specs are selected"; else fail "e2e-touched starts once the specs are selected"; fi
 expect_eq "the specs are recorded" "board.spec.ts" "$(cat "$STATE2/touched-specs")"
 expect_eq "each suite ran once" "ran" "$(cat "$STUB_DIR/engine.ran")"
+expect_eq "the included Cargo suite ran once across both selection passes" ran "$(cat "$STUB_DIR/gateway.ran")"
+expect_eq "slow spec selection never starts another Cargo lane" "" "$(lane_overlaps "$STUB_DIR/events")"
 out="$(hs2 wait --budget 20)"
 expect_eq "the verdict passes" 0 "$?"
 expect_has "e2e-touched passes" "e2e-touched PASS" "$out"
 
-echo "on macOS the WebKit suite starts after the local touched specs"
-# Both take every e2e slot (ADR 0536), so overlapping runs would find one held.
+echo "browser retries use the current selection"
+reset_stub
+echo board.spec.ts > "$STUB_DIR/select.out"
+touch "$REPO2/crates/lucidos-app/e2e/obsolete-all.spec.ts"
+echo 'e2e-touched-webkit obsolete-all.spec.ts' > "$REPO2/.lucidos/harden-retry"
+hs2 start > "$TMP/out" 2>&1
+expect_has "an obsolete browser retry starts the full current set" "Suites (normal): lint-static lint-rust engine ts first-paint e2e-touched" "$(cat "$TMP/out")"
+expect_lacks "an obsolete retry is not a retry round" "a retry of what failed" "$(cat "$TMP/out")"
+hs2 wait --budget 20 > /dev/null
+expect_eq "only the complete current run can pass" 0 "$?"
+rm "$REPO2/crates/lucidos-app/e2e/obsolete-all.spec.ts"
+reset_stub
+echo board.spec.ts > "$STUB_DIR/select.out"
+echo 'e2e-touched board.spec.ts' > "$REPO2/.lucidos/harden-retry"
+hs2 start > "$TMP/out" 2>&1
+expect_has "a selected browser failure still retries first" "a retry of what failed): e2e-touched" "$(cat "$TMP/out")"
+hs2 wait --budget 20 > /dev/null
+expect_eq "a passing browser retry still owes the full set" 2 "$?"
+reset_stub
+echo 'e2e-touched board.spec.ts' > "$REPO2/.lucidos/harden-retry"
+touch "$STUB_DIR/select.fail"
+hs2 start > "$TMP/out" 2>&1
+expect_eq "a retry selector error fails start" 1 "$?"
+expect_eq "a selector error preserves the retry record" 'e2e-touched board.spec.ts' "$(cat "$REPO2/.lucidos/harden-retry")"
+if [ -f "$STATE2/suites" ]; then fail "a retry selector error writes no suite verdict"; else pass "a retry selector error writes no suite verdict"; fi
+
+echo "new include requirements survive failed startup"
+reset_stub
+echo gateway > "$REPO2/.lucidos/harden-retry"
+touch "$STUB_DIR/select.fail"
+hs2 start --include-suite cli > "$TMP/out" 2>&1
+expect_eq "selection failure refuses the new full round" 1 "$?"
+rm -f "$STUB_DIR/select.fail"
+hs2 start > "$TMP/out" 2>&1
+expect_lacks "failed startup cannot restore the old retry subset" 'a retry of what failed' "$(cat "$TMP/out")"
+expect_has "the new suite remains required after failed startup" cli "$(cat "$STATE2/suites")"
+hs2 wait --budget 20 > /dev/null
+expect_eq "the full round after failed startup passes" 0 "$?"
+
+echo "on every host the WebKit suite starts beside the local touched specs"
+# Remote WebKit dispatch must not wait for local slots.
 # A failing WebKit suite still fails the verdict, on either OS.
 printf '%s\n' board.spec.ts nav-mobile.spec.ts > "$STUB_DIR/select.out.both"
 for os in Darwin Linux; do
@@ -1492,23 +1950,17 @@ for os in Darwin Linux; do
     cp "$STUB_DIR/select.out.both" "$STUB_DIR/select.out"
     echo 2 > "$STUB_DIR/e2e-touched.sleep"
     echo 1 > "$STUB_DIR/e2e-touched-webkit.rc"
-    HS_UNAME_CMD="$TMP/uname-$os.sh" hs2 start > "$TMP/out" 2>&1
-    out="$(HS_UNAME_CMD="$TMP/uname-$os.sh" hs2 wait --budget 30)"
+    PATH="$TMP/host-$os:$PATH" hs2 start > "$TMP/out" 2>&1
+    out="$(PATH="$TMP/host-$os:$PATH" hs2 wait --budget 30)"
     expect_has "$os: both touched-spec suites are selected" "e2e-touched e2e-touched-webkit" "$(cat "$TMP/out")"
     expect_has "$os: a failing WebKit suite fails the verdict" "e2e-touched-webkit FAIL" "$out"
     expect_eq "$os: the local suite passed" 1 "$(printf '%s\n' "$out" | grep -c 'e2e-touched PASS')"
     first_end="$(grep -n -x 'end e2e-touched' "$STUB_DIR/events" | cut -d: -f1)"
     web_start="$(grep -n -x 'start e2e-touched-webkit' "$STUB_DIR/events" | cut -d: -f1)"
-    if [ "$os" = Darwin ]; then
-        if [ -n "$first_end" ] && [ -n "$web_start" ] && [ "$first_end" -lt "$web_start" ]; then
-            pass "Darwin: the WebKit suite starts after e2e-touched ended"
-        else
-            fail "Darwin: the WebKit suite starts after e2e-touched ended (end line $first_end, start line $web_start)"
-        fi
-    elif [ -n "$web_start" ] && [ -n "$first_end" ] && [ "$web_start" -lt "$first_end" ]; then
-        pass "Linux: the WebKit suite runs beside e2e-touched"
+    if [ -n "$web_start" ] && [ -n "$first_end" ] && [ "$web_start" -lt "$first_end" ]; then
+        pass "$os: the WebKit suite runs beside e2e-touched"
     else
-        fail "Linux: the WebKit suite runs beside e2e-touched (end line $first_end, start line $web_start)"
+        fail "$os: the WebKit suite runs beside e2e-touched (end line $first_end, start line $web_start)"
     fi
 done
 rm -f "$STUB_DIR/select.out" "$STUB_DIR/select.out.both"

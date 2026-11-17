@@ -85,6 +85,7 @@ async fn an_older_gateway_without_the_nudge_is_skipped_quietly() {
     p.a.remote_gateways().remove("cloud").unwrap();
     p.a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: "older".to_string(),
             address: format!("https://localhost:{port}"),
             pairing_id: p.pairing_id.clone(),

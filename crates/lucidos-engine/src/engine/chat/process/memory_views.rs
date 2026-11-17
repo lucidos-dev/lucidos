@@ -74,7 +74,7 @@ impl LucidosEngine {
             Ok(true) => Surface::Home,
             Ok(false) => Surface::Chat,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Chat] Could not tell whether {} is the home thread: {}",
                     thread_id,
                     e
@@ -105,14 +105,14 @@ impl LucidosEngine {
         {
             Ok(workspace) => workspace,
             Err(e) => {
-                log!("[Chat] The workspace memory view could not be read: {}", e);
+                log_legacy!("[Chat] The workspace memory view could not be read: {}", e);
                 Default::default()
             }
         };
         let thread = view::thread_view(&self.pool, thread_id, budgets.thread, user_message)
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[Chat] The memory view of thread {} could not be read: {}",
                     thread_id,
                     e

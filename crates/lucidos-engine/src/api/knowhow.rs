@@ -126,7 +126,7 @@ async fn record_knowhow_read(state: &AppState, id: &str, actor: Option<MessageOr
                 )
                 .await
         }
-        Err(e) => crate::log!("[Knowhow] Cannot check for today's read of {}: {}", id, e),
+        Err(e) => crate::log_legacy!("[Knowhow] Cannot check for today's read of {}: {}", id, e),
     }
 }
 

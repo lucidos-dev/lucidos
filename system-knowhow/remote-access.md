@@ -91,6 +91,18 @@ makes it the first device on a fresh install, with no terminal.
 Any paired device can then let the next one in. **Settings → Access → Pair a
 device** mints a code and draws a QR the phone can scan.
 
+**Once a device is paired, a local process's code waits for it.** Every process
+on the machine can read the local token, so the token alone no longer lets a
+device in. A code from `lucidos pair`, or the desktop window's own, redeems only
+after a paired device taps **Allow** under **Settings → Access**. The waiting
+device says so on its pairing screen. Every paired device gets a notification
+that opens that page, where **Waiting for your Allow** lists the request.
+**Don't allow** fails it.
+
+A code a paired device minted never waits. When no paired device works any
+more, `lucidos devices revoke --all` clears the stale rows, and the next code
+pairs at once.
+
 A terminal does the same, and is the fallback when nothing is paired at all:
 
 ```bash
@@ -540,7 +552,7 @@ What to know:
   workspaces at `/<slug>/` and the picker at `/~/`, so a proxy must forward the
   whole host, not a sub-path. A loopback, link-local or unspecified address is
   refused, since no other device can open it.
-- **One per gateway**, stored in `~/.lucidos/network.toml` under the gateway's
+- **One per gateway**, stored in `~/.lucidos/private/network.toml` (`~/.lucidos/network.toml` in a home an older release created) under the gateway's
   port. A second gateway on the same machine keeps its own.
 - **Saving checks it.** The gateway fetches `<origin>/~/api/v1/health` and
   compares its per-boot `instance_id`. A match is verified. No answer from this
@@ -771,6 +783,9 @@ Access adds a device. **Settings → Devices** lists every device and holds
 | **Revoke** | the whole machine | Stops this device reaching Lucidos, on every workspace. |
 | **Remove** | this workspace | Forgets its push subscription and its preferences here, and leaves it paired. |
 
+Device preferences include **Agent brand colours** in **Settings → Appearance & Behavior**.
+Removing a device forgets that choice here along with its other preferences.
+
 Both halves key on the id the gateway minted at pairing, so each device has one
 row. (There used to be separate **Paired devices** and **Devices** lists.)
 
@@ -796,42 +811,49 @@ week. Most are automated browser runs, since every fresh browser profile
 arrives as a new device. A device someone named, paired, or turned push on for
 never drops off this way. See *one-off device* in the glossary.
 
-### People: whose device is which
+### Users: whose device is which
 
-Below the list, **People** names the people who pair devices to this machine,
-an *operator* in the glossary. People belong to the gateway, so every
-workspace it serves sees the same people. A personal machine has one person,
-who holds every device, and shows only **Add a person**. Once a second person
-exists:
+**Settings → Users**, beside Devices, names the people who pair devices to this machine.
+Each is a *user* in the glossary. Users belong to the gateway, so every
+workspace it serves sees the same users. A personal machine has one user,
+who holds every device. Settings lists that user too, so you can rename them
+or add an email without adding a second user.
 
-- Each paired device row gets a person picker.
+Each user row has **Add email**, **Rename** and **Remove**. An email is how
+Lucidos recognises that user across gateways, issue trackers and chat tools.
+**Remove** revokes every device of that user, then forgets them.
+
+Once a second user exists:
+
+- Each paired device row gets a user picker.
 - **Settings → Access → Pair a device** asks who the code is for. The device
-  that uses it joins that person. Without a choice, it joins the first person.
-- Each person row has **Add email**, **Rename** and **Remove**. An email is how
-  Lucidos recognises that person when they write from an issue tracker or a
-  chat tool. **Remove** revokes every device of that person, then forgets
-  them. That is how a team offboards someone.
+  that uses it joins that user. Without a choice, it joins the first user.
 
-A person grants nothing. Every paired device can still do everything, whoever
+A user grants nothing. Every paired device can still do everything, whoever
 it belongs to (ADR 0623).
 
 A device that reaches this machine through a paired gateway shows as its
-person on the other gateway, "Sam via laptop". When that person has an email
-that a person here also has, it is the same person: one human who pairs their
-own laptop and server counts once. So give your person the same email on both
-gateways. Ending the gateway pairing forgets the people it relayed.
+user on the other gateway, "Sam". When another user shares that name, the
+gateway joins it, "Sam (laptop)". When that user has an email that a user
+here also has, it is the same user and shows the local name: one human who
+pairs their own laptop and server counts once. So give your user the same email on both
+gateways. Ending the gateway pairing forgets the users it relayed.
 
-The gateway keeps devices and people in its *gateway event log*, in its data
+The gateway keeps devices and users in its *gateway event log*, in its data
 directory, so they work while Postgres is down. The same list is on the
-gateway API: `GET` and `POST /~/api/v1/auth/operators`, `PUT` and `DELETE
-/~/api/v1/auth/operators/{id}`, `POST /~/api/v1/auth/operators/{id}/emails`,
-`DELETE /~/api/v1/auth/operators/{id}/emails/{email}`, and `PUT
-/~/api/v1/auth/devices/{id}/operator` with `{"operator_id": "..."}`. A
-pairing code names its person with `POST
-/~/api/v1/auth/pairing-code?operator=<id>`.
+gateway API: `GET` and `POST /~/api/v1/auth/users`, `PUT` and `DELETE
+/~/api/v1/auth/users/{id}`, `POST /~/api/v1/auth/users/{id}/emails`,
+`DELETE /~/api/v1/auth/users/{id}/emails/{email}`, and `PUT
+/~/api/v1/auth/devices/{id}/user` with `{"user_id": "..."}`. A
+pairing code names its user with `POST
+/~/api/v1/auth/pairing-code?user=<id>`.
+
+Gateways and engines may update separately. During the user rename, HTTP
+adapters keep older counterparts' identity lists and pairing selections intact.
+Stored history still migrates to the new names (ADR 0655).
 
 A device that reaches this machine through a *gateway pairing* shows as its
-person on the other gateway, such as "Sam via laptop".
+user on the other gateway, such as "Sam", or "Sam (laptop)" when the name is shared.
 
 ### Pair a gateway
 
@@ -842,19 +864,23 @@ carry it, right under **Pair a device**:
 | Section | On which gateway | What it does |
 |---|---|---|
 | **Pair a gateway** | B, the one being opened | Mints a *gateway pairing secret* and shows the `https` address to use with it. Lists the gateways that may open this one, with **Unpair**. |
-| **Remote gateways** | A, the one opening | Takes B's address, the pasted secret and a short name, then pairs. Lists the remote gateways, with **Remove**. |
+| **Remote gateways** | A, the one opening | Takes a short name, the pasted secret, optional extra request headers, then B's address, with **Pair** last. Lists the remote gateways, with **Remove**. |
 
 `lucidos pair --gateway` on B mints the same secret from a terminal. The
 Workspaces picker also has **Add a remote gateway**, with the same form.
 
 These rules hold, whatever the network:
 
-- **Add only a gateway you run.** B's pages open on A's own address, so they
-  can do anything A's devices can do on A. A paired gateway is trusted like
-  A itself. A's form says so.
-- **`https` only.** A refuses a plain `http` address, because the credential
-  would cross the network in clear text. Give B an `https` address first:
-  Route B below, or an *external address*.
+- **A owns the remote workspace frontend.** A serves its installed client; B
+  supplies workspace data and sandboxed content. B cannot run privileged browser
+  code on A. Missing or incompatible client contracts require an upgrade
+  on the gateway or engine named by the error (ADR 0723).
+- **`https` only, except on one machine.** A refuses a plain `http` address,
+  because the credential would cross the network in clear text. Give B an
+  `https` address first: Route B below, or an *external address*. A loopback
+  address (`localhost`, `127.0.0.1` or `::1`) pairs over `http` too, and A
+  takes B's own certificate there. Use it for two gateways on one machine,
+  such as the app and a dev checkout.
 - **B must be new enough.** A reads `gateway_protocol` from B's health and
   refuses a gateway too old to pair. Update B, then try again.
 - **A must be new enough too.** An A older than the *gateway pairing secret*
@@ -864,9 +890,40 @@ These rules hold, whatever the network:
   the address you typed, and sends headers only to that origin.
 - **Secrets never cross over.** A device *pairing secret* or code never pairs
   a gateway, and a *gateway pairing secret* never pairs a device.
+- **A terminal's secret waits for B's owner.** When `lucidos pair --gateway`
+  minted it and B has a paired device, A's form says B is waiting. Tap
+  **Allow** under **Settings → Access** on a device paired with B, and A pairs.
+  A secret minted in B's Settings never waits.
 
 **Unpair** on B refuses A's very next request. **Remove** on A also asks B to
 forget the pairing. When B does not answer, A says so, and you unpair on B.
+
+#### Manage a remote gateway's users and devices
+
+A gateway pairing opens B's workspaces, not B's users and devices. The
+*manage grant* adds that (ADR 0656). Devices on A may then list and revoke
+B's devices. They may add, rename and remove B's users and their emails, and
+move a device to another user. Nothing else on B is reachable this way:
+pairing codes, gateway pairings, the external address and updates stay on B.
+
+- **Off by default**, for every pairing, old and new. B's user turns it on
+  for one paired gateway. `lucidos pair --gateway --manage` mints a secret
+  whose pairing starts with it on.
+- **The grant belongs to the pairing, never to a user.** Every device on A
+  gets it, as every device on A gets B's workspaces.
+- **A calls** `/~/api/v1/remote-gateways/<name>/manage/<call>`, where
+  `<call>` is the same path as on B's own `/~/api/v1/auth/`: `devices`,
+  `devices/<id>`, `users`, `users/<id>`, `users/<id>/emails`,
+  `users/<id>/emails/<email>`, `devices/<id>/user`.
+- **Refusals carry a `reason_kind`.** `manage-not-granted` (403) means B's
+  user has not turned the grant on. `remote-gateway-too-old` (409) means B
+  predates the hop. `remote-refused` (502) means B no longer accepts A.
+- **In the app.** Inside a remote workspace (`/<slug>@<name>/`), **Settings →
+  Devices** and **Settings → Users** show B's lists first, under "On <name>".
+  Below them come the devices that use this workspace and A's own users.
+  A refused grant says how to turn it on, and a B too old for the hop hides
+  the section. On B, the switch sits on each row under Settings → Access →
+  Pair a gateway.
 
 **A remote behind an access proxy.** Prefer a tailnet address when both
 machines have one. Otherwise enter the remote's HTTPS address and add its
@@ -903,8 +960,13 @@ landing*). Without one, they land locally and push after, as before.
 
 When A pushes a change to `main` on `origin`, it nudges each remote gateway.
 B's engines then check for the new `main` at once, instead of at the next
-`follow_main_interval_minutes` tick (ADR 0589). B still builds in the
-background and waits for a tap on **Switch to new version**. An older B that
+`follow_main_interval_minutes` tick (ADR 0589). With `follow_main_build=auto`,
+B builds in the background. With `follow_main_build=on-switch`, it follows
+without compiling and offers **Build new version** when engine source is newer.
+
+Once built, **Switch** still waits for a tap. Each workspace chooses its own
+mode. Local Apply and explicit rebuilds still build; another workspace sharing
+the checkout may also build its shared binary. An older B that
 lacks the nudge just follows on its usual interval.
 
 ### What a device is called
@@ -1102,7 +1164,7 @@ curl -sk -o /dev/null -w '%{http_code}\n' https://mymac.tailnet-name.ts.net:5252
 Direct access (Routes A and C, and any LAN or tailnet-IP URL) needs the gateway
 bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 
-- Machine-global config lives in `~/.lucidos/network.toml`:
+- Machine-global config lives in `network.toml`, beside the local token:
   `[gateway] bind = "loopback" | "all" | "<IP>"` plus `[engine] inherit`.
 - **`[engine] inherit` reaches a directly-launched engine, not one the gateway
   spawned.** A gateway-spawned engine is pinned to loopback whatever the file
@@ -1172,7 +1234,9 @@ Restart engine.
 
 After the restart, `GET /~/api/v1/health` lists any address the gateway still
 awaits as `pending_binds`. Only a credentialed caller sees that field: send the
-`x-lucidos-local-token` header with the contents of `~/.lucidos/local-token`.
+`x-lucidos-local-token` header with the contents of `~/.lucidos/private/local-token` (`~/.lucidos/local-token` in a home an older release created).
+The agent sandbox hides that file, so an agent cannot make this call. Ask the
+user to open the new address and say whether it loads.
 
 ### An engine that faces a network asks for a credential
 
@@ -1188,14 +1252,20 @@ can be widened. It then requires a local credential on every path but
   That is the shipped route, and it is unaffected.
 - **A bookmark straight at an engine port stops working from another device.**
   On the machine itself it works only for processes that can read
-  `~/.lucidos/local-token`, such as the `lucidos` CLI.
+  the local token file, such as the `lucidos` CLI.
 - Local callers need no setup. The CLI, the gateway's proxy hop and the webhook
   hop already present their credential.
 
 Two credentials exist, both minted at startup, both mode 0600.
-`~/.lucidos/local-token` reaches everything, and
-`~/.lucidos/hook-socket-token` reaches only webhook delivery. So a
+`local-token` reaches everything, and
+`hook-socket-token`, beside it, reaches only webhook delivery. So a
 `tailscale funnel` on the hook port cannot restart a workspace.
+
+**Reaching is not being you.** Every process on the machine can read the local
+token, an agent's included. So an owner-only act it asks for waits for
+**Allow once** on a card, answered from a paired device. Apply, a human-only
+setting and starting a coding agent are such acts. Only the gateway's signed word that a
+paired device sent a request proves it came from you.
 
 Binding to the tailnet IP itself (`100.x.y.z`) is the middle ground: the
 tailnet reaches it, the coffee-shop LAN does not.
@@ -1305,3 +1375,10 @@ finish it. Two ways out:
 | `tailscale serve status` says "No serve config" but the URL works | Route C is in play. Not a problem. Probe the port. |
 | Anything needing a live socket fails, while pages load | A hop is dropping the WebSocket upgrade. Probe `/<slug>/api/v1/ws-echo`, which upgrades and echoes what you send it. A `101` means every hop carried it. |
 | Account Connect refuses on a phone, asking for https or a web redirect URI | The browser is not on a computer running Lucidos. See § Connecting accounts from another device. |
+
+## Diagnostic evidence
+
+Gateway and engine diagnostics use separate sanitized sinks.
+Diagnostic collection uses registry-derived paths rather than scanning service or host logs.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

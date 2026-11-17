@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { linkifyPaths, extractAppTargetFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractWorkspaceDiskDataPath, extractBareAppRef, extractTriggerIdFromHref, extractSettingsTargetFromHref, extractRepoFileTargetFromHref, hrefLineRef, labelLineRef, browserHandlesHref, _resetLinkifyCacheForTesting, PROSE_DATA_PATH_PREFIXES } from './linkifyPaths';
+import { findSettingsEntry, settingsSearchEntryIds } from '../components/search/searchIndex';
+import { SHORTCUT_DEFS } from './shortcuts';
 import { DATA_PATH_PREFIXES } from './dataPathPrefixes';
 
 describe('DATA_PATH_PREFIXES', () => {
@@ -246,6 +248,7 @@ describe('extractSettingsTargetFromHref', () => {
 
   it.each([
     ['settings:providers#xai', 'providers', 'xai'],
+    ['settings:permissions#agent-sandbox:unsandboxed', 'permissions', 'agent-sandbox:unsandboxed'],
     ['settings:providers/#vertex-region', 'providers', 'vertex-region'],
   ])('extracts the row of %s', (href, view, fragment) => {
     expect(extractSettingsTargetFromHref(href)).toEqual({ view, fragment });
@@ -262,6 +265,10 @@ describe('extractSettingsTargetFromHref', () => {
     ['settings:providers#', null],
     ['settings:providers#a/b', null],
     ['settings:providers#a#b', null],
+    ['settings:providers#a b', null],
+    ['settings:providers#a\"b', null],
+    ["settings:providers#a'b", null],
+    ['settings:providers#a_b', null],
     ['settingsx:backup', null],
     ['app:settings', null],
     ['https://example.com/settings:backup', null],
@@ -269,10 +276,20 @@ describe('extractSettingsTargetFromHref', () => {
     expect(extractSettingsTargetFromHref(href)).toBe(expected);
   });
 
+  it('round-trips every indexed anchor, including generated shortcut anchors', () => {
+    const ids = [...settingsSearchEntryIds(), ...SHORTCUT_DEFS.map(def => `shortcut:${def.id}`)];
+    for (const id of ids) {
+      const entry = findSettingsEntry(id)!;
+      if (!entry.anchor) continue;
+      expect(extractSettingsTargetFromHref(`settings:${entry.subview}#${entry.anchor}`), id)
+        .toEqual({ view: entry.subview, fragment: entry.anchor });
+    }
+  });
+
   it('rewrites a row link to a nav-link carrying the view and the fragment', () => {
-    const html = linkifyPaths('<a href="settings:providers#xai">xAI</a>', [], []);
-    expect(html).toContain('data-settings-view="providers"');
-    expect(html).toContain('data-settings-fragment="xai"');
+    const html = linkifyPaths('<a href="settings:permissions#agent-sandbox:unsandboxed">Agent sandbox</a>', [], []);
+    expect(html).toContain('data-settings-view="permissions"');
+    expect(html).toContain('data-settings-fragment="agent-sandbox:unsandboxed"');
   });
 
   it('rewrites to a nav-link carrying the view', () => {

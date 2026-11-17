@@ -36,7 +36,7 @@ pub async fn settle_orphan_voice_sessions(pool: &PgPool, event_bus: &EventBus) {
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!("[Recovery] The orphan voice-session query failed: {}", e);
+            log_legacy!("[Recovery] The orphan voice-session query failed: {}", e);
             return;
         }
     };
@@ -44,7 +44,7 @@ pub async fn settle_orphan_voice_sessions(pool: &PgPool, event_bus: &EventBus) {
     if rows.is_empty() {
         return;
     }
-    log!(
+    log_legacy!(
         "[Recovery] Settling {} voice session(s) the last engine died holding",
         rows.len()
     );

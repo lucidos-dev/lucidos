@@ -24,6 +24,9 @@ import {
   shadowWithinReach,
 } from './appearance';
 
+import { MAX_VALUE_LENGTH } from './generated/theme-parts';
+import { FONT_CATALOG, WORKSPACE_FONT_FALLBACKS, WORKSPACE_FONT_LIMITS } from './generated/font-catalog';
+
 const here: string = dirname(fileURLToPath(import.meta.url));
 const cases: {
   shadowTokens: string[];
@@ -40,6 +43,19 @@ const cases: {
 ));
 
 describe('the token gate agrees with the engine', () => {
+  it('accepts every catalog and longest workspace font stack', () => {
+    for (const font of FONT_CATALOG) expect(isValidOverrideValue(font.stack)).toBe(true);
+    for (const fallback of Object.values(WORKSPACE_FONT_FALLBACKS)) {
+      const stack = `'ws-${'a'.repeat(WORKSPACE_FONT_LIMITS.slug)}', ${fallback}`;
+      expect(isValidOverrideValue(stack)).toBe(true);
+    }
+  });
+  it('caps ASCII and astral values by UTF-16 units', () => {
+    for (const value of ['a'.repeat(MAX_VALUE_LENGTH), '😀'.repeat(MAX_VALUE_LENGTH / 2)]) {
+      expect(isValidOverrideValue(value)).toBe(true);
+      expect(isValidOverrideValue(value + 'a')).toBe(false);
+    }
+  });
   // The engine's `core/themes` tests read the same fixture. If the two sides
   // disagreed, a theme could save and then never paint.
   it.each(cases.validNames)('accepts the name %s', name => {

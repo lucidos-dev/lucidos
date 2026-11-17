@@ -218,7 +218,9 @@ impl LucidosEngine {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                             error: error.clone(),
+                            spend_cap: None,
                             agent_exit: None,
+                            provider_error: None,
                         },
                         meta: meta.clone(),
                     },
@@ -461,7 +463,7 @@ impl LucidosEngine {
                 // the fixed total rather than nudged, so it cannot drift.
                 message_budget = budget_with_no_tools.saturating_sub(tools.defs_chars());
                 if changed {
-                    log!(
+                    log_legacy!(
                         "[AgenticLoop] thread={} round={} MCP tools changed mid-turn: {} to {} tools in the array",
                         thread_id,
                         rounds,
@@ -504,7 +506,7 @@ impl LucidosEngine {
                     schedule,
                 );
                 if !sweep.removed.is_empty() {
-                    log!(
+                    log_legacy!(
                         "[Context] swept {} pair(s) and {} message(s) on round {} of thread {}",
                         sweep.removed.len(),
                         sweep.messages_dropped,
@@ -847,7 +849,9 @@ impl LucidosEngine {
                                     thread_id,
                                     event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                         error: e.to_string(),
+                                        spend_cap: crate::llm::spend_cap::SpendCapNotice::from_error(e.as_ref()),
                                         agent_exit: None,
+                                        provider_error: None,
                                     },
                                     meta: meta.clone(),
                                 },
@@ -990,7 +994,7 @@ impl LucidosEngine {
             // the budget subtracts, so the comparison is like-for-like.
             if let Some(u) = usage {
                 let counted_chars = system_chars + tools.defs_chars() + context_chars;
-                log!(
+                log_legacy!(
                     "[Context] calibration model={} estimated={} actual_input={} \
                      cache_read={} cache_creation={} chars={} implied_chars_per_token={:.2}",
                     capture_seed.model,
@@ -1041,14 +1045,14 @@ impl LucidosEngine {
                         arguments: serde_json::json!({ "questions": questions_json }),
                         thought_signature: None,
                     });
-                    crate::log!(
+                    crate::log_legacy!(
                         "[InlineQuestionRepair] thread={} synthesised tool call from leaked ask_user_question payload (synth_id={})",
                         thread_id,
                         synth_id,
                     );
                 }
                 Some(InlineQuestionLeak::Degenerate { .. }) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[InlineQuestionRepair] thread={} stripped a leaked <ask_user_question> tag with no dispatchable payload, forcing a re-ask",
                         thread_id,
                     );
@@ -1091,7 +1095,7 @@ impl LucidosEngine {
                     arguments: d.arguments.clone(),
                     thought_signature: None,
                 });
-                crate::log!(
+                crate::log_legacy!(
                     "[InlineToolCallRepair] thread={} synthesised '{}' tool call from inline <invoke> tag (synth_id={})",
                     thread_id,
                     d.name,
@@ -1131,6 +1135,7 @@ impl LucidosEngine {
                         stable_prefix_fingerprint: report.stable_prefix_fingerprint,
                         ttft_ms: report.detail.ttft_ms,
                         request_id: report.detail.request_id,
+                        telemetry_owned_by_cli: false,
                         session: None,
                     },
                 )
@@ -1153,7 +1158,7 @@ impl LucidosEngine {
                     &tool_call.name,
                     &mut tool_call.arguments,
                 ) {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ToolArgEntityRepair] thread={} decoded HTML entities in '{}' arguments",
                         thread_id,
                         tool_call.name,
@@ -1259,7 +1264,7 @@ impl LucidosEngine {
                     || calls_only_turn_end_decisions(&response.tool_calls)
             });
             if let Some(draft) = &kept_draft {
-                log!(
+                log_legacy!(
                     "[AgenticLoop] thread={} kept its prose question after the nudge: {}",
                     thread_id,
                     response.content.as_deref().unwrap_or("").trim()
@@ -1368,7 +1373,9 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: error.to_string(),
+                                    spend_cap: None,
                                     agent_exit: None,
+                                    provider_error: None,
                                 },
                                 meta: meta.clone(),
                             },
@@ -1530,7 +1537,7 @@ impl LucidosEngine {
                         continue;
                     }
                 } else if !injected_prompts.is_empty() {
-                    log!(
+                    log_legacy!(
                         "[AgenticLoop] thread={} {} spoken aside(s) landed on a finished answer, not reopening it",
                         thread_id,
                         injected_prompts.len()
@@ -1565,7 +1572,7 @@ impl LucidosEngine {
                         role: "user".to_string(),
                         content: MessageContent::Text(NOTED_CARRY_ON.to_string()),
                     });
-                    log!(
+                    log_legacy!(
                         "[AgenticLoop] thread={} reply carried only the working understanding, continuing",
                         thread_id
                     );
@@ -1742,7 +1749,9 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error,
+                                    spend_cap: None,
                                     agent_exit: None,
+                                    provider_error: None,
                                 },
                                 meta: meta.clone(),
                             },
@@ -1754,7 +1763,7 @@ impl LucidosEngine {
                     // text. Complete normally (Idle, no red dot) via an empty
                     // ResponseGenerated; log the diagnostic so an operator can
                     // still see why the turn was empty.
-                    crate::log!(
+                    crate::log_legacy!(
                         "[AgenticLoop] thread={} empty completion treated as benign ({})",
                         thread_id,
                         diagnostic
@@ -1893,12 +1902,12 @@ impl LucidosEngine {
                 // If list_files called 2+ times, return cached result with strong stop message
                 if current_tool == tn::LIST_FILES && consecutive_same_call >= 2 {
                     if let Some(ref cached) = cached_list_files {
-                        log!(
+                        log_legacy!(
                             "[AgentLoop] Returning cached list_files result (call #{})",
                             consecutive_same_call
                         );
                         if consecutive_same_call >= 4 {
-                            log!(
+                            log_legacy!(
                                 "[AgentLoop] Force-breaking tool loop after {} repeated list_files attempts",
                                 consecutive_same_call
                             );
@@ -1949,14 +1958,14 @@ impl LucidosEngine {
                         .get("path")
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
-                    log!(
+                    log_legacy!(
                         "[AgentLoop] Blocking repeated read_file of '{}' (call #{})",
                         path_for_msg,
                         consecutive_same_call
                     );
                     // After 5 blocked attempts, force-break out of the loop
                     if consecutive_same_call >= 5 {
-                        log!(
+                        log_legacy!(
                             "[AgentLoop] Force-breaking tool loop after {} repeated read_file attempts",
                             consecutive_same_call
                         );
@@ -2013,7 +2022,7 @@ impl LucidosEngine {
                     };
                     if breaker_action == BreakerAction::Break {
                         // Attempt 5: the model kept retrying after warnings.
-                        log!(
+                        log_legacy!(
                             "[AgentLoop] Force-breaking loop: {} repeated after errors (attempt {}) on '{}'",
                             current_tool,
                             consecutive_failing_call,
@@ -2055,7 +2064,7 @@ impl LucidosEngine {
                     }
                     // Warn on attempts 3-4 without executing the call.
                     // Keep the previous error so another retry advances the streak.
-                    log!(
+                    log_legacy!(
                         "[AgentLoop] Skipping repeated failed call: {} (attempt {}) on '{}'",
                         current_tool,
                         consecutive_failing_call,
@@ -2116,7 +2125,7 @@ impl LucidosEngine {
                     if read.is_error {
                         had_errors = true;
                         note_failure(&mut failed, read.tool_called_event_id, curated.mode);
-                        log!(
+                        log_legacy!(
                             "[AgentLoop] Step {}/{}: Error, will retry: {}",
                             tool_calls_made,
                             max_tool_calls,
@@ -2126,7 +2135,7 @@ impl LucidosEngine {
                         if tool_call.name == tn::LIST_FILES {
                             cached_list_files = Some(read.result);
                         }
-                        log!(
+                        log_legacy!(
                             "[AgentLoop] Step {}/{}: Success",
                             tool_calls_made,
                             max_tool_calls
@@ -2394,17 +2403,37 @@ impl LucidosEngine {
                 let mut pending_checkpoint: Option<
                     crate::engine::command_guard::PendingCheckpoint,
                 > = None;
-                let outcome: crate::engine::tools::ToolOutcome = match self
-                    .command_guard_decision(
-                        &mut command_guard_ctx,
-                        &tool_call.name,
-                        &tool_call.arguments,
-                        thread_id,
-                        &tool_call.id,
-                        &meta,
-                        cancel_token,
-                    )
-                    .await
+                let execution_sandbox = self.resolve_tool_sandbox(&tool_call.name).await;
+                let paths = execution_sandbox
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s.as_ref())
+                    .map(|s| {
+                        crate::engine::command_guard::SecretPaths::for_sandbox(
+                            s,
+                            self.workspace_path(),
+                        )
+                    })
+                    .unwrap_or_else(crate::engine::command_guard::SecretPaths::conservative);
+                let decision = match &execution_sandbox {
+                    Err(reason) => {
+                        crate::engine::command_guard::GuardDecision::Refuse(reason.clone())
+                    }
+                    Ok(_) => {
+                        self.command_guard_decision(
+                            &mut command_guard_ctx,
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            thread_id,
+                            &tool_call.id,
+                            &meta,
+                            cancel_token,
+                            &paths,
+                        )
+                        .await
+                    }
+                };
+                let outcome: crate::engine::tools::ToolOutcome = match decision
                 {
                     crate::engine::command_guard::GuardDecision::Refuse(refusal) => Err(refusal),
                     // Trigger blocked by an ungranted side-effect: record the
@@ -2469,13 +2498,14 @@ impl LucidosEngine {
                             // cancel forever and the thread stayed `running` until
                             // the engine restarted.
                             run_tool_with_cancel(
-                                self.execute_tool(
+                                self.execute_tool_in_sandbox(
                                     &tool_call.name,
                                     &tool_call.arguments,
                                     extraction_ctx,
                                     request_id,
                                     device_id,
                                     thread_id,
+                                    execution_sandbox.as_ref().ok().and_then(|s| s.as_ref()),
                                 ),
                                 cancel_token,
                             )
@@ -2483,10 +2513,17 @@ impl LucidosEngine {
                         }
                     }
                 };
-                let (result, is_error) = match outcome {
+                let (mut result, is_error) = match outcome {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
+
+                if crate::engine::command_guard::command_text(&tool_call.name, &tool_call.arguments)
+                    .is_some_and(|text| paths.tool(&tool_call.name, text))
+                {
+                    result.push_str("\n\n");
+                    result.push_str(crate::engine::command_guard::SECRET_READ_STEER);
+                }
 
                 // Close the checkpoint bracket. Deliberately outside the
                 // success test: a command that failed or was cancelled midway
@@ -2606,14 +2643,14 @@ impl LucidosEngine {
 
                 if is_error {
                     had_errors = true;
-                    log!(
+                    log_legacy!(
                         "[AgentLoop] Step {}/{}: Error, will retry: {}",
                         tool_calls_made,
                         max_tool_calls,
                         result
                     );
                 } else {
-                    log!(
+                    log_legacy!(
                         "[AgentLoop] Step {}/{}: Success",
                         tool_calls_made,
                         max_tool_calls
@@ -2684,7 +2721,9 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                 error: reason.clone(),
+                                spend_cap: None,
                                 agent_exit: None,
+                                provider_error: None,
                             },
                             meta: meta.clone(),
                         },

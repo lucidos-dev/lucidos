@@ -1,11 +1,34 @@
 import { request } from './_fetch';
-import { people } from './threadPeople';
+import { LIVENESS_STATES } from './generated/engine-constants';
+import { people, users } from './threadUsers';
+
+/** What a thread is doing now, as the engine reports it (ADR 0679). The
+ *  engine derives it; a client only shows it. */
+export type LivenessState = (typeof LIVENESS_STATES)[number];
+
+/** A thread's *thread liveness*: the state plus the evidence behind it.
+ *  `as_of` is the engine's clock when it looked. */
+export interface ThreadLiveness {
+  state: LivenessState;
+  status: string;
+  last_activity_age_secs?: number;
+  /** Absent on a thread with no agent session, such as a chat thread. */
+  session?: {
+    ordinal: number;
+    continuity: 'first' | 'fresh' | 'handoff';
+    age_secs: number;
+  };
+  /** Present only while a handoff waits for its successor session. */
+  handoff?: 'pending';
+  as_of: string;
+}
 
 /** Why a turn end left a coding agent's work unproposed. Mirrors the engine's
  *  `UnproposedReason` wire names. */
 export type UnproposedReason =
   | 'plan_missing'
   | 'plan_awaiting_approval'
+  | 'plan_only_code'
   | 'outside_bound'
   | 'hardening_missing'
   | 'turn_incomplete'
@@ -62,6 +85,8 @@ export interface ThreadSummary {
   compose_text: string;
   compose_images: string[];
   compose_mode?: 'lucidos' | 'claude_code' | null;
+  /** Filled on `list()` rows. */
+  liveness?: ThreadLiveness;
 }
 
 export interface ThreadsListOptions {
@@ -123,6 +148,15 @@ export const threads = {
       .then(r => r.count);
   },
 
+  /** One thread's liveness. Read it before saying a thread is stuck. */
+  liveness(threadId: string): Promise<ThreadLiveness> {
+    return request<ThreadLiveness>(`/threads/${encodeURIComponent(threadId)}/liveness`);
+  },
+
   /** Driver and watchers of a root thread (ADR 0623). */
+  users,
+
+  /** @deprecated Use `threads.users`. Kept for apps written before the user
+   *  rename (docs/temporary-measures.md, "SDK threadPeople alias"). */
   people,
 };

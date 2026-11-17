@@ -34,6 +34,7 @@ fn tool_result() -> AgentEvent {
 /// The input the agent was sent.
 fn sent(text: &str) -> AgentInput {
     AgentInput {
+        defer_on_steer_failure: false,
         text: text.into(),
         images: Vec::new(),
         uuid: Uuid::new_v4(),
@@ -77,6 +78,8 @@ fn result() -> AgentEvent {
         text: String::new(),
         duration_ms: 1,
         error: None,
+        provider_error: None,
+        turn_end: None,
     }
 }
 

@@ -44,7 +44,7 @@ pub async fn is_home_thread(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool
 /// `wake`: every doubt wakes (ADR 0451).
 pub(crate) async fn spawner_is_home(pool: &sqlx::PgPool, parent_id: Uuid) -> bool {
     is_home_thread(pool, parent_id).await.unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Home check for {} failed, so its child wakes it: {}",
             parent_id,
             e
@@ -75,7 +75,7 @@ pub async fn ensure_home_thread(
         .await;
     match (emitted, home_thread_id(pool).await?) {
         (Ok(_), _) => {
-            crate::log!("[HomeThread] Created the home thread {}", thread_id);
+            crate::log_legacy!("[HomeThread] Created the home thread {}", thread_id);
             Ok(thread_id)
         }
         (Err(_), Some(winner)) => Ok(winner),

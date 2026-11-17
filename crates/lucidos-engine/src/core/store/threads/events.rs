@@ -1,6 +1,48 @@
 use super::*;
 
 impl EventStore {
+    /// The last main-agent capture before a launch, with its backend session.
+    /// A settings binding cannot cross a process's `SessionStarted` boundary.
+    pub(crate) async fn coding_agent_capture_before_launch(
+        &self,
+        thread_id: uuid::Uuid,
+        launch_id: uuid::Uuid,
+    ) -> Result<Option<(serde_json::Value, Option<String>, Option<String>)>, sqlx::Error> {
+        sqlx::query_as(
+            r#"
+            WITH launch AS (
+                SELECT MIN(sequence) AS sequence FROM events
+                WHERE thread_id = $1 AND event_type = 'CodingAgentBillingObserved'
+                  AND payload->>'launch_id' = $2
+            ), capture AS (
+                SELECT payload, sequence FROM events
+                WHERE thread_id = $1 AND event_type = 'ContextCaptured'
+                  AND sequence < (SELECT sequence FROM launch)
+                  AND payload->>'producer' IN ('codex', 'claude_code')
+                  AND payload->>'parent_tool_use_id' IS NULL
+                ORDER BY sequence DESC LIMIT 1
+            )
+            SELECT c.payload, s.payload->>'cc_session_id', s.payload->>'coding_agent'
+            FROM capture c
+            LEFT JOIN LATERAL (
+                SELECT payload FROM events
+                WHERE thread_id = $1 AND event_type = 'CodingAgentSettingsChanged'
+                  AND sequence < c.sequence
+                  AND payload->>'cc_session_id' IS NOT NULL
+                  AND sequence > COALESCE((
+                      SELECT MAX(sequence) FROM events WHERE thread_id = $1
+                        AND event_type = 'SessionStarted' AND sequence < c.sequence
+                  ), 0)
+                ORDER BY sequence DESC LIMIT 1
+            ) s ON TRUE
+            "#,
+        )
+        .bind(thread_id)
+        .bind(launch_id.to_string())
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// When the newest event on a thread was recorded. `Ok(None)` for a thread
     /// with no events yet.
     ///

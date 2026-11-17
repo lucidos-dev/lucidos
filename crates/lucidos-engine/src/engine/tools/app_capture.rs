@@ -103,6 +103,7 @@ async fn save_capture(
             &bytes,
             &format!("feat: app capture saved to {path}"),
             WriteAnnouncement::Entity {
+                writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id),
                 source: Some(tn::CAPTURE_APP.to_string()),
                 writer_thread_id: Some(thread_id),
             },
@@ -116,7 +117,7 @@ async fn save_capture(
     {
         Ok((w, h)) => format!("{w}x{h} px, "),
         Err(e) => {
-            log!("[AppCapture] saved {path}, but its pixel size is unreadable: {e}");
+            log_legacy!("[AppCapture] saved {path}, but its pixel size is unreadable: {e}");
             String::new()
         }
     };
@@ -184,7 +185,7 @@ pub(crate) async fn app_ui_tool_impl(
 
     let request_id = Uuid::new_v4().to_string();
     let rx = await_answer(pending, &request_id, device);
-    log!("[AppCapture] capture thread={thread_id} app={app_id} device={device:?}");
+    log_legacy!("[AppCapture] capture thread={thread_id} app={app_id} device={device:?}");
     let emitted = bus
         .emit(BusEvent::Thread {
             thread_id,

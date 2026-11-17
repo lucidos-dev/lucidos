@@ -151,6 +151,48 @@ async fn saving_the_credential_answers_the_request() {
 }
 
 #[tokio::test]
+async fn resolution_lookup_distinguishes_archived_forms_and_validates_ids() {
+    let client = user_client().await;
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("db connect");
+    let (thread_id, request_id) =
+        insert_credential_request(&pool, &unique_marker("e2e-archived-form")).await;
+    sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!pending_ids(&client).await.contains(&request_id.to_string()));
+    let unknown = Uuid::new_v4();
+    let url = format!("{}/api/v1/form-requests/resolved", base_url());
+    let lookup = || {
+        client
+            .get(&url)
+            .query(&[("request_ids", format!("{request_id},{unknown}"))])
+    };
+    let response = lookup().send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.json::<Vec<Uuid>>().await.unwrap().is_empty());
+    assert_eq!(cancel(&client, request_id).await.status(), 200);
+    let response = lookup().send().await.unwrap();
+    assert_eq!(response.json::<Vec<Uuid>>().await.unwrap(), [request_id]);
+    for ids in [
+        "invalid".to_owned(),
+        vec![request_id.to_string(); 101].join(","),
+    ] {
+        assert_eq!(
+            client
+                .get(&url)
+                .query(&[("request_ids", ids)])
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+    }
+}
+
+#[tokio::test]
 async fn canceling_an_unknown_request_is_a_404() {
     let client = user_client().await;
     let resp = cancel(&client, Uuid::new_v4()).await;

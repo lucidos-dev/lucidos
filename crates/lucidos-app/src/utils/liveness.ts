@@ -11,10 +11,15 @@
  *  channel is shared infrastructure and the crash / error telemetry is reusable
  *  for any future client-stability issue. */
 
+import { CLIENT_BUILD_ID } from 'virtual:build-id';
+import { formatBuildId } from './buildId';
 import { focusedThreadId } from '../store/store';
 import { composeDrafts } from '../store/composeDrafts';
 import { postClientLog } from './clientLog';
 import { isIOSPwa } from './platform';
+import { onPageHide, onPageWake } from './pageVisit';
+import { noteCrashPageHide } from './crashPageHide';
+import { takeCrashRecord } from './crashStorage';
 
 const HEARTBEAT_KEY = 'lucidos-liveness-heartbeat';
 const CLEAN_CLOSE_KEY = 'lucidos-liveness-clean-close';
@@ -28,6 +33,7 @@ const COLD_GAP_THRESHOLD_MS = 30 * 60 * 1_000;
 
 interface HeartbeatPayload {
   ts: number;
+  hiddenAt?: number;
   focusedThread: string | null;
   draftCount: number;
 }
@@ -117,7 +123,7 @@ function getNavigationStartMs(): number {
  *  reached from utils/tauri) can post without importing the store through here. */
 export { postClientLog };
 
-export function reportStartupKind(): void {
+export function reportStartupKind(): void | Promise<void> {
   const prior = readPriorHeartbeat();
   const cleanClose = (() => {
     try {
@@ -165,11 +171,15 @@ export function reportStartupKind(): void {
   } catch {
     /* telemetry only */
   }
-  postClientLog('lifecycle', 'startup', {
+  const raw = takeCrashRecord();
+  const data = {
+    build: formatBuildId(CLIENT_BUILD_ID),
     kind,
     gap_ms: gapMs,
     dead_ms: deadMs,
     reload_ms: reloadMs,
+    prev_hidden_ms: prior?.hiddenAt !== undefined && Number.isFinite(prior.hiddenAt)
+      ? Math.max(0, navStart - prior.hiddenAt) : null,
     clean_close: cleanClose,
     nav_type: navType,
     is_ios_pwa: isPwa,
@@ -179,7 +189,15 @@ export function reportStartupKind(): void {
     landing_path: landingPath,
     landing_search: landingSearch,
     landing_hash: landingHash,
-  });
+  };
+  if (kind === 'likely_crash' && raw) {
+    return import('./crashBreadcrumbs').then(({ recoveredStartup, BreadcrumbStore }) => {
+      // The captured record stays isolated from the new document's samples.
+      const store = new BreadcrumbStore({ getItem: () => raw, setItem: () => {} }, '');
+      postClientLog('lifecycle', 'startup', recoveredStartup(data, store));
+    }, () => { postClientLog('lifecycle', 'startup', data); });
+  }
+  postClientLog('lifecycle', 'startup', data);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +296,18 @@ export function startLivenessTracking(): () => void {
     writeHeartbeat();
   }, HEARTBEAT_INTERVAL_MS);
 
+  const stopHide = onPageHide(() => {
+    const prior = readPriorHeartbeat();
+    if (!prior) return;
+    try {
+      localStorage.setItem(HEARTBEAT_KEY, JSON.stringify({ ...prior, hiddenAt: Date.now() }));
+    } catch { /* Best-effort telemetry. The next heartbeat retries storage. */ }
+  });
+  const stopWake = onPageWake(writeHeartbeat);
+  function onHide(event: PageTransitionEvent) {
+    markCleanClose();
+    noteCrashPageHide(event.persisted);
+  }
   function markCleanClose() {
     try {
       localStorage.setItem(CLEAN_CLOSE_KEY, '1');
@@ -287,14 +317,16 @@ export function startLivenessTracking(): () => void {
   }
 
   window.addEventListener('beforeunload', markCleanClose);
-  window.addEventListener('pagehide', markCleanClose);
+  window.addEventListener('pagehide', onHide);
 
   const stopErrorBreadcrumbs = installErrorBreadcrumbs();
 
   return () => {
     clearInterval(intervalId);
     window.removeEventListener('beforeunload', markCleanClose);
-    window.removeEventListener('pagehide', markCleanClose);
+    window.removeEventListener('pagehide', onHide);
+    stopHide();
+    stopWake();
     stopErrorBreadcrumbs();
   };
 }

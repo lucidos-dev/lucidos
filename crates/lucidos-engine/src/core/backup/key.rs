@@ -140,18 +140,18 @@ impl BackupKeyStore {
 pub fn move_legacy_file_at_boot(workspace: &Path) {
     let keys = match BackupKeyStore::for_engine(workspace) {
         Ok(keys) => keys,
-        Err(e) => return log!("[Backup] Cannot reach the backup key store: {}", e),
+        Err(e) => return log_legacy!("[Backup] Cannot reach the backup key store: {}", e),
     };
     match keys.move_legacy_file() {
         Ok(LegacyKeyFile::Absent) => {}
-        Ok(LegacyKeyFile::Moved | LegacyKeyFile::Duplicate) => log!(
+        Ok(LegacyKeyFile::Moved | LegacyKeyFile::Duplicate) => log_legacy!(
             "[Backup] Moved .lucidos/backup.key into {}",
             keys.describe()
         ),
         Ok(LegacyKeyFile::Kept {
             file_key_id,
             store_key_id,
-        }) => log!(
+        }) => log_legacy!(
             "[Backup] .lucidos/backup.key holds key {} but {} holds key {}. \
              New backups use {}; the file stays for older archives",
             file_key_id,
@@ -159,7 +159,7 @@ pub fn move_legacy_file_at_boot(workspace: &Path) {
             store_key_id,
             store_key_id
         ),
-        Err(e) => log!("[Backup] Cannot move .lucidos/backup.key yet: {}", e),
+        Err(e) => log_legacy!("[Backup] Cannot move .lucidos/backup.key yet: {}", e),
     }
 }
 

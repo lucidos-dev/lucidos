@@ -48,6 +48,16 @@ const DISPATCHER_FILES = DISPATCHERS.map((d) => d.file).join(' or ');
  *  make this test pass WITHOUT an arm, and it should be harder to justify than
  *  writing the arm. */
 const NO_UI_STATE: Record<string, string> = {
+  LaneArrivalsHeld:
+    'the lane snapshot names the hold, and rides the ChangesUpdated the lane sends beside it',
+  LaneArrivalsReleased:
+    'the lane snapshot drops the hold, and rides the ChangesUpdated the lane sends beside it',
+  MainFollowed:
+    'the main check reads it as a landing, and its next snapshot rides ChangesUpdated; '
+    + 'the shell holds no follow state',
+  MemoryExtractionFailed:
+    'an exhausted extraction record for event queries and workspace learning; '
+    + 'the shell holds no extraction failure count or status',
   WorkspaceRestored:
     'a restricted-boot audit record emitted before serving SSE; StreamHello owns generation '
     + 'admission and cache reconstruction, and NotificationCreated populates the inbox',
@@ -103,6 +113,13 @@ const NO_UI_STATE: Record<string, string> = {
     + 'shows the injects column either, and the Files panel banner moves on '
     + '`HandshakeScriptApproved`',
   EmailSent: 'an audit record of a send. No surface lists sent mail',
+  // Temporary measure: docs/temporary-measures.md, Diagnostic fault UI adoption.
+  InternalFaultRecorded:
+    'the engine persists the fault count for diagnostic snapshots; the shell has no fault-count state yet',
+  DiagnosticBundleReceived:
+    'the private diagnostic inbox is queried through the CLI; no client inbox state exists',
+  DiagnosticBundleSent:
+    'the engine resets the persisted fault count; the shell has no diagnostic-report state yet',
   EngineSupervisorRespawned:
     'emitted at boot, for the timeline. Every client reconnecting after that '
     + 'boot re-reads its state anyway',

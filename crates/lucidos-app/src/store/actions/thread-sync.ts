@@ -1,14 +1,11 @@
-import { API } from '../../api/client';
-import { beginRestoreConnection, acceptRestoreHello, hasRestoreRuntime } from '../restoreRuntime';
+import { submitInteractiveRequest } from '../interactiveDeliveryService';
+
 import { flushUndeliveredComposeDrafts } from './compose';
-import { isChosenByPreference, isChosenForThread } from '../windowPeers';
+import { isChosenByPreference } from '../windowPeers';
 import type { ApplyEstimates, Change, LandingLane, MainCheck } from '../../api/client';
-import { EVENT_STREAM_RETRY_MS, eventStreamTargets, openEventStream, type EventStreamTargets, type StreamDrop } from '@lucidos/event-stream';
-import { postClientLog } from '../../utils/clientLog';
-import { getEventStream, noteEventFrame, setEventStream } from './event-stream';
-import { fanOutEventFrame, fanOutEventStreamStatus } from './app-bridge';
+
 import { threadMap, focusedThreadId, changes, appliedChanges, setAsideChanges, applyingChangeIds, landingLane, applyAllInProgress, applyAllBatch, applyAllCanceling, APPLY_ALL_SUMMARY_TOAST_KEY, applyEstimates, applyPhases, standingApplyThreadIds, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, removingQueuedMessageIds, queuedMessageRemovalKey, UNREAD_HOLD_EVENT_TYPES } from '../store';
-import { snapshotsVersion, backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showConfirm, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { snapshotsVersion, backgroundModelsVersion, chatModels, findChangeById, memoryRebuildProgress, summaryTreesVersion, backupProgress, backupStatusVersion, backupPreferencesVersion, backupRecipientVersion, intelligenceLadderVersion, recommendedCleanupProgress, diskUsageVersion, promptFootprintVersion, responseStylesVersion, recoveryProgress, showToast, dismissToast, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { describeRecommendedCleanupOutcome } from '../../utils/recommendedCleanup';
 import { isFormRequest } from '../thread-events/thread-event-types';
 import { rereadLoadedDashboards } from './dashboards';
@@ -24,6 +21,7 @@ import { loadThreadQueue } from './threadQueue';
 import { handlePresenceCheck, type PresenceCheckPayload } from './presence-pong';
 import { noteArrivalWhileAway, noteArrivalWhilePresent } from './seen-target';
 import { dropAllNotificationToasts, dropNotificationToast } from './in-app-notification-toast';
+import { pairingRequestsVersion } from '../pairingRequests';
 import {
   handleNativePushRequested,
   type NativePushRequestedPayload,
@@ -53,15 +51,15 @@ import { syncClientUpdateFromBuild } from './client-update';
 import { loadPreferences, refreshActiveTheme } from './preferences';
 import { loadChatModels } from './models';
 import { loadReleaseNotices } from './releaseNotices';
-import { loadOperators } from './operators';
-import { agentPauseVersion, loadPeople, threadPeopleVersion } from './people';
+import { loadGatewayUsers } from './gatewayUsers';
+import { reloadRemoteGatewayLists, remoteGatewayUsers } from './remoteGatewayManage';
+import { agentPauseVersion, loadUsers, threadUsersVersion } from './users';
 import { loadReaderDevices, readIsMine } from './reader-devices';
 import { loadArtifacts, refreshArtifacts } from './artifacts';
 import { refreshAppUI, captureAppUI } from './apps';
-import { requestWidgetFit } from '../widgetFit';
+import { isSelectedFitRenderer, requestWidgetFit } from '../widgetFit';
 import { clearWipIfMatches } from './wipPreview';
 import { closeResolvedFormRequest, openFormRequest, syncPendingFormRequests } from './form-requests';
-import { setDevicePushEnabled } from './push';
 import { getDeviceId } from './devices';
 import { focusThread } from './threads';
 import { refreshRepoView } from './repositories';
@@ -70,7 +68,7 @@ import {
   refreshLlmConfigured,
   PROVIDER_PREFERENCE_KEYS,
 } from './entityReferences';
-import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale, refreshArchivedCountAfterFlip } from './thread-loading';
+import { refreshThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale, refreshArchivedCountAfterFlip } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
 import { acceptComposeReport, parseComposeReport, type ComposeReportWire } from '../composeSync';
 import { clearDraft, setDraft } from '../composeDrafts';
@@ -78,18 +76,14 @@ import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
 import { snapshotCaptureFailureMessage } from './snapshot-capture-failure';
-import { errorDetail } from '../../utils/errorDetail';
+
 import { routeThreadNavigation } from './navigation-request';
+import { dispatchSSEFrame } from '../sseFrame';
 import { isForThisDevice, type DeviceScopeActor } from './device-scope';
 import { openBackupSettings } from './menu';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
 import { CHAT_DEFAULT_PREFS, CHAT_LADDER_PREF, LADDER_PREFS, LONG_PROMPT_SHARE_PREF } from '../intelligenceLadderPrefs';
-import {
-  applyTreeBackfillFrame,
-  applyTreeBackfillProgress,
-  forgetTreeBackfillOrder,
-  readyAfterCompleted,
-} from './treeBackfill';
+import { applyTreeBackfillFrame, applyTreeBackfillProgress, readyAfterCompleted } from './treeBackfill';
 import type { BackfillProgress, EmbeddingModelStatus } from '../../api/types';
 
 /** Keyed so a second failure replaces the first instead of stacking, and so the
@@ -102,31 +96,12 @@ const MAIN_FOLLOW_REFUSED_TOAST_KEY = 'main-follow-refused';
  *  entries on every boot, and a reconnecting client must not stack them. */
 const PROXY_CONFIG_REJECTED_TOAST_KEY = 'proxy-config-rejected';
 
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
-
-/** Where the shell reaches the engine's event surface. The suffixes live in the
- *  SDK beside the transports, so the shell and an app cannot name them
- *  differently. */
-function hostTargets(): EventStreamTargets {
-  return eventStreamTargets(API);
-}
-
-function markEventStreamStatus(status: 'connecting' | 'connected' | 'disconnected'): void {
-  if (typeof document === 'undefined') return;
-  document.documentElement.dataset.lucidosEventStream = status;
-}
-
-/** Set when `onerror` fires, consumed by the next `onopen`, so the resync runs
- *  only on RECONNECT. On the initial connect `loadAllThreads()` is already
- *  driving state via startup.ts. */
-let needsResyncOnOpen = false;
-
 /** In-flight resync coalescer. A call that lands while a pass runs sets
  *  `resyncAgain`, and the resync runs one more pass when it ends. So all the
  *  Lagged events or reconnects during one pass cost a single further pass. */
 let resyncInFlight: Promise<void> | null = null;
 let resyncAgain = false;
+let repoChangesDebounce: ReturnType<typeof setTimeout> | null = null;
 
 /** The preference keys the Backup page renders, mirroring the `PREF_BACKUP_*`
  *  constants in the engine's `core/backup/mod.rs`. Only a `PreferencesChanged`
@@ -153,13 +128,6 @@ const INTELLIGENCE_LADDER_PREFERENCE_KEYS = new Set([
 // recomputation in computed signals (blockedThreadCount iterates ALL threads
 // and ALL events). WKWebView's tighter CPU/memory limits can crash under load.
 // ---------------------------------------------------------------------------
-/** Generation counter to prevent stale EventSource handlers from interfering
- *  with newer connections. Incremented on each connectThreadEvents() call.
- *  onerror/onmessage handlers check their captured generation against the
- *  current value and bail if stale (old connection's handler firing after
- *  disconnectThreadEvents() + connectThreadEvents() replaced it). */
-let sseGeneration = 0;
-
 let flushRafId: number | null = null;
 
 /** Schedule a threadMap signal flush on the next animation frame.
@@ -179,20 +147,6 @@ export function flushThreadMap(): void {
   threadMap.value = new Map(threadMap.value);
 }
 
-/** Rebuild the thread's events Map and force a full re-fetch. Called by the
- *  ThreadView watchdog when has()/get() on the long-lived Map return wrong
- *  results — iOS Safari can corrupt Map internals under memory pressure.
- *  Caller is responsible for the eligibility check (has CONTENT events but
- *  exchanges are empty) and retry capping. */
-export function rebuildCorruptedThreadEvents(threadId: string): void {
-  const thread = threadMap.value.get(threadId);
-  if (!thread) return;
-  thread.events = new Map(thread.events);
-  thread.eventsLoaded = false;
-  thread.lastDbSeq = 0;
-  void loadThreadEvents(threadId);
-}
-
 /** The headline a change toast names the change by (`changeHeadline`).
  *
  *  The loaded row first, since it carries the stored summary. Else the thread's
@@ -205,10 +159,10 @@ function findChangeHeadline(threadId: string, changeId: string): string | undefi
 
 /** Route one frame's `data` payload into the store.
  *
- *  Module-private, and the one sink both transports reach: `onFrame` below
+ *  The one sink both transports reach: `onFrame` in thread-stream.ts
  *  hands it a direct frame and a worker-relayed one alike, which is what makes
  *  the two indistinguishable from here down. */
-function handleHostFrame(data: string): void {
+export function handleHostFrame(data: string): void {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(data);
@@ -224,153 +178,11 @@ function handleHostFrame(data: string): void {
     return;
   }
 
-  // SSE envelope: SystemEvent uses { "type": "...", "data": {...} }, ThreadEvent uses { "type": "ThreadEvent", "data": {...} }
-  const type = parsed.type as string;
-  const payload = (parsed.data ?? {}) as Record<string, unknown>;
-
-  if (type === 'ThreadEvent') {
-    handleThreadEvent(payload);
-  } else {
-    handleGlobalEvent(type, payload);
-  }
-
-  // Entity sync: recents, nav stack, pinned apps, store refresh.
-  processSSEForReferences(type, payload);
-}
-
-export function connectThreadEvents(): void {
-  if (getEventStream()) return;
-
-  const gen = ++sseGeneration;
-  let restoreEpoch = beginRestoreConnection();
-  let admitted = !hasRestoreRuntime();
-  let frames: Promise<void> = Promise.resolve();
-  markEventStreamStatus('connecting');
-
-  const admittedOpen = () => {
-    if (gen !== sseGeneration) return;
-    markEventStreamStatus('connected');
-    fanOutEventStreamStatus('open');
-    const reopenedAfterError = needsResyncOnOpen;
-    needsResyncOnOpen = false;
-    if (reopenedAfterError) reconcileAfterEventGap();
-    else readStateMissedBeforeOpen();
-  };
-  const dispatchFrame = (data: string) => {
-    handleHostFrame(data);
-    fanOutEventFrame(data);
-  };
-  const handlers = {
-    onFrame: (data: string) => {
-      // Stale handler: a newer connection replaced this one. The old transport
-      // was closed, but its queued message handler can still fire.
-      if (gen !== sseGeneration) return;
-      noteEventFrame();
-      if (!hasRestoreRuntime()) { dispatchFrame(data); return; }
-      const frameEpoch = restoreEpoch;
-      frames = frames.then(async () => {
-        if (gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
-        const frame = JSON.parse(data) as { type?: string; data?: { restore_generation?: unknown } };
-        if (frame.type === 'StreamHello') {
-          const generation = frame.data?.restore_generation;
-          if (generation !== null && (typeof generation !== 'string'
-            || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(generation))) {
-            throw new Error('The event stream did not identify its restore generation');
-          }
-          const accepted = await acceptRestoreHello(frameEpoch, generation);
-          if (!accepted || gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
-          admitted = true;
-          flushUndeliveredComposeDrafts();
-          admittedOpen();
-        } else if (admitted) dispatchFrame(data);
-      }).catch((err: unknown) => {
-        if (gen !== sseGeneration || frameEpoch !== restoreEpoch) return;
-        showToast(`Workspace restore recovery could not finish: ${errorDetail(err)}`, 'error', { title: 'Workspace recovery' });
-        // A connection sends one hello, so only a new one can retry admission.
-        // Without it every gated request would wait forever.
-        disconnectThreadEvents();
-        // This connection dropped every frame it held back, so the retry
-        // reconciles the gap. The disconnect above cleared the flag.
-        needsResyncOnOpen = true;
-        reconnectTimer = setTimeout(() => {
-          reconnectTimer = null;
-          connectThreadEvents();
-        }, EVENT_STREAM_RETRY_MS);
-      });
-    },
-
-    onOpen: () => {
-      if (gen !== sseGeneration) return;
-      // The first open reads what a frame emitted while no stream was up
-      // would have refreshed. A reopen after an error reads it through the gap
-      // reconcile, so it never runs both. On the first open startup.ts already
-      // loads thread state, and a resync there would double-fetch every page
-      // load.
-      restoreEpoch = beginRestoreConnection();
-      admitted = !hasRestoreRuntime();
-      if (admitted) admittedOpen();
-    },
-
-    onError: (drop: StreamDrop) => {
-      // Stale handler: disconnectThreadEvents() already closed this transport
-      // and connectThreadEvents() created a replacement. Without this guard the
-      // old handler closes the NEW connection, via the module-scoped
-      // `eventStream`, costing a 3s SSE gap on every iOS Safari PWA resume.
-      if (gen !== sseGeneration) return;
-      restoreEpoch = beginRestoreConnection();
-      admitted = !hasRestoreRuntime();
-
-      // A plain error is routine: every engine restart causes one. Every other
-      // drop is a failure only the client can see, so it reports it.
-      if (drop.reason !== 'error') {
-        const { reason, ...detail } = drop;
-        postClientLog('event-stream', reason, detail);
-      }
-
-      // Mark for resync. Events emitted during the gap never reach this tab, so
-      // the next successful connect must refetch persisted state.
-      needsResyncOnOpen = true;
-      // The engine may restart in the gap, and its backfill frames then count
-      // from one again. A snapshot read meanwhile sets the new order.
-      forgetTreeBackfillOrder();
-      markEventStreamStatus('disconnected');
-      fanOutEventStreamStatus('error');
-
-      // A transport that retries for itself keeps its connection: the shared
-      // worker owns the one upstream, and dropping our port would take that
-      // stream down for every other document. Its next `open` lands here and
-      // runs the resync armed above.
-      if (getEventStream()?.ownsReconnect) return;
-
-      getEventStream()?.close();
-      setEventStream(null);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        connectThreadEvents();
-      }, EVENT_STREAM_RETRY_MS);
-    },
-  };
-
-  // The shell answers a PresenceCheck, so it registers as a ponger. On a shared
-  // connection the worker merges its ports' answers into the one pong the engine
-  // waits for.
-  setEventStream(openEventStream(hostTargets(), handlers, { pongs: true }));
-}
-
-/** Make sure a stream is up after a resume, without cutting a healthy one.
- *
- *  A resume runs on every window focus, and a click that raises the window
- *  fires focus beside the action it caused. A frame the engine emits in a
- *  teardown gap is never replayed, so a navigate requested by that click would
- *  be lost. Only a missing or stale stream is replaced. A shared stream the
- *  worker finds silent reports through `onError`, then `onOpen`, and
- *  `reconcileAfterEventGap` repairs it there. */
-export function reviveThreadEvents(): void {
-  const stream = getEventStream();
-  if (stream && stream.revalidate() !== 'stale') return;
-  disconnectThreadEvents();
-  connectThreadEvents();
+  dispatchSSEFrame(parsed, {
+    thread: handleThreadEvent,
+    system: handleGlobalEvent,
+    references: processSSEForReferences,
+  });
 }
 
 /** The one repair after an event gap: a reopen after an error, or `Lagged`.
@@ -481,37 +293,14 @@ function resyncChangesAndQueue(): void {
   void loadThreadQueue();
 }
 
-export function disconnectThreadEvents(): void {
-  beginRestoreConnection();
-  // Bump generation BEFORE closing, so any onerror handler queued by the
-  // close() call sees a stale generation and bails out.
-  sseGeneration++;
-  // An explicit disconnect means the caller is taking ownership of state
-  // recovery. Do not let the next onopen also resync, or every real reconnect
-  // doubles the per-thread refreshThreadEvents fan-out.
-  needsResyncOnOpen = false;
-  // A resume sync disconnects here, often across an engine restart.
-  forgetTreeBackfillOrder();
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  markEventStreamStatus('disconnected');
-  // The closed transport's own error handler is now stale and stays silent, so
-  // app frames hear the drop here. Their next `open` is the reconnect.
-  fanOutEventStreamStatus('error');
-  getEventStream()?.close();
-  setEventStream(null);
-}
-
 /** Route an SSE ThreadEvent to the correct thread in threadMap.
  *  Exported for testing — not part of the public API. */
-export function handleThreadEvent(data: Record<string, unknown>): void {
+export function handleThreadEvent(data: Record<string, unknown>, envelopeId?: string): void {
   const threadId = data.thread_id as string;
   const seq = typeof data.seq === 'number' ? data.seq : null;
   const event = data.event as ThreadEvent | TransientEvent;
   const created = typeof data.created === 'string' ? data.created : undefined;
-  const eventId = typeof data.event_id === 'string' ? data.event_id : undefined;
+  const eventId = envelopeId ?? (typeof data.event_id === 'string' ? data.event_id : undefined);
   // Backend-computed projection snapshot. Present on every persisted thread
   // event, and on transient projection refreshes such as ChildrenCountChanged
   // or CodingAgentDiffChanged. handleEvent overlays it onto thread.meta.
@@ -525,6 +314,8 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   if (seq !== null && !aggregate) {
     console.warn(`[SSE] persisted event ${event.type} (seq=${seq}) missing aggregate — backend bug`);
   }
+
+  if (event.type === 'ThreadArchived' || event.type === 'ThreadUnarchived') void syncPendingFormRequests();
 
   const map = threadMap.value;
 
@@ -548,7 +339,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // events (with seq) justify creating a new thread entry. Side effects
     // (e.g. CodingAgentThreadSpawned creating a child thread) still run.
     if (seq === null) {
-      handleTransientSideEffects(event, threadId);
+      handleTransientSideEffects(event, threadId, eventId);
       return;
     }
     // A persisted event with no aggregate has no DB row either, so it produces
@@ -667,14 +458,14 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
 
   // The draft is not touched here: the send consumed the compose slot at
   // accept, and the engine reported what that left (ADR 0450).
-  // A people-only message can open a thread too: one started with a teammate.
-  if (event.type === 'MessageReceived' || event.type === 'PeopleMessagePosted') {
+  // A user-only message can open a thread too: one started with a teammate.
+  if (event.type === 'MessageReceived' || event.type === 'UserOnlyMessagePosted') {
     if (thread.meta.state !== 'active') { thread.meta.state = 'active'; metaChanged = true; }
   }
   if (event.type === 'AgentPaused' || event.type === 'AgentResumed') agentPauseVersion.value++;
   if (event.type === 'WorkItemDriverTaken' || event.type === 'WorkItemDriverReleased'
       || event.type === 'WorkItemWatched' || event.type === 'WorkItemUnwatched') {
-    threadPeopleVersion.value++;
+    threadUsersVersion.value++;
   }
   if (event.type === 'ThreadDiscarded') {
     if (thread.meta.state !== 'discarded') { thread.meta.state = 'discarded'; metaChanged = true; }
@@ -709,7 +500,7 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   // No auto-read on focus — user must explicitly click Archive, Apply, or Discard.
 
   // Dispatch side effects for transient events
-  handleTransientSideEffects(event, threadId);
+  handleTransientSideEffects(event, threadId, eventId);
 
   // Toast for change state transitions. An apply's progress is told only in
   // the Lucidos menu, so its one toast, keyed `applying-<thread>`, is the
@@ -1020,12 +811,18 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       void loadPreferences();
       break;
 
-    case 'OperatorsChanged':
-      // A device moved between people, so this page's person may hold others,
-      // and every people list on screen is stale.
+    case 'UsersChanged':
+      // A device moved between users, so this page's user may hold others,
+      // and every user list on screen is stale. In a remote workspace the
+      // engine is the remote gateway's, so its lists are the stale ones.
       void loadReaderDevices();
-      void loadOperators();
-      void loadPeople();
+      void loadGatewayUsers();
+      void loadUsers();
+      if (remoteGatewayUsers.value.status !== 'not-loaded') void reloadRemoteGatewayLists();
+      break;
+
+    case 'PairingRequestsChanged':
+      pairingRequestsVersion.value++;
       break;
 
     case 'ReleaseNoticeResolved':
@@ -1212,6 +1009,8 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'MainCheckPassed':
     case 'MainCheckFailed':
     case 'MainCheckAbandoned':
+    case 'MainCheckSuperseded':
+    case 'MainCheckRepairStarted':
     case 'MainCheckRedClosed':
       // The main check started, linked its run or ended, or its red closed.
       // The snapshot arrives whole with the `ChangesUpdated` the engine sends
@@ -1425,6 +1224,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
+    case 'OrdinarySubmissionAccepted':
+    case 'DraftSubmissionAccepted': {
+      // Acceptance consumed compose state in its transaction. Read the report
+      // it left through the usual revision and pending-local-edit guards.
+      void refreshThreadList();
+      break;
+    }
+
     // ThreadComposeChanged is a *compose report* (ADR 0437). The compose
     // store orders it by revision and lays any pending local edit over it.
     // So our own echo, a delayed frame and a peer's write take one path.
@@ -1489,6 +1296,7 @@ const ARTIFACT_REFRESHING_TOOLS = [
 function handleTransientSideEffects(
   event: ThreadEvent | TransientEvent,
   sourceThreadId: string,
+  eventId?: string,
 ): void {
   // A form request: open its form now. One this page misses is found by
   // `syncPendingFormRequests` on the next stream open.
@@ -1504,24 +1312,8 @@ function handleTransientSideEffects(
     // The actor names the device whose push preference the agent set. Enable
     // subscribes the device it is tapped on, so only that one may ask.
     case 'PushNotificationRequested':
-      if (!isForThisDevice(event.actor) || !isChosenForThread(sourceThreadId)) break;
-      void (async () => {
-        try {
-          const ok = await showConfirm(
-            'Enable push notifications?',
-            'Enable',
-            { variant: 'default' }
-          );
-          if (!ok) return;
-          // The same entry point both settings toggles use. Setting the device
-          // flag unconditionally instead would leave a refused permission with
-          // `push_enabled = true` and no subscription row. That is the
-          // divergence `refreshPushSubscription` repairs on the next load.
-          await setDevicePushEnabled(getDeviceId(), true);
-        } catch (e) {
-          showToast(`Failed to enable push notifications: ${errorDetail(e)}`, 'error');
-        }
-      })();
+      if (!isForThisDevice(event.actor)) break;
+      submitInteractiveRequest({ kind: 'push-enable', payload: {}, preference: { threadId: sourceThreadId } }, eventId);
       break;
 
     // Chat MCP consent moved to the persisted in-thread `McpPermissionRequested`
@@ -1563,10 +1355,14 @@ function handleTransientSideEffects(
       )) void captureAppUI(event.app_id, event.request_id, event.save_format);
       break;
 
-    // The engine names one device with a visible window. On it the window
-    // showing the thread renders the check, else the one touched last.
+    // A renderer handle selects its shell tab. Otherwise the named device
+    // uses the window showing this thread, or the one touched last.
     case 'WidgetFitRequested':
-      if (isForThisDevice(event.actor) && isChosenForThread(sourceThreadId)) {
+      if (event.renderer_session_id
+        ? isSelectedFitRenderer(event.renderer_session_id, event.renderer_device_id, getDeviceId())
+        : isForThisDevice(event.actor) && isChosenByPreference(
+          (window) => window.focusedThreadId === sourceThreadId, () => true,
+        )) {
         requestWidgetFit({
           requestId: event.request_id,
           appId: event.app_id,
@@ -1586,7 +1382,7 @@ function handleTransientSideEffects(
         showToast('Failed to handle navigation request from engine', 'error');
         break;
       }
-      routeThreadNavigation(nav, (event as { actor?: DeviceScopeActor }).actor, sourceThreadId);
+      routeThreadNavigation(nav, (event as { actor?: DeviceScopeActor }).actor, sourceThreadId, eventId);
       break;
     }
 
@@ -1617,3 +1413,16 @@ function handleTransientSideEffects(
 }
 
 export { handleNavigationRequest } from './navigation-request';
+
+/** Store recovery starts after transport admission and preserves frame order. */
+export function onStreamOpen(reopenedAfterError: boolean): void {
+  if (reopenedAfterError) reconcileAfterEventGap();
+  else readStateMissedBeforeOpen();
+}
+
+export function flushAdmittedComposeDrafts(): void {
+  flushUndeliveredComposeDrafts();
+}
+
+export { connectThreadEvents, disconnectThreadEvents, reviveThreadEvents } from './thread-stream';
+export { rebuildCorruptedThreadEvents } from './thread-event-repair';

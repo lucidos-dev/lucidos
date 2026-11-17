@@ -32,22 +32,19 @@ export const promptSideQuestionRequested = signal(false);
  *  Both switch the mode, whatever the box holds. */
 export function sideQuestionBlocker(args: {
   threadStarted: boolean;
-  isCodex: boolean;
 }): string | null {
   if (!args.threadStarted) return 'Side questions need a started thread.';
-  if (args.isCodex) return "Codex threads don't take side questions.";
   return null;
 }
 
 /** Whether side-question mode is in force. The stored flag counts only where a
- *  side question can be asked: a started, non-Codex thread. While it is on it
+ *  side question can be asked: a started thread. While it is on it
  *  wins over a pending question card, so the box asks rather than answers. */
 export function sideQuestionModeActive(args: {
   stored: boolean;
   threadStarted: boolean;
-  isCodex: boolean;
 }): boolean {
-  return args.stored && args.threadStarted && !args.isCodex;
+  return args.stored && args.threadStarted;
 }
 
 export { queuedUploadSends, type UploadSendIntent } from '../../store/uploadSendIntents';
@@ -378,15 +375,20 @@ export function threadHasConversation(threadId: string | null, thread: ThreadSta
   return hasContentEvents(thread.events) || thread.pendingUserMessages.length > 0;
 }
 
+export const PLACEHOLDER_AGENT_PAUSED = 'Agent paused. Mention @agent to wake it';
+
 /** Side-question mode wins over a pending question card: in the mode, Send
- *  asks the side question, and the × goes back to answering the card. */
+ *  asks the side question, and the × goes back to answering the card. Both
+ *  win over the agent pause, which only words the idle box. */
 export function promptPlaceholder(
   hasConversation: boolean,
   answeringQuestionCard: boolean,
   sideQuestionMode: boolean,
+  agentPaused = false,
 ): string {
   if (sideQuestionMode) return PLACEHOLDER_SIDE_QUESTION;
   if (answeringQuestionCard) return PLACEHOLDER_ANSWERING;
+  if (agentPaused) return PLACEHOLDER_AGENT_PAUSED;
   return hasConversation ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
 }
 

@@ -21,11 +21,11 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub async fn move_at_boot(pool: &PgPool) -> Result<(), BoxError> {
     let mailboxes = move_mailbox_passwords(pool).await?;
     if mailboxes > 0 {
-        log!("[SecretStore] Moved {mailboxes} mailbox password(s) into credentials");
+        log_legacy!("[SecretStore] Moved {mailboxes} mailbox password(s) into credentials");
     }
     let mcp = McpServerStore::move_env_into_credentials(pool).await?;
     if mcp > 0 {
-        log!("[SecretStore] Moved {mcp} MCP server env value(s) into credentials");
+        log_legacy!("[SecretStore] Moved {mcp} MCP server env value(s) into credentials");
     }
     Ok(())
 }
@@ -88,7 +88,7 @@ async fn move_mailbox_passwords(pool: &PgPool) -> Result<usize, BoxError> {
             .execute(&mut *tx)
             .await?;
     } else {
-        log!(
+        log_legacy!(
             "[SecretStore] Kept email_accounts.password: other credentials hold the names {} \
              and email:<name>. Rename one, and the next start moves the password.",
             stranded.join(", ")

@@ -70,6 +70,16 @@ export function listPendingFormRequests(): Promise<PendingFormRequest[]> {
   return json(`${API}/form-requests/pending`);
 }
 
+/** Check persisted resolutions; archived requests are absent from the pending list too. */
+export async function listResolvedFormRequests(ids: string[]): Promise<string[]> {
+  const resolved: string[] = [];
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const query = new URLSearchParams({ request_ids: ids.slice(offset, offset + 100).join(',') });
+    resolved.push(...await json<string[]>(`${API}/form-requests/resolved?${query}`));
+  }
+  return resolved;
+}
+
 /** The Cancel of a credential or email form. `resolved: false` means another
  *  device answered it first, which closes it just the same. */
 export function cancelFormRequest(requestId: string): Promise<{ resolved: boolean }> {
@@ -293,11 +303,16 @@ export function deleteOAuthAccountApi(id: string): Promise<ApiResult> {
   });
 }
 
-export function reauthorizeOAuth(provider: string, scopes: string): Promise<ApiResult> {
+/** `signIn` asks the engine to add the provider's sign-in scopes to `scopes`. */
+export function reauthorizeOAuth(
+  provider: string,
+  scopes: string,
+  signIn = false,
+): Promise<ApiResult> {
   return json(`${API}/oauth/reauthorize`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ provider, scopes }),
+    body: JSON.stringify({ provider, scopes, sign_in: signIn }),
   });
 }
 
@@ -754,6 +769,25 @@ export interface BackupStatus {
 
 export async function getBackupStatus(provider: string): Promise<BackupStatus> {
   return json(`${API}/backup/status?provider=${encodeURIComponent(provider)}`);
+}
+
+/** The workspace's own run history, cheap and local: no provider call.
+ *  Mirrors the engine's `LastSuccessfulBackupResponse`. */
+export interface LastSuccessfulBackupResponse {
+  /** When the newest successful run finished, or null if there never was one. */
+  at: string | null;
+  /** None, or older than 24h. */
+  stale: boolean;
+  /** A backup destination is set. */
+  configured: boolean;
+  /** None, or older than 7 days. The app-shell banner reads this. */
+  overdue: boolean;
+  /** When the newest successful backup turns overdue, or null when there is none. */
+  overdue_at: string | null;
+}
+
+export async function getLastSuccessfulBackup(): Promise<LastSuccessfulBackupResponse> {
+  return json(`${API}/backup/last-successful`);
 }
 
 // Restore lives in the workspace picker (gateway control plane), not here — see

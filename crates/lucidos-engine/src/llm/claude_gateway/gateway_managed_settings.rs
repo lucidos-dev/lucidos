@@ -203,14 +203,14 @@ pub(crate) async fn refresh(
     let fetched = match fetch(&origin, bearer, account.managed_settings_etag.as_deref()).await {
         Ok(fetched) => fetched,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Keeping the stored managed settings: {e}");
+            crate::log_legacy!("[ClaudeGateway] Keeping the stored managed settings: {e}");
             return;
         }
     };
     if let Err(e) =
         ClaudeGatewayAccountStore::store_managed_settings(pool, event_bus, account, fetched).await
     {
-        crate::log!("[ClaudeGateway] Could not store the gateway's managed settings: {e}");
+        crate::log_legacy!("[ClaudeGateway] Could not store the gateway's managed settings: {e}");
     }
 }
 
@@ -247,7 +247,7 @@ async fn refresh_if_due(pool: &PgPool, event_bus: &EventBus, access: &GatewayAcc
         Ok(Some(account)) => account,
         Ok(None) => return,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Could not read the sign-in: {e}");
+            crate::log_legacy!("[ClaudeGateway] Could not read the sign-in: {e}");
             return;
         }
     };
@@ -256,7 +256,7 @@ async fn refresh_if_due(pool: &PgPool, event_bus: &EventBus, access: &GatewayAcc
     };
     match access(origin).bearer().await {
         Ok(bearer) => refresh(pool, event_bus, &account, &bearer).await,
-        Err(e) => crate::log!("[ClaudeGateway] Not fetching the managed settings: {e}"),
+        Err(e) => crate::log_legacy!("[ClaudeGateway] Not fetching the managed settings: {e}"),
     }
 }
 

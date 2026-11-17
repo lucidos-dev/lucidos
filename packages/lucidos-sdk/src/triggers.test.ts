@@ -16,6 +16,7 @@ describe('Trigger type matches engine wire format', () => {
       cron_expressions: ['0 0 8 * * *'],
       timezone: 'UTC',
       paused: false,
+      coding_agent_grant: false,
       run: { type: 'intent' as const, intent: 'do the thing' },
     }) satisfies Trigger);
 });

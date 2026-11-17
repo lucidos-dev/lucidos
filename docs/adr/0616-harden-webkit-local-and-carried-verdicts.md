@@ -1,6 +1,6 @@
 # 0616: A macOS host runs the touched WebKit specs, a passing verdict carries, and the driver reruns a run with no verdict once
 
-- **Status**: Accepted
+- **Status**: Decision A superseded by [0658](0658-harden-webkit-github-only.md); C1 and C2 remain accepted
 - **Date**: 2026-11-02
 - **Amends**: [0536](0536-fast-test-loop.md),
   [0584](0584-busy-host-filtered-e2e-goes-to-github.md)

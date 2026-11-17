@@ -5,7 +5,7 @@ use super::*;
 use crate::core::McpServerStore;
 use crate::engine::event_bus::EventBus;
 use crate::engine::trigger_writes::TriggerRegistryWriter;
-use crate::gateway_operators::Operator;
+use crate::gateway_users::User;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use crate::triggers::TriggerConfig;
 
@@ -15,8 +15,8 @@ fn device(id: &str) -> MessageOrigin {
     }
 }
 
-fn person(id: &str, devices: &[&str]) -> Operator {
-    Operator {
+fn person(id: &str, devices: &[&str]) -> User {
+    User {
         id: id.into(),
         name: id.to_uppercase(),
         emails: vec![],
@@ -25,9 +25,9 @@ fn person(id: &str, devices: &[&str]) -> Operator {
 }
 
 /// Sam holds two devices; Kim holds one.
-fn team() -> OperatorSnapshot {
-    OperatorSnapshot {
-        operators: vec![
+fn team() -> UserSnapshot {
+    UserSnapshot {
+        users: vec![
             person("sam", &["sam-phone", "sam-laptop"]),
             person("kim", &["kim-phone"]),
         ],
@@ -147,8 +147,8 @@ fn a_change_notifies_everyone_but_its_maker_and_only_on_a_team() {
     assert_eq!(notice.message, "An agent added the repository \"x\".");
     assert_eq!(notice.audience, None, "nobody made it, so the team hears");
 
-    let solo = OperatorSnapshot {
-        operators: vec![person("sam", &["sam-laptop"])],
+    let solo = UserSnapshot {
+        users: vec![person("sam", &["sam-laptop"])],
         relayed: vec![],
     };
     assert_eq!(super::notice(&change, id, &solo), None);

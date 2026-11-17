@@ -1,3 +1,4 @@
+import { PREF_BACKUP_RETENTION, PREF_BACKUP_SCHEDULE } from '@lucidos/preference-catalog';
 import { type ComponentChildren, type VNode } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
@@ -10,6 +11,7 @@ import {
   knownOAuthProviders,
   showToast,
 } from '../../store/store';
+import { startBackup } from '../../store/actions/backup';
 import { grantOAuthScope, loadKnownOAuthProviders } from '../../store/actions/oauth';
 import {
   ProviderPermissionsHint,
@@ -22,7 +24,7 @@ import {
   oauthProviderFor,
 } from './backupProviderScopes';
 import { backupSeed, refreshMayApply } from './backupSeeding';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -39,9 +41,7 @@ import {
   setBackupSchedule,
   getBackupRetention,
   setBackupRetention,
-  createBackup,
   getBackupStatus,
-  ApiError,
   type BackupProviderInfo,
   type BackupKeys,
   type BackupStatus,
@@ -342,10 +342,10 @@ export function BackupSection() {
   const [selectedProvider, setSelectedProvider] = useState<string>('');
   const [keysLoadable, setKeysLoadable] = useState<Loadable<BackupKeys>>({ status: 'not-loaded' });
   const [statusLoadable, setStatusLoadable] = useState<Loadable<BackupStatus>>({ status: 'not-loaded' });
-  const [schedule, setSchedule] = useState<string>(PREFERENCE_CATALOG.backup_schedule.fallback);
+  const [schedule, setSchedule] = useState<string>(PREF_BACKUP_SCHEDULE.fallback);
   const [scheduleLoaded, setScheduleLoaded] = useState(false);
   const [scheduleSaving, setScheduleSaving] = useState(false);
-  const [retention, setRetention] = useState<string>(PREFERENCE_CATALOG.backup_retention.fallback);
+  const [retention, setRetention] = useState<string>(PREF_BACKUP_RETENTION.fallback);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
@@ -606,22 +606,7 @@ export function BackupSection() {
 
   async function handleBackup() {
     if (!selectedProvider) return;
-    const info = selectedProviderInfo();
-    if (info && !info.ready) {
-      showToast(`${info.name} is not ready — grant access first`, 'error');
-      return;
-    }
-    backupProgress.value = { phase: 'starting', progress: 0, total: 0 };
-    try {
-      await createBackup(selectedProvider);
-    } catch (err) {
-      backupProgress.value = null;
-      if (err instanceof ApiError && err.httpCode === 409) {
-        showToast('Another backup is already running', 'warning');
-      } else {
-        showToast(`Backup failed: ${errorDetail(err)}`, 'error');
-      }
-    }
+    await startBackup(selectedProvider);
   }
 
   /** Re-reads keep what is on screen: the answer names the same workspace. */

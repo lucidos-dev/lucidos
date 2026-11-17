@@ -4,6 +4,9 @@
 
 #![cfg(test)]
 
+/// Inbox query tests share the production decoder slot across test databases.
+pub static DIAGNOSTIC_QUERY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Connection;
 use std::path::PathBuf;
@@ -369,8 +372,9 @@ pub fn test_db_url(db_name: &str) -> String {
 pub const AGENT_DATABASE_URL: &str =
     "postgresql://lucidos_test_agent:pw@localhost:5432/lucidos_test?options=-c%20default_transaction_read_only%3Don";
 
-/// Record [`AGENT_DATABASE_URL`] as boot would. Every caller records the same
-/// value, so the order tests run in does not matter.
+/// Record [`AGENT_DATABASE_URL`] as boot would. The first record wins, and a
+/// test that builds a whole engine records the role it provisioned. So a test
+/// reads the recorded URL, never this constant.
 pub fn install_agent_database_url() {
     crate::core::set_agent_database_url(AGENT_DATABASE_URL.to_string());
 }
@@ -530,29 +534,48 @@ async fn build_template_db(admin: &mut sqlx::PgConnection, template: &str) {
 /// Drop every other template built more than `STALE_TEMPLATE_SECS` ago that no
 /// clone holds right now. A branch still using one rebuilds it on its next test.
 async fn drop_stale_templates(admin: &mut sqlx::PgConnection, keep: &str) {
-    let stale: Vec<String> = sqlx::query_scalar(
+    for name in stale_templates(admin, keep, None).await {
+        drop_if_still_stale(admin, keep, &name).await;
+    }
+}
+
+/// Templates other than `keep` built more than `STALE_TEMPLATE_SECS` ago, or
+/// never finished. `only` narrows the answer to one name.
+async fn stale_templates(
+    admin: &mut sqlx::PgConnection,
+    keep: &str,
+    only: Option<&str>,
+) -> Vec<String> {
+    sqlx::query_scalar(
         "SELECT datname FROM (
            SELECT d.datname, shobj_description(d.oid, 'pg_database') AS built
            FROM pg_database d
            WHERE d.datname LIKE 'lucidos\\_template\\_%' AND d.datname <> $1
+             AND ($3::text IS NULL OR d.datname = $3)
          ) t
          WHERE CASE WHEN built ~ '^[0-9]+$' THEN built::bigint ELSE 0 END
                < extract(epoch FROM now())::bigint - $2",
     )
     .bind(keep)
     .bind(STALE_TEMPLATE_SECS)
+    .bind(only)
     .fetch_all(&mut *admin)
     .await
-    .expect("list stale templates");
-    for name in stale {
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
-            .bind(&name)
-            .fetch_one(&mut *admin)
-            .await
-            .expect("try stale template lock");
-        if !locked {
-            continue;
-        }
+    .expect("list stale templates")
+}
+
+/// Drop `name` under its exclusive lock, judging it stale again once locked:
+/// another test run may have rebuilt it since the list was read.
+async fn drop_if_still_stale(admin: &mut sqlx::PgConnection, keep: &str, name: &str) {
+    let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
+        .bind(name)
+        .fetch_one(&mut *admin)
+        .await
+        .expect("try stale template lock");
+    if !locked {
+        return;
+    }
+    if !stale_templates(admin, keep, Some(name)).await.is_empty() {
         // Best effort: a template that will not drop costs only disk.
         let _ = sqlx::query(&format!("ALTER DATABASE \"{name}\" WITH IS_TEMPLATE false"))
             .execute(&mut *admin)
@@ -560,12 +583,12 @@ async fn drop_stale_templates(admin: &mut sqlx::PgConnection, keep: &str) {
         let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{name}\""))
             .execute(&mut *admin)
             .await;
-        sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-            .bind(&name)
-            .execute(&mut *admin)
-            .await
-            .expect("release stale template lock");
     }
+    sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
+        .bind(name)
+        .execute(&mut *admin)
+        .await
+        .expect("release stale template lock");
 }
 
 /// Emit one thread event as test setup and return the id of the row it wrote.
@@ -809,6 +832,7 @@ pub async fn start_cc_session(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: branch.into(),
@@ -828,6 +852,102 @@ pub async fn start_cc_session(
     })
     .await
     .unwrap();
+}
+
+/// A whole engine on database `db`, with the mock model. Keep the workspace
+/// alive for as long as the engine runs.
+pub async fn boot_mock_engine(
+    db: &str,
+) -> (
+    std::sync::Arc<crate::engine::LucidosEngine>,
+    tempfile::TempDir,
+) {
+    let workspace = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(
+        crate::engine::LucidosEngine::new(
+            workspace.path().to_path_buf(),
+            &test_db_url(db),
+            crate::llm::ProviderBuildContext {
+                default_model: "mock".into(),
+                model_is_mock: true,
+                vertex_project_id: String::new(),
+                vertex_location: crate::llm::vertex::location_handle(String::new()),
+                vertex_token_cache: None,
+                model_registry: Default::default(),
+                not_served: Default::default(),
+                claude_gateway_access: None,
+                chatgpt_plan_access: None,
+            },
+        )
+        .await
+        .unwrap(),
+    );
+    engine.set_self_arc(&engine);
+    (engine, workspace)
+}
+
+/// Whether this process is the child that boots a whole engine. The parent
+/// reruns `test` in a child with its own HOME, asserts it passed, and gets
+/// `false`.
+pub async fn in_engine_child(test: &str) -> bool {
+    const CHILD: &str = "LUCIDOS_TEST_ENGINE_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(test) {
+        return true;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--include-ignored"])
+            .env(
+                "RUST_MIN_STACK",
+                crate::engine_runtime::WORKER_THREAD_STACK_SIZE.to_string(),
+            )
+            .env(CHILD, test)
+            .env("HOME", home.path())
+            .env_remove("LUCIDOS_GATEWAY_DATA")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the child must execute exactly one test: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    false
+}
+
+/// Run the test `make_test` builds on the engine's own runtime and stack size.
+/// A test that drives a whole turn needs both: a test thread overflows on it.
+pub fn run_on_engine_runtime<M, F>(name: &'static str, make_test: M)
+where
+    M: FnOnce() -> F + Send + 'static,
+    F: std::future::Future<Output = ()>,
+{
+    let test = std::thread::Builder::new()
+        .stack_size(crate::engine_runtime::WORKER_THREAD_STACK_SIZE)
+        .spawn(move || {
+            crate::engine_runtime::build_runtime()
+                .expect("the engine runtime builds")
+                .block_on(async move {
+                    if in_engine_child(name).await {
+                        make_test().await;
+                    }
+                })
+        })
+        .expect("the test thread starts");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
 }
 
 /// A coding-agent thread with a session, a child of `parent` when given.
@@ -1225,6 +1345,50 @@ pub mod source_scan {
         out.sort();
         out
     }
+}
+
+/// A self-signed certificate for `127.0.0.1` and `localhost`, and its private
+/// key, as PEM.
+///
+/// Built with the `openssl` crate rather than a new dev-dependency. It carries
+/// a SAN because rustls refuses a certificate with none before it weighs the
+/// signature, even for a client that accepts invalid certificates.
+pub fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
+    use openssl::asn1::Asn1Time;
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::rsa::Rsa;
+    use openssl::x509::extension::SubjectAlternativeName;
+    use openssl::x509::{X509NameBuilder, X509};
+
+    let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+    let mut subject = X509NameBuilder::new().unwrap();
+    subject.append_entry_by_text("CN", "localhost").unwrap();
+    let subject = subject.build();
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&subject).unwrap();
+    builder.set_issuer_name(&subject).unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+        .unwrap();
+    let san = SubjectAlternativeName::new()
+        .ip("127.0.0.1")
+        .dns("localhost")
+        .build(&builder.x509v3_context(None, None))
+        .unwrap();
+    builder.append_extension(san).unwrap();
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+
+    (
+        builder.build().to_pem().unwrap(),
+        key.private_key_to_pem_pkcs8().unwrap(),
+    )
 }
 
 #[path = "test_support_tests.rs"]

@@ -48,6 +48,7 @@ const READ_EXEMPT: Record<string, Exemption> = {
   'store/actions/event-navigation.ts': { tag: 'returns-value', why: 'looks up the thread owning an event for a jump' },
   'store/actions/form-requests.ts': { tag: 'best-effort', why: 'offers an open form request on each stream open' },
   'store/actions/push.ts': { tag: 'returns-value', why: "reads the gateway's HTTPS origin for the enable-push failure toast" },
+  'store/actions/repoSelectionRestore.ts': { tag: 'returns-value', why: 'hands the selected change to repository context, which holds the Loadable; restore failures toast' },
   'store/actions/slowness.ts': { tag: 'best-effort', why: 'a slowness banner that is simply absent when unmeasurable' },
   'store/actions/update-relay.ts': { tag: 'best-effort', why: 'update relay status rides the release check; a watch has its own give-up bound' },
   'store/actions/widget-actions.ts': { tag: 'returns-value', why: 'reads a widget by id to open it in Canvas; failure toasts' },

@@ -17,7 +17,7 @@ impl LucidosEngine {
             match serde_json::to_string(&*cache) {
                 Ok(json) => Some(json),
                 Err(e) => {
-                    log!("[ClaudeCode] Failed to serialize CC commands cache: {}", e);
+                    log_legacy!("[ClaudeCode] Failed to serialize CC commands cache: {}", e);
                     None
                 }
             }
@@ -25,7 +25,7 @@ impl LucidosEngine {
         if let Some(json) = json {
             let path = self.workspace_path.join(".lucidos/cc-commands.json");
             if let Err(e) = std::fs::write(&path, &json) {
-                log!("[ClaudeCode] Failed to write CC commands cache: {}", e);
+                log_legacy!("[ClaudeCode] Failed to write CC commands cache: {}", e);
             }
         }
     }
@@ -111,7 +111,7 @@ impl LucidosEngine {
         // engines. Nothing here can recover from that, but it must not be
         // silent.
         if self.self_arc.set(Arc::downgrade(arc)).is_err() {
-            log!("[Engine] set_self_arc called twice: keeping the first Arc");
+            log_legacy!("[Engine] set_self_arc called twice: keeping the first Arc");
         }
         // The Thread Queue executes admitted entries through the engine —
         // wire it the moment the Arc exists so no submission can race a
@@ -399,21 +399,40 @@ impl LucidosEngine {
         crate::engine::git_ops::plan_marker_files(&self.pool, repo_root, branch_name).await
     }
 
-    /// Approve a `Proposed` plan, flipping it to `Planned` so the gate passes.
-    /// Returns whether a proposed row was flipped, or why the user's approval
-    /// is missing. Called by the `/api/v1/internal/approve-plan` endpoint that
-    /// `lucidos planned approve` hits after the user approves the plan.
+    /// Approve a proposed plan for implementation or landing alone, checking the user's scope.
     pub(crate) async fn approve_plan(
         &self,
         repo_root: &std::path::Path,
         branch_name: &str,
         caller_thread: Option<&str>,
+        plan_only: bool,
     ) -> Result<
         Option<crate::engine::git_ops::ApprovedPlan>,
         crate::engine::git_ops::PlanApprovalError,
     > {
-        crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name, caller_thread)
+        if let Some(thread) = caller_thread.and_then(|id| uuid::Uuid::parse_str(id).ok()) {
+            return crate::engine::plan_lifecycle::approve(
+                &self.event_bus,
+                thread,
+                repo_root,
+                branch_name,
+                plan_only,
+            )
+            .await;
+        }
+        if plan_only {
+            crate::engine::git_ops::approve_plan_for(
+                &self.pool,
+                repo_root,
+                branch_name,
+                caller_thread,
+                true,
+            )
             .await
+        } else {
+            crate::engine::git_ops::approve_plan(&self.pool, repo_root, branch_name, caller_thread)
+                .await
+        }
     }
 
     /// Borrow the event store for sharing with read-only handlers.

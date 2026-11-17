@@ -275,6 +275,7 @@ async fn continuation_requested_turn_keeps_its_own_anchor() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),

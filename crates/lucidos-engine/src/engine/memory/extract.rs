@@ -88,7 +88,7 @@ impl LucidosEngine {
         {
             Ok(s) => s,
             Err(e) => {
-                log!(@Memory, "Failed to fetch thread context for extraction: {}", e);
+                log_legacy!(@Memory, "Failed to fetch thread context for extraction: {}", e);
                 return (!base.is_empty()).then_some(base);
             }
         };
@@ -304,7 +304,7 @@ impl LucidosEngine {
         };
         found
             .unwrap_or_else(|e| {
-                log!(@Memory, "Could not resolve the thread for {:?}: {}", source, e);
+                log_legacy!(@Memory, "Could not resolve the thread for {:?}: {}", source, e);
                 None
             })
             .flatten()
@@ -335,7 +335,7 @@ impl LucidosEngine {
         // window isn't auto-indexed".
         if !self.embedder.is_ready() {
             if verbose {
-                log!(
+                log_legacy!(
                     @Memory,
                     "Embedding model not ready yet — skipping memory indexing (recovered by a rebuild)"
                 );
@@ -371,30 +371,31 @@ impl LucidosEngine {
         let resample = resample_extraction(verbose, || {
             crate::memory::extract_facts(content, context, lang_ref, &memory_call, &capture)
         });
-        let outcome = match tokio::time::timeout(memory_call.deadline(), resample).await {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                log!(@Memory, "Extraction timed out ({:?}), falling back", memory_call.deadline());
-                Extraction::Failed
-            }
-        };
+        let outcome = report_extraction(
+            &self.event_bus,
+            &source,
+            memory_call.running_model(),
+            memory_call.deadline(),
+            resample,
+        )
+        .await;
         let facts: Vec<ExtractedFact> = match outcome {
             Extraction::Facts(f) => f,
             Extraction::Nothing => return false,
-            Extraction::Failed if is_artifact => {
+            Extraction::Failed(_) if is_artifact => {
                 if verbose {
-                    log!(@Memory, "No facts extracted from artifact, skipping fallback");
+                    log_legacy!(@Memory, "No facts extracted from artifact, skipping fallback");
                 }
                 return false;
             }
-            Extraction::Failed => match crate::memory::fallback_fact(content, "General") {
+            Extraction::Failed(_) => match crate::memory::fallback_fact(content, "General") {
                 Some(f) => {
                     used_fallback = true;
                     vec![f]
                 }
                 None => {
                     if verbose {
-                        log!(@Memory, "Extraction failed; fallback content not storable, skipping");
+                        log_legacy!(@Memory, "Extraction failed; fallback content not storable, skipping");
                     }
                     return false;
                 }
@@ -407,7 +408,7 @@ impl LucidosEngine {
             Ok(e) => e,
             Err(e) => {
                 if verbose {
-                    log!(@Memory, "Failed to generate embeddings: {}", e);
+                    log_legacy!(@Memory, "Failed to generate embeddings: {}", e);
                 }
                 return used_fallback;
             }
@@ -471,7 +472,7 @@ impl LucidosEngine {
                 Ok(_) => DedupAction::Insert,
                 Err(e) => {
                     if verbose {
-                        log!(@Memory, "Dedup search failed, inserting anyway: {}", e);
+                        log_legacy!(@Memory, "Dedup search failed, inserting anyway: {}", e);
                     }
                     DedupAction::Insert
                 }
@@ -506,7 +507,7 @@ impl LucidosEngine {
                 deferred.lock().unwrap().extend(all_delete_ids);
             } else if let Err(e) = index.delete_many(&all_delete_ids).await {
                 if verbose {
-                    log!(@Memory, "Failed to delete superseded entries: {}", e);
+                    log_legacy!(@Memory, "Failed to delete superseded entries: {}", e);
                 }
             }
         }
@@ -544,14 +545,14 @@ impl LucidosEngine {
                 }
                 Err(e) => {
                     if verbose {
-                        log!(@Memory, "Failed to index fact: {}", e);
+                        log_legacy!(@Memory, "Failed to index fact: {}", e);
                     }
                 }
             }
         }
 
         if skipped > 0 || superseded > 0 {
-            log!(@Memory, "Dedup: {} skipped, {} superseded, {} inserted", skipped, superseded, inserted);
+            log_legacy!(@Memory, "Dedup: {} skipped, {} superseded, {} inserted", skipped, superseded, inserted);
         }
 
         used_fallback
@@ -565,7 +566,38 @@ enum Extraction {
     /// The model read the content and found nothing worth remembering.
     Nothing,
     /// No attempt produced a readable answer.
-    Failed,
+    Failed(&'static str),
+}
+
+/// Bound the whole extraction and announce one failure before the caller chooses its fallback.
+async fn report_extraction(
+    bus: &crate::engine::event_bus::EventBus,
+    source: &MemorySource,
+    model: &str,
+    deadline: std::time::Duration,
+    resample: impl std::future::Future<Output = Extraction>,
+) -> Extraction {
+    let outcome = match tokio::time::timeout(deadline, resample).await {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            log_legacy!(@Memory, "Extraction timed out ({:?}), falling back", deadline);
+            Extraction::Failed("timed_out")
+        }
+    };
+    if let Extraction::Failed(reason) = &outcome {
+        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        if let Err(error) = bus
+            .emit(BusEvent::System(SystemEvent::MemoryExtractionFailed {
+                source: source.clone(),
+                model: model.to_string(),
+                reason: (*reason).to_string(),
+            }))
+            .await
+        {
+            log_legacy!(@Memory, "Failed to record memory extraction failure: {}", error);
+        }
+    }
+    outcome
 }
 
 /// Up to three extraction attempts, retrying only a failed call or an
@@ -579,13 +611,28 @@ where
         Output = Result<Vec<ExtractedFact>, Box<dyn std::error::Error + Send + Sync>>,
     >,
 {
+    let mut reason = "call_failed";
     for attempt in 1..=3u32 {
         match attempt_call().await {
             Ok(facts) if facts.is_empty() => return Extraction::Nothing,
             Ok(facts) => return Extraction::Facts(facts),
             Err(e) => {
+                reason = if e
+                    .to_string()
+                    .starts_with("[Memory] Failed to parse extraction JSON")
+                    || e.to_string()
+                        .starts_with("[Memory] Failed to deserialize extraction facts")
+                {
+                    "unreadable_reply"
+                } else {
+                    "call_failed"
+                };
+                if e.is::<crate::llm::spend_cap::SpendCapReached>() {
+                    return Extraction::Failed(reason);
+                }
+
                 if verbose {
-                    log!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
+                    log_legacy!(@Memory, "Extraction failed (attempt {}/3): {}", attempt, e);
                 }
                 // Exponential backoff before the next attempt, for a transient
                 // error only. The provider already retried internally; this
@@ -597,7 +644,7 @@ where
             }
         }
     }
-    Extraction::Failed
+    Extraction::Failed(reason)
 }
 
 /// The surviving thread that wrote `path` (relative to `data/artifacts/`)
@@ -638,3 +685,25 @@ mod resample_tests;
 #[cfg(test)]
 #[path = "../memory_tests/artifact_writer.rs"]
 mod artifact_writer_tests;
+
+#[cfg(test)]
+mod spend_cap_tests {
+    #[tokio::test]
+    async fn a_spend_cap_is_never_resampled() {
+        let mut calls = 0;
+        let result = super::resample_extraction(false, || {
+            calls += 1;
+            let cap = crate::llm::spend_cap::SpendCapReached {
+                provider: crate::llm::ProviderKind::OpenAi,
+                resets_at: None,
+                message: "spent".into(),
+            };
+            std::future::ready(Err(
+                Box::new(cap) as Box<dyn std::error::Error + Send + Sync>
+            ))
+        })
+        .await;
+        assert!(matches!(result, super::Extraction::Failed("call_failed")));
+        assert_eq!(calls, 1);
+    }
+}

@@ -97,7 +97,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "coding_agent": {
                         "type": "string",
                         "enum": CodingAgent::ALL.map(CodingAgent::as_str),
-                        "description": "Use \"codex\" when the user asks for Codex; omit for Claude Code."
+                        "description": "Omit for the installed agent, Claude Code first."
                     },
                     "folder": {
                         "type": "string",
@@ -189,8 +189,9 @@ const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "report never wakes you.\n\n",
     "By default the message QUEUES: a mid-turn child reads it at its next natural break, ",
     "which inside a long tool call can be many minutes, and nothing in flight is thrown away. ",
-    "urgent: true stops the child's current turn instead. On a CODEX child urgent changes ",
-    "nothing, since a Codex turn cannot read a queued message until it ends.\n\n",
+    "urgent: true stops the child's current turn instead, on either backend. Codex with ",
+    "app-server steer support takes ordinary messages mid-turn; older app-servers and ",
+    "exec interrupt for every follow-up.\n\n",
     "Side effects invisible from the verb, all three in ",
     "`system-knowhow/coding-agent-events`: a child's PENDING PERMISSION CARD HOLDS your ",
     "message until a human acts; a follow-up racing the child's own finish can produce a completion ",
@@ -316,8 +317,8 @@ mod tests {
             "the default must be stated, or the model cannot tell what urgent changes:\n{d}"
         );
         assert!(
-            d.contains("CODEX child urgent changes nothing"),
-            "the Codex no-op is an honest asymmetry and must be stated, not hidden:\n{d}"
+            d.contains("app-server steer support") && d.contains("exec interrupt"),
+            "the model must know when Codex preserves the turn and when it interrupts:\n{d}"
         );
     }
 

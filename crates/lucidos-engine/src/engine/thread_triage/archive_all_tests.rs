@@ -239,3 +239,33 @@ fn a_refused_cascade_is_counted_by_its_blocker() {
     );
     assert_eq!(reason("apply_in_progress"), "busy");
 }
+
+#[test]
+fn completed_selection_requires_output_and_reuses_every_safety_refusal() {
+    let good = row(|_| {});
+    let rows = vec![
+        good.clone(),
+        row(|f| f.has_output = false),
+        row(|f| f.status = ThreadStatus::Running),
+        row(|f| f.status = ThreadStatus::Paused),
+        row(|f| f.live_event_waits = 1),
+        row(|f| f.has_pending_question = true),
+        row(|f| f.has_pending_change = true),
+        row(|f| f.has_unproposed_work = true),
+        row(|f| f.has_draft = true),
+        row(|f| f.status = ThreadStatus::Failed),
+        row(|f| f.is_pinned = true),
+        row(|f| f.sub_thread_busy = true),
+        row(|f| f.sub_thread_needs = vec![NeedFact::Draft]),
+    ];
+    let p = completed_preflight(&rows);
+    assert_eq!(p.safe_thread_count, 1);
+    assert_eq!(p.safe[0].thread_id, good.facts.thread_id);
+    assert_eq!(p.kept_thread_count, rows.len() - 1);
+    let nested = family(3, 0, |_| {});
+    assert_eq!(
+        completed_preflight(&[nested]).safe_thread_count,
+        1,
+        "each selected thread counts once, never its overlapping family"
+    );
+}

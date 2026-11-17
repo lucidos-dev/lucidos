@@ -211,14 +211,18 @@ mod tests {
         assert_eq!(budget.next_request(), None, "the call is out of time");
     }
 
-    /// `lucidos proxy` cannot import this crate, so it carries
-    /// [`CLIENT_WAIT_SECS`] as a literal and this test pins it.
-    #[test]
-    fn the_cli_waits_the_client_wait() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let cli = std::fs::read_to_string(root.join("crates/lucidos-cli/src/proxy.rs"))
-            .expect("read the CLI proxy source");
-        let needle = format!("const CLIENT_WAIT_SECS: u64 = {CLIENT_WAIT_SECS};");
-        assert!(cli.contains(&needle), "lucidos proxy must carry `{needle}`");
+    mod guard_tests {
+        use super::*;
+
+        /// `lucidos proxy` cannot import this crate, so it carries
+        /// [`CLIENT_WAIT_SECS`] as a literal and this test pins it.
+        #[test]
+        fn the_cli_waits_the_client_wait() {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let cli = std::fs::read_to_string(root.join("crates/lucidos-cli/src/proxy.rs"))
+                .expect("read the CLI proxy source");
+            let needle = format!("const CLIENT_WAIT_SECS: u64 = {CLIENT_WAIT_SECS};");
+            assert!(cli.contains(&needle), "lucidos proxy must carry `{needle}`");
+        }
     }
 }

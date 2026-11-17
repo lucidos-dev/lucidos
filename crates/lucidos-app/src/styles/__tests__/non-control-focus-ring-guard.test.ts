@@ -2,7 +2,7 @@
  * A surface that is not a control paints no focus ring.
  *
  * Two ways one of these boxes takes focus. `ProgressDialog` focuses its own
- * body, so a modal with no Cancel keeps the keyboard. Chrome promotes the
+ * frame, so a modal with no Cancel keeps the keyboard. Chrome promotes the
  * scroll boxes to Tab stops, which it does to any overflowing scroller holding
  * no focusable child. Either way the box ends up `:focus-visible` and wears the
  * browser's ring around a block of text. The report was the restart dialog,
@@ -40,7 +40,7 @@ const SHEETS: Array<{ file: string; css: string }> = styleSheetPaths(STYLES_ROOT
 /** The boxes that hold focus without being something the user presses. Add a
  *  class here when a new one appears, together with its suppression. */
 const SURFACES = [
-  'progress-dialog-body', // the restart dialog's body, focused for containment
+  'progress-dialog',      // the restart dialog's frame, focused for containment
   'confirm-details',      // the confirm dialog's detail list
   'dialog-body',          // the scrolling body of every centred dialog
   'step-detail-body',     // the scrolling body of the step-detail family

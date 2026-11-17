@@ -62,6 +62,11 @@ pub const AUTO_RECOVERY_AFTER_HANG_REASON: &str = "auto_recovery_after_hang";
 /// not loop. See `auto_resume_after_api_error`.
 pub const AUTO_RESUME_AFTER_API_ERROR_REASON: &str = "auto_resume_after_api_error";
 
+/// Tag stamped on `ContinuationRequested.reason` when the owner allowed an
+/// unattested caller's coding-agent run once (`api::owner_door`). The run
+/// gets the prompt it never had, and the spawn gate spends the Allow.
+pub const OWNER_ALLOWED_START_REASON: &str = "owner_allowed_start";
+
 /// Tag stamped on `ContinuationRequested.reason` when recovery auto-resumes an
 /// in-flight coding-agent thread after a **user-initiated** *Switch to new
 /// version* (detected by a device-attributed teardown `ResponseAborted`). A crash
@@ -76,6 +81,30 @@ pub const AUTO_RESUME_AFTER_SWITCH_REASON: &str = "auto_resume_after_switch";
 /// user pressed a button that starts a new turn, so it opens a resume
 /// exchange, as Continue does.
 pub const HARDEN_REQUESTED_REASON: &str = "harden_requested";
+
+/// Tag stamped on `ContinuationRequested.reason` when the owner lets a paused
+/// thread's plan nudge run (`automation_pause`). The resume carries the
+/// nudge for the plan hold the branch's work last met.
+pub const PLAN_REQUESTED_REASON: &str = "plan_requested";
+
+/// Tag stamped on `ContinuationRequested.reason` when the owner lets a paused
+/// session past its context ceiling hand off. The resume carries the ceiling
+/// re-entry prompt.
+pub const HANDOFF_REQUESTED_REASON: &str = "handoff_requested";
+
+/// Tag stamped on `ContinuationRequested.reason` when the owner lets a paused
+/// thread build the plan they approved. The resume carries the approved-plan
+/// re-entry prompt.
+pub const BUILD_REQUESTED_REASON: &str = "build_requested";
+
+/// Tag stamped on `ContinuationRequested.reason` when the owner wakes a paused
+/// thread to read the reports filed while it was paused. The turn-gap note
+/// carries the reports themselves.
+pub const REPORTS_REQUESTED_REASON: &str = "reports_requested";
+
+/// The resume message of [`REPORTS_REQUESTED_REASON`].
+pub const REPORTS_REQUESTED_MESSAGE: &str = "Reports arrived while the owner had paused this \
+     thread's automatic steps. The owner woke you to read them: read them, then carry on.";
 
 /// Tag an older `ContinuationRequested.reason` carries: a Claude Code effort
 /// pick restarted the session mid-turn and resumed it. Nothing emits it since
@@ -108,6 +137,10 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
         reason,
         Some(USER_CLICKED_CONTINUE_REASON)
             | Some(HARDEN_REQUESTED_REASON)
+            | Some(PLAN_REQUESTED_REASON)
+            | Some(BUILD_REQUESTED_REASON)
+            | Some(HANDOFF_REQUESTED_REASON)
+            | Some(REPORTS_REQUESTED_REASON)
             | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
             | Some(AUTO_RESUME_AFTER_SWITCH_REASON)
             | Some(AUTO_RESUME_AFTER_API_ERROR_REASON)
@@ -233,8 +266,27 @@ pub(crate) async fn continue_input_for_reason(
     thread_id: Uuid,
     reason: Option<&str>,
 ) -> String {
-    if reason == Some(HARDEN_REQUESTED_REASON) {
-        return crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string();
+    match reason {
+        Some(HARDEN_REQUESTED_REASON) => {
+            return crate::engine::claude_code::AUTO_HARDEN_MESSAGE.to_string();
+        }
+        Some(PLAN_REQUESTED_REASON) => {
+            if let Some(hold) = crate::engine::change_ops::held_plan(pool, thread_id).await {
+                return hold.agent_nudge().to_string();
+            }
+        }
+        Some(BUILD_REQUESTED_REASON) => {
+            return crate::engine::turn_end::approved_plan::APPROVED_PLAN_REENTRY_TEXT.to_string();
+        }
+        Some(HANDOFF_REQUESTED_REASON) => {
+            if let Ok(Some(crossing)) =
+                crate::engine::context_ceiling::past_ceiling(pool, thread_id).await
+            {
+                return crate::engine::agent_session::ceiling_reentry_prompt(crossing);
+            }
+        }
+        Some(REPORTS_REQUESTED_REASON) => return REPORTS_REQUESTED_MESSAGE.to_string(),
+        _ => {}
     }
     if reason != Some(ANSWERED_AFTER_IDLE_REASON) {
         return CONTINUE_RESUME_USER_MESSAGE.to_string();
@@ -248,7 +300,7 @@ pub(crate) async fn continue_input_for_reason(
             // answer we were spawned for is not readable back. Say so: the
             // agent still resumes, but the silence lands in the log rather than
             // only in the model's guesswork.
-            crate::log!(
+            crate::log_legacy!(
                 "[CCQuestion] answered_after_idle continuation for thread {} has no \
                  recoverable answer, resuming with the bare continue message",
                 thread_id
@@ -301,7 +353,7 @@ pub(crate) async fn continue_retry_input(
 /// restart tries again.
 pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
     if crate::engine::worktree_cleanup::is_worktree_dirty(wt_path).await {
-        log!(
+        log_legacy!(
             "[Recovery] Keeping duplicate worktree {}: it has uncommitted changes",
             wt_path.display()
         );
@@ -314,13 +366,13 @@ pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
     )
     .await
     {
-        Some(outcome) => log!(
+        Some(outcome) => log_legacy!(
             "[Recovery] Removed duplicate worktree {} ({} bytes, branch_deleted={})",
             wt_path.display(),
             outcome.freed_bytes,
             outcome.branch_deleted
         ),
-        None => log!(
+        None => log_legacy!(
             "[Recovery] Could not remove duplicate worktree {}: it is skipped until the next restart",
             wt_path.display()
         ),
@@ -390,7 +442,7 @@ pub(crate) fn recovery_repo_roots(
     for repo in external_repos {
         let path = PathBuf::from(&repo.path);
         if !path.exists() {
-            log!(
+            log_legacy!(
                 "[Recovery] Skipping external repo '{}': path does not exist: {}",
                 repo.name,
                 repo.path
@@ -398,7 +450,7 @@ pub(crate) fn recovery_repo_roots(
             continue;
         }
         if !seen.insert(canon(&path)) {
-            log!(
+            log_legacy!(
                 "[Recovery] Skipping external repo '{}': same path as an already-scanned repo",
                 repo.name
             );
@@ -469,7 +521,7 @@ pub(crate) async fn lookup_app_spawn_id(pool: &sqlx::PgPool, thread_id: Uuid) ->
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[Recovery] app-id lookup for thread {} failed: {}. \
              A lost worktree would be rebuilt in full rather than sparse",
             thread_id,
@@ -654,7 +706,7 @@ pub(crate) async fn last_turn_end(pool: &sqlx::PgPool, thread_id: Uuid) -> Optio
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[Recovery] last_turn_end({}): {}; settling nothing",
             thread_id,
             e
@@ -720,7 +772,7 @@ pub(crate) async fn recover_branch_ref_from_worktree(
     let repo_root = crate::engine::worktree_cleanup::resolve_repo_root_from_worktree(&wt).await?;
     match git_cmd(&["branch", branch_name, &head_sha], &repo_root).await {
         Ok(o) if o.status.success() => {
-            log!(
+            log_legacy!(
                 "[Recovery] Recreated missing branch {} at {} from surviving worktree {} — session resumable",
                 branch_name,
                 &head_sha[..head_sha.floor_char_boundary(8)],
@@ -729,7 +781,7 @@ pub(crate) async fn recover_branch_ref_from_worktree(
             Some((repo_root, wt))
         }
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Could not recreate branch {} from worktree {}: {}",
                 branch_name,
                 wt.display(),
@@ -738,7 +790,7 @@ pub(crate) async fn recover_branch_ref_from_worktree(
             None
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] git branch create for {} errored: {}",
                 branch_name,
                 e

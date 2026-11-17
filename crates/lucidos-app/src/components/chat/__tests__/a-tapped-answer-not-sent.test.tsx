@@ -10,6 +10,8 @@ const { retryUnsentPick, discardUnsentAnswers } = vi.hoisted(() => ({
   retryUnsentPick: vi.fn(),
   discardUnsentAnswers: vi.fn(),
 }));
+const { recoverQuestionPick } = vi.hoisted(() => ({ recoverQuestionPick: vi.fn() }));
+vi.mock('../../../store/actions/questionPickRecovery', () => ({ recoverQuestionPick }));
 vi.mock('../../../store/actions/chat-claude-code', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/chat-claude-code')>()),
   retryUnsentPick,
@@ -30,6 +32,7 @@ beforeEach(() => {
   document.body.appendChild(host);
   retryUnsentPick.mockReset();
   discardUnsentAnswers.mockReset();
+  recoverQuestionPick.mockReset();
 });
 
 afterEach(() => {
@@ -54,6 +57,15 @@ function optionWithNotice(): HTMLElement | null {
 }
 
 describe('a tapped answer that was not sent', () => {
+  it.each(['resolved', 'terminated'] as const)('recovers unconfirmed composer content when the card is %s', (state) => {
+    const held = { threadId: 't', answer: { kind: 'FreeText' as const, text: 'keep me' }, placement: { event_id: 'held', input_chain: 'page', input_seq: 1 } };
+    unsentPicks.set('tu-1', held);
+    mount(<QuestionBody threadId="t" toolUseId="tu-1" question="Choose" options={options}
+      resolved={state === 'resolved' ? { kind: 'Selected', option_id: 'a' } : undefined}
+      terminated={state === 'terminated'} />);
+    expect(recoverQuestionPick).toHaveBeenCalledWith('tu-1', held);
+  });
+
   it('marks the picked option and puts Not sent with a retry icon on it', () => {
     unsentPicks.set('tu-1', { threadId: 't', answer: { kind: 'Selected', option_id: 'b' }, failure });
     mount(card());
@@ -80,6 +92,17 @@ describe('a tapped answer that was not sent', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(host.querySelector('.question-unsent-detail')!.textContent)
       .toBe('Lucidos did not answer after 4 tries. Last error: Load failed.');
+  });
+
+  it('shows an explicit server refusal without describing it as an unanswered request', () => {
+    unsentPicks.set('tu-1', {
+      threadId: 't', answer: { kind: 'Selected', option_id: 'b' }, failure,
+      refusal: { reason: 'compose_snapshot_stale', message: 'Another send was accepted first. Retry this answer to send it again.' },
+    });
+    mount(card());
+    act(() => { host.querySelector<HTMLButtonElement>('.question-unsent-toggle')!.click(); });
+    expect(host.querySelector('.question-unsent-detail')!.textContent)
+      .toBe('Another send was accepted first. Retry this answer to send it again.');
   });
 
   it('sends the same answer again from the retry icon', () => {

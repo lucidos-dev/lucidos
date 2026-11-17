@@ -343,6 +343,24 @@ test_protects_pid_from_other_workspace_pidfile() {
     release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
 }
 
+# ── Test 3b: an e2e engine in the e2e root is protected too ───────────
+# A local e2e run keeps its workspaces under the e2e root, not ~/workspaces.
+test_protects_pid_from_e2e_root_pidfile() {
+    echo "test: an e2e root workspace's engine.pid protects that PID while its lock is held"
+    reset_env
+    local ws="$HOME/$E2E_ROOT_HOME_SUBPATH/workspaces/e2e-test"
+    mkdir -p "$ws/.lucidos"
+    echo "$LIVE_PID" > "$ws/.lucidos/engine.pid"
+    start_lock_holder "$SANDBOX" "$ws/.lucidos/engine.lock" ex
+    if (unset LUCIDOS_E2E_ROOT; is_protected_host_pid "$LIVE_PID"); then
+        pass "scanned the e2e root's e2e-test/.lucidos/engine.pid"
+    else
+        fail "the e2e root's engine pid was not protected"
+    fi
+    release_lock_holder "$HOLDER_PID" "$HOLDER_RELEASE"
+    rm -rf "${HOME:?}/$E2E_ROOT_HOME_SUBPATH"
+}
+
 # ── Test 4: a pidfile whose lock nobody holds protects nothing ─────────
 # The pid is alive, but no engine owns the workspace: the shape of a pid the OS
 # handed to an unrelated process after the engine died (ADR 0438).
@@ -597,6 +615,19 @@ test_passwd_home_is_parsed_exactly() {
 # ═══════════════════════════════════════════════════════════════════════
 # Suite 2: allocate_ports
 # ═══════════════════════════════════════════════════════════════════════
+
+# ── The registry stays machine-wide under the e2e root ──────────────────
+test_the_registry_ignores_the_e2e_root() {
+    echo "test: the port registry stays in the real Lucidos home under the e2e overrides"
+    local got
+    got="$(HOME=/home/u LUCIDOS_PRIVATE_DIR=/tmp/e2e/private LUCIDOS_E2E_ROOT=/tmp/e2e \
+        bash -c 'source "$1/ports.sh" >/dev/null 2>&1; printf %s "$LUCIDOS_PORT_REGISTRY"' _ "$SCRIPT_DIR")"
+    if [ "$got" = "/home/u/.lucidos/port-registry" ]; then
+        pass "registry at $got"
+    else
+        fail "registry moved to '$got'"
+    fi
+}
 
 # ── Test 9: default allocation uses offset 0 ───────────────────────────
 test_default_allocation_uses_offset_0() {
@@ -1668,6 +1699,7 @@ test_kill_shim_refuses_foreign_pid
 test_protects_host_pid_from_env_var
 test_protects_frontend_pid_from_env_var
 test_protects_pid_from_other_workspace_pidfile
+test_protects_pid_from_e2e_root_pidfile
 test_unlocked_pidfile_does_not_protect
 test_does_not_protect_arbitrary_pid
 test_stale_pidfile_does_not_protect
@@ -1677,6 +1709,7 @@ test_ancestor_pid_is_protected_without_env_or_home
 test_reclaim_refuses_ancestor_with_engine_cmdline
 test_pidfile_scan_is_not_confined_to_home
 test_passwd_home_is_parsed_exactly
+test_the_registry_ignores_the_e2e_root
 test_default_allocation_uses_offset_0
 test_allocation_is_stable_across_calls
 test_two_workspaces_get_different_offsets

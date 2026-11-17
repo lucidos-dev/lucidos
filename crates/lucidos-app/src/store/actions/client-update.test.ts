@@ -46,13 +46,13 @@ describe('syncClientUpdateFromBuild — badge', () => {
   it('clears the badge when the served build matches the running build', async () => {
     updateAvailable.value = true;
     mockGetServedBuildId.mockResolvedValue('client123');
-    await syncClientUpdateFromBuild();
+    expect(await syncClientUpdateFromBuild()).toBe(false);
     expect(updateAvailable.value).toBe(false); // self-correcting: was true, now cleared
   });
 
   it('lights the badge when the served build is newer than the running build', async () => {
     mockGetServedBuildId.mockResolvedValue('server999');
-    await syncClientUpdateFromBuild();
+    expect(await syncClientUpdateFromBuild()).toBe(true);
     expect(updateAvailable.value).toBe(true);
   });
 

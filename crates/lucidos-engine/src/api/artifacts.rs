@@ -23,8 +23,36 @@ pub(super) struct CommitsResponse {
 /// Handle file upload and import
 pub(super) async fn upload_file(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     mut multipart: Multipart,
 ) -> Json<UploadResponse> {
+    let actor = match crate::api::actor::require_user_actor_response(&headers, &state.pool).await {
+        Ok(actor) => actor,
+        Err(_) => {
+            return Json(UploadResponse {
+                success: false,
+                filename: None,
+                error: Some("Upload requires an authenticated caller".into()),
+            })
+        }
+    };
+    let origin = crate::core::artifact_writer::ArtifactWriterOrigin::from_actor(
+        &actor,
+        headers
+            .get(crate::api::app_reach::APP_ID_HEADER)
+            .map(|h| String::from_utf8_lossy(h.as_bytes()))
+            .as_deref(),
+    );
+    let writer = match origin.resolve(&state.pool).await {
+        Ok(writer) => writer,
+        Err(e) => {
+            return Json(UploadResponse {
+                success: false,
+                filename: None,
+                error: Some(format!("Failed to resolve artifact writer: {e}")),
+            })
+        }
+    };
     // Get the file from multipart
     let field = match multipart.next_field().await {
         Ok(Some(field)) => field,
@@ -92,10 +120,14 @@ pub(super) async fn upload_file(
 
     // Import using the engine's import functionality — no lock needed
     let dest = format!("imported/{}", filename);
-    log!(@upload, "Starting import for {}", filename);
-    match state.engine.import_file_from_path(&temp_path, &dest).await {
+    log_legacy!(@upload, "Starting import for {}", filename);
+    match state
+        .engine
+        .import_file_from_path(&temp_path, &dest, writer)
+        .await
+    {
         Ok((result, commit_sha, resolved_dest)) => {
-            log!(@upload, "Import succeeded: {}", result);
+            log_legacy!(@upload, "Import succeeded: {}", result);
 
             // Reflect the ACTUAL final filename — a collision auto-suffix may
             // have landed the file at e.g. "imported/Brev (1).pdf".
@@ -120,7 +152,7 @@ pub(super) async fn upload_file(
             })
         }
         Err(e) => {
-            log!(@upload, "Import failed: {}", e);
+            log_legacy!(@upload, "Import failed: {}", e);
             Json(UploadResponse {
                 success: false,
                 filename: Some(filename),

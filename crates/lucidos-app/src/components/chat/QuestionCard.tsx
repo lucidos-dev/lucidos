@@ -2,8 +2,10 @@ import { signal } from '@preact/signals';
 import type { ComponentChildren } from 'preact';
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { answerThreadQuestion, retryUnsentPick } from '../../store/actions/chat-claude-code';
+import { recoverQuestionPick } from '../../store/actions/questionPickRecovery';
 import { createTapGate } from '../../utils/tapGesture';
-import { pendingAnswers, unsentPicks, usePickMark, type PickMark, type UnsentPick } from '../../store/pendingDecisions';
+import { pendingAnswers, unsentPicks, type UnsentPick } from '../../store/pendingDecisions';
+import { usePickMark, type PickMark } from '../../hooks/usePickMark';
 import { renderMarkdown, renderMarkdownInline } from '../../utils/renderMarkdown';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 import { UserMessageBody } from './chat-exchange-parts';
@@ -13,7 +15,7 @@ import { discardUnsentAnswers, retryUnsentMessage } from '../../store/actions/ch
 import { RetryIcon } from '../shared/icons';
 import { Disclosure } from '../shared/Disclosure';
 import { unsentMessages } from '../../store/unsentMessages';
-import { sendFailureDetail, type SendFailure } from '../../store/actions/sendRetry';
+import type { SendFailure } from '../../store/actions/sendRetry';
 import { OptionWidgetFrame } from '../widgets/OptionWidgetFrame';
 import { ReplyHtml, hasWidgetEmbedSlot } from '../widgets/useWidgetEmbedSlots';
 
@@ -191,6 +193,15 @@ function QuestionText({ question, threadId, eventId }: { question: string; threa
  *  lives in the `ask_user_question` tool description and the question rules in
  *  the engine prompts. */
 export function QuestionBody({ threadId, eventId, toolUseId, question, options, multiSelect, resolved, typedAnswer, terminated }: QuestionBodyProps) {
+  const unsentPick = unsentPicks.map.value.get(toolUseId);
+  useEffect(() => {
+    if ((!resolved && !terminated) || !unsentPick) return;
+    if (unsentPick.answer.kind === 'FreeText' || (unsentPick.answer.kind === 'MultiSelected' && (unsentPick.answer.text || unsentPick.answer.image_hashes?.length))) {
+      recoverQuestionPick(toolUseId, unsentPick);
+    } else {
+      unsentPicks.clear(toolUseId);
+    }
+  }, [resolved, terminated, unsentPick, toolUseId]);
   // Drain the module-level maps once the persisted answer lands. Without this,
   // selections + optimistic pending leak across the session. The landing the
   // answer deferred runs now too, once the spinner has given way to the mark.
@@ -198,12 +209,11 @@ export function QuestionBody({ threadId, eventId, toolUseId, question, options, 
     if (!resolved) return;
     pendingAnswers.clear(toolUseId);
     clearMultiSelected(toolUseId);
-    unsentPicks.clear(toolUseId);
     followConfirmedCard(toolUseId);
   }, [resolved, toolUseId]);
 
   // A dead card draws no unconfirmed pick, matching its "Unanswered" header.
-  // The pick stays stored, so an answer that still lands shows it again.
+  // Unconfirmed composer content moves to a fresh draft above.
   // A typed answer still sending reads as the card's answer. Any other typed
   // answer keeps the card as it is and draws under its options, so its text
   // is never hidden.
@@ -223,8 +233,6 @@ export function QuestionBody({ threadId, eventId, toolUseId, question, options, 
     return <TerminatedQuestionBody threadId={threadId} eventId={eventId} question={question} options={options} multiSelect={multiSelect} typedAnswer={typedAnswer} />;
   }
   const typedBlock = typedAnswer && typedAnswerBlock(typedAnswer);
-
-  const unsentPick = unsentPicks.map.value.get(toolUseId);
 
   if (multiSelect) {
     const selected = multiSelectedByToolUse.value.get(toolUseId) ?? [];
@@ -282,6 +290,7 @@ function typedAnswerBlock(answer: TypedAnswer) {
       imageHashes={answer.image_hashes}
       unsent={unsentEventId === undefined ? undefined : {
         failure: unsentMessages.value.get(unsentEventId)?.failure,
+        refusal: unsentMessages.value.get(unsentEventId)?.refusal,
         onRetry: () => void retryUnsentMessage(unsentEventId),
       }}
     />
@@ -342,19 +351,26 @@ function unsentPickTextBlock(pick: UnsentPick, toolUseId: string) {
     <TypedAnswerBlock
       text={text}
       imageHashes={imageHashes}
-      unsent={optionIds.length > 0 ? undefined : { failure: pick.failure, onRetry: () => void retryPick(pick.threadId, toolUseId) }}
+      unsent={optionIds.length > 0 ? undefined : { failure: pick.failure, refusal: pick.refusal, onRetry: () => void retryPick(pick.threadId, toolUseId) }}
     />
   );
 }
 
 interface UnsentNoticeProps {
   failure: SendFailure | undefined;
+  refusal?: UnsentPick['refusal'];
   onRetry: () => void;
+}
+
+/** The details a Not sent notice opens to. */
+function sendFailureDetail(failure: SendFailure): string {
+  const tries = failure.attempts === 1 ? 'try' : 'tries';
+  return `Lucidos did not answer after ${failure.attempts} ${tries}. Last error: ${failure.reason}.`;
 }
 
 /** "Not sent" and a retry icon, for an answer none of whose attempts got a
  *  reply. Tapping "Not sent" rolls open what the attempts ended on. */
-function UnsentNotice({ failure, onRetry }: UnsentNoticeProps) {
+function UnsentNotice({ failure, refusal, onRetry }: UnsentNoticeProps) {
   const [open, setOpen] = useState(false);
   return (
     <div class="question-unsent">
@@ -379,7 +395,7 @@ function UnsentNotice({ failure, onRetry }: UnsentNoticeProps) {
         </button>
       </div>
       <Disclosure open={open} bodyClass="question-unsent-detail">
-        {failure ? sendFailureDetail(failure) : 'Lucidos did not answer, so this answer was not sent.'}
+        {refusal?.message ?? (failure ? sendFailureDetail(failure) : 'Lucidos did not answer, so this answer was not sent.')}
       </Disclosure>
     </div>
   );
@@ -440,7 +456,7 @@ function LiveOptions({
             {unsent && opt.id === noticeOn ? (
               <div class="question-option-unsent">
                 {button}
-                <UnsentNotice failure={unsent.failure} onRetry={() => void retryPick(unsent.threadId, toolUseId)} />
+                <UnsentNotice failure={unsent.failure} refusal={unsent.refusal} onRetry={() => void retryPick(unsent.threadId, toolUseId)} />
               </div>
             ) : button}
           </OptionSlot>

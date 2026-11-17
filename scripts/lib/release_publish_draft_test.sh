@@ -34,6 +34,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_present "$SCRIPT_DIR/../.." scripts/release.sh scripts/lib/release_draft.sh
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_SH="$PROJECT_DIR/scripts/release.sh"
 PUBLISH_SH="$PROJECT_DIR/scripts/release-to-lucidos.sh"

@@ -18,13 +18,16 @@
 //!    "You" and the source thread id flows into the route popover.
 //! 2. `caller` set → `Workspace` (other Lucidos workspace; carries optional
 //!    thread/event id from the request body)
-//! 3. `device_id` present     → `Device`, the id alone. A display resolves the
-//!    device's name from it.
+//! 3. `device_id` present     → `Device`, the id alone, when this engine's
+//!    starter stamped it (`api::gateway_stamp`). A display resolves the
+//!    device's name from it. Unstamped, it is `UnattestedCaller`, carrying the
+//!    id as a hint.
 //! 4. **Machine-local token** (`X-Lucidos-Local-Token` verifies against the
-//!    mode 0600 file the gateway minted) → `Api { mode: Engine }`, the engine's
-//!    own machinery. The build-watch and the release scripts reach the engine
-//!    this way: they belong to no thread, so they hold no origin token, and
-//!    they are not a person either. See ADR 0169.
+//!    mode 0600 file the gateway minted) → `UnattestedCaller` in `Engine` mode.
+//!    The build-watch and the release scripts reach the engine this way: they
+//!    belong to no thread, so they hold no origin token. Any subprocess can
+//!    read the token too, so it proves no owner. One switch holds that meaning
+//!    (`local_auth::local_process_origin`). See ADR 0169.
 //! 5. else                    → `None`. A caller presenting no credential has
 //!    said nothing about itself, and there is no honest actor to build. It is
 //!    NOT the user: stamping one made dropping a credential buy more than
@@ -95,6 +98,7 @@
 //! depth.
 
 use super::hex;
+use super::owner_door::OnUnattested;
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -106,9 +110,10 @@ use uuid::Uuid;
 ///
 /// How much it is worth depends on who is asking. Through the *workspace
 /// gateway* it is the gateway's own value: `enforce` strips the client's copy
-/// and re-injects the device it authenticated. Straight to the engine's
-/// loopback port it is whatever the caller typed. That second case is the
-/// ADR 0050 posture, and the reason nothing here reads it as authorization.
+/// and re-injects the device it authenticated, with a gateway stamp
+/// (`api::gateway_stamp`). Straight to the engine's loopback port it is
+/// whatever the caller typed, and it carries no valid stamp. Only a stamped id
+/// builds a `Device` actor.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
 /// Header carrying the pairing label of the device in [`HEADER_DEVICE_ID`],
@@ -234,7 +239,9 @@ pub fn mint_agent_origin_token(
             // Say so. A silently dropped claim looks exactly like a trigger
             // that woke itself for some other reason.
             if let Some(dropped) = emitting_trigger_id {
-                log!("[Origin] Trigger id is not header-safe, minting with no claim: {dropped:?}");
+                log_legacy!(
+                    "[Origin] Trigger id is not header-safe, minting with no claim: {dropped:?}"
+                );
             }
             ABSENT_SEGMENT.to_string()
         }
@@ -494,40 +501,57 @@ pub fn build_message_origin(
             emitting_trigger_id,
         });
     }
+    let local_token = super::local_auth::is_local_process(headers);
+    // Another workspace is a claim like a device id: only the gateway's stamp
+    // over the caller, its thread and its verdict makes it more.
     if let Some(c) = caller {
-        return Some(MessageOrigin::Workspace {
-            workspace: c.workspace,
-            thread_id: c.thread_id,
-            event_id: c.event_id,
-            user_agent,
-            mode: c.mode,
-        });
+        return Some(
+            match super::gateway_stamp::workspace_call_verdict(headers, &c.workspace, c.thread_id) {
+                Some(verdict) => MessageOrigin::Workspace {
+                    workspace: c.workspace,
+                    thread_id: c.thread_id,
+                    event_id: c.event_id,
+                    user_agent,
+                    mode: c.mode,
+                    verdict: Some(verdict),
+                },
+                None => MessageOrigin::UnattestedCaller {
+                    mode: c.mode,
+                    user_agent,
+                    claimed_device_id: device_id.map(str::to_string),
+                    claimed_local_token: local_token,
+                    claimed_workspace: Some(c.workspace),
+                    claimed_thread_id: c.thread_id,
+                },
+            },
+        );
     }
     match mode {
         ActorMode::Human => {
-            if let Some(id) = device_id {
-                Some(MessageOrigin::Device {
-                    device_id: id.to_string(),
-                })
-            } else if super::local_auth::is_local_process(headers) {
-                // A device wins above, because it names a person and this names
-                // a machine. The order is load-bearing rather than theoretical:
-                // the gateway injects BOTH on every request it proxies, its own
-                // token to prove the hop and the device it authenticated. Read
-                // the other way round, every action from a phone would be
-                // recorded as the engine's own machinery.
-                Some(MessageOrigin::Api {
+            // A device claim wins over the local token, because the gateway
+            // sends BOTH on every request it proxies: its own token to prove
+            // the hop, and the device it authenticated beside it.
+            match device_id {
+                // Only a stamp makes a device id more than typed text.
+                Some(id) if super::gateway_stamp::device_is_stamped(headers, id) => {
+                    Some(MessageOrigin::Device {
+                        device_id: id.to_string(),
+                    })
+                }
+                Some(id) => Some(MessageOrigin::UnattestedCaller {
+                    mode,
                     user_agent,
-                    mode: ActorMode::Engine,
-                    source_thread_id: None,
-                    emitting_trigger_id: None,
-                })
-            } else {
+                    claimed_device_id: Some(id.to_string()),
+                    claimed_local_token: local_token,
+                    claimed_workspace: None,
+                    claimed_thread_id: None,
+                }),
+                None if local_token => Some(super::local_auth::local_process_origin(user_agent)),
                 // Nobody. Not the user: a caller presenting no credential has
                 // said nothing about itself, and naming it human is the
                 // inversion ADR 0169 removes. `require_user_actor` turns this
                 // into a refusal for a handler that must know who is acting.
-                None
+                None => None,
             }
         }
         ActorMode::Agent | ActorMode::Engine => {
@@ -575,16 +599,15 @@ pub fn user_actor(
 pub const UNIDENTIFIED_CALLER: &str =
     "This request carries no identity, so the engine cannot record who is acting. \
      Present one of four credentials: the thread-bound origin token a Lucidos-spawned \
-     subprocess is given, the machine-local token in ~/.lucidos/local-token, an \
+     subprocess is given, the machine-local token file, an \
      x-lucidos-device-id header for a registered device, or a caller_workspace body \
      field for a call from another workspace.";
 
 /// Is this device id evidence, or a header somebody typed?
 ///
-/// [`user_actor`] stamps ANY non-empty id as a `Device` actor, falling
-/// back to a `device-<short>` label. That is right for attribution and wrong
-/// for a gate, and `friendly_name` cannot tell the two apart: it names an
-/// absent device, and a failed read, as readily as a real one.
+/// Asked of an id with no gateway stamp. [`user_actor`] records ANY such id
+/// as an `UnattestedCaller` hint. That is right for attribution and wrong for
+/// a gate, which needs the id to name a real device row.
 ///
 /// A database error counts as registered. This sits on the user's own action
 /// path, so failing closed would refuse real work on a blip. Same trade and
@@ -594,7 +617,7 @@ async fn device_is_evidence(pool: &PgPool, device_id: &str) -> bool {
     match crate::core::DeviceStore::is_registered(pool, device_id).await {
         Ok(exists) => exists,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Actor] device lookup for '{}' failed ({}); treating it as registered so a \
                  database blip cannot refuse real work",
                 device_id,
@@ -648,10 +671,11 @@ fn blank_filtered(s: &str) -> Option<&str> {
 /// four routes drifted apart before ADR 0169, so callers take this and never
 /// re-derive the check.
 ///
-/// **A device id must name a registered device.** Attribution accepts any id
-/// and a gate cannot, or the evidence ADR 0168 clause 4 asks for would be one
-/// header anyone can type. An id that names nothing is suppressed rather than
-/// refused outright, so the caller falls through to its other credentials.
+/// **A device id must be stamped or name a registered device.** Attribution
+/// accepts any id and a gate cannot. An unstamped id naming nothing is
+/// suppressed rather than refused, so the caller falls through to its other
+/// credentials. An unstamped id naming a registered device is an
+/// `UnattestedCaller`: identified, and never the owner.
 ///
 /// 401 rather than 403: the caller may retry with a credential, and nothing
 /// here says its identity would be insufficient. That is a later question, and
@@ -662,7 +686,12 @@ pub(crate) async fn require_user_actor(
     device_id_override: Option<&str>,
 ) -> Result<MessageOrigin, super::error::ApiError> {
     let device_id = match claimed_device_id(device_id_override, headers) {
-        Some(id) if device_is_evidence(pool, id).await => Some(id),
+        Some(id)
+            if super::gateway_stamp::device_is_stamped(headers, id)
+                || device_is_evidence(pool, id).await =>
+        {
+            Some(id)
+        }
         _ => None,
     };
     build_message_origin(headers, ActorMode::Human, device_id, None, None, None, None).ok_or_else(
@@ -693,8 +722,9 @@ pub(crate) async fn require_owner_device_for(
     pool: &PgPool,
     device_id_override: Option<&str>,
     refusal: &'static str,
+    on_unattested: OnUnattested,
 ) -> Result<MessageOrigin, super::error::ApiError> {
-    owner_device(headers, pool, device_id_override)
+    owner_device(headers, pool, device_id_override, on_unattested)
         .await
         .map_err(|e| {
             if e.status == axum::http::StatusCode::FORBIDDEN {
@@ -709,27 +739,29 @@ pub(crate) async fn require_owner_device_for(
 /// registered devices.
 ///
 /// The gate in front of an irreversible, owner-only action (ADR 0192). Only a
-/// resolved `Device` passes. Two other credentials reach here and are refused:
+/// resolved `Device` passes, and a `Device` implies a gateway stamp. Every
+/// other attestation is refused:
 ///
 /// - The **thread-bound origin token**, which proves the opposite of a person:
 ///   a Lucidos-spawned subprocess. It arrives as `Api { mode: Agent }`.
-/// - The **machine-local token**, the engine's own machinery, as
-///   `Api { mode: Engine }`. The build-watch and the release scripts hold it.
+/// - The **machine-local token**, which names a machine and never a person,
+///   whichever way `local_auth`'s switch stands.
+/// - A typed device id with no stamp, which arrives as `UnattestedCaller`.
+///   `on_unattested` says whether that caller is asked about or refused.
 ///
 /// A cross-workspace `caller_workspace` is a body field this route never
-/// parses, so such a caller arrives as one of the two above or as nobody.
-///
-/// **A device header is attribution, not authentication**, and ADR 0192 records
-/// the residual that leaves. This gate closes the part it can: the fail-open
-/// probe, and an app document borrowing the shell's id.
+/// parses, so such a caller arrives as one of the above or as nobody. This gate
+/// also refuses the fail-open probe and an app document borrowing the shell's
+/// id.
 ///
 /// 403 rather than 401: the caller identified itself perfectly well, and the
 /// answer is still no.
 pub(crate) async fn require_owner_device(
     headers: &axum::http::HeaderMap,
     pool: &PgPool,
+    on_unattested: OnUnattested,
 ) -> Result<MessageOrigin, super::error::ApiError> {
-    owner_device(headers, pool, None).await
+    owner_device(headers, pool, None, on_unattested).await
 }
 
 /// [`require_owner_device`], taking [`require_user_actor`]'s override.
@@ -737,6 +769,7 @@ async fn owner_device(
     headers: &axum::http::HeaderMap,
     pool: &PgPool,
     device_id_override: Option<&str>,
+    on_unattested: OnUnattested,
 ) -> Result<MessageOrigin, super::error::ApiError> {
     // An app iframe loads on the engine's own origin and reads the shell's
     // `localStorage`. Its `fetch` therefore carries the owner's real device id
@@ -747,7 +780,9 @@ async fn owner_device(
         headers,
         super::secret_reveal::RefererRule::WhenPresent,
     ) {
-        crate::log!("[Actor] Refusing an owner-only action from an app document");
+        crate::log_legacy!(
+            "[Actor] Refusing an owner-only action from an app document or device session"
+        );
         return Err(super::error::ApiError::new(
             axum::http::StatusCode::FORBIDDEN,
             NOT_THE_OWNERS_DEVICE,
@@ -758,8 +793,15 @@ async fn owner_device(
     // thread whose newest turn-start event has a `Device` actor carries one.
     // So an agent working inside a turn the user opened would inherit this.
     let actor = require_user_actor(headers, pool, device_id_override).await?;
+    // The replay of an act the owner allowed once runs as its caller.
+    if super::owner_door::replaying() {
+        return Ok(actor);
+    }
+    if let MessageOrigin::UnattestedCaller { .. } = actor {
+        return Err(super::owner_door::unattested(on_unattested));
+    }
     let MessageOrigin::Device { device_id, .. } = &actor else {
-        crate::log!(
+        crate::log_legacy!(
             "[Actor] Refusing an owner-only action: the caller is {:?}, not a registered device",
             actor
         );
@@ -776,7 +818,7 @@ async fn owner_device(
     match crate::core::DeviceStore::is_registered(pool, device_id).await {
         Ok(true) => Ok(actor),
         Ok(false) | Err(_) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Actor] Refusing an owner-only action: device '{}' could not be confirmed",
                 device_id
             );
@@ -788,35 +830,75 @@ async fn owner_device(
     }
 }
 
-/// Refuse a Lucidos-spawned subprocess: an agent, a script, or the `lucidos`
-/// CLI one of them runs. A verified origin token proves the caller is one.
+/// What an unattested caller is told at a route only the owner may use.
+pub const NOT_ATTESTED_AS_OWNER: &str =
+    "Only the workspace owner may do this, and this request does not prove it came from \
+     them. A device id or the machine-local token is a claim any local process can make. \
+     Do it in the Lucidos app instead.";
+
+/// Who a caller's credentials say it is, at a door only the owner may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerAttestation {
+    /// A device the gateway stamped, the machine-local token while
+    /// `local_auth` says it proves the owner, or the replay of an act the
+    /// owner allowed once.
+    Owner,
+    /// A Lucidos-spawned subprocess: an agent, a script, or the `lucidos` CLI
+    /// one of them runs.
+    Agent,
+    /// Every other caller, the *unattested caller*.
+    Unattested,
+}
+
+/// Read a caller's credentials as [`OwnerAttestation`].
+pub(crate) fn owner_attestation(headers: &axum::http::HeaderMap) -> OwnerAttestation {
+    if super::owner_door::replaying() {
+        return OwnerAttestation::Owner;
+    }
+    match user_actor(headers, None) {
+        Some(MessageOrigin::Device { .. })
+        | Some(MessageOrigin::Api {
+            mode: ActorMode::Engine,
+            source_thread_id: None,
+            emitting_trigger_id: None,
+            ..
+        }) => OwnerAttestation::Owner,
+        Some(MessageOrigin::Api {
+            mode: ActorMode::Agent,
+            ..
+        }) => OwnerAttestation::Agent,
+        _ => OwnerAttestation::Unattested,
+    }
+}
+
+/// Pass only a caller its credentials attest as the workspace owner.
 ///
 /// For a route only a person may use: a human-only setting, a confirmed send,
-/// a secret reveal. A device, a cross-workspace caller and the machine-local
-/// token pass, since the user's own terminal holds that token. Identity is
-/// [`require_user_actor`]'s question, not this one.
+/// a secret reveal. An agent gets `agent_refusal`, written for the agent
+/// reading it. An unattested caller is asked about or refused, as
+/// `on_unattested` says (`api::owner_door`).
 ///
-/// **A layer, not a boundary.** Any process running as the user can read the
-/// machine-local token, or type a device id on loopback (ADR 0192). This stops
-/// an agent using the credential it was handed, not one set on impersonating
-/// the user.
+/// **A layer, not a boundary.** A process running as the owner can still
+/// rewrite Lucidos's own files. Only an OS sandbox closes that.
 ///
 /// 403: the caller identified itself, and the answer is still no.
-pub(crate) fn refuse_agent_caller(
+pub(crate) fn require_attested_owner(
     headers: &axum::http::HeaderMap,
-    refusal: impl Into<String>,
+    agent_refusal: impl Into<String>,
+    on_unattested: OnUnattested,
 ) -> Result<(), super::error::ApiError> {
-    match subprocess_origin(headers) {
-        SubprocessOrigin::Subprocess { .. } => {
-            let refusal = refusal.into();
-            crate::log!("[Actor] Refused an agent caller: {}", refusal);
-            Err(super::error::ApiError::new(
-                axum::http::StatusCode::FORBIDDEN,
-                refusal,
-            ))
+    let refusal = match owner_attestation(headers) {
+        OwnerAttestation::Owner => return Ok(()),
+        OwnerAttestation::Agent => {
+            super::error::ApiError::new(axum::http::StatusCode::FORBIDDEN, agent_refusal)
         }
-        SubprocessOrigin::NotSubprocess => Ok(()),
-    }
+        OwnerAttestation::Unattested => super::owner_door::unattested(on_unattested),
+    };
+    crate::log_legacy!(
+        "[Actor] Stopped a caller not attested as the owner: {}",
+        refusal.message
+    );
+    Err(refusal)
 }
 
 /// [`require_user_actor`], shaped for a handler that returns a bare `Response`.

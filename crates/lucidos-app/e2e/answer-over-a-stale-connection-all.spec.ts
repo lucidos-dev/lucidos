@@ -76,7 +76,7 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       await page.route(ANSWER_ROUTE, async (route) => {
         attempts += 1;
         if (attempts === 1) await route.abort('failed');
-        else await route.continue();
+        else await route.fallback();
       });
 
       await navigateToApp(page);
@@ -123,7 +123,7 @@ test.describe('CC AskUserQuestion over a dropped connection', () => {
       // The tap and every quiet retry fail, which is the state the user was
       // actually in.
       let landing = false;
-      await page.route(ANSWER_ROUTE, (route) => (landing ? route.continue() : route.abort('failed')));
+      await page.route(ANSWER_ROUTE, (route) => (landing ? route.fallback() : route.abort('failed')));
 
       await navigateToApp(page);
       await openThreadDrawer(page);

@@ -185,6 +185,7 @@ fn thread_event_sse_json_has_seq_and_event_id() {
         eid.to_string(),
         "SSE JSON must include event_id for frontend pending message matching"
     );
+    assert_eq!(json["event_id"], eid.to_string());
     assert_eq!(json["data"]["event"]["type"], "MessageReceived");
     assert_eq!(json["data"]["event"]["text"], "hello");
 }
@@ -338,7 +339,7 @@ fn system_notification_created_matches_server_event_shape() {
             task_id: None,
             app_id: None,
             thread_id: None,
-            event_id: None,
+            event_id: Some("target-event".into()),
             tap: crate::scheduler::notifications::Tap::Modal,
             actor: None,
             audience: None,
@@ -351,6 +352,15 @@ fn system_notification_created_matches_server_event_shape() {
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
     assert_eq!(json["type"], "NotificationCreated");
+    assert_eq!(json["event_id"], emitted.event_id.to_string());
+    assert_eq!(json["data"]["event_id"], "target-event");
+    let replay: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(replay["event_id"], json["event_id"]);
+    let mut distinct = emitted.clone();
+    distinct.event_id = Uuid::new_v4();
+    let distinct: serde_json::Value = serde_json::from_str(&distinct.to_sse_json()).unwrap();
+    assert_ne!(distinct["event_id"], json["event_id"]);
+    assert_eq!(distinct["data"], json["data"]);
     assert_eq!(json["data"]["id"], "n-1");
     assert_eq!(json["data"]["title"], "Test");
     assert_eq!(json["data"]["message"], "Hello");
@@ -649,6 +659,7 @@ fn domain_event_sse_json_uses_inner_event_type() {
     };
 
     let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(json["event_id"], emitted.event_id.to_string());
     assert_eq!(
         json["type"], "SlidePresenterState",
         "Wire `type` must be the inner event_type, not the wrapper 'DomainEvent', \
@@ -766,6 +777,7 @@ fn reserved_type_names_match_event_type() {
         },
         MainCheckPassed {
             check_id: Uuid::nil(),
+            fix_thread_id: None,
             run_url: None,
             flaky: Vec::new(),
             flaky_fix_thread_id: None,
@@ -777,15 +789,28 @@ fn reserved_type_names_match_event_type() {
             failures: Vec::new(),
             run_url: None,
             fix_thread_id: Uuid::nil(),
+            superseded_by_fix: None,
+        },
+        MainCheckRepairStarted {
+            check_id: Uuid::nil(),
+            fix_thread_id: Uuid::nil(),
+            started_by: crate::engine::MainRepairStartedBy::Auto,
+            actor: None,
         },
         MainCheckAbandoned {
             check_id: Uuid::nil(),
             reason: "r".into(),
             run_url: None,
         },
+        MainCheckSuperseded {
+            check_id: Uuid::nil(),
+            to_sha: "c".into(),
+            run_url: None,
+        },
         MainCheckRedClosed {
             check_id: Uuid::nil(),
             reason: crate::engine::RedCloseReason::Closed,
+            fix_thread_id: None,
             actor: None,
         },
         BackupProgress {
@@ -819,6 +844,7 @@ fn reserved_type_names_match_event_type() {
             commit_hash: "c".into(),
             summary: None,
             writer_thread_id: None,
+            writer: None, // Legacy event fixture.
         },
         TriggerCreated {
             trigger_id: "t".into(),
@@ -876,12 +902,14 @@ fn reserved_type_names_match_event_type() {
             commit: "c".into(),
             source: None,
             writer_thread_id: None,
+            writer: None, // Legacy event fixture.
         },
         ArtifactUpdated {
             artifact_path: "p".into(),
             commit: "c".into(),
             source: None,
             writer_thread_id: None,
+            writer: None, // Legacy event fixture.
         },
         ArtifactDeleted {
             artifact_path: "p".into(),
@@ -927,6 +955,8 @@ fn reserved_type_names_match_event_type() {
         PermissionGrantsChanged {
             grant_file: crate::core::GrantFile::CodingAgentTools,
             patterns: vec!["Bash(git:*)".into()],
+            source: crate::core::grants::GrantSource::Settings,
+            granted_in_thread_id: None,
             actor: None,
         },
         CredentialRevealed {

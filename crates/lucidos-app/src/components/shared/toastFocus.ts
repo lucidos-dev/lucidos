@@ -1,15 +1,11 @@
 import type { ToastItem } from '../../store/types';
 
-/** Whether a toast draws its close X. A toast that waits to be answered does.
- *  So does one with a target (a button or a card `onClick`), timed or not: a
- *  tap on its card goes somewhere, so the X is the only way to just close it.
- *  It is also what Escape presses. A timed toast with no target leaves by
- *  itself and draws none. A caller can withhold the X with `dismissable: false`. */
+/** Timed toasts always offer an early exit. Persistent status toasts can
+ *  withhold the close X with `dismissable: false`. Escape uses the same X. */
 export function toastHasClose(
-  t: Pick<ToastItem, 'dismissable' | 'persistent' | 'action' | 'secondaryAction' | 'onClick'>,
+  t: Pick<ToastItem, 'dismissable' | 'persistent'>,
 ): boolean {
-  if (t.dismissable === false) return false;
-  return t.persistent !== false || !!t.action || !!t.secondaryAction || !!t.onClick;
+  return t.persistent === false || t.dismissable !== false;
 }
 
 /** Pure decision for the Tab trap over the toast that currently holds focus.

@@ -1,3 +1,5 @@
+import { readSavedScroll, threadScrollKey } from '../savedScroll';
+import { readerHasReached } from '../thread-events/exchange-anchors';
 import { effect, signal, untracked } from '@preact/signals';
 import { ApiError } from '../../api/client';
 import { fetchEventLocation } from '../../api/threads';
@@ -342,7 +344,7 @@ export async function showEventWhereItLives(eventId: string): Promise<void> {
 }
 
 /** Open a thread from the Blocked or Review group, landing on what waits for
- *  the user (`landingTarget`) rather than on the saved reading position.
+ *  the user (`landingTarget`) unless the saved place has reached its turn.
  *
  *  The target comes from the thread's events, so the thread opens at once and
  *  lands as soon as nothing more is arriving. A slow load never delays the tap.
@@ -372,8 +374,8 @@ function conversationPaneOnScreen(): boolean {
 }
 
 /** Pure: the group a row of the drawer's list lands from, or null. A Blocked
- *  or Review row opens on what needs the user; every other row opens the
- *  thread as it was. */
+ *  or Review row lands on what needs the user unless the saved place has
+ *  reached it; every other row opens the thread as it was. */
 export function landingGroupFor(grouping: DrawerGrouping, selected: OngoingGroup): LandingGroup | null {
   if (grouping !== 'ongoing') return null;
   return selected === 'blocked' || selected === 'review' ? selected : null;
@@ -426,6 +428,8 @@ async function landOnTarget(threadId: string, group: LandingGroup): Promise<void
     if (!stillOpen()) return;
     target = landingTargetIn(threadId, group);
   }
+  const thread = threadMap.value.get(threadId);
+  if (target && thread && readerHasReached(computeExchanges(thread), target, readSavedScroll(threadScrollKey(threadId)))) return;
   const eventId = target?.kind === 'card-not-loaded' ? target.newestTurnId : target?.eventId;
   if (eventId) landOnEvent(threadId, eventId);
 }

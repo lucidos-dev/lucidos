@@ -80,4 +80,13 @@ describe('the drawer disclosure fade', () => {
         render(<Drawer ids={['a', 'b', 'c']} open />, host);
         expect(maskReach()).toEqual(['100px', '0px']);
     });
+
+    it('rolls an empty message without inventing a bottom divider', () => {
+        render(<Drawer ids={['__section_tiles']} open={false} />, host);
+        render(<Drawer ids={['__section_tiles', 'empty-review']} open />, host);
+        expect(maskReach()).toEqual(['50px', '0px']);
+        expect(host.querySelector('.flip-disclosure-hairline')).toBeNull();
+        render(<Drawer ids={['__section_tiles']} open={false} />, host);
+        expect(host.querySelector('.flip-disclosure-hairline')).toBeNull();
+    });
 });

@@ -19,7 +19,7 @@ import { activityAction, buildTimerIsLive } from '../../store/actions/background
 import { openApplyPhase } from '../../store/actions/applyProgress';
 import { cancelApplyAllBatch } from '../../store/actions/chat-changes';
 import { LANE_PLACE_LABEL } from '../../store/actions/landingLane';
-import { cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
+import { fixMainNow, cancelLaneBatch, closeMainCheck, removeFromLandingLane } from '../../store/actions/laneControls';
 import {
   LANE_GATHERING_LABEL,
   LANE_WAITING_FOR_ORIGIN_LABEL,
@@ -69,6 +69,7 @@ export interface ActivityGroupProps {
   onCancelLaneBatch: (batchId: string) => void;
   onOpenFixThread: (threadId: string) => void;
   onCloseMainCheck: (checkId: string) => void;
+  onFixMain?: () => void;
   onOpenPending: () => void;
   onShowBuildLog: () => void;
 }
@@ -197,14 +198,26 @@ function mainCheckStatus(line: MainCheckLine, props: ActivityGroupProps): VNode 
         <div key="main-check" class="brand-menu-activity-position" data-role="main-check">Main check: running</div>
       );
     case 'red': {
-      const phase = `Main red: ${line.summary}`;
+      const phase = `${line.flakyOnly ? 'Main flaky' : 'Main red'}: ${line.summary}`;
       const fix = line.fixThread;
       return (
         <div key="main-check" class="brand-menu-activity-entry" data-role="main-check">
           {fix
             ? linkRow(phase, fix.title, () => props.onOpenFixThread(fix.threadId))
             : <div class="brand-menu-activity-position">{phase}</div>}
-          {!line.closing && (
+          {line.repair && (
+            <div class="brand-menu-activity-position">
+              {line.repair.state === 'running' ? 'Repair running'
+                : line.repair.state === 'waiting' ? `Repair waits for ${line.repair.waiting_on.join(', ') || 'idle capacity'}`
+                : 'No repair scheduled'}
+            </div>
+          )}
+          {line.repair && line.repair.state !== 'running' && (
+            <button type="button" role="menuitem" class="action-btn action-btn-secondary" onClick={props.onFixMain}>
+              Fix now
+            </button>
+          )}
+          {!line.closing && !line.flakyOnly && (
             /* Closes the red for good. The fix thread stays an ordinary
                thread, and what landed meanwhile starts the next check. */
             <button
@@ -452,6 +465,7 @@ export function ActivityMenuGroup({ onClose }: { onClose: () => void }) {
     onCancelLaneBatch: (batchId) => void cancelLaneBatch(batchId),
     onOpenFixThread: openThread,
     onCloseMainCheck: (checkId) => void closeMainCheck(checkId),
+    onFixMain: () => void fixMainNow(),
     onOpenPending: () => {
       onClose();
       // `showToast` freezes a new toast over the pane focused at that moment.

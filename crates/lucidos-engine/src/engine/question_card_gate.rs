@@ -528,7 +528,7 @@ pub(crate) async fn refuse_card(
         }
         Ok(None) => None,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[QuestionCardGate] thread={thread_id} query failed, showing the card: {e}"
             );
             None

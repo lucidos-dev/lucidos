@@ -1,3 +1,4 @@
+import { PREF_BACKUP_SCHEDULE } from '@lucidos/preference-catalog';
 /**
  * What the Backup page's provider and schedule controls should show, given the
  * two reads that answer for them.
@@ -13,7 +14,7 @@
  */
 import type { BackupProviderInfo, BackupSchedule } from '../../api/client';
 import { pickInitialProvider } from './backupProviderScopes';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 
 /** May an in-flight background refresh apply what it read?
  *
@@ -92,7 +93,7 @@ export function backupSeed(
   }
   return {
     providers,
-    schedule: scheduleRead.value.schedule || PREFERENCE_CATALOG.backup_schedule.fallback,
+    schedule: scheduleRead.value.schedule || PREF_BACKUP_SCHEDULE.fallback,
     provider: pickInitialProvider(scheduleRead.value.provider, available),
   };
 }

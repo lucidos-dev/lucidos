@@ -181,29 +181,6 @@
     white-space: nowrap;
 }
 
-/* The agent pause (ADR 0649): a muted line above the composer while typed
-   messages stay between people. Resume packs right of the words. */
-.agent-pause-strip {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.5rem;
-    margin-bottom: 0.375rem;
-    font-size: var(--font-size-sm);
-    color: var(--text-secondary);
-}
-.agent-pause-strip-text strong {
-    color: var(--text-primary);
-    font-weight: 600;
-}
-.agent-pause-strip-resume {
-    font-size: var(--font-size-xs);
-    padding: 0.125rem 0.625rem;
-}
-.agent-pause-strip-failed {
-    color: var(--accent-red);
-}
-
 /* The mentions on offer while an @ word is typed (ADR 0649). */
 .mention-suggestions {
     display: flex;
@@ -1204,7 +1181,7 @@
     /* `translate` glides with the mobile dynamic bars (styles/mobile.css). */
     transition: opacity var(--duration-normal), background-color var(--duration-fast),
         color var(--duration-fast), border-color var(--duration-fast),
-        translate var(--bars-glide-duration, 0s) ease;
+        translate var(--bars-glide-duration, 0s) ease, transform var(--duration-normal) ease;
     z-index: calc(var(--z-float) + 1);
     box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
 }
@@ -1225,14 +1202,19 @@
 
 .scroll-to-top { top: max(calc(var(--header-controls-top) + 0.75rem), calc(var(--mobile-header-height, 0rem) + 0.25rem)); }
 
-/* The bottom slot stack (base.css). The follow toggle always stands in the
-   bottom slot, over the composer's top edge. It renders inside `.prompt-area`,
-   so it rides a growing prompt. The down chevron stands one slot higher. */
+/* The bottom slot row (base.css), over the composer's top edge. The follow
+   toggle renders inside `.prompt-area`, so it rides a growing prompt. The down
+   chevron stands in the same row, at the right edge. While it shows, the toggle
+   slides one slot left of it, and back when it hides. `transform` carries the
+   slide, since mobile's `translate` already carries the bars glide. */
 .follow-toggle { bottom: calc(100% + var(--scroll-chevron-inset)); }
+.thread-pane:has(.scroll-to-bottom.visible) .follow-toggle {
+    transform: translateX(calc(-1 * (var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))));
+}
 /* A menu open in the composer rises over the toggle's slot. The toggle steps
    down to the base layer, so the menu, later in the tree, paints over it. */
 .prompt-area:has([data-overlay-panel]):not(:has(.modal-overlay)) .follow-toggle { z-index: auto; }
-.scroll-to-bottom { bottom: calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap)); }
+.scroll-to-bottom { bottom: var(--scroll-chevron-inset); }
 
 /* The compose view puts the destination row above the prompt box, inside
    `.prompt-area`. The toggle still stands on the prompt box itself, where a
@@ -1269,10 +1251,12 @@
         inset: calc(-1 * var(--scroll-chevron-reach));
     }
 
-    /* The down chevron and the follow toggle each reach half the stack gap
-       toward the other, so the two reaches meet and never overlap. */
-    .scroll-to-bottom::before { bottom: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
-    .follow-toggle::before { top: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
+    /* While side by side, the down chevron and the follow toggle each reach
+       half the stack gap toward the other, so the two reaches meet and never
+       overlap. A hidden chevron takes no tap, so the toggle keeps its full
+       reach then. */
+    .scroll-to-bottom::before { left: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
+    .thread-pane:has(.scroll-to-bottom.visible) .follow-toggle::before { right: calc(-0.5 * var(--scroll-chevron-stack-gap)); }
 }
 
 @media (--desktop-layout) {
@@ -2376,4 +2360,16 @@ button.initiator-actor,
 
 .initiator-files li {
     margin: 0.125rem 0;
+}
+
+
+.thread-status-waiting-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-secondary);
+}
+
+.thread-status-waiting-icon svg {
+    width: 0.7rem;
+    height: 0.7rem;
 }

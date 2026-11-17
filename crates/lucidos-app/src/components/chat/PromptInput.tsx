@@ -5,6 +5,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { signal, untracked, useSignalEffect } from '@preact/signals';
 import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive, scaledDurationMs } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
+import { chatTurnSelection } from '../../store/threadModelSelections';
 import { discardUnsentAnswers, sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
@@ -47,7 +48,8 @@ import { currentComposerEnterKey } from '../../store/actions/preferences';
 import { canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting } from '../../store/canceledQuestions';
 import { NotReadyStrip } from './NotReadyStrip';
 import { mentionCandidates, mentionQueryAt, type MentionCandidate } from './mentions';
-import { mentionablePeople, mentionsEnabled } from '../../store/actions/people';
+import { mentionableUsers, mentionsEnabled } from '../../store/actions/users';
+import { useAgentPaused } from '../../hooks/useAgentPaused';
 import { CODING_AGENT_NAME } from './agentExitCopy';
 import { LUCIDOS_AGENT_LABEL } from '../../store/thread-events';
 import { lazyComponent } from '../../utils/lazyComponent';
@@ -56,7 +58,8 @@ import { composeHandlers } from './composeHandlers';
 import { focusIfNeeded } from '../../utils/dom';
 import { threadEntryFocusTarget } from './choiceCardNav';
 import { focusIntoPane } from '../layout/paneFocus';
-import { syncTextareaValue, promptCaretToEndSeq } from './promptValueSync';
+import { syncTextareaValue, promptCaretToEndSeq, requestPromptCaretToEnd } from './promptValueSync';
+import { endPromptHistory, sentPrompts, stepPromptHistory } from './promptHistory';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
 import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, useWidthRemeasure, animateTextareaHeightFrom, easeEmptiedTextarea, remeasureTextareaForPlaceholder } from './promptResize';
 import { isMobile } from '../../utils/viewport';
@@ -80,8 +83,7 @@ import { passSendGate, sendGateAsks } from './rungSwitch';
 /** The card draws only on a large thread at a clean idle, so its code loads off the first-paint set. */
 const SuccessorCard = lazyComponent(() => import('./SuccessorCard').then((m) => m.SuccessorCard));
 const HandedOffCard = lazyComponent(() => import('./HandedOffCard').then((m) => m.HandedOffCard));
-// Team-only: a personal gateway never draws them, so the first frame skips them.
-const AgentPauseStrip = lazyComponent(() => import('./AgentPauseStrip').then((m) => m.AgentPauseStrip));
+// Team-only: a personal gateway never draws it, so the first frame skips it.
 const MentionSuggestions = lazyComponent(() => import('./MentionSuggestions').then((m) => m.MentionSuggestions));
 
 const attachMenuOpen = signal(false);
@@ -457,7 +459,7 @@ export function PromptInput() {
     resolveCodingAgent(mentionThreadId),
   );
   const mentionOffer = mention && mentionsEnabled.value
-    ? mentionCandidates(mention.query, mentionablePeople.value, mentionBackend ? CODING_AGENT_NAME[mentionBackend] : LUCIDOS_AGENT_LABEL)
+    ? mentionCandidates(mention.query, mentionableUsers.value, mentionBackend ? CODING_AGENT_NAME[mentionBackend] : LUCIDOS_AGENT_LABEL)
     : [];
 
   function autoResize() {
@@ -470,6 +472,29 @@ export function PromptInput() {
    *  ease down while the gesture is still under way. */
   function writeComposerValue(el: HTMLTextAreaElement, text: string): void {
     el.value = text;
+  }
+
+  /** Up and Down walk the thread's sent prompts (`promptHistory.ts`). A recall
+   *  writes the draft, never the box, then asks the sync for an end caret. */
+  function recallPromptHistory(e: KeyboardEvent) {
+    const threadId = focusedThreadId.value;
+    const el = inputRef.current;
+    if (!threadId || !el) return;
+    const text = stepPromptHistory(
+      threadId,
+      {
+        direction: e.key === 'ArrowUp' ? 'up' : 'down',
+        text: el.value,
+        selectionStart: el.selectionStart,
+        selectionEnd: el.selectionEnd,
+        modified: ['Meta', 'Control', 'Alt', 'Shift'].some((key) => e.getModifierState(key)),
+      },
+      sentPrompts(threadMap.peek().get(threadId)),
+    );
+    if (text === null) return;
+    e.preventDefault();
+    updateCompose(threadId, { text });
+    requestPromptCaretToEnd();
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -498,6 +523,10 @@ export function PromptInput() {
         inputRef.current?.blur();
       }
       return;
+    }
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && mentionOffer.length === 0) {
+      recallPromptHistory(e);
+      if (e.defaultPrevented) return;
     }
     if (composerEnterSends(e, currentComposerEnterKey(), isMobile())) {
       e.preventDefault();
@@ -558,7 +587,6 @@ export function PromptInput() {
     }
     const sideQuestion = routeSideQuestion(msg, {
       started: thread.meta.state !== 'composing',
-      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
     }, intent.asSideQuestion === true);
     if (sideQuestion.kind !== 'message') {
       clearSubmittingThread(threadId);
@@ -613,7 +641,6 @@ export function PromptInput() {
     const useCodingAgent = effectiveSendMode(thread) === 'claude_code';
     const sideQuestion = routeSideQuestion(msg, {
       started: threadId !== null && thread !== undefined && thread.meta.state !== 'composing',
-      codex: effectiveCodingAgentBackend(thread, resolveCodingAgent(threadId)) === 'codex',
     }, sideQuestionMode);
     if (sideQuestion.kind === 'refuse') {
       showToast(sideQuestion.toast, 'info');
@@ -629,7 +656,9 @@ export function PromptInput() {
     // A queued send keeps the draft and fires later, which would read as a
     // dead button. The composer's upload line says it is waiting, for as long
     // as it waits (`uploadSendNotice`).
+    // A refused send keeps the walk, so Down can still restore the draft.
     if (sideQuestion.kind === 'ask' && threadId) {
+      endPromptHistory(threadId);
       if (uploadInFlight) {
         queueUploadSend(threadId, { useCodingAgent, context, asSideQuestion: true });
         return;
@@ -638,6 +667,7 @@ export function PromptInput() {
       return;
     }
     if (threadId && sendGateAsks(threadId) && !await passSendGate(threadId)) return;
+    if (threadId) endPromptHistory(threadId);
     if (threadId && uploadInFlight) {
       // A queued send still flips the button to the optimistic Cancel — settle.
       armCancelSettle();
@@ -884,7 +914,6 @@ export function PromptInput() {
   const sideQuestionMode = sideQuestionModeActive({
     stored: sideQuestionModeOn(focusedThreadId.value),
     threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
-    isCodex: promptCodingAgent === 'codex',
   });
   // A placeholder swap changes what the empty box has to fit without touching
   // its value, which is all `resizeTextarea` reacts to. So each swap forces a
@@ -894,7 +923,10 @@ export function PromptInput() {
   //
   // A height ease in flight is re-aimed rather than overwritten, so it never
   // ends in a snap. See `remeasureTextareaForPlaceholder`.
-  const placeholder = promptPlaceholder(threadHasConversation(focusedThreadId.value, focusedThread), answeringQuestionCard, sideQuestionMode);
+  // The agent pause (ADR 0649) is team-only, and a draft has none yet.
+  const pausableThreadId = mentionsEnabled.value && focusedThread?.meta.state === 'active' ? focusedThreadId.value : null;
+  const agentPaused = useAgentPaused(pausableThreadId);
+  const placeholder = promptPlaceholder(threadHasConversation(focusedThreadId.value, focusedThread), answeringQuestionCard, sideQuestionMode, agentPaused);
   useEffect(() => {
     const el = inputRef.current;
     if (el) remeasureTextareaForPlaceholder(el);
@@ -996,7 +1028,6 @@ export function PromptInput() {
   // listens on `click`.
   const sideQuestionRefusal = sideQuestionBlocker({
     threadStarted: focusedThread !== undefined && focusedThread.meta.state !== 'composing',
-    isCodex: promptCodingAgent === 'codex',
   });
   /** The toggle and the shortcut turn the mode on and off alike. Where a side
    *  question cannot be asked, the shortcut says why. The toggle is not drawn
@@ -1296,8 +1327,10 @@ export function PromptInput() {
 
   // The rung control, for a coding agent and for the Lucidos Agent alike: a
   // pill beside the send button, with a step at each end. A running turn does
-  // not disable it: the list still opens, and the control refuses the pick.
-  const rungDisabledReason = answersCard
+  // not disable it: Lucidos Agent picks apply to the next turn.
+  const pendingRung = !inComposeContext && !promptCodingAgent && ['running', 'waiting_for_user_answer', 'paused'].includes(focusedStatus)
+    && chatTurnSelection(focusedThreadId.value ?? undefined).pending;
+  const rungDisabledReason = answersCard && promptCodingAgent
     ? 'Answer or cancel the pending question or permission request before changing the model and effort'
     : null;
   // The banner's members: Diff, and the one control in the action slot. With
@@ -1461,7 +1494,7 @@ export function PromptInput() {
     rung: {
       key: RUNG_FOLD_KEY,
       dataRole: 'rung-control',
-      label: 'Model and effort',
+      label: pendingRung ? 'Model and effort *' : 'Model and effort',
       disabledTooltip: rungDisabledReason ?? undefined,
       icon: () => <RungMenuIcon />,
       onMenuClick: (anchor) => { if (anchor) rungFoldOpenRequest.value = anchor; },
@@ -1607,7 +1640,6 @@ export function PromptInput() {
       </Disclosure>
       <MentionSuggestions key="mentions" candidates={mentionOffer} onPick={pickMention} />
       <NotReadyStrip key="not-ready" />
-      <AgentPauseStrip key="agent-pause" />
       <SuccessorCard key="successor" onSend={() => void submit()} />
       <HandedOffCard key="handed-off" />
       <div key="prompt-box" class="prompt-box">

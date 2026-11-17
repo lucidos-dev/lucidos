@@ -152,6 +152,7 @@ async fn state_after_clearing_event(event: ThreadEvent) -> CodingAgentChangeStat
 #[tokio::test]
 async fn change_applied_clears_the_change_state() {
     let state = state_after_clearing_event(ThreadEvent::ChangeApplied {
+        content: Default::default(),
         change_id: String::new(),
         requires_restart: false,
         client_update: false,

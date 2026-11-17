@@ -1,6 +1,8 @@
 use serde_json::{Map, Value};
 
-use crate::http::{client as http_client, send_and_print};
+use crate::http::{
+    client as http_client, client_with_timeout as http_client_with_timeout, send_and_print,
+};
 use crate::workspace::{BoxError, Workspace};
 
 pub(crate) fn cmd_emit(
@@ -60,6 +62,7 @@ pub(crate) struct QueryFilters<'a> {
 }
 
 pub(crate) fn cmd_query(ws: &Workspace, filters: QueryFilters<'_>) -> Result<(), BoxError> {
+    print_liveness_header(ws, filters.thread_id);
     let url = format!("{}/api/v1/events/query", ws.base_url());
     let params = build_query_params(&filters);
     let mut req = http_client()?.get(&url);
@@ -78,6 +81,7 @@ pub(crate) struct CountFilters<'a> {
 }
 
 pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(), BoxError> {
+    print_liveness_header(ws, filters.thread_id);
     let url = format!("{}/api/v1/events/count", ws.base_url());
     let params = build_count_params(&filters);
     let mut req = http_client()?.get(&url);
@@ -85,6 +89,59 @@ pub(crate) fn cmd_count(ws: &Workspace, filters: CountFilters<'_>) -> Result<(),
         req = req.query(&params);
     }
     send_and_print("GET", &url, req)
+}
+
+/// Print one thread's liveness on stderr, so stdout stays parseable JSON. A
+/// failed read, or an engine without the route, prints nothing: an absent
+/// header claims nothing.
+fn print_liveness_header(ws: &Workspace, thread_id: Option<&str>) {
+    let Some(thread_id) = thread_id else {
+        return;
+    };
+    let url = format!("{}/api/v1/threads/{}/liveness", ws.base_url(), thread_id);
+    let liveness = http_client_with_timeout(std::time::Duration::from_secs(5))
+        .ok()
+        .and_then(|client| client.get(&url).send().ok())
+        .filter(|response| response.status().is_success())
+        .and_then(|response| response.json::<Value>().ok());
+    if let Some(line) = liveness.as_ref().and_then(liveness_header_line) {
+        // User-facing CLI output on stderr, beside the JSON on stdout.
+        eprintln!("{line}");
+    }
+}
+
+/// `# thread: working · running · session 2 (handoff, 9 min) · active 4 s ago`.
+fn liveness_header_line(liveness: &Value) -> Option<String> {
+    let mut parts = vec![
+        liveness.get("state")?.as_str()?.to_string(),
+        liveness.get("status")?.as_str()?.to_string(),
+    ];
+    if let Some(session) = liveness.get("session") {
+        parts.push(format!(
+            "session {} ({}, {})",
+            session.get("ordinal")?.as_u64()?,
+            session.get("continuity")?.as_str()?,
+            age(session.get("age_secs")?.as_i64()?)
+        ));
+    }
+    if liveness.get("handoff").and_then(Value::as_str) == Some("pending") {
+        parts.push("handoff pending".to_string());
+    }
+    if let Some(secs) = liveness
+        .get("last_activity_age_secs")
+        .and_then(Value::as_i64)
+    {
+        parts.push(format!("active {} ago", age(secs)));
+    }
+    Some(format!("# thread: {}", parts.join(" · ")))
+}
+
+fn age(secs: i64) -> String {
+    match secs {
+        ..=59 => format!("{secs} s"),
+        60..=3599 => format!("{} min", secs / 60),
+        _ => format!("{} h", secs / 3600),
+    }
 }
 
 fn build_count_params(filters: &CountFilters<'_>) -> Vec<(&'static str, String)> {
@@ -137,6 +194,33 @@ fn build_query_params(filters: &QueryFilters<'_>) -> Vec<(&'static str, String)>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_header_line_reads_like_the_wire_object() {
+        let liveness = serde_json::json!({
+            "state": "working",
+            "status": "running",
+            "last_activity_age_secs": 4,
+            "session": {"ordinal": 2, "continuity": "handoff", "age_secs": 553},
+            "as_of": "2026-11-13T16:43:15Z",
+        });
+        assert_eq!(
+            liveness_header_line(&liveness).as_deref(),
+            Some("# thread: working · running · session 2 (handoff, 9 min) · active 4 s ago")
+        );
+        let stalled = serde_json::json!({
+            "state": "stalled", "status": "idle", "handoff": "pending",
+            "last_activity_age_secs": 7200, "as_of": "2026-11-13T16:43:15Z",
+        });
+        assert_eq!(
+            liveness_header_line(&stalled).as_deref(),
+            Some("# thread: stalled · idle · handoff pending · active 2 h ago")
+        );
+        assert_eq!(
+            liveness_header_line(&serde_json::json!({"error": "x"})),
+            None
+        );
+    }
 
     #[test]
     fn enforce_summary_accepts_existing_string() {

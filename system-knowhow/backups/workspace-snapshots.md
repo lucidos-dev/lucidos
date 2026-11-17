@@ -1,6 +1,6 @@
 ---
 name: Workspace snapshots
-description: Local workspace snapshots: create, list, check, keep, delete, restore the same workspace, recovery snapshots, owner approval, and interrupted restore status. Load before risky workspace changes or an in-place rollback.
+description: Local workspace snapshots: create, list, check, keep, delete, restore the same workspace, recovery snapshots, the restore permission, and interrupted restore status. Load before risky workspace changes or an in-place rollback.
 ---
 
 # Workspace snapshots
@@ -31,10 +31,13 @@ delete, status and restore. Target the intended workspace explicitly when
 working across workspaces. A handle is opaque; never read or edit snapshot
 storage, keys, dumps or journals directly.
 
-An agent restore needs the owner's exact, single-use approval for that target
-and handle, or the target owner's allow policy. Policy alone never authorizes
-restoring the agent's own workspace. Source identity must be verified through
-the gateway before policy or approval is considered. A lost approval-spend or
+An agent restores only into a *machine-made workspace*: the gateway refuses
+an agent restore into a user's or unknown one with
+`snapshot_restore_target_protected`, under either policy. The owner restores
+those from the picker. A machine-made workspace is the agent's, so the restore
+needs no card, and the thread records `MachineMadeWorkspaceChanged`. An agent
+can never restore the workspace it runs in. Source identity must be verified through
+the gateway before policy is considered. A lost authorization or
 restore response is uncertain: inspect status, never blindly retry.
 
 CLI restore accepts `--wait` to poll the admitted restore's exact gateway

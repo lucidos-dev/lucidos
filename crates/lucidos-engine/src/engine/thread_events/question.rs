@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::api::thread_reach::ThreadReachVerb;
+use crate::engine::permission::Action;
+
+use super::MessageOrigin;
 
 /// One option offered by CC's AskUserQuestion tool. Persisted inside
 /// `UserQuestionAsked` and looked up when the user picks one to send the
@@ -84,14 +86,14 @@ pub enum AnswerKind {
     Superseded,
 }
 
-/// The one clause-4 act an *owner approval card* proposes (ADR 0387).
+/// The one clause-4 act the retired single-use Allow once card proposed
+/// (ADR 0387).
 ///
-/// Set on a `UserQuestionAsked` only by the internal ask route, when the agent
-/// asks with an `OwnerApprovalRequested` id. The engine then writes the card's
-/// question and options. Its presence is what makes the card's Allow spendable.
+/// History only: nothing writes it now. It stays so stored
+/// `UserQuestionAsked` and `OwnerApprovalRequested` rows still read.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OwnerApproval {
-    pub verb: ThreadReachVerb,
+    pub verb: Action,
     /// The thread the act aims at. Workspace-scoped snapshot approvals use
     /// explicit workspace and snapshot fields instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +102,38 @@ pub struct OwnerApproval {
     pub target_workspace_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot_handle: Option<String>,
+}
+
+/// An owner-only act an *unattested caller* asked for, parked on a permission
+/// request until the owner answers it (`api::owner_door`).
+///
+/// The engine writes the card. Allow once from a stamped device grants a
+/// permission for this one act, and `PermissionSpent` records its run.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct UnattestedAct {
+    /// Who asked: always an `UnattestedCaller`. The replayed act runs as it.
+    pub caller: MessageOrigin,
+    pub request: UnattestedRequest,
+}
+
+/// What an [`UnattestedAct`] runs on Allow once.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UnattestedRequest {
+    /// A request to an owner-only route, replayed as it arrived. `path`
+    /// carries its query and is relative to `/api/v1`.
+    Http {
+        method: String,
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        /// The restore generation the caller sent, so a replay after a
+        /// snapshot restore is fenced as the live request would be.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_generation: Option<String>,
+    },
+    /// One coding-agent run in the card's own thread.
+    StartCodingAgent,
 }
 
 impl AnswerKind {

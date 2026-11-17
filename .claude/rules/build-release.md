@@ -4,6 +4,8 @@ paths:
   - "scripts/check-staged-copies.sh"
   - "scripts/release*.sh"
   - "scripts/lib/build_*.sh"
+  - "scripts/lib/dmg_*.sh"
+  - "scripts/lib/dmg_layout.py"
   - "scripts/lib/stage_runtime*.sh"
   - "scripts/lib/stage_runtime*.py"
   - "scripts/lib/resource_contract*.sh"
@@ -11,6 +13,9 @@ paths:
   - "scripts/lib/install*.sh"
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
+  - "scripts/lib/release_blockers.sh"
+  - "scripts/lib/release_blockers_test.sh"
+  - "scripts/lib/private_data_patterns*.sh"
   - "scripts/lib/github_auth*.sh"
   - "scripts/*onnxruntime*.sh"
   - "scripts/block-ort-upstream.sh"
@@ -37,31 +42,21 @@ paths:
   - "scripts/check-mirror-pushers.sh"
   - "scripts/mirror-push-gate.sh"
   - "scripts/lib/check_mirror_pushers_test.sh"
-  # The local rc channel, described under "Test an update before publishing".
-  - "scripts/publish-rc-channel.sh"
-  - "scripts/lib/rc_channel*.sh"
+  # The Local publisher; see "Named update channels" below.
+  - "scripts/publish-local-channel.sh"
+  - "scripts/lib/local_channel*.sh"
+  - "scripts/lib/update_channel_feed*"
+  - "scripts/lib/release_channel*.py"
 ---
 
 # Build, Packaging & Installer
 
-Building the engine and desktop app, lockfile determinism, runtime staging, the
-release pipeline and the `curl … | sh` installer. The dev-runtime half is
-`.claude/rules/dev-runtime.md`, and the front-door CI jobs are
-`.claude/rules/front-door.md`. Facts that no ADR or script header holds live in
-`docs/release-pipeline-notes.md`.
-
-**`paths:` above is an explicit list, not a `scripts/**` catch-all.** A new script
-under `scripts/` gets no rule until its path is added here or to `dev-runtime.md`.
-A path may sit in both lists (`codesign.sh` does). `Makefile` belongs to
-`dev-runtime.md` alone.
+See `dev-runtime.md`, `front-door.md` and `docs/release-pipeline-notes.md` for related conventions.
+Add new script paths above; `Makefile` belongs to `dev-runtime.md`.
 
 ## Build
 
-```bash
-cargo build -p lucidos-engine --release    # Engine
-./scripts/build-dmg.sh [--emit-tarball]     # macOS: self-contained .app + .dmg (bundled PG)
-./scripts/build-headless.sh [--check]       # Linux + macOS: Tauri-free headless tarball
-```
+
 
 ### GitHub Actions never gates a change: release checks, on-demand e2e and the main check
 
@@ -70,8 +65,8 @@ cargo build -p lucidos-engine --release    # Engine
   `install-smoke.yml` and `release-tarballs.yml`. Their headers say what fires
   each (ADRs 0382, 0386, 0464, 0536).
 - **Never add a workflow that compiles, lints, type-checks or tests per push or
-  PR.** Lucidos is not PR-based, so such a trigger never fires or fires too late.
-  A per-change check goes into `scripts/lib/harden_suites.sh` (`hs_select_suites`, `hs_suite_command`).
+  PR.** Put per-change checks in `scripts/lib/harden_suites.sh`
+  (`hs_select_suites`, `hs_suite_command`).
 - **Nothing in a workflow deploys.** Deploys run on the maintainer's machine
   (ADR 0031).
 - **The main check gates nothing.** `scripts/main-check.sh <sha>` runs after a
@@ -92,15 +87,9 @@ cargo build -p lucidos-engine --release    # Engine
 
 ### CI caches DEPENDENCIES only, and the release legs sit in their own namespace
 
-A release build may use `Swatinem/rust-cache` only because it drops workspace
-members before saving, so every release compiles `crates/**` from source. Four
-rules, each asserted by `release_tarballs_gate_test.sh`:
-
-- **Pin the action by commit, never by tag.**
-- **Key per leg** (triple and container image).
-- **Only the `rc/**` arm writes** (`save-if`).
-- **`prefix-key` fences release from smoke.** Nothing `install-smoke` writes may be
-  readable by `release-tarballs`.
+Pin `Swatinem/rust-cache` by commit and drop workspace members before caching.
+Key per triple/container; only `rc/**` saves. Keep release and smoke prefixes
+separate. `release_tarballs_gate_test.sh` enforces this contract.
 
 ### Lockfile determinism: builds are fail-closed (ADR 0020)
 
@@ -180,11 +169,11 @@ object while the scan inspects only the tip. All of it is in `release_tree.sh`:
 
 Every write to the public mirror goes through `release_tree_push` in
 `scripts/lib/release_tree.sh`. It refuses unless the ref is a release or e2e ref
-(`main`, `rc/*`, `e2e/*`, `v*`), the tree passes the scan and the ancestry is
+(`main`, `rc/*`, `e2e/*`, `v*`, exactly `channel/beta`), the tree passes the scan and the ancestry is
 published. `release_mirror_gate` points `remote.lucidos.pushurl` at a refusing
 value, installed by `scripts/mirror-push-gate.sh`. `./scripts/check-mirror-pushers.sh`
 fails `/harden` when any other tracked script pushes. Route the push through
-`release_tree_push`, never widen the allowlist.
+`release_tree_push`; no other channel ref is allowed.
 
 ### The source side: main gets the bump, and the tag names it (ADR 0029)
 
@@ -261,15 +250,21 @@ to `main`, creates a `v*` tag or publishes a Release. Preserve that.
 - **Ask once per release whether it needs a release notice.** See
   `docs/release-pipeline-notes.md`.
 
-### Test an update before publishing: the rc channel
+### Named update channels (ADR 0715)
 
-- **`scripts/publish-rc-channel.sh <version>` is by hand only.** Phase A names
-  it in its handoff and never runs it.
-- **It writes only `<workspace>/data/artifacts/releases/rc/`.** It reads the
-  staging and never touches `~/.lucidos` or the app's data.
-  `scripts/lib/rc_channel_test.sh` asserts both.
-- **The bundle keeps its real signature.** The update address changes where the
-  app looks, never which key it trusts. Steps: `docs/desktop-app.md`.
+- **Local staging is manual.** `publish-local-channel.sh` asks the gateway CLI
+  for its directory. Never derive a machine-home path or select a channel.
+- **Beta reuses Phase A bytes after every rc install-smoke gate succeeds.**
+  Only `release_tree_push` moves `refs/tags/channel/beta`.
+- **Reserve before exposure.** Commit the private version/hash ledger before
+  public mutation. Retired versions cannot be reused; assets are immutable.
+- **Serialize publish, retire and refresh.** Stable stays the feed floor.
+  Refresh failure prints `STILL OWED` without failing Stable.
+- **Verify before advertising.** HEAD-check bundles; compare feed bytes at edge
+  and origin. Deploy through the workspace, never CI.
+
+Commands, retry protocol and fixtures: `docs/release-pipeline-notes.md`,
+§ Named update feeds; Local steps: `docs/desktop-app.md`.
 
 ## Installer (`install.sh` + `uninstall.sh`)
 
@@ -304,3 +299,9 @@ to `main`, creates a `v*` tag or publishes a Release. Preserve that.
 publisher pins the download links. `scripts/lib/version_sources_test.sh` enforces
 it, and Phase A runs it against the worktree after both bumps. Never hand-maintain
 a second copy.
+
+### A release tag needs a clean blocker ledger
+
+The gate reads the private ledger at main HEAD and checks fix ancestry against the cut.
+Never write a waiver unattended; the owner must authorize one version and its reason.
+Format, retry state and audit records: `docs/release-pipeline-notes.md` § Release blockers.

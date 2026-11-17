@@ -92,54 +92,6 @@ fn the_marker_name_is_the_wire_name() {
     assert!(MARKER_ENTRY.starts_with(format!("{AGENT_RUN_ENV}=").as_bytes()));
 }
 
-/// Only an agent spawn stamps the marker. A background task, a trigger script
-/// or an MCP server that did would die with the agent's turn (ADR 0257).
-#[test]
-fn only_the_agent_spawn_sets_the_marker() {
-    use crate::test_support::source_scan::production_sources;
-    let allowed = [
-        "runtime/agent_run_marker.rs",
-        "runtime/spawn_env.rs",
-        "core/environment_variables.rs",
-    ];
-    for (rel, text) in production_sources() {
-        if allowed.contains(&rel.as_str()) {
-            continue;
-        }
-        assert!(
-            !text.contains("AGENT_RUN_ENV") && !text.contains("LUCIDOS_AGENT_RUN"),
-            "{rel} names the agent run marker; only the agent spawn may set it"
-        );
-    }
-}
-
-/// The launchers exec the gateway and the shared build-watch without the
-/// marker. Otherwise an agent that starts them from Bash would reap them, and
-/// every engine the gateway spawns, at its turn end.
-#[test]
-fn the_daemon_launchers_drop_the_marker() {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/workspace.sh");
-    let script = std::fs::read_to_string(&path).expect("read workspace.sh");
-    assert!(
-        script.contains(&format!("AGENT_RUN_ENV=\"{AGENT_RUN_ENV}\"")),
-        "workspace.sh names the marker as the engine does"
-    );
-    for launch in [
-        "run_gateway_supervised \"$(gateway_data_dir)\"",
-        "exec perl \"$WORKSPACE_LIB_DIR/build_watch_exec.pl\"",
-    ] {
-        let line = script
-            .lines()
-            .find(|line| line.contains(launch))
-            .unwrap_or_else(|| panic!("workspace.sh launches `{launch}`"));
-        assert!(
-            line.contains("unset \"$AGENT_RUN_ENV\""),
-            "`{launch}` must be exec'd without the marker: {line}"
-        );
-    }
-}
-
 /// What a sleeper runs. macOS hides the environment of Apple platform binaries
 /// such as `/bin/sleep`, so the sleeper is this test binary instead.
 #[test]
@@ -376,4 +328,56 @@ async fn the_resumed_session_reaps_what_the_handed_over_run_left() {
         died,
         "the resumed session's end reaps the handed-over processes"
     );
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Only an agent spawn stamps the marker. A background task, a trigger script
+    /// or an MCP server that did would die with the agent's turn (ADR 0257).
+    #[test]
+    fn only_the_agent_spawn_sets_the_marker() {
+        use crate::test_support::source_scan::production_sources;
+        let allowed = [
+            "runtime/agent_run_marker.rs",
+            "runtime/spawn_env.rs",
+            "core/environment_variables.rs",
+        ];
+        for (rel, text) in production_sources() {
+            if allowed.contains(&rel.as_str()) {
+                continue;
+            }
+            assert!(
+                !text.contains("AGENT_RUN_ENV") && !text.contains("LUCIDOS_AGENT_RUN"),
+                "{rel} names the agent run marker; only the agent spawn may set it"
+            );
+        }
+    }
+
+    /// The launchers exec the gateway and the shared build-watch without the
+    /// marker. Otherwise an agent that starts them from Bash would reap them, and
+    /// every engine the gateway spawns, at its turn end.
+    #[test]
+    fn the_daemon_launchers_drop_the_marker() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/lib/workspace.sh");
+        let script = std::fs::read_to_string(&path).expect("read workspace.sh");
+        assert!(
+            script.contains(&format!("AGENT_RUN_ENV=\"{AGENT_RUN_ENV}\"")),
+            "workspace.sh names the marker as the engine does"
+        );
+        for launch in [
+            "run_gateway_supervised \"$(gateway_data_dir)\"",
+            "exec perl \"$WORKSPACE_LIB_DIR/build_watch_exec.pl\"",
+        ] {
+            let line = script
+                .lines()
+                .find(|line| line.contains(launch))
+                .unwrap_or_else(|| panic!("workspace.sh launches `{launch}`"));
+            assert!(
+                line.contains("unset \"$AGENT_RUN_ENV\""),
+                "`{launch}` must be exec'd without the marker: {line}"
+            );
+        }
+    }
 }

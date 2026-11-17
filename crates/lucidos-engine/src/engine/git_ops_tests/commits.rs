@@ -290,3 +290,29 @@ async fn worktree_dirty_files_reads_a_rename_origin_whole() {
         "both halves of each rename, with the origin path intact",
     );
 }
+
+#[tokio::test]
+async fn landing_content_uses_the_landed_trees_not_the_proposal_files() {
+    use crate::engine::thread_events::ChangeContent;
+    let (_tmp, repo) = make_test_repo().await;
+    tokio::fs::create_dir_all(repo.join("docs/plans"))
+        .await
+        .unwrap();
+    commit_on_branch(&repo, "plan", "docs/plans/example.md", "plan").await;
+    let files = changed_files_in_range(&repo, "main..plan").await.unwrap();
+    assert_eq!(ChangeContent::from_files(&files), ChangeContent::PlanOnly);
+    // The proposal was plan-only; a later code commit changes what lands.
+    git_cmd(&["checkout", "plan"], &repo).await.unwrap();
+    tokio::fs::write(repo.join("code.rs"), "fn example() {}")
+        .await
+        .unwrap();
+    git_cmd(&["add", "."], &repo).await.unwrap();
+    git_cmd(&["commit", "-m", "add code"], &repo).await.unwrap();
+    let files = changed_files_in_range(&repo, "main..plan").await.unwrap();
+    assert_eq!(ChangeContent::from_files(&files), ChangeContent::Code);
+    assert!(changed_files_in_range(&repo, "missing..plan")
+        .await
+        .is_err());
+    let files = changed_files_in_range(&repo, "plan..plan").await.unwrap();
+    assert_eq!(ChangeContent::from_files(&files), ChangeContent::Code);
+}

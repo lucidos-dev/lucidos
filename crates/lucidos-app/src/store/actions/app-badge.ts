@@ -11,6 +11,7 @@ import { unreadCount } from '../store';
 import { IS_PICKER, WORKSPACE_ID } from '../../utils/basePath';
 import { isTauri } from '../../utils/platform';
 import { listRemoteWorkspaces, listWorkspaces, type WorkspaceStatus } from '../../api/client/control';
+import { notifyRows } from '../../utils/notificationRows';
 import { mergeRemoteListings, type RemoteGatewayView } from '../../utils/remoteWorkspaces';
 
 type BadgingNavigator = Navigator & {
@@ -43,8 +44,8 @@ export function applyAppBadge(count: number): void {
 export const peerWorkspaces = signal<WorkspaceStatus[]>([]);
 
 /** Every paired remote gateway's workspaces, as of the last refresh. Feeds the
- *  Lucidos menu's notifications group only. The icon badge and the brand mark
- *  count this gateway's workspaces, so a remote count never moves them.
+ *  Lucidos menu's notifications group and header total. The icon badge counts
+ *  this gateway's workspaces, so a remote count never moves it.
  *
  *  Views rather than bare rows, so a gateway that falls silent keeps its last
  *  rows marked unreachable, the same shape the picker holds. */
@@ -89,28 +90,31 @@ const otherWorkspacesUnread = computed(() =>
     .reduce((sum, w) => sum + (w.unread_count ?? 0), 0),
 );
 
-/** The number BOTH badges show: this workspace's live unread count plus every
- *  other workspace behind the gateway.
- *
- *  One computed, two readers. `syncWorkspaceAppBadge` writes it onto the
- *  installed app's icon, and the brand mark renders it. Deriving the same total
- *  twice is exactly how the two would drift apart.
- *
- *  Our own half is ALWAYS the live `unreadCount`, so an optimistic mark-read
- *  drops both on the same tick. */
+/** Origin-scoped total for the OS icon, matching native and push badge writers. */
 export const crossWorkspaceUnreadTotal = computed(
   () => unreadCount.value + (badgesEveryWorkspace() ? otherWorkspacesUnread.value : 0),
+);
+
+/** The header counts exactly the notification rows offered by its menu. */
+export const notificationsMenuUnreadTotal = computed(() =>
+  notifyRows({
+    peers: peerWorkspaces.value,
+    remotePeers: remotePeerWorkspaces.value,
+    ownUnread: unreadCount.value,
+    ownId: WORKSPACE_ID,
+    ownName: null,
+  }).reduce((sum, row) => sum + row.count, 0),
 );
 
 /** Re-read the OTHER workspaces' unread counts from the gateway and re-assert
  *  the icon badge. A no-op outside a gateway-served workspace context.
  *
  *  The counts come from the same control listing the in-app workspace switcher
- *  renders (`GET /~/api/v1/control/workspaces`), refreshed by the gateway's 2s
- *  supervise loop. A stopped workspace reports no count and contributes 0, the
+ *  renders (`GET /~/api/v1/control/workspaces`), read as the requesting device.
+ *  A stopped workspace reports no count and contributes 0, the
  *  same "running workspaces only" rule the picker badge and the desktop dock
  *  badge already follow. It also re-reads every paired remote gateway through
- *  {@link refreshRemotePeers}, for the notifications group's remote rows only.
+ *  {@link refreshRemotePeers}, for the notification rows and header total.
  *
  *  The rows are stored whole, but only the OTHERS are counted. Our own row is
  *  dropped, and {@link crossWorkspaceUnreadTotal} supplies this workspace's

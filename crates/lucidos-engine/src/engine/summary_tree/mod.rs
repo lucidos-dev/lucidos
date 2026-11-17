@@ -186,7 +186,9 @@ pub(crate) struct Runtime {
 impl Runtime {
     fn set(&self, compactor: std::sync::Arc<compactor::Compactor>) {
         if self.compactor.set(compactor).is_err() {
-            log!("[SummaryTree] A second compactor started; the first stays the one routes read");
+            log_legacy!(
+                "[SummaryTree] A second compactor started; the first stays the one routes read"
+            );
         }
     }
 

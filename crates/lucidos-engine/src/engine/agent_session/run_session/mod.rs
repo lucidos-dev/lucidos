@@ -15,6 +15,7 @@ mod completion;
 pub(in crate::engine::agent_session) mod entry_guard;
 mod idle_change_state;
 mod idle_snapshot;
+mod resume_billing;
 mod run;
 mod spawn_context;
 

@@ -37,7 +37,7 @@ impl<P: JudgmentProvider, F: JudgmentProvider> JudgmentProvider for WithFallback
         {
             Ok(judgment) => Ok(judgment),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Judgment] The System One call failed: {}. Asking the chat model",
                     e
                 );

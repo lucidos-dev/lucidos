@@ -197,7 +197,7 @@ impl Exporter {
         };
         let unsendable = calls.iter().filter(|c| !c.sendable).count();
         if unsendable > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[ClaudeGateway] Not sending {unsendable} telemetry records made before this \
                  sign-in or while telemetry was off"
             );
@@ -226,12 +226,12 @@ impl Exporter {
                 sent = send(&target, &bearer, encode(&bearer), self.retry_step).await?;
             }
             match sent {
-                Sent::Delivered => crate::log!(
+                Sent::Delivered => crate::log_legacy!(
                     "[ClaudeGateway] Sent {} telemetry records to {}",
                     to_send.len(),
                     target.url
                 ),
-                Sent::Refused { status, why } => crate::log!(
+                Sent::Refused { status, why } => crate::log_legacy!(
                     "[ClaudeGateway] Dropping {} telemetry records that {} refused with {status}: {why}",
                     to_send.len(),
                     target.url
@@ -305,7 +305,7 @@ impl Exporter {
         .fetch_one(&self.pool)
         .await?;
         if skipped > 0 {
-            crate::log!("[ClaudeGateway] Not sending {skipped} telemetry records: {why}");
+            crate::log_legacy!("[ClaudeGateway] Not sending {skipped} telemetry records: {why}");
         }
         self.store_cursor(horizon, opted_out).await?;
         Ok(Pass::Done)
@@ -364,10 +364,12 @@ impl Exporter {
     }
 }
 
-/// The gateway calls in `($1, $2]`, served by provider `$3`: a capture with a
-/// usage block (one without reported nothing to count) or a failed call.
+/// Engine-owned gateway calls in `($1, $2]`, served by provider `$3`:
+/// a measured capture or failed call. Coding agents own their telemetry.
 const GATEWAY_CALLS: &str = "sequence > $1 AND sequence <= $2
      AND payload->>'provider' = $3
+     AND COALESCE(payload->>'producer', 'main_llm') IN ('main_llm', 'auxiliary')
+     AND COALESCE(payload->>'telemetry_owned_by_cli', 'false') != 'true'
      AND ((event_type = 'ContextCaptured' AND payload->'usage' IS NOT NULL)
           OR event_type = 'ModelCallFailed')";
 
@@ -442,7 +444,9 @@ fn call_row(stored: StoredRow) -> Option<CallRow> {
         }),
         Ok(_) => None,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Call {sequence} does not read back, skipping it: {e}");
+            crate::log_legacy!(
+                "[ClaudeGateway] Call {sequence} does not read back, skipping it: {e}"
+            );
             None
         }
     }
@@ -507,7 +511,7 @@ pub(crate) async fn spawn_exporter(
 ) {
     let exporter = Exporter::new(pool, access);
     if let Err(e) = exporter.record_opt_out().await {
-        crate::log!("[ClaudeGateway] Could not record the telemetry opt-out: {e}");
+        crate::log_legacy!("[ClaudeGateway] Could not record the telemetry opt-out: {e}");
     }
     spawn(exporter, rx);
 }
@@ -543,7 +547,7 @@ fn spawn(exporter: Exporter, mut rx: tokio::sync::broadcast::Receiver<EmittedEve
                     let backoff =
                         (EXPORT_INTERVAL * 2u32.saturating_pow(failures)).min(MAX_BACKOFF);
                     retry_at = tokio::time::Instant::now() + backoff;
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ClaudeGateway] {e}. Trying again in {}s",
                         backoff.as_secs()
                     );
@@ -559,8 +563,18 @@ fn wakes_the_exporter(event: &BusEvent) -> bool {
     match event {
         BusEvent::Thread {
             event:
-                ThreadEvent::ContextCaptured { provider, .. }
-                | ThreadEvent::ModelCallFailed { provider, .. },
+                ThreadEvent::ContextCaptured {
+                    provider, producer, ..
+                },
+            ..
+        } => {
+            matches!(
+                producer,
+                crate::engine::ContextProducer::MainLlm | crate::engine::ContextProducer::Auxiliary
+            ) && provider.as_deref() == Some(ProviderKind::ClaudeGateway.as_str())
+        }
+        BusEvent::Thread {
+            event: ThreadEvent::ModelCallFailed { provider, .. },
             ..
         } => provider.as_deref() == Some(ProviderKind::ClaudeGateway.as_str()),
         BusEvent::System(

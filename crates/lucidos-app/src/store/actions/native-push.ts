@@ -8,6 +8,7 @@
 // notifications.rs). Tapping the banner routes through the SAME dispatchDeepLink
 // the web-push service-worker tap uses.
 
+import { json, API } from '../../api/client/_core';
 import type { Tap } from '@lucidos/sdk';
 import { isTauri } from '../../utils/platform';
 import { WORKSPACE_ID } from '../../utils/basePath';
@@ -68,7 +69,23 @@ export function handleNativePushRequested(payload: NativePushRequestedPayload): 
       tap: payload.tap ?? null,
     },
   });
-  if (outcome === 'not_shown') void showNativeBanner(payload);
+  if (outcome === 'not_shown') {
+    void showNativeBanner(payload).then((accepted) => { if (accepted) void acknowledgeNativePush(payload.notification_id); });
+  } else {
+    void acknowledgeNativePush(payload.notification_id);
+  }
+}
+
+async function acknowledgeNativePush(notificationId: string): Promise<void> {
+  try {
+    await json(`${API}/notification/native-receipt`, {
+      method: 'POST', body: JSON.stringify({ notification_id: notificationId }),
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (error) {
+    // Background delivery retries with the same notification identity.
+    console.warn('[NativePush] Receipt failed:', error);
+  }
 }
 
 /** Payload of the engine's `NativePushDismissRequested` SSE — the cross-device
@@ -127,10 +144,10 @@ async function dismissNativeBanner(payload: NativePushDismissRequestedPayload): 
   }
 }
 
-async function showNativeBanner(payload: NativePushRequestedPayload): Promise<void> {
+async function showNativeBanner(payload: NativePushRequestedPayload): Promise<boolean> {
   try {
     const title = payload.title.length > 0 ? payload.title : 'Lucidos';
-    await showNativeNotification({
+    const accepted = await showNativeNotification({
       title,
       body: payload.body,
       // SW-message shape so the tap routes through the same dispatchDeepLink the
@@ -151,17 +168,20 @@ async function showNativeBanner(payload: NativePushRequestedPayload): Promise<vo
         workspace: WORKSPACE_ID,
       },
     });
+    // Legacy binaries return null on successful completion.
+    return accepted === true || accepted === null;
   } catch (err) {
     // Telemetry carve-out (.claude/rules/frontend.md): runs on a background SSE
     // frame without user intent. A failed native banner is non-fatal — the bell
     // badge (NotificationCreated) is the durable signal and the next
-    // notification re-attempts. A toast here would be wrong: the user isn't
+    // delivery worker retries. A toast here would be wrong: the user isn't
     // looking at the app (that's exactly why we chose the OS surface). The
     // failure is still recorded durably: `invoke` reports it to the engine log
     // (utils/ipcHealth → `[Client/ipc]`). Silence here is precisely how the
     // tauri 2.11 ACL regression hid — every banner was rejected for a month and
     // the only trace was a console warning nobody could see.
     console.warn('[NativePush] Failed to show native notification:', err);
+    return false;
   }
 }
 

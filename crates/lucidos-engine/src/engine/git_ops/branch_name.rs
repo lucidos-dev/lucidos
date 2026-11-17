@@ -233,7 +233,7 @@ async fn existing_branches_for(repo_root: &Path, base: &str) -> Option<HashSet<S
     .await
     .ok()?;
     if !out.status.success() {
-        log!(
+        log_legacy!(
             "[Git] for-each-ref for {} returned non-zero in {}: {}",
             base,
             repo_root.display(),
@@ -274,7 +274,7 @@ pub(crate) async fn allocate_coding_agent_branch(
     let base = coding_agent_branch_base(agent, scope, &branch_slug(thread_name), thread_id);
     let existing = existing_branches_for(repo_root, &base).await;
     if existing.is_none() {
-        log!(
+        log_legacy!(
             "[Git] Could not list branches matching {} in {} (git gave no answer within {}s). Using a unique suffix rather than assuming the name is free",
             base,
             repo_root.display(),

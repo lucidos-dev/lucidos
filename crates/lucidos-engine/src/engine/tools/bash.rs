@@ -11,6 +11,7 @@ use crate::engine::thread_events::{EventMeta, ThreadEvent};
 use crate::llm::tools::{
     BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS,
 };
+use crate::runtime::agent_sandbox::{Sandbox, SandboxedCommand};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -116,7 +117,7 @@ async fn drain_pipe<R: tokio::io::AsyncRead + Unpin>(mut pipe: R, sink: Arc<Pipe
             Err(e) => {
                 // The write end is gone in a way that is not a clean EOF.
                 // Nothing more can arrive, so stop and keep what we have.
-                log!("[Bash] pipe read ended with an error: {}", e);
+                log_legacy!("[Bash] pipe read ended with an error: {}", e);
                 return;
             }
         }
@@ -205,7 +206,7 @@ impl Drop for ShellGroupGuard {
 
 /// Spawn the `run_bash` shell as the leader of its own process group, below
 /// the engine's priority, so [`ShellGroupGuard`] can reach every process in it.
-fn spawn_shell(cmd: &mut tokio::process::Command) -> std::io::Result<tokio::process::Child> {
+fn spawn_shell(cmd: &mut SandboxedCommand) -> std::io::Result<tokio::process::Child> {
     crate::runtime::spawn_env::spawn_below_engine(cmd)
 }
 
@@ -325,6 +326,7 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        sandbox: &Sandbox,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c,
@@ -350,7 +352,7 @@ impl LucidosEngine {
 
         // `pipefail` shell — see `core::shell`. A `cmd | tee log` would
         // otherwise report tee's 0 and hide the real failure.
-        let mut cmd = command_shell().command(command);
+        let mut cmd = command_shell().command(sandbox, command)?;
         cmd.current_dir(self.workspace_path())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -367,7 +369,7 @@ impl LucidosEngine {
         );
 
         let log_command = redact_postgres_secrets(command);
-        log!(
+        log_legacy!(
             "[Bash] Running: {}",
             &log_command[..log_command.floor_char_boundary(200)]
         );
@@ -457,6 +459,7 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        sandbox: &Sandbox,
     ) -> ToolOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c,
@@ -480,6 +483,7 @@ impl LucidosEngine {
             .await;
         let (task_id, started_at) = self
             .start_background_task(
+                sandbox,
                 thread_id,
                 command,
                 self.workspace_path(),
@@ -514,6 +518,7 @@ impl LucidosEngine {
     /// `spec.description` is the agent's name for the work, shown on the wait.
     pub(crate) async fn start_background_task(
         &self,
+        sandbox: &Sandbox,
         thread_id: uuid::Uuid,
         command: &str,
         cwd: &std::path::Path,
@@ -521,14 +526,14 @@ impl LucidosEngine {
         spec: TaskSpec<'_>,
     ) -> Result<(String, chrono::DateTime<chrono::Utc>), String> {
         let safe_command = redact_postgres_secrets(command);
-        log!(
+        log_legacy!(
             "[BashBg] Spawning: {}",
             &safe_command[..safe_command.floor_char_boundary(200)]
         );
 
         let (task_id, finish_rx) = self
             .bash_background
-            .spawn_task(command, cwd, env_vars, Some(thread_id), spec)
+            .spawn_task(sandbox, command, cwd, env_vars, Some(thread_id), spec)
             .await
             .map_err(|e| format!("Error: failed to spawn background command: {}", e))?;
 
@@ -548,7 +553,7 @@ impl LucidosEngine {
             })
             .await
         {
-            log!("[BashBg] failed to emit BackgroundBashStarted: {}", e);
+            log_legacy!("[BashBg] failed to emit BackgroundBashStarted: {}", e);
         }
 
         self.spawn_bash_completion_watcher(thread_id, task_id.clone(), finish_rx);
@@ -587,7 +592,7 @@ impl LucidosEngine {
             // swept, or the teardown sweep took the record first and emitted
             // this same event. Either way somebody else owns the completion.
             let Some(record) = registry.completion_record(&task_id).await else {
-                log!(
+                log_legacy!(
                     "[BashBg] watcher fired but task {} is gone or already recorded",
                     task_id
                 );
@@ -605,7 +610,7 @@ impl LucidosEngine {
                 })
                 .await
             {
-                log!("[BashBg] failed to emit BackgroundBashCompleted: {}", e);
+                log_legacy!("[BashBg] failed to emit BackgroundBashCompleted: {}", e);
                 // Hand the claim back. It is a promise to write the row, and
                 // this one did not. Holding it tells the teardown the task is
                 // settled, and the boot sweep then reports a success as a loss.
@@ -946,43 +951,6 @@ fn truncate_output_tail(s: &str, max: usize, already_dropped: usize) -> String {
 mod tests {
     use super::*;
 
-    /// This file with its test module cut off, through the shared reader.
-    fn production_src() -> String {
-        crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/tools/bash.rs"),
-        )
-    }
-
-    /// The result leaves through the redaction, not around it, and the child
-    /// inherits none of the engine's own secrets.
-    ///
-    /// The string returned here is persisted verbatim in `ToolResult` and read
-    /// back by the agent. The composition is covered in
-    /// `core::subprocess_secrets`; this is the wiring, which a helper test
-    /// cannot see.
-    #[test]
-    fn the_bash_tool_result_leaves_through_the_secret_redaction() {
-        let src = production_src();
-        let at = src
-            .find("pub(crate) async fn execute_bash_tool")
-            .expect("execute_bash_tool is still here");
-        let end = src[at..]
-            .find("\n    /// `run_bash_background(")
-            .expect("execute_bash_tool is still followed by the background tool");
-        let body = &src[at..at + end];
-        assert!(
-            body.contains("redact_subprocess_output(")
-                && body.contains("subprocess_secret_values(env_vars,"),
-            "execute_bash_tool must return through `core::redact_subprocess_output` \
-             over `core::subprocess_secret_values`. A verbose curl or an `env` dump \
-             otherwise writes a credential into the events table."
-        );
-        assert!(
-            body.contains("InheritedSecrets::Strip("),
-            "a chat shell must not inherit the engine's secrets"
-        );
-    }
-
     /// A `BackgroundBashCompleted` written before the write-time mask still
     /// holds the raw value, and its task's env is gone. So a drain that falls
     /// back to the row masks it against the credentials stored now.
@@ -1058,6 +1026,7 @@ mod tests {
         };
         let (task_id, _rx) = registry
             .spawn_task(
+                &Sandbox::unsandboxed(),
                 "true",
                 std::path::Path::new("/tmp"),
                 &[],
@@ -1102,7 +1071,9 @@ mod tests {
     /// Spawn through the same shell and pipe setup `execute_bash_tool` uses,
     /// so these exercise the real fd topology rather than a simplified one.
     fn spawn_like_the_tool(command: &str) -> tokio::process::Child {
-        let mut cmd = command_shell().command(command);
+        let mut cmd = command_shell()
+            .command(&Sandbox::unsandboxed(), command)
+            .expect("unsandboxed command");
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1508,19 +1479,58 @@ mod tests {
         );
     }
 
-    /// One completion reaches the thread once. The event wait armed over the
-    /// task delivers it, so the watcher must not also push it into a session.
-    #[test]
-    fn the_completion_watcher_only_emits_and_never_pushes_into_a_session() {
-        let src = production_src();
-        let start = src
-            .find("fn spawn_bash_completion_watcher(")
-            .expect("the watcher is still here");
-        let body = &src[start..];
-        let body = &body[..body.find("\n    }\n").expect("end of the watcher")];
-        assert!(
-            !body.contains("msg_tx") && !body.contains("agent_sessions"),
-            "the watcher must leave delivery to the event wait:\n{body}"
-        );
+    mod guard_tests {
+        /// This file with its test module cut off, through the shared reader.
+        fn production_src() -> String {
+            crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("engine/tools/bash.rs"),
+            )
+        }
+
+        /// The result leaves through the redaction, not around it, and the child
+        /// inherits none of the engine's own secrets.
+        ///
+        /// The string returned here is persisted verbatim in `ToolResult` and read
+        /// back by the agent. The composition is covered in
+        /// `core::subprocess_secrets`; this is the wiring, which a helper test
+        /// cannot see.
+        #[test]
+        fn the_bash_tool_result_leaves_through_the_secret_redaction() {
+            let src = production_src();
+            let at = src
+                .find("pub(crate) async fn execute_bash_tool")
+                .expect("execute_bash_tool is still here");
+            let end = src[at..]
+                .find("\n    /// `run_bash_background(")
+                .expect("execute_bash_tool is still followed by the background tool");
+            let body = &src[at..at + end];
+            assert!(
+                body.contains("redact_subprocess_output(")
+                    && body.contains("subprocess_secret_values(env_vars,"),
+                "execute_bash_tool must return through `core::redact_subprocess_output` \
+             over `core::subprocess_secret_values`. A verbose curl or an `env` dump \
+             otherwise writes a credential into the events table."
+            );
+            assert!(
+                body.contains("InheritedSecrets::Strip("),
+                "a chat shell must not inherit the engine's secrets"
+            );
+        }
+
+        /// One completion reaches the thread once. The event wait armed over the
+        /// task delivers it, so the watcher must not also push it into a session.
+        #[test]
+        fn the_completion_watcher_only_emits_and_never_pushes_into_a_session() {
+            let src = production_src();
+            let start = src
+                .find("fn spawn_bash_completion_watcher(")
+                .expect("the watcher is still here");
+            let body = &src[start..];
+            let body = &body[..body.find("\n    }\n").expect("end of the watcher")];
+            assert!(
+                !body.contains("msg_tx") && !body.contains("agent_sessions"),
+                "the watcher must leave delivery to the event wait:\n{body}"
+            );
+        }
     }
 }

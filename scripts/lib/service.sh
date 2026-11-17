@@ -178,7 +178,31 @@ service_is_bind_value() {
 # it is the SAME knob the picker's Settings → Network access edits, so a later
 # UI change keeps working (unlike baking bind env into the unit, which would
 # permanently shadow the file: env > file in the resolution order).
-service_network_toml_path() { printf '%s/.lucidos/network.toml' "${1%/}"; }
+# It is a private entry (ADR 0645): the copy of lucidos_private_entry_in
+# below is byte-identical to scripts/lib/storage_root.sh's, because
+# uninstall.sh fetches this file alone.
+service_network_toml_path() { lucidos_private_entry_in "${1%/}/.lucidos" network.toml; }
+
+lucidos_private_entry_in() {
+    local home="$1" name="$2" legacy
+    local names="network.toml network.toml.lock paired-devices.json webhook-token run secret-keys snapshots gateway local-token hook-socket-token pg-shared-password .local-token.lock .hook-socket-token.lock .pg-shared-password.lock"
+    case " $names " in
+        *" $name "*) ;;
+        *) printf '%s/private/%s\n' "$home" "$name"; return 0 ;;
+    esac
+    if [ -e "$home/$name" ] || [ -L "$home/$name" ]; then
+        printf '%s/%s\n' "$home" "$name"; return 0
+    fi
+    if [ -e "$home/private/$name" ] || [ -L "$home/private/$name" ]; then
+        printf '%s/private/%s\n' "$home" "$name"; return 0
+    fi
+    for legacy in $names; do
+        if [ -e "$home/$legacy" ] || [ -L "$home/$legacy" ]; then
+            printf '%s/%s\n' "$home" "$name"; return 0
+        fi
+    done
+    printf '%s/private/%s\n' "$home" "$name"
+}
 
 # service_network_toml_bind <contents> — extract the current [gateway] bind
 # value ("" when absent). Tolerant single-line parse, used for the
@@ -387,11 +411,14 @@ service_launchd_timeout() { printf '%s' "${LUCIDOS_LAUNCHD_TIMEOUT:-30}"; }
 # ── plist / unit templating (pure) ───────────────────────────────────────────
 
 # service_xml_escape <string> — minimal XML escaping for plist values.
+# Bash 5.2 reads an unquoted `&` in a replacement as the matched text, and 3.2
+# keeps a quoted one's quotes inside "${...}". A quoted variable in an unquoted
+# assignment is literal in both.
 service_xml_escape() {
-    local s="$1"
-    s="${s//&/&amp;}"
-    s="${s//</&lt;}"
-    s="${s//>/&gt;}"
+    local s="$1" amp='&amp;' lt='&lt;' gt='&gt;'
+    s=${s//&/"$amp"}
+    s=${s//</"$lt"}
+    s=${s//>/"$gt"}
     printf '%s' "$s"
 }
 
@@ -869,7 +896,7 @@ SERVICE_NETWORK_TOML_LOCK=network.toml.lock
 service_write_network_toml() {
     local path
     path="$(service_network_toml_path "$1")"
-    mkdir -p "$(dirname "$path")" || return 1
+    (umask 077 && mkdir -p "$(dirname "$path")") || return 1
     (
         exec 9>>"$(dirname "$path")/$SERVICE_NETWORK_TOML_LOCK" || exit 1
         if command -v perl >/dev/null 2>&1; then

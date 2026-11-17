@@ -80,6 +80,7 @@ try {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         category: 'theme-mode',
+        code: label,
         message: label,
         data: Object.assign({ tMs: Math.round(performance.now() - t0) }, info),
       }),

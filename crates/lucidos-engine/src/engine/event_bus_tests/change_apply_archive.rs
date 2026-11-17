@@ -32,6 +32,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
@@ -54,6 +55,7 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
@@ -126,6 +128,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
@@ -148,6 +151,7 @@ async fn change_applied_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
@@ -218,6 +222,7 @@ async fn change_discarded_keeps_inbox_shows_archive() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
@@ -282,6 +287,7 @@ async fn apply_then_archive_moves_to_archive_section() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             description: Some("Fix".into()),
             files: vec!["a.rs".into()],
@@ -305,6 +311,7 @@ async fn apply_then_archive_moves_to_archive_section() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             requires_restart: false,
             client_update: false,
@@ -989,6 +996,7 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1066,6 +1074,7 @@ async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1118,6 +1127,7 @@ async fn thread_archived_goes_idle_and_the_proposal_follows_the_changes_row() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             requires_restart: true,
             client_update: false,

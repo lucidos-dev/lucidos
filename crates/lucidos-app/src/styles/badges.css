@@ -76,7 +76,7 @@
  *
  * A heavier rule that restates `will-change` keeps `transform` in it.
  * Measured in Chrome, `opacity` alone leaves the digit drifting at rest. */
-.badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+.badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
 .section-count-badge,
 .drawer-badge,
 .brand-menu-ws-badge,
@@ -94,7 +94,7 @@
    width rounds UP to a whole pixel, which never clips the content. A badge's
    own `min-width` still sets the floor, which is why none states a `width`. */
 @supports (width: calc-size(fit-content, size)) {
-    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
     .section-count-badge,
     .drawer-badge,
     .brand-menu-ws-badge,
@@ -105,6 +105,37 @@
     .theme-card-badge {
         width: calc-size(fit-content, round(up, size, 1px));
     }
+}
+
+/* Icon boxes never read cap height or baseline metrics. One whole-pixel inset
+   on each side keeps the icon and circle on the same grid throughout rotation.
+   A fifth of the box leaves room for the glyph's diagonal reach. */
+.badge.badge-icon {
+    --badge-icon-box: var(--badge-height);
+    --badge-icon-inset-share: 0.2;
+    --badge-icon-inset: calc(var(--badge-icon-box) * var(--badge-icon-inset-share));
+    display: grid;
+    place-items: center;
+    width: var(--badge-icon-box);
+    height: var(--badge-icon-box);
+    min-width: 0;
+    min-height: 0;
+    padding: var(--badge-icon-inset);
+    line-height: 0;
+    will-change: transform;
+}
+
+@supports (width: round(down, 1rem, 1px)) {
+    .badge.badge-icon {
+        --badge-icon-box: round(down, var(--badge-height), 1px);
+        --badge-icon-inset: round(down, var(--badge-icon-box) * var(--badge-icon-inset-share), 1px);
+    }
+}
+
+.badge-icon > :is(.brand-badge-spinner, .brand-badge-queued),
+.badge-icon svg {
+    width: 100%;
+    height: 100%;
 }
 
 /* ── And where it sits on the PIXEL GRID ──────────────────────────────────
@@ -142,12 +173,13 @@
        box. This one also survives a badge landing in a plain line of text.
 
        The two dots that wear `.badge` draw no glyph, so they keep the box their
-       own rules give them. `:where()` weighs nothing, so neither does the
+       own rules give them. Icon boxes also keep their independent geometry.
+       `:where()` weighs nothing, so neither does the
        `:not()` around it, and this still ties with every rule it re-homes.
 
        A badge with no `--badge-height` gets an invalid box, so its height and
        padding stay at their initial values. */
-    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner)),
+    .badge:not(:where(.brand-badge-dot, .system-attention-badge-corner, .badge-icon)),
     .section-count-badge,
     .drawer-badge,
     .brand-menu-ws-badge,
@@ -169,33 +201,6 @@
         min-height: 0;
         --badge-baseline-inset: round((var(--badge-box) - 1cap) / 2, 1px);
         padding-block: 0 var(--badge-baseline-inset);
-    }
-
-    /* The one badge whose content can be an icon. While work runs, the brand
-       badge holds a spinning glyph instead of the "!", and while it waits, a
-       still hourglass. A line box trimmed to a cap band neither has would park
-       the icon off centre. So would the padding that lifts a baseline. It
-       keeps the flex centring.
-       No inline padding either: that is room for a count's digits, and it
-       stretched a one-icon badge into a pill beside the round "!". */
-    .badge:has(.brand-badge-spinner, .brand-badge-queued) {
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        text-box-trim: none;
-        padding: 0;
-    }
-
-    /* Flex centring halves the room around the icon, and Chrome and WebKit
-       snap a half pixel either way. At 100% a 9px icon in the 12px box sat a
-       pixel low. So the inset is a whole pixel each side, rounded down to
-       favour the larger icon. It inherits the badge's font, so `--badge-box`
-       resolves to the same box here. */
-    .badge :is(.brand-badge-spinner, .brand-badge-queued) svg {
-        --badge-icon-snapped: calc(var(--badge-box)
-            - 2 * round(down, (var(--badge-box) - var(--badge-icon-size)) / 2, 1px));
-        width: var(--badge-icon-snapped);
-        height: var(--badge-icon-snapped);
     }
 }
 

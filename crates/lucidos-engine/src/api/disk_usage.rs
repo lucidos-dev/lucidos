@@ -217,7 +217,7 @@ pub(super) async fn cleanup_worktree(
             &state.engine.event_bus,
             &headers,
             Some(thread_uuid),
-            super::thread_reach::ThreadReachVerb::Discard,
+            crate::engine::permission::Action::Discard,
         )
         .await
         .map_err(|e| (e.status_code(), e.to_string()))?;
@@ -385,29 +385,6 @@ pub(super) fn router() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    /// This file with its test module cut off. Uncut, a scan can match its own
-    /// test fixtures and pass while production has lost the thing it pins.
-    fn production_src() -> String {
-        crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("api/disk_usage.rs"),
-        )
-    }
-
-    /// The handler asks the worker's own probe. A hand-built one drifts from
-    /// what the worker counts as live.
-    #[test]
-    fn the_cleanup_handler_asks_the_workers_liveness_probe() {
-        let src = production_src();
-        assert!(
-            src.contains("worktree_cleanup_active_threads()"),
-            "cleanup_worktree must ask the engine's shared liveness probe"
-        );
-        assert!(
-            !src.contains("ActiveThreads::new("),
-            "no hand-built liveness probe in the handler"
-        );
-    }
-
     /// One test walks the whole cycle: the state is a process-wide static.
     #[test]
     fn a_pass_reads_finished_while_it_reports_and_blocks_a_new_one_until_done() {
@@ -466,52 +443,77 @@ mod tests {
         }
     }
 
-    /// The liveness gate runs BEFORE the tier match, so every tier is covered.
-    ///
-    /// A gate inside one tier arm leaves the other two destroying a live
-    /// session's tree. `cleanup_worktree` states what each tier removes.
-    #[test]
-    fn the_cleanup_handler_refuses_a_live_session_before_it_picks_a_tier() {
-        let src = production_src();
-        let at = src
-            .find("pub(super) async fn cleanup_worktree")
-            .expect("cleanup_worktree is still here");
-        let body = &src[at..];
-        let gate = body
-            .find("is_active(thread_uuid)")
-            .expect("cleanup_worktree must ask whether a coding-agent session is live");
-        let tiers = body
-            .find("match req.tier")
-            .expect("cleanup_worktree still dispatches on the tier");
-        assert!(
-            gate < tiers,
-            "the live-session refusal must come before the tier match, or tier 1 \
-             still strips a running build's artifacts"
-        );
-    }
-
-    /// Tiers 2 and 3 remove another thread's worktree, so they take the reach
-    /// gate before the handler reads the disk. A gate after the dirty check
-    /// would still tell an out-of-reach agent whether the tree holds edits.
-    #[test]
-    fn the_cleanup_handler_asks_the_reach_gate_before_it_removes_anything() {
-        let src = production_src();
-        let at = src
-            .find("pub(super) async fn cleanup_worktree")
-            .expect("cleanup_worktree is still here");
-        let body = &src[at..];
-        let gate = body
-            .find("refuse_without_authority(")
-            .expect("cleanup_worktree must ask the thread_reach gate");
-        for later in ["worktree.exists()", "is_worktree_dirty(", "match req.tier"] {
-            let at = body
-                .find(later)
-                .unwrap_or_else(|| panic!("cleanup_worktree still calls {later}"));
-            assert!(gate < at, "the reach gate must come before {later}");
+    mod guard_tests {
+        /// This file with its test module cut off. Uncut, a scan can match its own
+        /// test fixtures and pass while production has lost the thing it pins.
+        fn production_src() -> String {
+            crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("api/disk_usage.rs"),
+            )
         }
-        assert!(
-            body.contains("ThreadReachVerb::Discard"),
-            "removing a worktree discards its changes, so it asks as Discard"
-        );
+
+        /// The handler asks the worker's own probe. A hand-built one drifts from
+        /// what the worker counts as live.
+        #[test]
+        fn the_cleanup_handler_asks_the_workers_liveness_probe() {
+            let src = production_src();
+            assert!(
+                src.contains("worktree_cleanup_active_threads()"),
+                "cleanup_worktree must ask the engine's shared liveness probe"
+            );
+            assert!(
+                !src.contains("ActiveThreads::new("),
+                "no hand-built liveness probe in the handler"
+            );
+        }
+
+        /// The liveness gate runs BEFORE the tier match, so every tier is covered.
+        ///
+        /// A gate inside one tier arm leaves the other two destroying a live
+        /// session's tree. `cleanup_worktree` states what each tier removes.
+        #[test]
+        fn the_cleanup_handler_refuses_a_live_session_before_it_picks_a_tier() {
+            let src = production_src();
+            let at = src
+                .find("pub(super) async fn cleanup_worktree")
+                .expect("cleanup_worktree is still here");
+            let body = &src[at..];
+            let gate = body
+                .find("is_active(thread_uuid)")
+                .expect("cleanup_worktree must ask whether a coding-agent session is live");
+            let tiers = body
+                .find("match req.tier")
+                .expect("cleanup_worktree still dispatches on the tier");
+            assert!(
+                gate < tiers,
+                "the live-session refusal must come before the tier match, or tier 1 \
+             still strips a running build's artifacts"
+            );
+        }
+
+        /// Tiers 2 and 3 remove another thread's worktree, so they take the reach
+        /// gate before the handler reads the disk. A gate after the dirty check
+        /// would still tell an out-of-reach agent whether the tree holds edits.
+        #[test]
+        fn the_cleanup_handler_asks_the_reach_gate_before_it_removes_anything() {
+            let src = production_src();
+            let at = src
+                .find("pub(super) async fn cleanup_worktree")
+                .expect("cleanup_worktree is still here");
+            let body = &src[at..];
+            let gate = body
+                .find("refuse_without_authority(")
+                .expect("cleanup_worktree must ask the thread_reach gate");
+            for later in ["worktree.exists()", "is_worktree_dirty(", "match req.tier"] {
+                let at = body
+                    .find(later)
+                    .unwrap_or_else(|| panic!("cleanup_worktree still calls {later}"));
+                assert!(gate < at, "the reach gate must come before {later}");
+            }
+            assert!(
+                body.contains("Action::Discard"),
+                "removing a worktree discards its changes, so it asks as Discard"
+            );
+        }
     }
 }

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { VNode } from 'preact';
 import { actorInitiator, describeExecutor, shouldShowResponseStatusBadge } from './ChatExchange';
-import { ClaudeIcon, CodexIcon, PowerIcon, PersonIcon, ApiPlugIcon } from '../shared/icons';
+import { ClaudeIcon, CodexIcon, PowerIcon, UserIcon, ApiPlugIcon } from '../shared/icons';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { LUCIDOS_AGENT_LABEL, type ThreadEvent } from '../../store/thread-events';
 
@@ -39,7 +39,7 @@ describe('actorInitiator (closed set: You / Lucidos Agent / Lucidos Engine / Sys
   it('device → You (the only origin that is unambiguously the user)', () => {
     const { icon, label } = actorInitiator({ kind: 'device', device_id: 'd' });
     expect(label).toBe('You');
-    expect((icon as VNode).type).toBe(PersonIcon);
+    expect((icon as VNode).type).toBe(UserIcon);
   });
   it('api with default mode → API caller (anonymous HTTP, never impersonates the user)', () => {
     // Regression: a Lucidos agent that POSTed via raw urllib without forwarding

@@ -1,24 +1,24 @@
+import { navigateToNewChat, navigateToUrl } from './navigationDirect';
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
-import { isChosenByPreference, type PeerState } from '../windowPeers';
+import { submitInteractiveRequest } from '../interactiveDeliveryService';
 import { openAppById, exitAppFullscreen } from './apps';
-import { openFilePreview, openUrl } from './artifacts';
+import { openFilePreview } from './artifacts';
 import { resolveFileTarget } from './fileTarget';
-import { openOAuthAuthorizationUrl } from './oauth';
+
 import { navigateToTrigger } from './triggers';
-import { focusThread, focusThreadOrBootstrap, unfocusThread } from './threads';
+import { focusThread, focusThreadOrBootstrap } from './threads';
 import { isForThisDevice, type DeviceScopeActor } from './device-scope';
 import { formatThreadLabel } from './thread-label';
 import { pushNavState } from './navigation';
 import { holdFocusedPaneWhileTyping, releaseTypingHold, revealContentPane } from './pane';
-import { ensureFocusedComposeThread, updateCompose } from './compose';
+
 import { openEncodedRepoFilePreview } from './repositories';
 import { openRepoFileLink } from './repoFileLink';
-import { prefillNewChatDestination } from './newChatPrefill';
+
 import { revealDashboard } from './dashboardNav';
 import { fileFindScope, requestFind } from './find-request';
-import { focusPromptNow } from '../../components/chat/promptFocus';
-import { isMobile } from '../../utils/viewport';
-import { showToast, dismissToast, repositories, focusedThreadId, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview, settingsLinkedFragment } from '../store';
+
+import { showToast, dismissToast, repositories, focusedThreadId, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_SUBVIEW_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview, settingsLinkedFragment } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -346,70 +346,8 @@ export function handleNavigationRequest(nav: {
       pushNavState();
       revealContentPane();
       break;
-    case 'new-chat': {
-      // On a SINGLE-PANE layout an open overlay (app, file preview, settings
-      // panel) really is covering the conversation, so it has to close for the
-      // chat panel underneath to become the visible target for the prefill.
-      // The split layout renders the thread pane and the content pane side by
-      // side and `panelOverlay` only ever affects the content one, so the
-      // conversation is already visible in its own pane: clearing there would
-      // just throw away the app the user was working in (ContentPane's
-      // `{!overlay && …}` fallback drops back to the Files panel) to reveal
-      // something that was never hidden. Same predicate the pane reveals
-      // branch on, so the two stay consistent.
-      //
-      // The split has one case where the content pane IS the whole viewport: a
-      // fullscreen app panel. Leave fullscreen there rather than closing the
-      // app, so the content pane keeps it and the compose view becomes visible
-      // beside it. (Single pane doesn't need the call: dropping the overlay
-      // unmounts the panel, which exits native fullscreen, and ends the CSS
-      // fallback through ContentHeaderActions' not-an-app-anymore effect.)
-      if (isMobile()) {
-        panelOverlay.value = null;
-      } else {
-        exitAppFullscreen();
-      }
-      // Drop any focused thread so ensureFocusedComposeThread allocates a
-      // fresh one — without this it returns the existing focused id and the
-      // prefill would land on whatever thread the user was viewing. This is
-      // also what makes the conversation visible: unfocusThread owns the
-      // `revealThreadPane()` call for the compose view (mobile swipes to the
-      // thread pane, desktop re-activates the Threads pane group and
-      // re-expands a collapsed split), so the branch must not pass the
-      // `{ revealPane: false }` bookkeeping opt-out.
-      unfocusThread();
-      const id = ensureFocusedComposeThread();
-      if (typeof nav.prompt === 'string' && nav.prompt.length > 0) {
-        updateCompose(id, { text: nav.prompt });
-      }
-      // rAF: Preact hasn't committed the pane/unfocusThread mutations
-      // yet, so a sync focus would query the pre-render DOM and miss (or hit
-      // the wrong layout's) prompt-input element. Mirrors the keyboard
-      // shortcut path in useKeyboardShortcuts.ts.
-      requestAnimationFrame(() => focusPromptNow());
-      return prefillNewChatDestination(id, nav, opts?.source);
-    }
-    case 'url':
-      if (!nav.url) {
-        showToast('Navigation target missing url', 'error');
-        break;
-      }
-      // `purpose: 'oauth'` marks the one URL that has an end: an authorization
-      // page the provider will redirect to the loopback callback. It always
-      // goes to the OS browser, since providers refuse a sign-in flow in an
-      // embedded webview. Recording it is what lets
-      // `handleOAuthAccountConnected` front this window afterwards. Every other
-      // URL opens wherever the user's preferences point it.
-      if (nav.purpose === 'oauth') {
-        openOAuthAuthorizationUrl(nav.url);
-      } else {
-        // `source` is carried so a browser that refuses the tab can say which
-        // thread (or app) asked for it. A navigate arriving over SSE is not
-        // something the user clicked, so an unattributed toast would read as
-        // coming from nowhere.
-        openUrl(nav.url, opts?.source);
-      }
-      break;
+    case 'new-chat': return navigateToNewChat(nav, opts?.source);
+    case 'url': return navigateToUrl(nav, opts?.source);
     default:
       // Unknown target — log via toast so a future schema drift surfaces
       // loudly instead of silently no-op'ing.
@@ -436,14 +374,19 @@ export function routeThreadNavigation(
   nav: Parameters<typeof handleNavigationRequest>[0],
   actor: DeviceScopeActor | null | undefined,
   sourceThreadId: string,
+  eventId?: string,
 ): void {
   if (!isForThisDevice(actor)) return;
+  submitInteractiveRequest({
+    kind: 'navigation', payload: { nav, sourceThreadId },
+    preference: sourceThreadId === NIL_THREAD_ID ? { fromApp: true } : { threadId: sourceThreadId },
+  }, eventId);
+}
+
+export function presentThreadNavigation(
+  nav: Parameters<typeof handleNavigationRequest>[0], sourceThreadId: string,
+): void {
   const fromApp = sourceThreadId === NIL_THREAD_ID;
-  const showsSource = (window: PeerState) => fromApp
-    ? window.appId !== null
-    : window.focusedThreadId === sourceThreadId;
-  const anyWindow = () => true;
-  if (!isChosenByPreference(showsSource, anyWindow)) return;
   if (fromApp || sourceThreadId === focusedThreadId.value) {
     // Named in any "couldn't open" toast downstream, so the error says where
     // it came from instead of swallowing it.

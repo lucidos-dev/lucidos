@@ -234,8 +234,89 @@ fn attribute<'a>(record: &'a [(String, String)], key: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// One record per gateway capture with usage, posted to the gateway with the
-/// bearer and a real `Content-Length`, and no content in the body.
+/// CLI-owned calls stay out of engine telemetry, including auxiliary copy pings.
+#[tokio::test]
+async fn coding_agent_gateway_attribution_does_not_duplicate_cli_telemetry() {
+    let f = Fixture::new().await;
+    let gateway = MockGateway::start().await;
+    f.sign_in(&gateway, telemetry_policy()).await;
+    let exporter = f.exporter();
+    exporter.export_once().await.unwrap();
+
+    for (producer, cli_owned) in [
+        (crate::engine::ContextProducer::ClaudeCode, false),
+        (crate::engine::ContextProducer::Codex, false),
+        (crate::engine::ContextProducer::Auxiliary, true),
+    ] {
+        let mut event = auxiliary_capture(
+            ContextPurpose::CacheKeepAlive,
+            "claude-opus-5-5",
+            40,
+            Some(ApiUsage {
+                input_tokens: 10,
+                ..ApiUsage::default()
+            }),
+            false,
+        );
+        if let ThreadEvent::ContextCaptured {
+            provider,
+            producer: captured_by,
+            telemetry_owned_by_cli,
+            ..
+        } = &mut event
+        {
+            *provider = Some("claude-gateway".into());
+            *captured_by = producer;
+            *telemetry_owned_by_cli = cli_owned;
+        }
+        f.bus
+            .emit_or_log(
+                BusEvent::Thread {
+                    thread_id: Uuid::new_v4(),
+                    event,
+                    meta: EventMeta::NONE,
+                },
+                "[Test] Coding-agent gateway capture",
+            )
+            .await;
+    }
+    exporter.export_once().await.unwrap();
+    assert!(
+        gateway.logs_requests().is_empty(),
+        "the CLI owns its telemetry"
+    );
+    let mut prefill = auxiliary_capture(
+        ContextPurpose::CacheKeepAlive,
+        "claude-opus-5-5",
+        40,
+        Some(ApiUsage {
+            input_tokens: 10,
+            ..ApiUsage::default()
+        }),
+        false,
+    );
+    if let ThreadEvent::ContextCaptured { provider, .. } = &mut prefill {
+        *provider = Some("claude-gateway".into());
+    }
+    f.bus
+        .emit_or_log(
+            BusEvent::Thread {
+                thread_id: Uuid::new_v4(),
+                event: prefill,
+                meta: EventMeta::NONE,
+            },
+            "[Test] Engine prefill",
+        )
+        .await;
+    exporter.export_once().await.unwrap();
+    assert_eq!(
+        sequences(&gateway.logs_requests()).len(),
+        1,
+        "engine prefill still exports"
+    );
+    f.done().await;
+}
+
 #[tokio::test]
 async fn each_gateway_capture_is_sent_once_without_content() {
     let f = Fixture::new().await;

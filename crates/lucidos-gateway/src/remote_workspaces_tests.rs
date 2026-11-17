@@ -37,11 +37,17 @@ async fn pair() -> Pair {
     )
     .await;
     let b_address = format!("https://localhost:{port}");
-    let code = b.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
         credential,
-    } = b.paired_gateways().redeem(&code, None).unwrap()
+    } = b
+        .paired_gateways()
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
     else {
         panic!("a fresh code redeems");
     };
@@ -72,6 +78,7 @@ async fn pair() -> Pair {
 fn add_remote(a: &GatewayState, name: &str, address: &str, credential: &str) {
     a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: name.to_string(),
             address: address.to_string(),
             pairing_id: "pairing".to_string(),
@@ -108,6 +115,36 @@ async fn listed_on_a(p: &Pair) -> (StatusCode, Value) {
         .body(Body::empty())
         .unwrap();
     send(&p.a, req).await
+}
+
+#[tokio::test]
+async fn remote_counts_match_the_namespaced_inbox_instead_of_the_shared_count() {
+    let p = pair().await;
+    let reader = crate::relay::namespaced_device_id(&p.pairing_id, "device-1");
+    let _engine = crate::notification_count_tests::install_inbox(&p.b, reader.clone()).await;
+    let (status, rows) = listed_on_a(&p).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["workspaces"][0]["unread_count"], 0);
+    assert_eq!(p.b.list_status().await[0].unread_count, Some(12));
+    assert!(p
+        .b
+        .directory()
+        .relayed
+        .iter()
+        .any(|d| d.device_id == reader));
+}
+
+#[tokio::test]
+async fn a_failed_remote_inbox_probe_keeps_the_workspace_but_omits_its_shared_count() {
+    let p = pair().await;
+    let _engine = crate::notification_count_tests::install_inbox(&p.b, "unused".into()).await;
+    let dead = crate::engine_hop::test_engine::scratch();
+    p.b.set_route_for_test("dev", crate::engine_hop::test_engine::unreachable(&dead));
+    let (status, rows) = listed_on_a(&p).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(rows[0]["state"], "reachable");
+    assert_eq!(rows[0]["workspaces"][0]["id"], "dev");
+    assert!(rows[0]["workspaces"][0].get("unread_count").is_none());
 }
 
 #[tokio::test]

@@ -74,7 +74,7 @@ pub async fn boot(pool: &PgPool, database: &str, store: &dyn KeyStore) -> Result
     }
     let sealed = seal_plain_values(pool, &key).await?;
     if sealed > 0 {
-        log!("[SecretStore] Sealed {sealed} stored secret(s) that were plain text");
+        log_legacy!("[SecretStore] Sealed {sealed} stored secret(s) that were plain text");
     }
     validate_constraints(pool).await?;
     Ok(Boot::Ready(key))
@@ -97,7 +97,7 @@ fn parked_key(
     let parked = parked_key_name(name, id);
     let key = store.get(&parked)?.filter(|key| key.id() == *id);
     if key.is_some() {
-        log!(
+        log_legacy!(
             "[SecretStore] Using the key parked in {}",
             store.describe(&parked)
         );
@@ -114,7 +114,7 @@ fn mint(store: &dyn KeyStore, name: &str) -> Result<SecretKey, BoxError> {
     match store.get(name)? {
         Some(read_back) if !created || read_back == key => {
             if created {
-                log!(
+                log_legacy!(
                     "[SecretStore] Created key {} in {}",
                     key.id(),
                     store.describe(name)
@@ -359,7 +359,7 @@ pub async fn import_key(
     }
     let name = secrets_key_name(database);
     if let Some(parked) = super::key_store::replace_keeping(store, &name, key)? {
-        log!(
+        log_legacy!(
             "[SecretStore] Kept the key {} replaced as {}",
             name,
             store.describe(&parked)

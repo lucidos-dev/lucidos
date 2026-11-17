@@ -23,7 +23,7 @@ import {
 } from '../../../store/store';
 import { makeThreadState } from '../../../store/actions/threads-test-helpers';
 import { _resetComposeDraftsForTesting, patchDraft } from '../../../store/composeDrafts';
-import { handleArchiveAll } from '../../../store/actions/archive-all';
+import { archiveAllPhase, handleArchiveAll } from '../../../store/actions/archive-all';
 import { ThreadGroupingButton } from '../../layout/ThreadsHeaderControls';
 
 vi.mock('../../../store/actions/thread-loading', () => ({
@@ -34,7 +34,10 @@ vi.mock('../../../store/actions/thread-loading', () => ({
     ensureThreadInMap: vi.fn(),
     refreshStaleThreadEvents: vi.fn(),
 }));
-vi.mock('../../../store/actions/archive-all', () => ({ handleArchiveAll: vi.fn() }));
+vi.mock('../../../store/actions/archive-all', async () => {
+    const { signal } = await import('@preact/signals');
+    return { archiveAllPhase: signal('idle'), handleArchiveAll: vi.fn() };
+});
 
 let host: HTMLDivElement;
 const tiles = () => Array.from(host.querySelectorAll<HTMLElement>('.drawer-ongoing-tiles .ongoing-tile'));
@@ -52,6 +55,7 @@ function mount(): void {
 
 beforeEach(() => {
     vi.clearAllMocks();
+    archiveAllPhase.value = 'idle';
     vi.stubGlobal('IntersectionObserver', class { observe() {} disconnect() {} });
     vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} });
     _resetComposeDraftsForTesting();
@@ -320,6 +324,21 @@ describe('the Ongoing grouping', () => {
         expect(emptyState()).toBeUndefined();
     });
 
+    it('gives empty groups distinct transition rows when switching tiles', () => {
+        mount();
+        act(() => { tile('Review').click(); });
+        const review = host.querySelector<HTMLElement>('.ongoing-grouping .empty-state')!;
+        const reviewId = review.dataset.flipId;
+        expect(reviewId).toBeTruthy();
+        expect(reviewId).not.toMatch(/^__section_/);
+        act(() => { tile('Drafts').click(); });
+        const drafts = host.querySelector<HTMLElement>('.ongoing-grouping .empty-state')!;
+        expect(drafts.dataset.flipId).toBeTruthy();
+        expect(drafts.dataset.flipId).not.toBe(reviewId);
+        act(() => { tile('Blocked').click(); });
+        expect(emptyState()).toBeUndefined();
+    });
+
     it('has no Idle group, and a thread matching no status shows in none', () => {
         setSelectedOngoingGroup('in-flight');
         mount();
@@ -383,6 +402,27 @@ describe('the Ongoing grouping', () => {
         act(() => { current.querySelector<HTMLButtonElement>('.drawer-archive-all')!.click(); });
         expect(handleArchiveAll).toHaveBeenCalledTimes(1);
         expect(current.getAttribute('aria-expanded')).toBe('true');
+    });
+
+    it('keeps archive progress visible across drawer remounts and prevents repeat clicks', () => {
+        setDrawerGrouping('folders');
+        act(() => { archiveAllPhase.value = 'checking'; });
+        mount();
+        const button = host.querySelector<HTMLButtonElement>('.drawer-archive-all')!;
+        expect(button.disabled).toBe(true);
+        expect(button.textContent).toContain('Checking…');
+        expect(button.getAttribute('aria-busy')).toBe('true');
+        act(() => { button.click(); });
+        expect(handleArchiveAll).not.toHaveBeenCalled();
+        act(() => { archiveAllPhase.value = 'confirming'; });
+        expect(button.textContent).toContain('Awaiting confirmation…');
+        expect(button.getAttribute('aria-busy')).toBe('false');
+        act(() => { archiveAllPhase.value = 'archiving'; });
+        expect(button.textContent).toContain('Archiving…');
+        expect(button.getAttribute('aria-busy')).toBe('true');
+        act(() => { archiveAllPhase.value = 'idle'; });
+        expect(button.disabled).toBe(false);
+        expect(button.textContent).toContain('Archive all');
     });
 
     it('gives way to search, which shows its own results', () => {

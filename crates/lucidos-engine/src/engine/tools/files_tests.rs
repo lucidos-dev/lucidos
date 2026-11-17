@@ -785,8 +785,7 @@ fn read_text_from_zip_rejects_oversized_entry() {
     );
 }
 
-/// A zip bomb lies in its header. Here the entry claims 10 bytes and inflates
-/// to 1000, so only a cap on the decompressed output can refuse it.
+/// An entry claiming 10 bytes but inflating to 1000 must fail during decompression.
 #[test]
 fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
     use std::io::Write as _;
@@ -816,8 +815,8 @@ fn read_text_from_zip_refuses_an_entry_whose_header_understates_its_size() {
 
     let err = read_text_from_zip(&zip_path, "bomb.txt", 100).unwrap_err();
     assert!(
-        err.contains("too large"),
-        "an entry inflating past the cap must be refused, got: {err}"
+        err.contains("larger than its declared uncompressed size"),
+        "an entry exceeding its declared size must be refused, got: {err}"
     );
 }
 
@@ -1184,24 +1183,6 @@ fn only_an_in_process_write_under_data_scripts_records_authorship() {
     }
 }
 
-/// The HTTP layer must never claim in-process authorship. The compiler forces
-/// every call site to name one, so what is left to protect is which one the
-/// API surface names.
-#[test]
-fn no_http_handler_claims_in_process_authorship() {
-    let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
-        .into_iter()
-        .filter(|(rel, text)| {
-            rel.starts_with("api/") && text.contains("WriteAuthorship::InProcessTool")
-        })
-        .map(|(rel, _)| rel)
-        .collect();
-    assert!(
-        offenders.is_empty(),
-        "an HTTP handler cannot vouch for a handshake script: {offenders:?}"
-    );
-}
-
 // --- change_owner --------------------------------------------------------
 
 /// `delete_file` resolved a shared knowhow file into the user dir, then
@@ -1297,4 +1278,24 @@ fn a_copy_onto_its_own_source_is_recognised() {
     assert!(!is_same_file(&a, &b));
     assert!(!is_same_file(&a, &dir.path().join("new.md")));
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "x");
+}
+
+mod guard_tests {
+    /// The HTTP layer must never claim in-process authorship. The compiler forces
+    /// every call site to name one, so what is left to protect is which one the
+    /// API surface names.
+    #[test]
+    fn no_http_handler_claims_in_process_authorship() {
+        let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
+            .into_iter()
+            .filter(|(rel, text)| {
+                rel.starts_with("api/") && text.contains("WriteAuthorship::InProcessTool")
+            })
+            .map(|(rel, _)| rel)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "an HTTP handler cannot vouch for a handshake script: {offenders:?}"
+        );
+    }
 }

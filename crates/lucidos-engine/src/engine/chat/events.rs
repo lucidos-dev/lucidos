@@ -19,7 +19,7 @@ pub(crate) fn images_to_hashes(
         .filter_map(|img| match write_blob_from_base64(workspace, &img.base64) {
             Ok(blob) => Some(blob.hash),
             Err(e) => {
-                crate::log!("[Image] blob write failed, image dropped: {}", e);
+                crate::log_legacy!("[Image] blob write failed, image dropped: {}", e);
                 None
             }
         })
@@ -159,153 +159,6 @@ fn synthesize_legacy_origin(
     }
 }
 
-/// The clock-free half of the pre-emit rule (see
-/// [`crate::engine::LucidosEngine::pre_emit_chat_message_received`] for what
-/// each exclusion costs and why). Split out so the rule is readable and
-/// testable on its own; the caller pairs it with the open-question lookup,
-/// which needs the database.
-pub(super) fn chat_message_is_pre_emittable(
-    mode: ActorMode,
-    use_coding_agent: Option<bool>,
-    thread_exists: bool,
-    input_ahead: bool,
-) -> bool {
-    mode == ActorMode::Human && use_coding_agent != Some(true) && thread_exists && !input_ahead
-}
-
-impl crate::engine::LucidosEngine {
-    /// Persist a chat follow-up's `MessageReceived` at the API boundary, before
-    /// the handler acks, and report it back so the spawned turn does not emit a
-    /// second one.
-    ///
-    /// The ack already means the input holds its place in the thread's input
-    /// order (*admission*, ADR 0449). Recording here adds that the message is
-    /// in the thread too, so the client's own read finds it at once. See
-    /// `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
-    ///
-    /// Returns `None` when this request must NOT be pre-emitted, and the
-    /// spawned turn records it instead, in the order admission gave it:
-    ///
-    /// - **An input ahead of it.** Recording now would put it before an input
-    ///   admitted first.
-    /// - **Not a person typing** (`mode != Human`). Agent and engine callers
-    ///   have their own boundary events and their own ordering.
-    /// - **A coding-agent dispatch.** That path deliberately emits its
-    ///   `MessageReceived` *after* a Codex redirect interrupt reaches a
-    ///   boundary, so the interrupted turn's terminal sequences first; emitting
-    ///   here would reorder the exchange.
-    /// - **A thread that does not exist yet.** The starter event stays behind
-    ///   whatever the slow path emits for a new thread.
-    /// - **A thread with an open question.** A typed reply there is rerouted to
-    ///   `UserQuestionAnswered` and never becomes a `MessageReceived`, so
-    ///   emitting one would be a spurious extra event.
-    /// - **A failed emit.** Logged. The input keeps its place in the order, so
-    ///   the spawned turn records it without losing it or its order.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn pre_emit_chat_message_received(
-        &self,
-        thread_id: Option<Uuid>,
-        thread_exists: bool,
-        // An input admitted before this one is still unrecorded.
-        input_ahead: bool,
-        mode: ActorMode,
-        use_coding_agent: Option<bool>,
-        user_message: &str,
-        user_images: Option<&[crate::api::ChatImage]>,
-        device_id: Option<&str>,
-        model: Option<&str>,
-        reasoning_effort: Option<&str>,
-        provider: Option<&str>,
-        event_id: Option<&str>,
-        origin: Option<MessageOrigin>,
-        // The *voice session* this message was spoken on. `None` is typed.
-        // The voice path passes the same id to the turn it then starts, so a
-        // message this function declines to pre-emit still lands marked.
-        voice_session_id: Option<Uuid>,
-    ) -> Option<crate::engine::PreEmittedOrigin> {
-        let thread_id = thread_id?;
-        if !chat_message_is_pre_emittable(mode, use_coding_agent, thread_exists, input_ahead) {
-            return None;
-        }
-        // An open question turns the next typed message into its answer.
-        // Same lookup the turn itself uses, so the two agree.
-        if crate::engine::agent_question::lookup_active_question_tool_use_id(self.pool(), thread_id)
-            .await
-            .is_some()
-        {
-            return None;
-        }
-
-        // Stamp the pair the turn resolves, so per-thread model memory reads
-        // back an unchanged value. The turn re-resolves with this event
-        // excluded, landing on the same answer. The gate keeps a rung pick
-        // from landing between the resolve and the emit (`chat::rung`).
-        let _turn_start = self.turn_start_gate.hold(thread_id).await;
-        let crate::core::ResolvedModelSelection {
-            model,
-            reasoning_effort,
-            provider,
-        } = self
-            .resolve_chat_pair(
-                thread_id,
-                crate::core::ResolvedModelSelection {
-                    model: model.map(str::to_string),
-                    reasoning_effort: reasoning_effort.map(str::to_string),
-                    provider: provider.map(str::to_string),
-                },
-            )
-            .await;
-
-        use crate::engine::thread_events::{EventChannel, EventMeta};
-        let emitted = self
-            .event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id,
-                event: make_message_received(
-                    self.workspace_path(),
-                    user_message,
-                    user_images,
-                    device_id,
-                    // A human message never carries spawn linkage
-                    // (`validate_mode_and_spawn` rejects it).
-                    None,
-                    None,
-                    None,
-                    mode,
-                    model.as_deref(),
-                    reasoning_effort.as_deref(),
-                    provider.as_deref(),
-                    origin,
-                    voice_session_id,
-                ),
-                meta: EventMeta {
-                    event_id: event_id.and_then(|s| Uuid::parse_str(s).ok()),
-                    channel: Some(EventChannel::Chat),
-                    ..EventMeta::NONE
-                },
-            })
-            .await;
-        match emitted {
-            Ok(Some(result)) => Some(crate::engine::PreEmittedOrigin::Message(result.event_id)),
-            Ok(None) => {
-                crate::log!(
-                    "[Chat] Pre-ack MessageReceived for thread {} returned no result; the turn will emit it",
-                    thread_id
-                );
-                None
-            }
-            Err(e) => {
-                crate::log!(
-                    "[Chat] Pre-ack MessageReceived for thread {} failed ({}); the turn will emit it",
-                    thread_id,
-                    e
-                );
-                None
-            }
-        }
-    }
-}
-
 /// The whole text half of an image-description request. Named so
 /// `core::aux_context_backfill` can size a historical call from the same
 /// string the live path sends, instead of a constant that drifts from it.
@@ -390,7 +243,7 @@ pub(super) fn format_relative_age(duration: chrono::Duration) -> String {
 /// has already landed here and the turn has nothing left to do. Nothing
 /// downstream would double-emit now: `process_message_with_steps` settles the
 /// exchange only once one exists, and no caller adds a terminator of its own.
-pub(super) async fn emit_routing_failure(
+pub(crate) async fn emit_routing_failure(
     bus: &dyn crate::engine::event_bus::EventBusEmitter,
     thread_id: Uuid,
     error: &str,
@@ -401,7 +254,9 @@ pub(super) async fn emit_routing_failure(
             thread_id,
             event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                 error: error.to_string(),
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             },
             meta: EventMeta::NONE,
         })
@@ -409,7 +264,7 @@ pub(super) async fn emit_routing_failure(
     {
         Ok(_) => Ok(()),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Chat] Failed to emit ResponseFailed for thread {}: {} — outer \
                  handler will emit its own ResponseFailed since the routing \
                  terminator never landed",
@@ -591,6 +446,7 @@ mod origin_invariants {
             event_id: None,
             user_agent: None,
             mode: ActorMode::Human,
+            verdict: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -618,6 +474,7 @@ mod origin_invariants {
             event_id: None,
             user_agent: None,
             mode: ActorMode::Human,
+            verdict: None,
         };
         let res = make_message_received_with_origin(
             std::path::Path::new(""),
@@ -930,86 +787,6 @@ mod origin_invariants {
             panic!("not a MessageReceived");
         };
         assert_eq!(voice_session_id, None);
-    }
-}
-
-#[cfg(test)]
-mod pre_emit_eligibility {
-    use super::*;
-
-    /// The case the whole change exists for: a person's follow-up on a thread
-    /// that already exists. Only here can two requests race, and only here does
-    /// pre-emitting buy an ordering guarantee.
-    #[test]
-    fn human_chat_follow_up_is_pre_emittable() {
-        assert!(chat_message_is_pre_emittable(
-            ActorMode::Human,
-            None,
-            true,
-            false
-        ));
-        assert!(chat_message_is_pre_emittable(
-            ActorMode::Human,
-            Some(false),
-            true,
-            false
-        ));
-    }
-
-    /// Pre-emitting a brand-new thread's first message would put
-    /// `MessageReceived` ahead of whatever the slow path emits for a new thread.
-    #[test]
-    fn first_message_on_a_new_thread_is_not_pre_emittable() {
-        assert!(!chat_message_is_pre_emittable(
-            ActorMode::Human,
-            None,
-            false,
-            false
-        ));
-    }
-
-    /// The coding-agent path emits its `MessageReceived` only AFTER a Codex
-    /// redirect interrupt reaches a boundary, so the interrupted turn's
-    /// terminal sequences first. Pre-emitting would reorder the exchange.
-    #[test]
-    fn coding_agent_dispatch_is_not_pre_emittable() {
-        assert!(!chat_message_is_pre_emittable(
-            ActorMode::Human,
-            Some(true),
-            true,
-            false
-        ));
-    }
-
-    /// An input with one still ahead of it in the thread's input order must
-    /// record after it, in the spawned turn. Recording it at the ack would put
-    /// it ahead of an input admitted first (ADR 0449).
-    #[test]
-    fn an_input_with_one_ahead_is_not_pre_emittable() {
-        assert!(!chat_message_is_pre_emittable(
-            ActorMode::Human,
-            None,
-            true,
-            true
-        ));
-    }
-
-    /// Agent- and engine-mode posts carry their own boundary events and their
-    /// own ordering; the API boundary must not speak for them.
-    #[test]
-    fn non_human_modes_are_not_pre_emittable() {
-        assert!(!chat_message_is_pre_emittable(
-            ActorMode::Agent,
-            None,
-            true,
-            false
-        ));
-        assert!(!chat_message_is_pre_emittable(
-            ActorMode::Engine,
-            None,
-            true,
-            false
-        ));
     }
 }
 

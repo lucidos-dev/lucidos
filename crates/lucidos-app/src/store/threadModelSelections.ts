@@ -3,7 +3,7 @@
  *  A thread remembers the pair it runs instead of snapping back to the account
  *  default on every new message. The engine holds that memory as thread events:
  *  the model, effort and provider stamped on each starter (`MessageReceived`,
- *  `TriggerStarted`), and the user's own pick between turns
+ *  `TriggerStarted`), applied turn stamps, and the user's next-turn pick
  *  (`ChatSettingsChanged`, recorded through `POST /api/v1/chat/settings`).
  *  Resolution is `the thread's newest such event ?? the account default`
  *  (`currentModel` and `accountChatEffort`, backed by the `chat_model` /
@@ -11,7 +11,7 @@
  *  backend are remembered with their model, so switching model carries neither.
  *
  *  Nothing here is held only in this tab: a pick on another device arrives as
- *  an event over SSE, and the face follows it. An active-thread pick never
+ *  an event over SSE. The face distinguishes live and pending settings. A pick never
  *  writes the account preference, which stays a Settings-only default. The
  *  engine resolves a follow-up's pair the same way
  *  (`PreferenceStore::last_thread_chat_settings`). */
@@ -19,13 +19,16 @@
 import { threadMap, currentModel } from './store';
 import { accountChatEffort, storedChatModel } from './actions/preferences';
 import type { StoredEvent } from './thread-events';
+import { getThreadEventsBump } from './threadActivity';
 
-type PairEvent = Extract<StoredEvent, { type: 'MessageReceived' | 'TriggerStarted' | 'ChatSettingsChanged' }>;
+type PairEvent = Extract<StoredEvent, { type: 'MessageReceived' | 'TriggerStarted' | 'ChatSettingsChanged' | 'ChatTurnSettingsResolved' }>;
 
 function isPairEvent(event: StoredEvent): event is PairEvent {
+  if (event.type === 'MessageReceived' && (event as { request_event_id?: string }).request_event_id) return false;
   return event.type === 'MessageReceived'
     || event.type === 'TriggerStarted'
-    || event.type === 'ChatSettingsChanged';
+    || event.type === 'ChatSettingsChanged'
+    || event.type === 'ChatTurnSettingsResolved';
 }
 
 /** The fields of a pair event and of a server `PairStamp` that name the pair. */
@@ -48,6 +51,7 @@ function newestPairValue(
   read: (event: PairFields) => unknown,
 ): string | undefined {
   if (!threadId) return undefined;
+  getThreadEventsBump(threadId);
   const thread = threadMap.value.get(threadId);
   if (!thread) return undefined;
   let bestSeq = -Infinity;
@@ -120,4 +124,33 @@ export function resolveActiveThreadReasoningEffort(
     ? undefined
     : lastThreadReasoningEffort(threadId, named);
   return remembered ?? accountChatEffort(model);
+}
+
+/** The applied pair and a later pick, reconstructed from events or a paged snapshot. */
+export function chatTurnSelection(threadId: string | undefined) {
+  if (threadId) getThreadEventsBump(threadId);
+  const thread = threadId ? threadMap.value.get(threadId) : undefined;
+  type Stamp = PairFields & { sequence: number; type: string; request_event_id?: string | null };
+  const stamps: Stamp[] = [];
+  for (const [sequence, event] of thread?.events ?? []) {
+    if (isPairEvent(event)) stamps.push({ ...event, sequence });
+  }
+  for (const stamp of thread?.pairStamps ?? []) {
+    stamps.push({ ...stamp, type: stamp.event_type ?? 'MessageReceived' });
+  }
+  const applied = stamps.filter(s => s.type === 'ChatTurnSettingsResolved')
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  const live = applied ?? stamps.filter(s => s.type !== 'ChatSettingsChanged')
+    .sort((a, b) => b.sequence - a.sequence)[0];
+  const pick = stamps.filter(s => s.type === 'ChatSettingsChanged'
+    && s.sequence > (live?.sequence ?? -Infinity)).sort((a, b) => b.sequence - a.sequence)[0];
+  // Picking the running pair again cancels the pending pick.
+  const pending = pick && live && samePair(pick, live) ? undefined : pick;
+  return { live, pending };
+}
+
+function samePair(a: PairFields, b: PairFields): boolean {
+  return (a.model || undefined) === (b.model || undefined)
+    && (a.reasoning_effort || undefined) === (b.reasoning_effort || undefined)
+    && (a.provider || undefined) === (b.provider || undefined);
 }

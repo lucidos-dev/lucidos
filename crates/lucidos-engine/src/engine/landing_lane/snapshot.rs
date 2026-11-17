@@ -24,6 +24,18 @@ pub struct LaneSnapshot {
     /// landing. The lane holds what it could not push and retries (ADR 0589).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_for_origin: Option<String>,
+    /// The batch that holds clean arrivals off `main` while it hardens again
+    /// after a catch-up, and the arrivals it holds (ADR 0694).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arrival_hold: Option<ArrivalHoldSnapshot>,
+}
+
+/// The open hold on clean arrivals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArrivalHoldSnapshot {
+    pub batch_id: Uuid,
+    /// The held changes, in arrival order. Each also appears in `waiting`.
+    pub arrivals: Vec<Uuid>,
 }
 
 /// The open lane batch.
@@ -66,6 +78,10 @@ impl LaneSnapshot {
             waiting: lane.waiting().iter().map(|m| m.change_id).collect(),
             gathering: lane.gathering(),
             waiting_for_origin: None,
+            arrival_hold: lane.arrival_hold().map(|hold| ArrivalHoldSnapshot {
+                batch_id: hold.batch_id,
+                arrivals: hold.arrivals().to_vec(),
+            }),
         }
     }
 
@@ -128,8 +144,32 @@ mod tests {
                 waiting: vec![id(3), id(4)],
                 gathering: false,
                 waiting_for_origin: None,
+                arrival_hold: None,
             }
         );
+    }
+
+    /// While the batch hardens again, the snapshot names it as the holder
+    /// and lists what it holds. No hold, no key on the wire.
+    #[test]
+    fn the_snapshot_names_the_batch_that_holds_arrivals() {
+        let mut lane = lane_with_batch(vec![member(1)]);
+        lane.wait(member(2));
+        lane.hold_arrivals(BATCH);
+        lane.hold(member(3));
+        let snapshot = LaneSnapshot::of(&lane, None);
+        assert_eq!(
+            snapshot.arrival_hold,
+            Some(ArrivalHoldSnapshot {
+                batch_id: BATCH,
+                arrivals: vec![id(3)],
+            })
+        );
+        assert_eq!(snapshot.waiting, vec![id(2), id(3)]);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["arrival_hold"]["batch_id"], BATCH.to_string());
+        let unheld = serde_json::to_value(LaneSnapshot::of(&Lane::default(), None)).unwrap();
+        assert!(unheld.get("arrival_hold").is_none());
     }
 
     /// While a press hands changes over, what conflicts waits with no batch

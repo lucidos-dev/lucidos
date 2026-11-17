@@ -11,7 +11,7 @@ use super::{
     parse_send_notification_args, parse_source_arg, parse_status_arg, pending_scope_arg,
     query_events_impl, status_filter_arg,
 };
-use crate::core::store::{EventStore, StatusFilter};
+use crate::core::store::StatusFilter;
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -703,7 +703,7 @@ mod build_query_events_response_tests {
     #[test]
     fn returns_full_set_when_under_budget() {
         let events = vec![row("Small", 10), row("Small", 10), row("Small", 10)];
-        let out = build_query_events_response(&events, 100_000);
+        let out = build_query_events_response(&events, 100_000, None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
         assert_eq!(parsed["total_matching"], 3);
         assert_eq!(parsed["returned"], 3);
@@ -724,7 +724,7 @@ mod build_query_events_response_tests {
             row("Tiny", 10),
         ];
         // Enough room for the two small events but not the 50 KB blob.
-        let out = build_query_events_response(&events, 1_000);
+        let out = build_query_events_response(&events, 1_000, None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
         assert_eq!(parsed["total_matching"], 4);
         assert_eq!(parsed["returned"], 2);
@@ -738,7 +738,7 @@ mod build_query_events_response_tests {
     #[test]
     fn empty_events_when_first_alone_exceeds_budget() {
         let events = vec![row("Huge", 50_000)];
-        let out = build_query_events_response(&events, 1_000);
+        let out = build_query_events_response(&events, 1_000, None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
         assert_eq!(parsed["total_matching"], 1);
         assert_eq!(parsed["returned"], 0);
@@ -800,10 +800,58 @@ mod build_query_events_response_tests {
         }
     }
 
+    /// The widest liveness header the engine writes.
+    fn widest_liveness() -> crate::engine::thread_liveness::ThreadLiveness {
+        use crate::engine::thread_liveness::*;
+        ThreadLiveness {
+            state: LivenessState::WaitingForUserAnswer,
+            status: crate::engine::thread_lifecycle::ThreadStatus::WaitingForUserAnswer,
+            last_activity_age_secs: Some(i64::MAX),
+            session: Some(LivenessSession {
+                ordinal: u32::MAX,
+                continuity: SessionOpening::Handoff,
+                age_secs: i64::MAX,
+            }),
+            handoff: Some(LivenessHandoff::Pending),
+            as_of: Utc.timestamp_opt(1_700_000_000, 0).unwrap(),
+        }
+    }
+
+    /// The header leads the result, stays within 256 bytes, and takes
+    /// nothing from the event window `byte_limit` buys.
+    #[test]
+    fn the_liveness_header_leads_is_small_and_costs_no_events() {
+        let liveness = widest_liveness();
+        let header = serde_json::to_string(&liveness).unwrap();
+        assert!(header.len() <= 256, "{} bytes: {header}", header.len());
+
+        let events: Vec<EventRow> = (0..20).map(|_| row("Tiny", 40)).collect();
+        let bare = build_query_events_response(&events, 1_024, None);
+        let out = build_query_events_response(&events, 1_024, Some(&liveness));
+        let header_at = out.find("\"liveness\"").expect("a header");
+        let events_at = out.find("\"events\"").expect("the events");
+        assert!(header_at < events_at, "{out}");
+        let returned =
+            |s: &str| serde_json::from_str::<serde_json::Value>(s).unwrap()["returned"].clone();
+        assert_eq!(
+            returned(&out),
+            returned(&bare),
+            "the same event window fills"
+        );
+        assert!(
+            returned(&out).as_u64().unwrap() < 20,
+            "the budget still binds"
+        );
+        assert!(serde_json::from_str::<serde_json::Value>(&bare)
+            .unwrap()
+            .get("liveness")
+            .is_none());
+    }
+
     /// Empty store input round-trips to an empty array with no hint.
     #[test]
     fn empty_input_yields_empty_array_no_hint() {
-        let out = build_query_events_response(&[], 100_000);
+        let out = build_query_events_response(&[], 100_000, None);
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("compact JSON");
         assert_eq!(parsed["total_matching"], 0);
         assert_eq!(parsed["returned"], 0);
@@ -819,7 +867,7 @@ mod build_query_events_response_tests {
     #[test]
     fn output_is_compact_json_not_pretty_printed() {
         let events = vec![row("Tiny", 10)];
-        let out = build_query_events_response(&events, 100_000);
+        let out = build_query_events_response(&events, 100_000, None);
         assert!(
             !out.contains("\n  "),
             "result must be compact JSON (no indentation): {}",
@@ -1209,7 +1257,6 @@ fn a_call_to_execute_intent_is_refused_with_its_replacement() {
 /// Seed `mine` with two `Counted` rows and `other` with one, then count.
 async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result<String, String> {
     let (pool, db) = setup_test_db().await;
-    let store = EventStore::new(pool.clone());
     let other = Uuid::new_v4();
     for _ in 0..2 {
         insert_thread_event(&pool, Uuid::new_v4(), mine, "Counted", json!({})).await;
@@ -1217,11 +1264,70 @@ async fn count_with(args: serde_json::Value, caller: Uuid, mine: Uuid) -> Result
     insert_thread_event(&pool, Uuid::new_v4(), other, "Counted", json!({})).await;
     insert_thread_event(&pool, Uuid::new_v4(), other, "OnlyOther", json!({})).await;
 
-    let out = count_events_impl(&store, &args, caller).await;
+    let out = count_events_impl(&pool, &args, caller).await;
 
     pool.close().await;
     teardown_test_db(&db).await;
     out
+}
+
+/// The incident's read, replayed through the tool: a thread mid-handoff whose
+/// newest row is a tool error. The result leads with `working`, which
+/// contradicts "the handoff failed" on the spot. A count says the same, and a
+/// read spanning every thread carries no header.
+#[tokio::test]
+async fn a_thread_scoped_read_leads_with_the_threads_liveness() {
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread = crate::test_support::seed_coding_thread(&bus, None).await;
+    let error: ThreadEvent = serde_json::from_value(json!({
+        "type": "CodingAgentToolResult",
+        "name": "Bash",
+        "result": "Error: Could not read the handoff narrative",
+    }))
+    .unwrap();
+    bus.emit(BusEvent::Thread {
+        thread_id: thread,
+        event: error,
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    let scoped = json!({"thread_id": thread.to_string(), "limit": 6});
+    let out = query_events_impl(&pool, &scoped, some_caller())
+        .await
+        .unwrap();
+    assert!(out.starts_with("{\"liveness\":"), "{out}");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["liveness"]["state"], "working");
+    assert_eq!(parsed["liveness"]["status"], "running");
+    assert_eq!(parsed["events"][0]["event_type"], "CodingAgentToolResult");
+
+    let counted = count_events_impl(
+        &pool,
+        &json!({"thread_id": thread.to_string()}),
+        some_caller(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        counted.starts_with("{\"liveness\":{\"state\":\"working\""),
+        "{counted}"
+    );
+
+    let everywhere = query_events_impl(&pool, &json!({"limit": 6}), some_caller())
+        .await
+        .unwrap();
+    assert!(!everywhere.contains("\"liveness\""), "{everywhere}");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
 }
 
 #[tokio::test]

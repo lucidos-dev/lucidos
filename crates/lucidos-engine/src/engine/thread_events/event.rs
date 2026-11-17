@@ -2,17 +2,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::api::thread_reach::ThreadReachVerb;
 use crate::core::event_subscription::EventSubscription;
+use crate::engine::permission::Action;
 use crate::runtime::CodingAgent;
 
 use super::{
     AbortCause, ActorMode, AnswerKind, ApplyNowOutcome, CacheKeepAliveStatus, CancelCause,
     CaptureFormat, ChildCompletionStatus, CodingAgentExit, Dashboard, EventWaitCancelCause,
     FireRetry, FormRequestOutcome, HandoffConsent, LegacyArrangedTile, McpEnablementSource,
-    MessageOrigin, OwnerApproval, QuestionOption, RecalledMemory, RetryOf, SessionEndReason,
-    TodoItem, TriggerInvocation, UnproposedReason, UnqueueReason, VoiceSessionEndReason,
-    WakeBucket, WakeMode, WakeSource,
+    MessageOrigin, OwnerApproval, ProviderError, QuestionOption, RecalledMemory, RetryOf,
+    SessionEndReason, TodoItem, TriggerInvocation, UnattestedAct, UnproposedReason, UnqueueReason,
+    VoiceSessionEndReason, WakeBucket, WakeMode, WakeSource,
 };
 
 /// Initial restored composer, inserted only when its fresh destination is absent.
@@ -23,6 +23,16 @@ pub struct RecoveredCompose {
     pub text: String,
     pub image_hashes: Vec<String>,
     pub selection: Option<Value>,
+}
+
+/// A draft an agent created for the owner (ADR 0665). It seeds the composer
+/// once, when its thread is created, and never overwrites a later edit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentDraft {
+    pub text: String,
+    pub image_hashes: Vec<String>,
+    pub selection: Option<Value>,
+    pub drafted_by_thread_id: uuid::Uuid,
 }
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -162,6 +172,12 @@ pub enum ThreadEvent {
     /// matching injected prompt when it drains the queue.
     QueuedMessageRemoved {
         removed_message_id: uuid::Uuid,
+        /// Stop requests atomic restoration; trash and coding-agent withdrawals do not.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        restore_to_compose: bool,
+        /// Result of atomic restoration, retained for projection replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compose: Option<Box<crate::core::store::ComposeReport>>,
     },
     /// An agent-sent message held back from a coding agent, because the thread
     /// waits on a human: an open question, or older held messages. It stays
@@ -282,12 +298,18 @@ pub enum ThreadEvent {
         /// sending a retired model's successor (ADR 0418).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         served_model: Option<String>,
-        /// The backend that served the call, as the router resolved its route
-        /// (`claude-gateway`, `vertex`, ...). Absent when no router chose one,
-        /// as for a coding agent's own call, and on every row written before
-        /// the field existed. The gateway telemetry exporter selects on it.
+        /// The backend the router chose or the coding agent reported
+        /// (`claude-gateway`, `vertex`, ...). Coding-agent calls use `unknown`
+        /// when unresolved; `CodingAgentBillingObserved` preserves why.
+        /// Absent on older captures without provider attribution. Gateway
+        /// telemetry selects engine-owned producers as well as this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<String>,
+        /// The caller ran in a CLI process that owns its telemetry. Engine
+        /// exporters must leave this capture to that process. Defaults false
+        /// for older captures; producer-based exclusions still apply.
+        #[serde(default, skip_serializing_if = "is_false")]
+        telemetry_owned_by_cli: bool,
         /// Time to the first content delta of the stream that answered, from
         /// the same start as `duration_ms`, so never above it. Absent when
         /// no delta arrived or the provider's send loop does not trace it,
@@ -304,6 +326,17 @@ pub enum ThreadEvent {
         /// Absent on every row written before the field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<u32>,
+    },
+    /// Secret-free billing evidence observed from a coding-agent process.
+    /// Scoped to this launch, never a pin to replay as current auth on resume.
+    CodingAgentBillingObserved {
+        coding_agent: CodingAgent,
+        /// Correlates observations from one spawned process, independently of
+        /// backend session ids that a resume may reuse.
+        launch_id: uuid::Uuid,
+        attribution: crate::runtime::billing_provider::BillingAttribution,
+        #[serde(default)]
+        billing_mode: crate::runtime::billing_provider::BillingMode,
     },
     /// A metered chat call that failed. It is **never a `ContextCaptured`**: a
     /// capture binds to a transcript step and every usage rollup sums it, while
@@ -457,6 +490,17 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "is_false")]
         abandoned: bool,
     },
+    /// The engine started a *confinement run* as background task `task_id`,
+    /// under permission `permission_id`. `revision` is the worktree's `HEAD`
+    /// when the tree was clean, and absent when it was dirty. The paired
+    /// `BackgroundBashCompleted` carries the result. A passing run certifies
+    /// its own clean revision for a later harden retry.
+    ConfinementRunStarted {
+        task_id: String,
+        permission_id: uuid::Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
+    },
     ResponseGenerated {
         #[serde(default, skip_serializing_if = "is_empty_str")]
         text: String,
@@ -493,11 +537,18 @@ pub enum ThreadEvent {
     },
     ResponseFailed {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        spend_cap: Option<crate::llm::spend_cap::SpendCapNotice>,
         /// Set when the coding agent's process ended on its own and took the
         /// turn with it. Absent on every other failure, and on stored events
         /// from before it existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_exit: Option<CodingAgentExit>,
+        /// The structured code the provider attached to the failed turn. A
+        /// policy block is never resumed. Absent when the provider sent no
+        /// code, and on stored events from before it existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_error: Option<ProviderError>,
     },
 
     // Resume-after-abort boundary. Opens a new exchange in the timeline whose
@@ -535,6 +586,9 @@ pub enum ThreadEvent {
         resumed_abort_id: Option<uuid::Uuid>,
     },
     SessionStarted {
+        /// The mode resolved for the spawned process. Absent on legacy rows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<crate::runtime::agent_sandbox::SandboxMode>,
         session_id: String,
         #[serde(default, skip_serializing_if = "is_empty_str")]
         branch: String,
@@ -618,6 +672,9 @@ pub enum ThreadEvent {
     /// the same branch, with `message` as its first input. Pending until that
     /// session's `SessionStarted`.
     SessionHandedOff {
+        /// The repository-scoped branch marker at the handoff.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_path: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cause: Option<super::HandoffCause>,
         #[serde(default)]
@@ -702,11 +759,11 @@ pub enum ThreadEvent {
         ceiling: crate::engine::context_ceiling::ContextCeiling,
         source: crate::engine::context_ceiling::CeilingSource,
     },
-    /// The session grew past its context ceiling, and the engine sent the
-    /// *ceiling re-entry* (ADR 0629). Once per session, at the turn end that
-    /// crossed it.
+    /// A live main-session capture crossed the context ceiling (ADR 0701).
+    /// Recorded once per session; re-entry waits for a safe boundary.
+    /// A session whose first capture already exceeds its ceiling is exempt.
     ContextCeilingReached {
-        /// The session's context size at that turn end, in tokens.
+        /// The session's context size at the crossing, in tokens.
         context_tokens: u64,
         /// The effective ceiling it crossed, in tokens.
         ceiling: u64,
@@ -731,6 +788,16 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         post_tokens: Option<u64>,
         #[serde(default = "default_coding_agent_claude_code")]
+        coding_agent: CodingAgent,
+    },
+    /// The coding agent ran another model than the pinned one the turn asked
+    /// for, because the account may not run it. Read off the agent's Init
+    /// line. The thread's current model is the served one from here on.
+    CodingAgentModelSubstituted {
+        /// The model id the spawn asked for.
+        requested: String,
+        /// The model id the agent reported running.
+        served: String,
         coding_agent: CodingAgent,
     },
     #[serde(alias = "ClaudeCodeTextStreamed")]
@@ -926,6 +993,11 @@ pub enum ThreadEvent {
         /// still records that an idle overlapped a background task.
         #[serde(default, skip_serializing_if = "is_false")]
         bg_bash_pending: bool,
+        /// How the agent ended the turn this idle closes, as its driver saw it.
+        /// `None` from Claude Code, for an idle no agent turn closed, and on
+        /// rows written before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_end: Option<super::TurnEndFacts>,
     },
     /// Continuation requested, emitted when a CC turn that was interrupted
     /// (engine restart mid-turn, Q9a recovery path) needs to be resumed
@@ -1015,8 +1087,8 @@ pub enum ThreadEvent {
     },
     /// Someone became the *driver* of this thread's family (ADR 0623), on its
     /// root. The actor names them: a device, or a trigger fire whose
-    /// actor email an operator holds. Recorded by Take, Take over, and by
-    /// answering a gate. Projects nothing: `engine::thread_people` folds it.
+    /// actor email a user holds. Recorded by Take, Take over, and by
+    /// answering a gate. Projects nothing: `engine::thread_users` folds it.
     WorkItemDriverTaken,
     /// The root thread's driver gave the role up, on its family root. It has
     /// no driver until someone takes it.
@@ -1032,20 +1104,20 @@ pub enum ThreadEvent {
     /// Someone started watching this root thread: its gate pushes reach them
     /// beside the driver. Recorded on the family root.
     WorkItemWatched {
-        /// The person a *person mention* made a watcher (ADR 0649). Absent
+        /// The person a *user mention* made a watcher (ADR 0649). Absent
         /// means the actor's own person, who tapped Watch.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        operator_id: Option<String>,
+        user_id: Option<String>,
     },
     /// The actor stopped watching this root thread, from any of their devices.
     WorkItemUnwatched,
     /// A person wrote to the other people in this thread, not to its agent: a
-    /// *people-only message* (ADR 0649). The meta actor names the sender.
+    /// *user-only message* (ADR 0649). The meta actor names the sender.
     ///
     /// **`Metadata`, and that is why it is not a `MessageReceived`.** It starts
     /// no turn and is never injected into a running one. The agent reads it as
     /// context on its next woken turn.
-    PeopleMessagePosted {
+    UserOnlyMessagePosted {
         text: String,
         /// Blob hashes of attached images, as on `MessageReceived`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1053,11 +1125,11 @@ pub enum ThreadEvent {
         /// The device the message came from, by id only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
-        /// The operators the message mentions. An operator id, because that is
-        /// the only stable handle for a person. A removed operator's id
+        /// The users the message mentions. A user id, because that is
+        /// the only stable handle for a person. A removed user's id
         /// resolves to nobody.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        mentioned_operator_ids: Vec<String>,
+        mentioned_user_ids: Vec<String>,
     },
     /// Typed messages in this thread stop waking its agent: the *agent pause*
     /// (ADR 0649). A running turn carries on. The meta actor names who paused.
@@ -1068,6 +1140,67 @@ pub enum ThreadEvent {
     AgentResumed {
         cause: super::AgentPauseCause,
     },
+    /// The engine's automatic steps on this thread now ask the owner first:
+    /// the *automation pause*. A running turn carries on, and messages still
+    /// deliver. The meta actor names who paused it.
+    AutomationPaused {
+        reason: String,
+    },
+    /// An owner act ended the automation pause: *unpause*.
+    AutomationUnpaused {
+        cause: super::AutomationUnpauseCause,
+    },
+    /// The owner's pick on a *permission request* granted a *permission*.
+    /// `request_tool_use_id` names the card, and `picked_by` says whether a tap,
+    /// typed words or spoken words picked it. The meta actor is the owner's
+    /// device. A tool card's "Allow for this thread" carries the grant file
+    /// line it stores as `pattern`, which the lane's own matcher reads.
+    PermissionGranted {
+        permission_id: uuid::Uuid,
+        action: crate::engine::permission::Action,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        breadth: Option<String>,
+        lifetime: crate::engine::permission::Lifetime,
+        holder: crate::engine::permission::Holder,
+        request_tool_use_id: String,
+        picked_by: crate::engine::permission::PickedBy,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+    /// A once permission covered the action it allowed, so it ended. A unique
+    /// index refuses a second spend.
+    PermissionSpent {
+        permission_id: uuid::Uuid,
+    },
+    /// The gateway explicitly refused without changing anything. Copy the spent
+    /// once grant under a new id, keeping its original request and turn boundary.
+    /// A unique index permits at most one restoration of each spend.
+    PermissionRestored {
+        spent: uuid::Uuid,
+        restored: uuid::Uuid,
+    },
+    /// Someone revoked a permission. The meta actor names who.
+    PermissionRevoked {
+        permission_id: uuid::Uuid,
+    },
+    /// An agent prepared a *permission request* on its own thread, through
+    /// `POST /api/v1/permission-requests`. The engine wrote `card`. It shows
+    /// when the agent asks its question tool with `request_id` as its only
+    /// question. A request grants nothing until the owner picks an option.
+    PermissionRequestPrepared {
+        request_id: String,
+        request: crate::engine::permission::PermissionRequest,
+        card: crate::engine::permission::PreparedCard,
+    },
+    /// One item of a confirmed *batch* ran, or was skipped because its
+    /// source changed. On the thread that raised the batch. `index` counts
+    /// from 0 in the batch's order, and `permission_id` is the spent grant.
+    BatchItemRan {
+        permission_id: uuid::Uuid,
+        index: u32,
+        item: crate::engine::permission::batch::BatchItem,
+        outcome: crate::engine::permission::batch::BatchItemOutcome,
+    },
     /// A thread was created in `composing` state. Emitted by the first
     /// successful POST /threads (debounced first user input: keystroke,
     /// image attach, or mode toggle on a fresh compose). The thread can
@@ -1075,6 +1208,9 @@ pub enum ThreadEvent {
     ThreadStarted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recovered_compose: Option<RecoveredCompose>,
+        /// Set only by the agent-draft service, never beside `recovered_compose`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_draft: Option<AgentDraft>,
         /// Initial mode the user opened compose with. Mutable while the
         /// thread is `Composing`; locked on first `MessageReceived`.
         mode: String,
@@ -1179,8 +1315,31 @@ pub enum ThreadEvent {
         result_summary: Option<String>,
     },
 
+    /// Planning began, with an explicit purpose supplied by the planning skill.
+    /// Does not record approval or open the source edit gate.
+    PlanStarted {
+        kind: super::PlanKind,
+    },
+
+    /// A committed plan revision was submitted for approval.
+    PlanProposed {
+        kind: super::PlanKind,
+        plan_path: String,
+        plan_sha: String,
+        branch_name: String,
+    },
+    /// The engine checked the user's approval for this committed revision.
+    PlanApproved {
+        kind: super::PlanKind,
+        plan_path: String,
+        plan_sha: String,
+        scope: super::PlanScope,
+    },
+
     // Changes — change_id is the primary identifier
     ChangeProposed {
+        #[serde(default)]
+        content: super::ChangeContent,
         #[serde(default, skip_serializing_if = "is_empty_str")]
         change_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1238,6 +1397,8 @@ pub enum ThreadEvent {
         diff: String,
     },
     ChangeApplied {
+        #[serde(default)]
+        content: super::ChangeContent,
         #[serde(default, skip_serializing_if = "is_empty_str")]
         change_id: String,
         #[serde(default, skip_serializing_if = "is_false")]
@@ -1337,6 +1498,14 @@ pub enum ThreadEvent {
         error: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
+        /// A merge already landed, but recording its content failed. Retries use
+        /// this range instead of treating the landing as an empty no-op.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pre_merge_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        post_merge_sha: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        landing_merge_sha: Option<String>,
     },
     /// An Apply Now passed its refusals and began. Sets `apply_in_flight` TRUE
     /// until the apply's own `ApplyNowEnded`, so every client reads one answer
@@ -1446,11 +1615,18 @@ pub enum ThreadEvent {
         claude_config_dir_explicit: Option<bool>,
     },
 
-    /// The user picked a Lucidos Agent thread's model and effort between turns
-    /// (ADR 0544 for the lock). The thread's next turn runs on it, however it
-    /// starts: `last_thread_chat_settings` reads it beside the starters. The
-    /// payload is flat, like a starter's. The actor rides on `EventMeta`.
+    /// A resolved next-turn user pick, including mid-turn (ADR 0544).
     ChatSettingsChanged {
+        model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+
+    /// The resolved pair applied when a Lucidos Agent turn is admitted.
+    /// `EventMeta::request_event_id` identifies its durable turn anchor.
+    ChatTurnSettingsResolved {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
@@ -1579,12 +1755,25 @@ pub enum ThreadEvent {
         worktree_path: Option<String>,
         #[serde(default)]
         multi_select: bool,
-        /// Set only on an *owner approval card* (ADR 0387): the act its
-        /// Allow once authorizes. The engine wrote this card's text.
+        /// Set only on the retired single-use Allow once card (ADR 0387): the
+        /// act it proposed. History only: nothing sets it now, and an engine
+        /// card carries `permission_request` instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner_approval: Option<OwnerApproval>,
+        /// Set only on a card the engine raised for an *unattested caller*
+        /// before that card became a permission request. History only: the
+        /// act now rides in `permission_request.unattested_act`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unattested_act: Option<UnattestedAct>,
+        /// Set only on a *permission request* the engine raised and worded:
+        /// what each option grants (`engine::permission`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_request: Option<crate::engine::permission::PermissionRequest>,
     },
     UserQuestionAnswered {
+        /// The atomic composer consumption, retained for projection rebuilds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compose: Option<Box<crate::core::store::ComposeReport>>,
         tool_use_id: String,
         answer: AnswerKind,
         /// The pick was a *quiet option*, so the turn ends without waking the
@@ -1593,26 +1782,42 @@ pub enum ThreadEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         quiet: bool,
     },
-    /// A thread asked for an *owner approval* (ADR 0387), through `POST
-    /// /api/v1/owner-approvals`. `question` is the card the engine wrote. It
-    /// is shown when the thread asks `AskUserQuestion` with `request_id` as
-    /// its question. A request grants nothing until the owner allows the card.
+    /// A thread asked for the retired single-use Allow once card (ADR 0387).
+    /// History only: nothing emits it now. `PermissionRequestPrepared`
+    /// records the request that replaced it.
     OwnerApprovalRequested {
         request_id: String,
         approval: OwnerApproval,
         question: String,
     },
-    /// A thread spent an *owner approval* on the clause-4 act it names
-    /// (ADR 0387). Emitted only by `api::owner_approval`, before the act's
-    /// handler writes anything. `tool_use_id` names the approval card, and a
-    /// unique index on it refuses a second spend.
+    /// A thread spent the retired single-use Allow once card on the act it
+    /// names (ADR 0387). History only: nothing emits it now, and
+    /// `PermissionSpent` records the spend that replaced it.
     OwnerApprovalSpent {
         tool_use_id: String,
-        verb: ThreadReachVerb,
+        verb: Action,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_thread_id: Option<uuid::Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target_workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot_handle: Option<String>,
+    },
+    /// The owner's Allow once on an *unattested caller*'s card was spent on
+    /// its act. History only: nothing emits it now. That card is a permission
+    /// request, and `PermissionSpent` records the spend.
+    UnattestedActSpent {
+        tool_use_id: String,
+    },
+    /// An agent acted on a *machine-made workspace* with no card: the
+    /// workspace is the agent's. A stop, start, rename or autostart change
+    /// comes from `api::workspace_broker`, and a snapshot restore from
+    /// `api::snapshots`, which names the snapshot. Emitted before the act,
+    /// which may still be refused.
+    MachineMadeWorkspaceChanged {
+        verb: Action,
+        workspace_id: String,
+        reason: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         snapshot_handle: Option<String>,
     },
@@ -1673,6 +1878,10 @@ pub enum ThreadEvent {
         summary: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grant_head: Option<String>,
+        /// The grants the card offers, which a click stores exactly. Absent on
+        /// a card raised before the engine stamped its offer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        grant_offer: Option<crate::engine::claude_code::GrantOffer>,
     },
     /// User resolved a `CommandPermissionRequested` (or the engine resolved it
     /// as superseded / orphaned). Chat counterpart of
@@ -2321,6 +2530,12 @@ pub enum ThreadEvent {
         /// carries it. Absent when the workspace-wide scale is the largest.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scale_device_id: Option<String>,
+        /// Public selection handle, never the renderer credential. Its actor
+        /// is the verified source thread, rather than an impersonated Device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renderer_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        renderer_device_id: Option<String>,
     },
     NavigationRequested {
         payload: String,

@@ -10,14 +10,20 @@
 #   ./scripts/harden-other-model-review.sh --hardened-by <backend> [--base <sha>]
 #
 # `decide` prints "run <reviewer> <base>", or a skipped status line. The
-# review itself covers <base>...HEAD (default main). It prints each attempt's
-# review, then ONE status line, always the last line. <R> is Codex or Claude:
+# review itself covers <base>...HEAD (default main), both frozen to commits
+# before the first attempt. It prints each attempt's review, then ONE status
+# line, always the last line. <R> is Codex or Claude:
 #
 #   <R> review: verdict returned (attempt N of 2)                          exit 0
 #   <R> review: NO VERDICT after N attempts (<cause>, reviewer said
 #     "...", upstream: <status or stderr line>)                            exit 1
 #   <R> review: unavailable (<why>)                                        exit 2
 #   <R> review: skipped (<why>)                                 `decide`, exit 0
+#
+# A verdict counts only with proof the reviewer read the patch: a structured
+# answer with status "reviewed" that names exactly the diff's changed files.
+# A sandbox error, a refusal, "unable to assess", empty or unstructured output
+# is NO VERDICT, and <cause> says which check failed.
 #
 # An attempt with no verdict is retried once. A timed-out attempt is not.
 # `task-timeout` prints the engine background task's kill timer.
@@ -76,19 +82,19 @@ label=$(omr_label "$reviewer")
 # shellcheck disable=SC2086 # a list of names, split on purpose
 unset $OMR_SCRUBBED_ENV
 
-WORK="$(mktemp -d)" || exit 2
-trap 'rm -rf "$WORK"' EXIT
+OMR_WORK="$(mktemp -d)" || exit 2
+trap 'rm -rf "$OMR_WORK"' EXIT
 
 OMR_WHY=""
-if ! "omr_${reviewer}_ready"; then
+if ! "omr_${reviewer}_ready" || ! omr_freeze_range "$base"; then
     echo "$label review: unavailable ($OMR_WHY)"
     exit 2
 fi
 
 attempt=1
 while :; do
-    out="$WORK/out.$attempt" err="$WORK/err.$attempt" started=$(date +%s)
-    omr_with_timeout "$OMR_ATTEMPT_TIMEOUT_S" "omr_${reviewer}_run" "$base" > "$out" 2> "$err"
+    out="$OMR_WORK/out.$attempt" err="$OMR_WORK/err.$attempt" started=$(date +%s)
+    omr_with_timeout "$OMR_ATTEMPT_TIMEOUT_S" "omr_${reviewer}_run" "$OMR_BASE" "$OMR_HEAD" > "$out" 2> "$err"
     status=$?
     echo "--- attempt $attempt of $OMR_ATTEMPTS: exit $status ---"
     "omr_${reviewer}_show" "$out"
@@ -96,6 +102,7 @@ while :; do
         echo "--- attempt $attempt stderr ---"
         cat "$err"
     fi
+    OMR_REJECTED=""
     if [ "$status" != 124 ] && "omr_${reviewer}_verdict" "$status" "$out"; then
         echo "$label review: verdict returned (attempt $attempt of $OMR_ATTEMPTS)"
         exit 0
@@ -103,6 +110,7 @@ while :; do
     if [ "$status" = 124 ] || [ "$attempt" = "$OMR_ATTEMPTS" ]; then
         cause="exit $status"
         [ "$status" = 124 ] && cause="timed out after ${OMR_ATTEMPT_TIMEOUT_S}s"
+        [ -n "$OMR_REJECTED" ] && cause="$cause, $OMR_REJECTED"
         noun=attempts
         [ "$attempt" = 1 ] && noun=attempt
         said=$("omr_${reviewer}_said" "$out")

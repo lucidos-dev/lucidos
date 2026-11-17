@@ -77,7 +77,7 @@ fn terminate_decision_handed_off_leaves_queued_follow_ups_to_the_successor() {
 fn a_handed_off_session_forwards_no_more_input() {
     const RUN_SRC: &str = include_str!("../run_session/run.rs");
     let arm = RUN_SRC
-        .find("msg_rx.recv(), if !handed_off &&")
+        .find("msg_rx.recv(), if input_gate.receives() &&")
         .expect("the input arm must be off once the session handed off");
     let body = &RUN_SRC[arm..];
     let forward = body
@@ -101,9 +101,15 @@ fn every_idle_exit_refreshes_the_handoff_flag() {
     let exit = RUN_SRC
         .find("async fn exit_idle_subprocess_unless_owed(")
         .expect("the idle exit exists");
+    let refresh = RUN_SRC[exit..]
+        .find("input_gate.handed_off =")
+        .expect("the idle exit must write its handoff read back to the run loop");
     assert!(
-        RUN_SRC[exit..].contains("*handed_off = crate::engine::successor::handoff_pending("),
-        "the idle exit must write its handoff read back to the run loop"
+        RUN_SRC[exit + refresh..]
+            .trim_start_matches("input_gate.handed_off =")
+            .trim_start()
+            .starts_with("crate::engine::successor::handoff_pending("),
+        "the flag it writes is the handoff read"
     );
     for call in [
         "self.exit_idle_subprocess_unless_owed(",
@@ -112,11 +118,30 @@ fn every_idle_exit_refreshes_the_handoff_flag() {
         for (at, _) in RUN_SRC.match_indices(call) {
             let line = &RUN_SRC[at..at + RUN_SRC[at..].find('\n').unwrap()];
             assert!(
-                line.contains("&mut handed_off"),
+                line.contains("&mut input_gate"),
                 "an idle exit must refresh the loop's flag: {line}"
             );
         }
     }
+}
+
+/// A policy block closes the gate like a handoff: the input arm stops
+/// forwarding, and the idle exit leaves the queue to a fresh session.
+#[test]
+fn a_provider_block_closes_the_input_gate() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    assert!(RUN_SRC.contains("!self.handed_off && !self.provider_blocked"));
+    let result_arm = RUN_SRC
+        .find("AgentEvent::Result { text, error: cc_error, provider_error, turn_end, .. } => {")
+        .expect("the run loop handles a Result");
+    let set = RUN_SRC[result_arm..]
+        .find("input_gate.provider_blocked = true;")
+        .expect("a policy block closes the gate");
+    assert!(RUN_SRC[result_arm..result_arm + set].contains(".is_policy_block()"));
+    let exit = RUN_SRC
+        .find("async fn exit_idle_subprocess_unless_owed(")
+        .expect("the idle exit exists");
+    assert!(RUN_SRC[exit..].contains("let leaves_queue_to_next_session = !input_gate.forwards();"));
 }
 
 /// An input the session forwarded before it handed off sits in the agent's own

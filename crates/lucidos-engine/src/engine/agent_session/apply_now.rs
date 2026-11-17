@@ -136,7 +136,7 @@ impl Drop for ChangeClaimGuard {
         let (thread_id, claimant) = (self.thread_id, self.claimant.clone());
         handle.spawn(async move {
             release_change_claim(&mut *sessions.lock().await, thread_id, &claimant);
-            log!(
+            log_legacy!(
                 "[AgentSession] A change claim on thread {} outlived its work and was released on drop",
                 thread_id
             );
@@ -248,7 +248,7 @@ impl LucidosEngine {
         // branch needs no separate cover: it delegates to `apply_change`, which
         // carries the change-scoped guard.
         if self.merge_ownership_for_thread(thread_id).await == MergeOwnership::ResolverOwnsIt {
-            log!(
+            log_legacy!(
                 "[ApplyNow] Refused for thread {}: a conflict resolution is in flight and owns the merge",
                 thread_id
             );
@@ -263,14 +263,14 @@ impl LucidosEngine {
         {
             Ok(false) => {}
             Ok(true) => {
-                log!(
+                log_legacy!(
                     "[ApplyNow] Refused for thread {}: it is parked on a question",
                     thread_id
                 );
                 return Err(crate::engine::claude_code::QUESTION_OPEN_MESSAGE.into());
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ApplyNow] Refused for thread {}: could not check for a parked question: {}",
                     thread_id,
                     e
@@ -338,7 +338,7 @@ impl LucidosEngine {
                                 engine.apply_pending_now(thread_id, pending, actor),
                             );
                             if futures::FutureExt::catch_unwind(applying).await.is_err() {
-                                log!(
+                                log_legacy!(
                                     "[ApplyNow] Applying pending changes panicked for {}",
                                     thread_id
                                 );
@@ -356,12 +356,15 @@ impl LucidosEngine {
                     // (ADR 0400). A stale session's work is proposed by its
                     // own recovery, never by an Apply.
                     let error = self.nothing_proposed_refusal(thread_id).await;
-                    log!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
+                    log_legacy!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
                     let refused = self
                         .event_bus
                         .emit(crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                pre_merge_sha: None,
+                                post_merge_sha: None,
+                                landing_merge_sha: None,
                                 change_id: String::new(),
                                 error: error.to_string(),
                                 actor: actor.clone(),
@@ -372,7 +375,7 @@ impl LucidosEngine {
                     return Ok(match refused {
                         Ok(emitted) => emitted.and_then(|r| r.summary_version),
                         Err(e) => {
-                            log!(
+                            log_legacy!(
                                 "[ApplyNow] ChangeApplyFailed (no live session, nothing pending) emit failed: {}",
                                 e
                             );
@@ -457,7 +460,7 @@ impl LucidosEngine {
             release_change_claim(&mut *engine.agent_sessions.lock().await, thread_id, &msg_tx);
 
             if let Err(e) = result {
-                log!("[ApplyNow] Failed for thread {}: {}", thread_id, e);
+                log_legacy!("[ApplyNow] Failed for thread {}: {}", thread_id, e);
                 // Tell the user why. `ApplyNowEnded` below ends the apply.
                 engine
                     .event_bus
@@ -465,6 +468,9 @@ impl LucidosEngine {
                         crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ChangeApplyFailed {
+                                pre_merge_sha: None,
+                                post_merge_sha: None,
+                                landing_merge_sha: None,
                                 change_id: String::new(),
                                 error: format!("Apply failed: {}", e),
                                 actor: actor.clone(),
@@ -496,13 +502,13 @@ impl LucidosEngine {
         pending: Vec<crate::core::changes::Change>,
         actor: Option<MessageOrigin>,
     ) {
-        log!(
+        log_legacy!(
             "[ApplyNow] No live session for thread {} but {} pending change(s) — applying directly without stale-recovery",
             thread_id,
             pending.len()
         );
         for change in pending {
-            log!(
+            log_legacy!(
                 "[ApplyNow] Applying pending change {} on resumed thread {}",
                 change.id,
                 thread_id
@@ -511,7 +517,7 @@ impl LucidosEngine {
             // second emit draws the same card twice. The two errors it leaves
             // unannounced mean the row it was just handed no longer reads.
             if let Err(e) = self.apply_change(change.id, actor.clone()).await {
-                log!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
+                log_legacy!("[ApplyNow] apply_change for {} failed: {}", change.id, e);
             }
         }
     }
@@ -584,7 +590,7 @@ impl LucidosEngine {
         let pending = match self.changes().get_pending_by_branch(branch_name).await {
             Ok(row) => row.is_some(),
             Err(e) => {
-                log!("[ApplyNow] pending lookup for {}: {}", branch_name, e);
+                log_legacy!("[ApplyNow] pending lookup for {}: {}", branch_name, e);
                 false
             }
         };
@@ -667,7 +673,7 @@ impl LucidosEngine {
             // ends its turn too, so the marker is the proof, not the wait
             // returning Ok.
             if !branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await {
-                log!(
+                log_legacy!(
                     "[ApplyNow] Hardening session ended without writing marker for branch {} — aborting apply",
                     branch_name
                 );
@@ -703,7 +709,7 @@ impl LucidosEngine {
         )
         .await;
         if still_dirty.or_unknown(true) {
-            log!(
+            log_legacy!(
                 "[ApplyNow] Branch {}'s worktree is still dirty (or unreadable) after the \
                  auto-commit. Leaving the worktree untouched",
                 branch_name
@@ -713,6 +719,9 @@ impl LucidosEngine {
                     BusEvent::Thread {
                         thread_id,
                         event: ThreadEvent::ChangeApplyFailed {
+                            pre_merge_sha: None,
+                            post_merge_sha: None,
+                            landing_merge_sha: None,
                             change_id: String::new(),
                             error: "Could not confirm the coding agent's changes were \
                                     committed, so nothing was applied. The files are still in \
@@ -759,7 +768,7 @@ impl LucidosEngine {
                 .pending_for_thread(thread_id)
                 .await
                 .unwrap_or_else(|e| {
-                    log!(
+                    log_legacy!(
                         "[ApplyNow] pending_for_thread({}): {}. Treating the branch as having nothing to apply",
                         thread_id,
                         e
@@ -772,7 +781,7 @@ impl LucidosEngine {
                 Some(change) => match self.claim_pending_change(change.id).await? {
                     Some(claim) => Some((change, claim)),
                     None => {
-                        log!(
+                        log_legacy!(
                             "[ApplyNow] Change {} is being applied elsewhere or was resolved; leaving it to that path",
                             change.id
                         );
@@ -786,22 +795,27 @@ impl LucidosEngine {
                     || crate::engine::git_ops::main_history_touches_files(repo_root, &change.files)
                         .await;
                 if already_on_main {
-                    log!(
+                    log_legacy!(
                         "[ApplyNow] Branch {} already present on main — marking pending change {} applied (no-op)",
                         branch_name,
                         change.id
                     );
-                    self.emit_change_applied(
-                        &claim,
-                        thread_id,
-                        false, // no-op: the work is already on main, nothing to restart now
-                        false, // client_update
-                        Vec::new(),
-                        change.thread_title.clone(),
-                        actor.clone(),
-                        None,
-                    )
-                    .await;
+                    if let Err(error) = self
+                        .emit_change_applied(
+                            &claim,
+                            thread_id,
+                            false, // no-op: the work is already on main, nothing to restart now
+                            false, // client_update
+                            Vec::new(),
+                            change.thread_title.clone(),
+                            actor.clone(),
+                            None,
+                        )
+                        .await
+                    {
+                        log_legacy!("[ApplyNow] Could not record merged change: {}", error);
+                        return Ok(());
+                    }
                     // The branch is reset for reuse below. `emit_change_applied`
                     // cleared the applied change's branch markers. Make sure the
                     // already-merged main reaches the remote: the abandoned
@@ -816,7 +830,7 @@ impl LucidosEngine {
 
             // Genuinely nothing to apply (empty branch, no pending change, or a
             // declared-files-but-no-commits mismatch that recovery refused).
-            log!(
+            log_legacy!(
                 "[ApplyNow] No commits on branch {} — nothing to apply",
                 branch_name
             );
@@ -826,6 +840,9 @@ impl LucidosEngine {
                     BusEvent::Thread {
                         thread_id,
                         event: ThreadEvent::ChangeApplyFailed {
+                            pre_merge_sha: None,
+                            post_merge_sha: None,
+                            landing_merge_sha: None,
                             change_id: String::new(),
                             error: "No changes to apply — branch is already merged".to_string(),
                             actor: actor.clone(),
@@ -880,7 +897,7 @@ impl LucidosEngine {
             ProposeOutcome::AwaitingLanding(id) => id,
         };
         let Some(claim) = self.claim_pending_change(change_id).await? else {
-            log!(
+            log_legacy!(
                 "[ApplyNow] Change {} is being applied elsewhere or was resolved; leaving it to that path",
                 change_id
             );
@@ -926,7 +943,7 @@ impl LucidosEngine {
                     .bounded_fix_refusal(repo_root, dirty, branch_name)
                     .await
                 {
-                    log!(
+                    log_legacy!(
                         "[ApplyNow] Apply blocked: bounded security fix left its bound on branch {}",
                         branch_name
                     );
@@ -959,19 +976,24 @@ impl LucidosEngine {
         {
             Ok((pre_sha, post_sha)) => {
                 let client_update = files_have_client_update(&changed_files);
-                self.apply_now_success(
-                    &claim,
-                    thread_id,
-                    requires_restart,
-                    client_update,
-                    &pre_sha,
-                    &post_sha,
-                    worktree_path,
-                    repo_root,
-                    branch_name,
-                    actor.clone(),
-                )
-                .await;
+                if let Err(error) = self
+                    .apply_now_success(
+                        &claim,
+                        thread_id,
+                        requires_restart,
+                        client_update,
+                        &pre_sha,
+                        &post_sha,
+                        worktree_path,
+                        repo_root,
+                        branch_name,
+                        actor.clone(),
+                    )
+                    .await
+                {
+                    log_legacy!("[ApplyNow] Could not record merged change: {}", error);
+                    return Ok(());
+                }
             }
             Err(e) => {
                 self.emit_apply_failed(thread_id, change_id, &e.to_string(), actor.clone())
@@ -999,7 +1021,7 @@ impl LucidosEngine {
         let change = match self.changes().get_by_id(change_id).await {
             Ok(Some(change)) => change,
             Ok(None) => {
-                log!("[ApplyNow] change {} vanished before queueing", change_id);
+                log_legacy!("[ApplyNow] change {} vanished before queueing", change_id);
                 self.mark_session_idle(thread_id, worktree_path).await;
                 return;
             }
@@ -1018,7 +1040,7 @@ impl LucidosEngine {
                 crate::engine::ApplyStatus::Applied | crate::engine::ApplyStatus::Noop
             ),
             Err(e) => {
-                log!("[ApplyNow] landing lane refused {}: {}", change_id, e);
+                log_legacy!("[ApplyNow] landing lane refused {}: {}", change_id, e);
                 false
             }
         };
@@ -1053,7 +1075,7 @@ impl LucidosEngine {
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         // Fast path: if branch already includes main, just ff
         if let Ok(shas) = catchup_and_ff_to_main(repo_root, worktree_path, branch_name).await {
-            log!("[MergeViaCC] Fast path succeeded for {}", branch_name);
+            log_legacy!("[MergeViaCC] Fast path succeeded for {}", branch_name);
             return Ok(shas);
         }
 
@@ -1087,7 +1109,7 @@ impl LucidosEngine {
         // probe merge so the panel can list which files actually conflict
         // (empty list = clean merge that just needs a merge commit).
         let conflict_files = probe_merge_conflicts(worktree_path).await;
-        log!(
+        log_legacy!(
             "[MergeViaCC] Fast path failed — delegating merge to CC for {} ({} conflicting file(s))",
             branch_name,
             conflict_files.len()
@@ -1289,7 +1311,7 @@ impl LucidosEngine {
 
             match result {
                 Ok((pre_sha, post_sha)) => {
-                    engine
+                    if let Err(error) = engine
                         .apply_now_success(
                             &claim,
                             thread_id,
@@ -1302,10 +1324,17 @@ impl LucidosEngine {
                             &branch_name,
                             actor,
                         )
-                        .await;
+                        .await
+                    {
+                        log_legacy!(
+                            "[Changes] Could not record merged change {}: {}",
+                            change_id,
+                            error
+                        );
+                    }
                 }
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Changes] Async in-place merge failed for {}: {} — session stays alive for retry",
                         change_id,
                         e
@@ -1334,7 +1363,7 @@ impl LucidosEngine {
         repo_root: &Path,
         branch_name: &str,
         actor: Option<MessageOrigin>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
         let change_id = claim.change_id();
         let commits = commits_in_range(repo_root, pre_sha, post_sha).await;
         // Title is best-effort metadata for the ChangeApplied event payload —
@@ -1346,7 +1375,7 @@ impl LucidosEngine {
         .fetch_optional(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[ApplyNow] Failed to load thread title for {}: {}",
                 thread_id,
                 e
@@ -1365,7 +1394,7 @@ impl LucidosEngine {
                 pre_sha, post_sha,
             )),
         )
-        .await;
+        .await?;
         // Apply-time net for the "≤1 pending change per thread" invariant: now
         // that this change landed, drop any stale pending change the thread
         // still holds on another branch so it can't keep blocking Archive.
@@ -1410,13 +1439,13 @@ impl LucidosEngine {
                 // `change_ops_emitters::post_apply_dev_refresh`.
             }
             Ok(None) => {
-                log!(
+                log_legacy!(
                     "[ApplyNow] entity-event emission skipped — change {} not found post-apply",
                     change_id
                 );
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ApplyNow] entity-event emission skipped — get_by_id({}) failed: {}",
                     change_id,
                     e
@@ -1431,7 +1460,7 @@ impl LucidosEngine {
         push_main_in_background(repo_root, &self.event_bus);
         self.broadcast_changes_updated().await;
 
-        commits
+        Ok(commits)
     }
 
     /// Refuse an Apply Now the proposal hold keeps. The branch keeps its work
@@ -1459,12 +1488,15 @@ impl LucidosEngine {
         use crate::engine::event_bus::BusEvent;
         use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
-        log!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
+        log_legacy!("[ApplyNow] Refused for thread {}: {}", thread_id, error);
         self.event_bus
             .emit_or_log(
                 BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::ChangeApplyFailed {
+                        pre_merge_sha: None,
+                        post_merge_sha: None,
+                        landing_merge_sha: None,
                         change_id: String::new(),
                         error: error.to_string(),
                         actor,
@@ -1544,6 +1576,7 @@ impl LucidosEngine {
                         // the canonical "no recorded SHA" sentinel.
                         worktree_head_sha: None,
                         bg_bash_pending: false,
+                        turn_end: None,
                     },
                     meta: EventMeta::NONE,
                 },
@@ -1568,7 +1601,7 @@ async fn emit_apply_now_ended(
     {
         Ok(emitted) => emitted.and_then(|r| r.summary_version),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[ApplyNow] ApplyNowEnded emit failed for {}: {}",
                 thread_id,
                 e
@@ -1597,7 +1630,7 @@ pub(crate) async fn end_interrupted_applies(
                 emit_apply_now_ended(event_bus, thread_id, ApplyNowOutcome::Interrupted).await;
             }
         }
-        Err(e) => log!("[Startup] Reading in-flight applies failed: {}", e),
+        Err(e) => log_legacy!("[Startup] Reading in-flight applies failed: {}", e),
     }
 }
 
@@ -1622,7 +1655,7 @@ pub(crate) async fn end_interrupted_applies(
 async fn reset_session_worktree_to_main(worktree_path: &Path, session_branch: &str) {
     let worktree_branch = worktree_current_branch(worktree_path).await;
     if let Some(reason) = foreign_worktree_reason(worktree_branch.as_deref(), session_branch) {
-        log!(
+        log_legacy!(
             "[ApplyNow] Not resetting {} to main for session branch {}: {}",
             worktree_path.display(),
             session_branch,
@@ -1633,14 +1666,14 @@ async fn reset_session_worktree_to_main(worktree_path: &Path, session_branch: &s
     match git_ran_ok(&["reset", "--hard", "main"], worktree_path).await {
         Ok(()) => {
             if let Err(e) = git_ran_ok(&["clean", "-fd"], worktree_path).await {
-                log!(
+                log_legacy!(
                     "[ApplyNow] git clean -fd failed in {}: {}",
                     worktree_path.display(),
                     e
                 );
             }
         }
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[ApplyNow] git reset --hard main failed in {}: {}. Leaving the tree alone, so the worktree still holds whatever was there",
             worktree_path.display(),
             e
@@ -1832,26 +1865,6 @@ mod tests {
         assert!(
             sessions.lock().await[&thread_id].change_claim.is_none(),
             "`release` frees it before returning"
-        );
-    }
-
-    /// Every production release goes through `release_change_claim`, so none
-    /// can clear a replacement's claim by thread id alone.
-    #[test]
-    fn the_apply_claim_is_released_in_one_place() {
-        let writers: Vec<(String, usize)> = crate::test_support::source_scan::production_sources()
-            .into_iter()
-            .map(|(path, src)| {
-                let clears = src.matches("change_claim = None").count()
-                    + src.matches("change_claim.take()").count();
-                (path, clears)
-            })
-            .filter(|(_, count)| *count > 0)
-            .collect();
-        assert_eq!(
-            writers,
-            vec![("engine/agent_session/apply_now.rs".to_string(), 1)],
-            "only `release_change_claim` may clear the claim"
         );
     }
 
@@ -2352,5 +2365,28 @@ mod tests {
             "Should time out when no events are arriving"
         );
         assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    mod guard_tests {
+        /// Every production release goes through `release_change_claim`, so none
+        /// can clear a replacement's claim by thread id alone.
+        #[test]
+        fn the_apply_claim_is_released_in_one_place() {
+            let writers: Vec<(String, usize)> =
+                crate::test_support::source_scan::production_sources()
+                    .into_iter()
+                    .map(|(path, src)| {
+                        let clears = src.matches("change_claim = None").count()
+                            + src.matches("change_claim.take()").count();
+                        (path, clears)
+                    })
+                    .filter(|(_, count)| *count > 0)
+                    .collect();
+            assert_eq!(
+                writers,
+                vec![("engine/agent_session/apply_now.rs".to_string(), 1)],
+                "only `release_change_claim` may clear the claim"
+            );
+        }
     }
 }

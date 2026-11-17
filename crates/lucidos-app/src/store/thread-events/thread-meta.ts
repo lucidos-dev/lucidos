@@ -31,8 +31,10 @@ export type ThreadAggregate = {
   /** See `ThreadMeta.summaryVersion`. */
   summaryVersion: number;
   activeChildrenCount: number;
-  /** See `ThreadMeta.waitingChildrenCount`. */
-  waitingChildrenCount?: number;
+  /** See `ThreadMeta.awaitedChildrenCount`. */
+  awaitedChildrenCount?: number;
+  /** See `ThreadMeta.awaitedByParent`. */
+  awaitedByParent?: boolean;
   totalChildrenCount: number;
   /** Count of descendants (transitive) currently blocking this thread's
    *  archive. Maintained by EventBus on
@@ -188,7 +190,8 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   let changed = meta.status !== prevStatus;
   if (meta.section !== agg.section) { meta.section = agg.section; changed = true; }
   if (meta.activeChildrenCount !== agg.activeChildrenCount) { meta.activeChildrenCount = agg.activeChildrenCount; changed = true; }
-  if ((meta.waitingChildrenCount ?? 0) !== (agg.waitingChildrenCount ?? 0)) { meta.waitingChildrenCount = agg.waitingChildrenCount ?? 0; changed = true; }
+  if ((meta.awaitedChildrenCount ?? 0) !== (agg.awaitedChildrenCount ?? 0)) { meta.awaitedChildrenCount = agg.awaitedChildrenCount ?? 0; changed = true; }
+  if (!!meta.awaitedByParent !== !!agg.awaitedByParent) { meta.awaitedByParent = !!agg.awaitedByParent; changed = true; }
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
@@ -247,6 +250,20 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   return changed;
 }
 
+/** A first send owns promotion while its message is pending or kept for retry.
+ *  Server snapshots taken before acceptance still describe a compose draft. */
+export function firstSendUnsettled(thread: ThreadState, state: ThreadMeta['state']): boolean {
+  return state === 'composing'
+    && (thread.pendingUserMessages.length > 0 || (thread.unsentMessageSeqs?.size ?? 0) > 0);
+}
+
+/** Reconcile a server snapshot with the local send that may precede it. */
+export function applyAggregateToThread(thread: ThreadState, aggregate: ThreadAggregate): boolean {
+  return applyAggregateToMeta(thread.meta, firstSendUnsettled(thread, aggregate.state)
+    ? { ...aggregate, state: thread.meta.state }
+    : aggregate);
+}
+
 /** Placeholder shown in the drawer while a thread waits for its first
  *  LLM-generated title. Treated as "no title" by anything that displays it. */
 export const PENDING_TITLE_PLACEHOLDER = '...';
@@ -287,12 +304,14 @@ export type ThreadMeta = {
   section: ThreadSection;
   /** Number of active child threads (non-zero means parent is "in progress"). */
   activeChildrenCount: number;
-  /** Direct children idle on their own live event wait, from
-   *  `thread_summaries.waiting_children_count`. Such a child has not finished
-   *  (ADR 0254), so the parent waits on it as on an active one. Disjoint from
-   *  `activeChildrenCount`, so the two add up. Absent reads as zero, which is
-   *  what a meta built before the field existed means. */
-  waitingChildrenCount?: number;
+  /** The *awaited children*, from `thread_summaries.awaited_children_count`:
+   *  direct children whose finish wakes this thread and that are unfinished,
+   *  at any depth (ADR 0672). A running `no-wake` child is not one. The
+   *  Waiting dot and the waiting indicator read it. Absent reads as zero. */
+  awaitedChildrenCount?: number;
+  /** This thread's parent waits on it (`thread_summaries.awaited_by_parent`).
+   *  The waiting indicator lists the children it names. Absent reads false. */
+  awaitedByParent?: boolean;
   /** Total number of child threads (active + finished). */
   totalChildrenCount: number;
   /** Count of descendants (transitive) currently blocking this thread's

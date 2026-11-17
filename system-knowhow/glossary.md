@@ -56,6 +56,14 @@ The Chrome the Lucidos Agent drives through its `browser_*` tools, headless or i
 
 **It always runs inside Chrome's sandbox**, so a page that exploits Chrome stays confined. There is no setting to turn the sandbox off. A machine where Chrome cannot start one gets no agent browser and an error naming the fix: run Lucidos as a non-root user, or give Chrome a usable sandbox (ADR 0457).
 
+### Agent sandbox
+The OS sandbox every agent-steered process runs in: the Lucidos Agent's commands and scripts, triggers, coding agents, background tasks and MCP servers. It hides Lucidos's own secrets and keeps each workspace's permission lists read-only. Everything else stays as reachable as before. macOS uses a seatbelt profile, Linux uses Landlock.
+
+Where the machine cannot apply it, those processes do not start.
+The owner gets one notification, and a banner names the reason.
+Turning **Sandbox agents** off (`agents_unsandboxed=true`, Settings → Permissions) lets them start without it in this workspace.
+The banner then warns instead (ADR 0645).
+
 ### Archive all
 The **Archive all** action on the drawer's *Current section* header, under the *Folders grouping*. It archives only what is safe, so a thread that needs the user stays, and so does a running one. Needing the user means an unanswered question, a pending *change*, unproposed branch work, an unsent *draft* or a failed run, here or in a sub-thread. A *pinned thread* sits in Pinned and is never touched, and neither is any thread of its family, even below an archived one.
 
@@ -87,7 +95,7 @@ The install origin decides how many workspaces it counts. Two installs show the 
 
 The icon and the bell must never disagree *for the workspace on screen*. The OS also writes the icon from a push payload's `app_badge`, so the page **re-asserts** the count rather than writing only on change. It takes this workspace's share from the same live unread set the bell projects. While the app is closed, the icon can lag a read made elsewhere until the next push or open. See `system-knowhow/notifications.md` § App-icon badge.
 
-An open page **mirrors the icon's number in-app** from the same computed, so the two cannot disagree. One mirror is a count badge at the **Lucidos mark**'s bottom-right corner, leaving the top corner to the sparkle and the engine-state badge. The other is a group of rows atop the **Lucidos menu**, one per workspace with unreads, each routing to its notifications view. The mark carries a count onto the thread pane and the threads drawer, where the bell never appears.
+The **Lucidos mark**'s count badge totals the notification rows atop the **Lucidos menu**, including reachable paired remote gateways. Each row opens its workspace's notifications view. The OS icon counts only its own origin, so the mark can show a larger total. The mark's bottom-right badge carries this count onto the thread pane and the threads drawer, where the bell never appears.
 
 ### App lint
 The engine's check on an HTML, CSS or JS file the Lucidos Agent writes under `data/apps/<id>/`, with `create_app`, `write_file`, `edit_file` or `run_python`. It finds three mistakes: a `:hover` outside `@media (hover: hover)`, `.action-btn` variants swapped to show a choice, and a variant without its base class. Each finding comes back in the tool result as an `[APP LINT]` note with the line and the fix. It never refuses or changes the write.
@@ -219,7 +227,7 @@ Two sub-settings apply while the guard is on. Turning off the **LLM judge** uses
 
 A third sub-setting, **Answer coding-agent questions** (on by default), lets the guard also answer the permission cards of coding-agent commands (Codex, Claude Code `Bash`). It sees only what would otherwise card: the Claude Code permission mode and the Coding agent permissions list settle the rest first. On, a command the guard places as safe or reversible runs without a card, and a wrong reversible verdict has no undo. Off, the guard runs no Claude Code command unasked. Whatever the switches say, it refuses a catastrophic command it recognises. A Codex card means Codex's own sandbox blocked the command, so one the guard places as safe runs whatever the switches say.
 
-"Always allow" commands live in an editable list under **Settings → Permissions → Lucidos Agent permissions**. The list is **per workspace** (`<workspace>/.lucidos/agent-allowed-commands`), so another workspace asks again.
+"Always allow" commands live in an editable list under **Settings → Permissions → Lucidos Agent permissions**. The list is **per workspace**, so another workspace asks again. Lucidos mirrors it to `<workspace>/.lucidos/agent-allowed-commands`. A line you add to that file by hand grants nothing until you tap Import on the card it raises.
 
 A *trigger* fires unattended, so it cannot be asked. It runs irreversible commands only within its declared *side-effect grant*, and an ungranted one is blocked and fails the run. See `system-knowhow/running-python.md` § The command guard.
 
@@ -236,7 +244,7 @@ The compose view's single "who/where" picker for a new *thread*. It is the *Luci
 
 The Claude Code vs Codex pick is a separate chip, shown only for coding targets. It is remembered per workspace (`coding_agent_default` preference) and locked at the thread's first message.
 
-The Lucidos source target appears only on a dev build with a source checkout. A packaged install hides it, gated on the `/health` `packaged` flag. The *Lucidos Agent* follows the same signal: its system prompt states whether platform source exists. `run_coding_agent` with `folder` omitted is refused without it, so picker and agent always agree.
+The Lucidos source target appears only on a dev build with a source checkout. A packaged install hides it, gated on the `/health` `packaged` flag. An `.app` bundle remains packaged when built inside a checkout. The *Lucidos Agent* follows the same signal: its system prompt states whether platform source exists. `run_coding_agent` with `folder` omitted is refused without it, so picker and agent always agree.
 
 ### Config
 Workspace configuration files under `data/config/`, principally `apis.json` (proxy entries, signer wiring, OAuth flows). Users edit these directly or via the engine's auth-handshake flow.
@@ -426,7 +434,12 @@ Add one from the dashboard's Add, an app row's Add to dashboard, `widgets(action
 ### Draft
 What you typed into a *thread*'s composer and have not sent: text, images, or both. It lives with its thread and follows you to your other devices. A never-sent thread is all draft and shows in the **Drafts** group of the *Ongoing grouping*. A thread with history can hold one too, archived or not.
 
-The *Lucidos Agent* reads drafts and never writes them. The `threads` tool's `drafts` action lists each with a preview, last edit time and owning thread, and returns one whole by `thread_id`. `lucidos threads drafts` is the same read. A draft has no link of its own, so the agent gives its thread's *thread link*. Distinct from a *held message*, which an agent wrote and Lucidos keeps back.
+The `threads` tool's `drafts` action lists each draft with a preview, last edit time and owning thread, and returns one whole by `thread_id`. `lucidos threads drafts` is the same read. An agent sends your saved draft only when you tell it to, or approve its card: `submit_draft`, or `lucidos threads submit-draft`, sends it exactly as saved (ADR 0651). A draft has no link of its own, so the agent gives its thread's *thread link*. Distinct from a *held message*, which an agent wrote and Lucidos keeps back.
+
+An agent inside a thread can hand you a ready message as a draft in a new thread: `lucidos threads create-draft` (ADR 0665). It never opens that thread, never sends, and never touches a draft you already have. The drafts read names the agent's thread as `drafted_by`.
+
+### Draft revision
+A counter on a *thread*'s saved *draft*, `snapshot.draft_revision` in a one-draft read. It goes up only when the draft changes: its text, images, mode, picks or *compose epoch*. Activity, a new title or a status change leave it alone. An agent names it, with the compose epoch, to send exactly the draft it read (`submit_draft`, ADR 0651). A changed draft refuses the send as stale.
 
 ### Disabled tool
 One tool on an *MCP* server that the user switched off, so the *Lucidos Agent*
@@ -635,7 +648,7 @@ The *Lucidos Agent* enables a server with the `mcp` tool's `enable` action, whic
 It survives a restart: the thread's next turn starts its enabled servers again. **Stop** switches the server off in every thread, and **Remove** does the same. Distinct from a *disabled tool*, which is one tool switched off for every thread.
 
 ### MCP permission card
-The approval card the *Lucidos Agent* shows before calling a tool on an untrusted *MCP* server. Same UI as the *command permission card*: Deny, Allow once, Allow for this thread, Always allow this tool, or Always allow this server. "Always allow" choices go in an editable per-workspace list (`<workspace>/.lucidos/mcp-allowed-tools`). Entries are per tool (`Mcp(<server>:<tool>)`) or whole server (`Mcp(<server>:*)`). The thread waits until answered. A call to a server with auto-approve set never shows it.
+The approval card the *Lucidos Agent* shows before calling a tool on an untrusted *MCP* server. Same UI as the *command permission card*: Deny, Allow once, Allow for this thread, Always allow this tool, or Always allow this server. "Always allow" choices go in an editable per-workspace list, mirrored to `<workspace>/.lucidos/mcp-allowed-tools`. Entries are per tool (`Mcp(<server>:<tool>)`) or whole server (`Mcp(<server>:*)`). The thread waits until answered. A call to a server with auto-approve set never shows it.
 
 A *trigger* never shows this card either, because nobody is there to answer it. In a trigger thread, an MCP call runs silently only when the trigger lists the server in `mcp_servers`, or the server has auto-approve set. Any other call is refused, and the agent is told to stop using that server in this fire. The user gets a notification that names the trigger and the server.
 
@@ -779,6 +792,20 @@ The *provider* a *model* was last picked on, remembered per model on its row. So
 The picker asks for a provider last, after the model and its *reasoning effort*, and only when two of the model's providers are set up. With one set up it never asks, but still names the provider. A pick sticks to the thread or draft it was made in, so a later pick elsewhere never moves a running conversation. A *trigger* can pin its own. Settings → Models → Manage models shows and edits which providers serve each model, in the order tried.
 
 A model with no stored choice runs on its first backend with credentials. If the stored choice is later removed or switched off, the turn is refused rather than quietly moved. The picker badges it "not set up", so one click fixes it.
+
+### Billing attribution
+The *provider* a measured call's serving runtime identifies, independently of its model or producer.
+Missing or ambiguous evidence gives `unknown`; a model name or current setting never fills that gap.
+Older captures without attribution remain unattributed.
+
+A **billing observation** records fresh, secret-free evidence from a coding agent, even when the attribution matches its previous report.
+It is passive metadata, not another usage row.
+The capture carries the call's billing attribution.
+
+**Billing mode** distinguishes `token-metered`, `plan` and `unknown`.
+A plan's token cost is a list-price equivalent, not an extra charge.
+Knowing the provider alone does not prove its billing mode.
+See `system-knowhow/coding-agent-events.md` § Billing evidence.
 
 ### Provider
 The backend that serves a *model*. Each *model registry* entry names its provider, whose credentials are configured once under Settings → Providers.
@@ -932,31 +959,34 @@ On iOS the home-screen app is its own *device*, so it pairs separately from Safa
 The browser cookie carries a window, refreshed each day the device is seen, but the *workspace gateway* never reads it. So **Devices** shows when each device was last seen, to the day. That is what separates a phone in daily use from a laptop you sold, so read it before revoking. A device paired before Lucidos recorded this shows no last-seen until its next request.
 See also: *device*, *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
-### Operator
-A person, as Lucidos knows them: a name, one or more emails, and the *paired devices* they hold. One device belongs to one person. The *workspace gateway* keeps operators beside its devices, in its *gateway event log*, so every *workspace* it serves sees the same people. **Settings → Devices → People** names operators, adds their emails, moves a device to another operator, and removes an operator.
+### User
+A person, as Lucidos knows them: a name, one or more emails, and the *paired devices* they hold. One device belongs to one user. The *workspace gateway* keeps users beside its devices, in its *gateway event log*, so every *workspace* it serves sees the same users. **Settings → Users** names users, adds their emails, and removes a user. A device's row in **Settings → Devices** moves it to another user.
 
-Minting a *pairing secret* asks who it is for, and the device that uses it joins that operator. A device that reaches this gateway through a *gateway pairing* shows as its operator on the other gateway: "Sam via A".
+Minting a *pairing secret* asks who it is for, and the device that uses it joins that user. A device that reaches this gateway through a *gateway pairing* shows as its user on the other gateway: "Sam", or "Sam (A)" when another user shares the name.
 
-**An operator is identity without authority.** It decides attribution ("Sam changed this trigger"), routing (whose *gate* it is) and read state. It never allows or refuses an action: every paired device can read, answer and change anything (ADR 0623).
+**A user is identity without authority.** It decides attribution ("Sam changed this trigger"), routing (whose *gate* it is) and read state. It never allows or refuses an action: every paired device can read, answer and change anything (ADR 0623).
 
-Events keep the device, or an *actor* email for outside input, never the operator. So moving a device or an email also moves the credit for older actions. Removing an operator revokes all its devices, which is how a team offboards someone.
+Events keep the device, or an *actor* email for outside input, never the user. So moving a device or an email also moves the credit for older actions. Removing a user revokes all its devices, which is how a team offboards someone.
 
-On a gateway with people to tell apart, the transcript names a teammate's message: their name leads the timestamp, and the bubble aligns left like the agent's reply. A device no operator holds reads "Unknown person". The message's origin popover gains a Person row. Your own messages look as before.
+On a gateway with users to tell apart, the transcript names a teammate's message: their name leads the timestamp, and the bubble aligns left like the agent's reply. A device no user holds reads "Unknown user". The message's origin popover gains a User row. Your own messages look as before.
 
-Operators can also talk to each other inside a thread, without its agent: see *person mention*, *agent mention*, *agent pause* and *people-only message*.
+Formerly *operator*, and in the UI *person* or *people* (ADR 0655). Not to be confused with the user role of a model message.
 
-A gateway with one operator looks exactly as before.
-See also: *paired device*, *actor*, *team workspace*, *driver*, *people-only message*.
+Users can also talk to each other inside a thread, without its agent: see *user mention*, *agent mention*, *agent pause* and *user-only message*.
+
+A gateway with one user hides team controls; Settings → Users still lists
+that user so their name and emails are editable.
+See also: *paired device*, *actor*, *team workspace*, *driver*, *user-only message*.
 
 ### Team workspace
-A *workspace* that more than one *operator* pairs devices to, run as the team's factory. The workspace is the only principal: it holds the bot credentials and does the work, and people steer it. No person-level permission exists (ADR 0623).
+A *workspace* that more than one *user* pairs devices to, run as the team's factory. The workspace is the only principal: it holds the bot credentials and does the work, and users steer it. No user-level permission exists (ADR 0623).
 
-Tickets and chat threads reach it through *triggers*, each fire a *root thread*. Policy on where work stops for a person lives in knowhow, as *gates*. Questions and outcomes go back to the source through workspace script triggers, each a short message with a link to the thread. The *factory app* shows the team its open root threads.
-See also: *operator*, *root thread*, *gate*, *factory app*.
+Tickets and chat threads reach it through *triggers*, each fire a *root thread*. Policy on where work stops for a user lives in knowhow, as *gates*. Questions and outcomes go back to the source through workspace script triggers, each a short message with a link to the thread. The *factory app* shows the team its open root threads.
+See also: *user*, *root thread*, *gate*, *factory app*.
 
 ### Gateway event log
-The append-only file in the *workspace gateway*'s data directory that records every pairing, revoke and *operator* change. The device list and the operators are rebuilt from it, so it is their only source of truth. It needs no Postgres, so devices still pair and sign in while Postgres is down. The older `paired-devices.json` moves into it once, with every device under one operator.
-See also: *operator*, *paired device*.
+The append-only file in the *workspace gateway*'s data directory that records every pairing, revoke and *user* change. The device list and the users are rebuilt from it, so it is their only source of truth. It needs no Postgres, so devices still pair and sign in while Postgres is down. The older `paired-devices.json` moves into it once, with every device under one user.
+See also: *user*, *paired device*.
 
 ### Pairing code
 The 8-digit one-time code that makes a device a *paired device*, for a person who has to type. It works once and expires in five minutes. **It works only from another device on the LAN or the tailnet.** On the machine Lucidos runs on, and through a tunnel, a proxy or `tailscale serve`, Lucidos refuses it. It says to scan the QR or open the link instead (ADR 0615). Each code is minted beside a *pairing secret*, and using either spends both.
@@ -973,6 +1003,12 @@ See also: *paired device*, `system-knowhow/lucidos-cli.md` § `lucidos pair`, `s
 ### Pairing secret
 The long one-time secret minted beside every *pairing code*: `ldp_` and 26 more characters. The QR and the pairing link carry it, and the desktop app pairs its own window with it. It is long enough that no flood of guesses can find it, so Lucidos accepts it from any address and never rate limits it. A *gateway pairing secret* is the same idea for a *gateway pairing*, with no code beside it (ADR 0615).
 See also: *pairing code*, *public listener*, `system-knowhow/remote-access.md` § Pair a device.
+
+### Pairing request
+A *pairing code*, *pairing secret* or *gateway pairing secret* that waits for a paired device's **Allow** before it redeems. It happens when a process on the machine minted it, such as `lucidos pair` or the desktop window, while a device is already paired. Every process can read the local file that proves it is on the machine, an agent's too. So that file alone no longer lets a device in.
+
+The redeemer waits on its own screen. Every paired device gets a notification, and **Settings → Access** lists the request under *Waiting for your Allow*, with **Allow** and **Don't allow**. A code minted on a paired device never waits, and with nothing paired nothing waits. When no paired device works any more, `lucidos devices revoke --all` clears them, and the next code pairs at once.
+See also: *pairing code*, `system-knowhow/remote-access.md` § Devices pair before Lucidos answers them.
 
 ### Public listener
 A second port on this machine's loopback, the gateway's port plus 30 (**5282** packaged, **5281** dev). Point a tunnel or reverse proxy here, rather than at the main port. It serves everything the main port does, but every request on it counts as public, so a typed *pairing code* is never accepted there. `LUCIDOS_PUBLIC_PORT` moves it, and `0` turns it off (ADR 0615).
@@ -991,14 +1027,26 @@ See also: *pairing code*, *external address*, `system-knowhow/remote-access.md` 
 ### Gateway pairing
 A one-way grant from one *workspace gateway* to another: gateway B lets gateway A open its *workspaces*, for every device paired with A. B mints a *gateway pairing secret*, and A pastes it. Each side records the pairing in its own file, so auth state stays per gateway (ADR 0590).
 
-The grant is one-way: access both ways means pairing twice. **The trust is not.** B's pages open on A's address, so they can do anything A's devices can do on A. Add only a gateway you run.
+The grant is one-way: general access both ways means pairing twice. Pairing alone gives B no return authority. A serves its own frontend for remote workspaces; B supplies data and sandboxed content, without A's browser authority (ADR 0723).
 
-**Unpair** on B ends it on A's next request. **Remove** on A ends it on A and asks B to forget it too. Gateways pair over `https` only.
+**Unpair** on B ends it on A's next request. **Remove** on A ends it on A and asks B to forget it too. Gateways pair over `https` only, except on loopback, where nothing crosses a network.
 See also: *gateway pairing secret*, *remote gateway*, `system-knowhow/remote-access.md` § Pair a gateway.
 
 ### Gateway pairing secret
 The one-time secret that makes a *gateway pairing*: `lgp_` and 26 more characters, pasted rather than typed. It works once and expires in five minutes. It is long enough that no flood of guesses can find it, so it is accepted from any address and never rate limited (ADR 0615). It never pairs a device, and a device's *pairing secret* never pairs a gateway. Two places mint one: **Settings → Access → Pair a gateway**, and `lucidos pair --gateway`.
 See also: *gateway pairing*, *pairing secret*, `system-knowhow/lucidos-cli.md` § `lucidos pair`.
+
+### Manage grant
+A switch on one *gateway pairing*, on the gateway being opened: devices on the other gateway may also manage this gateway's *users* and *paired devices*. Off by default. It belongs to the pairing, never to a *user*, and reaches nothing else on this gateway (ADR 0656). `lucidos pair --gateway --manage` starts a pairing with it on.
+See also: *gateway pairing*, `system-knowhow/remote-access.md` § Manage a remote gateway's users and devices.
+
+### Return access grant
+A planned capability, not yet available in the runtime or CLI (ADR 0725). The following describes its approved contract.
+
+An optional grant on an existing *gateway pairing*, controlled by the gateway that holds the outgoing pairing. If A pairs to B, B gets no access back to A or A's other pairings. Only A's owner may enable return access so B's agents can read and start threads through A. Preserve the originating gateway, workspace, thread and source authorization. Off by default, one grant per source gateway.
+
+It creates no reciprocal pairing, device identity or *manage grant*. Revoking it or unpairing cuts the next incoming operation. Agents hosted by A need no return grant to use A's outgoing pairings (ADR 0725).
+See also: *gateway pairing*, *remote workspace*.
 
 ### Remote gateway
 Another *workspace gateway* this one has a *gateway pairing* with, listed under **Settings → Access → Remote gateways**. You give it a short name, such as `cloud`, when you add it.
@@ -1020,8 +1068,8 @@ The direct ancestor of a *child thread*, resolved via the child's `parent_thread
 ### Part token
 The custom property one *theme part* property compiles to, named `--part-<part>-<property>`, such as `--part-chat-text-text-shadow`. The engine emits it in the *theme*'s resolved map in canonical form, never the author's string. A shipped Lucidos stylesheet reads it under the part's selector, falling back to the element's unthemed paint. An app that loads the SDK stylesheet may read one by name. `--part-` is reserved: a theme's token maps cannot set one, and one in the *style overrides* must pass the same grammar.
 
-### Paused (thread status)
-A *thread* whose turn the user's own *Switch to new version* interrupted, and which the engine has promised to resume. Its indicator is the one that is not a dot: the standard pause glyph, in a neutral tone, never the red *failed* dot. The row's Info card says "Paused", and the transcript labels the turn "Paused by restart". The engine resumes the turn itself, usually within seconds, so no **Continue** button appears and nothing is asked of you. A paused thread does not count toward *attention*.
+### Thread pause
+The "Paused" thread status: a *thread* whose turn the user's own *Switch to new version* interrupted, and which the engine has promised to resume. The whole thread is paused until then. Its indicator is the one that is not a dot: the standard pause glyph, in a neutral tone, never the red *failed* dot. The row's Info card says "Paused", and the transcript labels the turn "Paused by restart". The engine resumes the turn itself, usually within seconds, so no **Continue** button appears and nothing is asked of you. A paused thread does not count toward *attention*.
 
 Every OTHER interruption is *failed*, with the red dot, an *attention* count, and Continue. That covers a crash, an engine shutdown the user did not ask for, and a switch whose resume the next boot cannot deliver. In that last case the boot replaces the pause with the error. So the pause glyph is a promise, never shown for a turn nothing is coming back for.
 
@@ -1142,6 +1190,13 @@ Ephemeral working files under `.lucidos/tmp/`, at the *workspace* root and so **
 They never **write** it, since they git-commit everything they write. So `write_file` / `edit_file` / `delete_file` refuse a scratch path and point at `run_python`, whose cwd is the workspace root. Only `.lucidos/tmp/` is addressable; the rest of `.lucidos/` (coding-agent *worktree*s, `exhaust/`, `engine.pid`) is refused both ways.
 See also: `system-knowhow/best-practices.md` rules 8 and 10; ADR 0051.
 
+### Spend cap hold
+A pause in background model calls after a provider reports that its spending cap was reached.
+It lasts until the provider's reset time, or one hour when no time was given.
+The agent's own turns still send, and any successful call ends the hold.
+**Try now** on the provider's settings row clears it by hand.
+Each provider has its own hold; other providers keep working.
+
 ### Script
 Code (Python, shell, JS) invoked by an *intent* or *knowhow*. Lives with its primary consumer when scoped (`data/apps/<id>/scripts/`, `data/triggers/<slug>/scripts/`, `data/knowhow/<domain>/scripts/`), or at top level (`data/scripts/`) when shared.
 
@@ -1191,12 +1246,12 @@ An update re-runs setup only when the staged revision is **greater** than the in
 ### Coding-agent grant
 Whether a *trigger*'s runs may start a *coding-agent thread*, set per trigger under "Allow coding agents". The default is off: such a spawn is refused, and the run fails with a notification naming the trigger and the missing grant. It covers intent and script triggers alike.
 
-Only the user grants it. An agent, an app frame or a plugin's `trigger.toml` cannot, though anyone may revoke it. An agent's edit to the trigger's work clears it. A granted trigger's coding agents hold every grant the user gave coding agents. So grant it only to a trigger whose input you trust. See `triggers.md` § "Coding-agent grant".
+Only the user grants it, on the trigger or by confirming a *batch*. An agent, an app frame or a plugin's `trigger.toml` cannot, though anyone may revoke it. An agent's edit to the trigger's work clears it. A granted trigger's coding agents hold every grant the user gave coding agents. So grant it only to a trigger whose input you trust. See `triggers.md` § "Coding-agent grant".
 
 ### Side-effect grant
 The irreversible side-effect categories a *trigger* may perform unattended, set per trigger under "Allowed side-effects". No human is present to ask, so the *command guard* consults the grant instead. An irreversible command (email, a mutating HTTP request, a cloud-CLI change, out-of-workspace destruction, anything else irreversible) runs only if its category is granted. Otherwise it is blocked and the run fails, with a notification naming the missing grant.
 
-Categories: **email**, **external API**, **cloud CLI**, **out-of-workspace destruction**, **other**. The default is empty. Consulted only while the *command guard* is on; chat turns ignore it, since they ask every time. Only the user widens it, so an agent can't widen its own unattended authority. An agent, an app frame or a plugin's `trigger.toml` cannot add a category, though anyone may narrow it. An agent's edit to the trigger's work clears it.
+Categories: **email**, **external API**, **cloud CLI**, **out-of-workspace destruction**, **other**. The default is empty, and a secret read is never grantable. Consulted only while the *command guard* is on; chat turns ignore it, since they ask every time. Only the user widens it, on the trigger or by confirming a *batch*, so an agent can't widen its own unattended authority. An agent, an app frame or a plugin's `trigger.toml` cannot add a category, though anyone may narrow it. An agent's edit to the trigger's work clears it.
 
 A *coding-agent thread* a trigger starts does not read this grant. It needs the trigger's *coding-agent grant* to start at all, then takes the workspace's own grants like every coding-agent session. See `coding-agent-events.md` § "Every session uses the workspace's grants".
 
@@ -1229,12 +1284,23 @@ See also: `system-knowhow/notifications.md` §§2, 4.
 ### Spawning thread
 The *thread* that issued the `run_thread` / `run_coding_agent` / `lucidos spawn-thread` call. For `relation: "child"`, it IS the parent. For `relation: "top"`, there is no parent and no callback wiring. Either way the spawn is *attributed*: the spawned thread's first message records its launcher, so its route popover links back here. Attribution is not linkage: a top-thread never reports back, counts as a child, or inherits the spawning thread's permissions.
 
+### Stopped thread
+A *thread* whose turn you ended with Stop. It takes no automatic engine wake
+until you resume it with a device message, Continue, a card answer, Harden or
+Apply. Event waits and child reports remain waiting for that resume.
+
+A message
+from Home or a parent can still start a turn, but does not lift the hold on
+engine wakes. The hold survives an engine restart and applies to chat and
+coding-agent threads. Distinct from an *automation pause*, which asks before
+an automatic step. See ADR 0696.
+
 ### Stopped child
-A *child thread* whose turn a user Stop ended, not yet continued, archived or discarded. Cancel on its question card counts as a Stop. The child is alive, and one message continues it. Its *parent thread* gets a quiet `ChildThreadStopped` note and no turn, and is still owed a result.
+A *stopped thread* that is a *child thread*, not yet continued, archived or discarded. Cancel on its question card counts as a Stop. The child is alive, and one message continues it. Its *parent thread* gets a quiet `ChildThreadStopped` note and no turn, and is still owed a result.
 
 The child's next finished turn sends the usual completion card. Archiving or deleting it, or discarding its change, sends one with status `canceled`. Meanwhile it counts toward *attention*, and a notice at the end of its transcript names the waiting parent. It blocks nothing, so the parent can still be archived.
 
-Distinct from *Paused*, which the engine resumes by itself. See ADR 0252.
+Distinct from a *thread pause*, which the engine resumes by itself. See ADR 0252.
 See also: *child thread*, *parent thread*.
 
 ### Status filter
@@ -1306,7 +1372,8 @@ See also: *Ongoing grouping*, *thread drawer*.
 ### Ongoing grouping
 The *thread drawer* grouping by what is still going on with each *thread*: *Blocked*, *Review*, **Drafts** and *In flight*. Each group is a tile at the top showing its count, always all four and always in that order. One tile is selected, and only its threads are listed below the tiles. Tapping a tile only selects it: the open thread stays where it is, and a tap on a row opens that row. An empty tile is dimmed but can still be selected, and then the list says it is empty. A thread that matches no group is not listed here: find it under the *Folders grouping*.
 
-Opening a thread from Blocked or Review lands on what needs you, rather than where you last read. Which target depends on the tile you opened it from.
+Opening a thread from Blocked or Review restores where you last read if you already reached the target turn.
+Otherwise it lands on what needs you. Which target depends on the tile you opened it from.
 
 A thread shows in every group it matches, so a failed thread with a ready *change* is in Blocked and in Review. Only one group is listed at a time, so no row shows twice. Every thread type is listed: the thread filter shapes the *Folders grouping* only, and its button hides here. Reached with the drawer header's *grouping button*, which shows an inbox and carries the Blocked count while the Folders grouping is on screen. **Show in Folders** always goes to the Folders grouping, where the thread has its place.
 See also: *Folders grouping*, *thread drawer*.
@@ -1319,7 +1386,8 @@ Its tile also works as a filter. Press the selected In flight tile again to list
 ### Blocked
 The *Ongoing grouping* group for threads that cannot go on without you. It lists every Current and Saved *thread* waiting for your answer or permission, one that failed, and a stopped *sub-thread*. It also lists one resting with *unproposed work* that is not hardened, whose *Not ready* strip offers **Harden**.
 
-Questions come first, then the newest. Its count rides the *grouping button* under Folders, and the thread-drawer toggle while the list is hidden. Opening a thread from Blocked lands on the open question or permission card, or on the failure. It was called Needs attention until ADR 0409.
+Questions come first, then the newest. Its count rides the *grouping button* under Folders, and the thread-drawer toggle while the list is hidden. Opening a thread from Blocked lands on the open question or permission card, or on the failure.
+A saved position in that turn or later, including the live edge, restores instead. It was called Needs attention until ADR 0409.
 
 While it holds threads, its tile wears the waiting colour. A halo breathes around it while a blocked thread is still unseen. Selecting Blocked sees them all, and opening one sees that one. Only a newly blocked thread starts the halo again. With Reduce motion on, the halo holds still.
 
@@ -1330,52 +1398,56 @@ A person starts one by writing a thread. A *trigger* starts one per fire, unless
 See also: *sub-thread*, *continue key*, *driver*, *gate*.
 
 ### Gate
-A question card in a *root thread* or one of its *sub-threads*: the point where the work waits for a person. Which work stops where is policy, written in knowhow. No engine code decides when to stop.
+A question card in a *root thread* or one of its *sub-threads*: the point where the work waits for a user. Which work stops where is policy, written in knowhow. No engine code decides when to stop.
 
-A gate is live. Anyone's answer clears it from every view, for every *operator*. A gate always reaches someone: with no reachable *driver*, its push goes to the whole team.
+A gate is live. Anyone's answer clears it from every view, for every *user*. A gate always reaches someone: with no reachable *driver*, its push goes to the whole team.
 See also: *driver*, *Blocked*, *root thread*.
 
 ### Driver
-The one *operator* responsible for a *root thread* and its *sub-threads* right now. A thread you start makes you its driver. A trigger's root thread starts with none. Answering a *gate*, or tapping **Take**, makes you the driver, and **Take over** moves the role in one tap.
+The one *user* responsible for a *root thread* and its *sub-threads* right now. A thread you start makes you its driver. A trigger's root thread starts with none. Answering a *gate*, or tapping **Take**, makes you the driver, and **Take over** moves the role in one tap.
 
-**The driver is soft.** Anyone can still answer any gate. A gate its driver leaves past the team's timeout escalates once: it pushes the whole team and shows in the Team view. The driver keeps the root thread. An answer from the source, through a keyed trigger fire, sets a driver only when its *actor* matches an operator.
+**The driver is soft.** Anyone can still answer any gate. A gate its driver leaves past the team's timeout escalates once: it pushes the whole team and shows in the Team view. The driver keeps the root thread. An answer from the source, through a keyed trigger fire, sets a driver only when its *actor* matches a user.
 
 The timeout is the `driver_timeout_hours` preference, and `0` never escalates. **Release** gives the role up.
-See also: *watcher*, *gate*, *operator*.
+See also: *watcher*, *gate*, *user*.
 
 ### Watcher
-An *operator* who follows a *root thread* without being responsible for it. Tap **Watch** on the thread's People row or in the *factory app*. A *person mention* also makes you one. A watcher gets the root thread's gate pushes beside the *driver*, and sees it under Mine. **Unwatch** on the People row, or on a *people-only message* push, stops it.
-See also: *driver*, *root thread*, *person mention*.
+An *user* who follows a *root thread* without being responsible for it. Tap **Watch** in the thread's users panel or in the *factory app*. A *user mention* also makes you one. A watcher gets the root thread's gate pushes beside the *driver*, and sees it under Mine. **Unwatch** in the users panel, or on a *user-only message* push, stops it.
+See also: *driver*, *root thread*, *user mention*.
 
-### Person mention
-`@Name` in a message, naming an *operator*. It pushes that person and makes them a *watcher* of the *root thread*. The composer suggests names as you type `@`, and **Tab** takes the first. A message that mentions only people is a *people-only message*, and it starts the *agent pause*. Team gateways only.
-See also: *agent mention*, *agent pause*, *operator*.
+### User mention
+`@Name` in a message, naming another *user*. Mentioning yourself does not address a user or start a pause. It pushes that user and makes them a *watcher* of the *root thread*.
+
+The composer suggests names as you type `@`, and **Tab** takes the first. A message that mentions only users is a *user-only message*, and it starts the *agent pause*. Team gateways only.
+See also: *agent mention*, *agent pause*, *user*.
 
 ### Agent mention
-`@agent` in a message. It wakes the thread's agent, and ends an *agent pause*. One message may carry it beside *person mentions*: then the agent answers, and only the people it names get a push.
-See also: *person mention*, *agent pause*.
+`@agent` in a message. It wakes the thread's agent, and ends an *agent pause*. One message may carry it beside *user mentions*: then the agent answers, and only the users it names get a push.
+See also: *user mention*, *agent pause*.
 
 ### Agent pause
-The state in which typed messages in a thread stop waking its agent. A message that mentions only people starts it. While it holds, an untagged message stays between people too. An *agent mention* or **Resume** ends it. The pause belongs to the thread and reads the same for everyone. An "Agent paused" or "Agent resumed" card marks each change in the transcript.
+The state in which device-origin typed messages in a thread stop waking its agent. CLI, API and cross-workspace sends still wake it.
 
-While it holds, a hint line above the composer reads "Agent paused. Mention @agent or Resume". A pause never stops a running turn. Input that no person typed (a trigger fire, a *sub-thread*'s report, a question answer) still wakes the agent. Team gateways only (ADR 0649).
-See also: *people-only message*, *agent mention*.
+A message that mentions only users starts it. While it holds, an untagged message stays between users too. An *agent mention* ends it. The pause belongs to the thread and reads the same for everyone. The transcript draws nothing for it.
 
-### People-only message
-A message a person writes to the other people in a thread, not to its agent. It starts no turn. The agent reads it, under the writer's name, the next time something wakes it. It pushes the people it mentions plus the *driver* and *watchers*, minus the writer, and one banner per thread replaces the last. Every one sits between an "Agent paused" card and the next "Agent resumed" card, so it carries no mark of its own.
-See also: *agent pause*, *person mention*, *watcher*.
+While it holds, the empty composer reads "Agent paused. Mention @agent to wake it". A pause never stops a running turn. Input that no user typed (a trigger fire, a *sub-thread*'s report, a question answer) still wakes the agent. Team gateways only (ADR 0649).
+See also: *user-only message*, *agent mention*.
+
+### User-only message
+A message a user writes to the other users in a thread, not to its agent. It starts no turn. The agent reads it, under the writer's name, the next time something wakes it. It pushes the users it mentions plus the *driver* and *watchers*, minus the writer, and one banner per thread replaces the last. It draws as an ordinary message bubble, with no mark of its own.
+See also: *agent pause*, *user mention*, *watcher*.
 
 ### Notification audience
-The devices a notification is for: the people a notice names, or else the root thread's. A notification that opens a thread is for its *root thread*'s *driver* and *watchers*. It widens to the whole team when the root thread has no driver, has an escalated *gate*, or names nobody who holds a device. Every other notification, and every notification on a gateway with one *operator*, is for everyone. Push skips devices outside it, where it reads as read.
+The devices a notification is for: the users a notice names, or else the root thread's. A notification that opens a thread is for its *root thread*'s *driver* and *watchers*. It widens to the whole team when the root thread has no driver, has an escalated *gate*, or names nobody who holds a device. Every other notification, and every notification on a gateway with one *user*, is for everyone. Push skips devices outside it, where it reads as read.
 See also: *driver*, *watcher*, *gate*, *read state*.
 
 ### Read state
-Whether you have read a notification, or seen a reply a *read request* points at. On a gateway with two or more *operators* it is per person: a read on one of your devices counts on all of them and on nobody else's. With one operator it is shared, as before.
-See also: *operator*, *notification audience*.
+Whether you have read a notification, or seen a reply a *read request* points at. On a gateway with two or more *users* it is per user: a read on one of your devices counts on all of them and on nobody else's. With one user it is shared, as before.
+See also: *user*, *notification audience*.
 
 ### Config change
 A repository, trigger, MCP server or credential that someone added, changed or removed. On a *team workspace* each one tells the rest of the team who made it, with **Undo** where the change can be inverted. Undo never brings back a credential's value, only its other settings.
-See also: *team workspace*, *operator*.
+See also: *team workspace*, *user*.
 
 ### Factory app
 The Lucidos app a *team workspace* installs from its setup knowhow (`system-knowhow/team-workspace`). It lists open *root threads* with their *driver* chips, split into Mine, Team and All, and offers **Take** and **Watch**. Team lists the *gates* nobody owns: no driver, or escalated past the team's timeout. The core thread drawer does not change.
@@ -1386,7 +1458,8 @@ A script *trigger* in a *team workspace* that turns a source's raw input into a 
 See also: *team workspace*, *actor*, *continue key*.
 
 ### Review
-The *Ongoing grouping* group for finished work that is your turn to look at. It lists every Current and Saved *thread* whose turn has ended and that holds a ready *change* or a *read request*. A change the *landing lane* holds leaves Review, since the lane decides when it lands. Opening one from Review lands on the change's turn when a change is ready, and otherwise on the start of the newest turn. A read request adds nothing to the Blocked count.
+The *Ongoing grouping* group for finished work that is your turn to look at. It lists every Current and Saved *thread* whose turn has ended and that holds a ready *change* or a *read request*. A change the *landing lane* holds leaves Review, since the lane decides when it lands. Opening one from Review lands on the change's turn when a change is ready, and otherwise on the start of the newest turn.
+A saved position in that turn or later, including the live edge, restores instead. A read request adds nothing to the Blocked count.
 
 Its tile splits the count into changes and unread. A thread with both a ready change and a read request counts as a change. Press the selected Review tile again to list only the changes, again for only the unread ones, and once more for all. The filter skips a kind with no threads, and with only one kind there is nothing to filter. The tile marks the count it lists. When the listed kind runs out, or you select another group, the whole group lists again.
 
@@ -1450,6 +1523,22 @@ The address that opens one Settings page, written as a markdown link target: `[S
 
 ### Reader fields
 Four fields on each row that `lucidos threads list`, `lucidos threads search` and the `threads` tool return, saying what each *thread* holds and how to open it. `has_draft` says whether it holds a *draft*. `draft_preview` and `draft_length` give the draft's first 200 characters and its length, only when there is one. `link` is its *thread link*. Other thread reads leave them out.
+
+### Thread liveness
+What a *thread* is doing right now, as Lucidos reports it: one `state` plus the evidence behind it. Every thread-scoped read carries it as `liveness`: an `events` read of one thread, each `threads` search and list row, and `lucidos.threads.liveness()`.
+
+| State | Meaning |
+|---|---|
+| `working` | A turn runs and was active within 10 minutes, or a successor session is about to start. |
+| `quiet` | A turn runs but nothing happened for 10 minutes or more. Not a verdict. |
+| `waiting_for_user_answer` | Parked on a question card. |
+| `paused` | A version switch interrupted it, and Lucidos resumes it. |
+| `failed` | The last turn failed, and nothing started since. |
+| `stalled` | A *handoff* happened, and the successor session has not started for 2 minutes. |
+| `waiting` | No turn, but it wakes itself: an *event wait* or a sub-thread it waits on. |
+| `idle` | Nothing runs and nothing is owed. |
+
+Beside the state it gives the thread `status` and the seconds since its last event. It names the current agent session: its `ordinal`, how it began, and its age. `handoff: "pending"` shows while a handoff waits, and `as_of` says when Lucidos looked. Call a thread stalled, stuck, failed or done only from a liveness read in the same turn. An older read, or an earlier reply, is history.
 
 ### Thread drawer
 The pane listing your *threads*, in one of two groupings: the *Folders grouping* (Pinned, *Current*, Archive) or the *Ongoing grouping*. Its header's title names the one on screen, or reads **Filters** while the thread filter is open. It hides when the header is too narrow to show it whole.
@@ -1609,12 +1698,29 @@ What lets a *thread* press one of the *workspace owner*'s buttons while the owne
 
 **A *trigger* firing the owner authorized.** The same decision, made in advance: they wrote the trigger, or switched it on. A trigger an agent wrote and fired carries nothing, or any thread could hand itself the owner's authority.
 
-Nothing is inherited. A thread you spawn opens its own turn, so it carries none of yours. A thread without one can still ask for a single act with an *owner approval*. See `system-knowhow/orchestrating-sub-threads.md` for what this permits and refuses.
+Nothing is inherited. A thread you spawn opens its own turn, so it carries none of yours. A thread without one can still ask you for a *permission* through a *permission request*. No standing instruction answers a card: a thread relays an answer through a *batch* the owner confirms. See `system-knowhow/orchestrating-sub-threads.md` for what this permits and refuses.
 
 ### Owner approval
-Your **Allow once** on an *owner approval card*: a *question card* Lucidos writes itself, asking whether a *thread* may do one thing outside its own subtree. Examples are applying another thread's change, or archiving a thread outside its subtree. Creating a top-thread needs no approval. The agent asks for it with `lucidos ask-owner-approval`, and its reason shows below as the agent's.
+Retired (ADR 0688). The single-use **Allow once** card a thread asked for to act outside its own subtree is now a *permission request* with its action's scopes. The agent asks with `lucidos ask-permission`. Use *permission request* for the card and *permission* for what your answer grants.
 
-Your Allow lets that thread do that one thing, to that one thread, once. It expires when the thread's next turn starts. **Don't allow**, Cancel, or an answer from anyone but you grants nothing. A card never asks to answer another card for you.
+### Permission request
+A request Lucidos writes itself, asking you to allow one *action*, with options it words. The UI shows it as a permission card. Every way you answer picks one of those options: a tap, or words you type or speak in the thread that shows it. Picking the option that refuses grants nothing.
+
+**A thread asks for one when it needs your say outside its own reach.** Examples are applying another thread's change, creating a workspace, or submitting one of your saved *drafts*. The agent asks with `lucidos ask-permission`, and its reason shows below as the agent's. Each action offers its own scopes. Creating a workspace can be allowed once, for this thread or always. Deleting a workspace, discarding a change or sending a draft is Allow once only, because it destroys work or sends your words.
+
+Words count only when a judgment confirms they choose that option. With no model to judge, or an unsure judgment, they grant nothing, and a tap still works. Spoken words count only from your own transcript on a call your device started, never from the voice agent's summary. Lucidos reads a wide grant back to you before your spoken yes counts.
+See also: *permission*, *batch*.
+
+### Batch
+One *permission request* that carries several items at once: question cards, permission request cards, tool permission cards, plan approvals and trigger grants. A thread gathers them from the *sub-threads* below it, and Lucidos words the batch itself. One confirm from you runs each item once. Lucidos checks each item again as it runs: an item whose card closed, whose plan changed, or whose trigger changed is skipped and named. A batch never holds another batch, or a card of the thread that raised it. It never picks an Always allow: that stays your own tap on the card.
+
+### Permission
+What your answer to a *permission request* grants. It names an *action* and how wide it reaches, such as one command or every command with that head. It also says how long it lasts and who holds it. It lasts once, for this thread, until the plan lands, or until you revoke it. A thread, a *trigger* or the whole workspace can hold one.
+
+A tool card's "Always allow" is one the workspace holds, and its "Allow for this thread" one the thread holds. Both survive a restart.
+
+### Action
+One thing Lucidos can do that a *permission* can cover, from one fixed list in the code. Examples are Apply, Archive, run a command, and continue hardening. A button, a tool call, a CLI command and your voice name the same action. So anything you can tap, you can also ask for.
 
 <!--gloss-trigger-start-->
 ### Trigger
@@ -1640,6 +1746,9 @@ See also: `system-knowhow/triggers.md` § "Running an existing trigger once, off
 
 ### Trigger definition
 The on-disk `trigger.toml` at `data/triggers/<slug>/trigger.toml`: a **derived read-model** of a *trigger*'s durable config. The engine writes it on create and update, removes it on delete, and rebuilds it from events on boot. It is NOT the source of truth (events are), and **not version-controlled** (it sits in the repo's local `.git/info/exclude`). The scheduler never reads it, so a hand-edit changes nothing that fires and is overwritten. It makes a trigger inspectable, and lets a *plugin* SHIP a trigger by declaring one (install parses it into a `TriggerCreated`). See ADR 0019, `system-knowhow/triggers.md` § "On-disk trigger definition".
+
+### Definition digest
+A hash of what a *trigger* runs and when: its `run`, its `on` list, its cron, its MCP servers and its app. Its name, pause, model and grants do not count. A *batch* that grants to a trigger shows the first 12 characters and stores the whole digest. Your consent binds to that digest: if the trigger's definition changes before the item runs, Lucidos skips it. Lucidos computes the digest on read, so older triggers have one too.
 
 ### Event subscription
 A standing request to be told when a matching *event* happens: an `event_type` plus an optional payload `condition` scoped to that event. One shape, one matcher, two species. Without a condition it matches every event of its type; with one, only events whose payload satisfies it.
@@ -1673,8 +1782,8 @@ The key is only for input. Lucidos compares it and never parses it, so it names 
 See also: *root thread*, *field path*, *actor*, `system-knowhow/triggers.md` § "Continue key".
 
 ### Actor
-The person behind a *trigger* fire, named by email. A trigger's `actor` field names the payload field that holds the email. Lucidos maps the email to an *operator*, and an email no operator holds reads as a stranger. A source that sends ids instead of emails gets a workspace script trigger that looks the email up and emits a domain event carrying it.
-See also: *operator*, *continue key*, `system-knowhow/triggers.md` § "Actor".
+The user behind a *trigger* fire, named by email. A trigger's `actor` field names the payload field that holds the email. Lucidos maps the email to a *user*, and an email no user holds reads as a stranger. A source that sends ids instead of emails gets a workspace script trigger that looks the email up and emits a domain event carrying it.
+See also: *user*, *continue key*, `system-knowhow/triggers.md` § "Actor".
 
 ### Trigger thread
 A *thread* spawned by a *trigger* firing, marked `source = 'trigger'`. Its LLM has the same knowhow access as a chat thread: the system prompt advertises the intent registry, and the LLM calls `load_knowhow` when relevant. No per-trigger knowhow allowlist. Terminal event: `TriggerCompleted`.
@@ -1690,6 +1799,15 @@ A typed answer need not answer the question. It may ask back or say something el
 A tapped option behaves the same way: with no answer, it stays marked **Not sent** with a retry icon. Tapping **Not sent** shows what went wrong.
 See also: *unsent message*.
 
+### Unattested caller
+A caller Lucidos cannot tie to a signed identity: it carries no valid *thread-bound origin token* and no gateway stamp, the gateway's signature on a device or workspace claim (ADR 0647). A typed device id, a `caller_workspace` body field and the machine-local token all land here. The chat shows its message as "Message from an unattested caller". Recorded as `MessageOrigin::UnattestedCaller`, with the claims kept as display hints (`claimed_device_id`, `claimed_workspace`, `claimed_local_token`).
+
+**It may read, chat and do ordinary writes, under its own actor and never the owner's.** At an owner-only act it either waits or is refused. An HTTP request waits on a *permission request* card offering **Allow once**, which runs it one time. A refusal answers 403, for a reveal, a body holding a secret, or a card answer.
+
+A coding-agent start waits on a card in its own thread, which reads as waiting for your answer, never failed. **Allow** starts it now. Once that run spends the grant, later runs in this thread start without asking, including handoffs and children tracing back to it (ADR 0711). Another thread from the same caller still asks, and feeding triggers still need their grants. A snapshot restore past the card drops that adoption. Don't allow settles the parked input with one refusal response; recovery never replays that input.
+
+Not the *API caller*, which presents no credential at all. An unattested caller presents one, but nothing signed.
+
 ### Unsent message
 A message you sent that got no answer from Lucidos, so it may never have arrived. Lucidos first retries it quietly, up to three times over about 13 seconds, while it still shows as sending.
 
@@ -1698,17 +1816,32 @@ Only then does it stay in the *thread* under a **Not sent** card that quotes it,
 It is kept on the sending device, so a page reload brings it back, Retry included. That covers a send the reload cut off, whose card says so. If the message did arrive after all, it shows as sent. **Discard** removes the card without sending. Other devices never see it, and your *draft* never holds a copy.
 See also: *draft*.
 
+### Update channel
+Where this machine checks for Lucidos updates. **Stable** carries published releases; **Beta** carries tested release candidates for the packaged macOS app.
+**Nightly** is reserved and unavailable. **Local** reads a candidate staged on this machine, through its gateway.
+
+A **Custom** channel reads a remembered *custom slot*. Switching channels keeps every slot and never installs an older or equal version.
+Every installable update still needs the Lucidos signature.
+
+### Custom slot
+A remembered name and *update address* that a Custom *update channel* selects. Switching channels preserves the slot; removing it is a separate action.
+Names contain 1 to 64 characters, with no surrounding whitespace, control characters, colon or slashes.
+
 ### Update address
 Where this machine's update check looks for a new Lucidos, as a `latest.json` URL. Empty means the published release, which is the default. A developer sets another one to test a release before it is published. It must use `https`, or `http` to `localhost`, `127.0.0.1` or `[::1]`.
 
-One setting covers the whole machine: the gateway's hourly check and the macOS app's **Check for Updates** both read it. Set it in **Settings > System > Overview > Maintenance**, with `lucidos update-address set <url>`, or as `update_address` in `~/.lucidos/updates.toml`. While it is set, that section shows a banner naming it, with **Use default** to clear it. A refused address is an error there, never a silent fall back to the default. An update must still carry the Lucidos signature to install.
+One setting covers the whole machine. The gateway's hourly check and the macOS
+app's **Check for Updates** both read it. Save and select a custom slot with
+`lucidos update-channel add Preview <url> --use`, or edit it in Settings.
+Selecting Stable keeps every slot. A refused address is an error, with no
+fallback. Every installable update still needs the Lucidos signature.
 
 ### Urgent follow-up
 A *child follow-up* marked `urgent: true`, which stops the child's current turn so it reads the message now, not at its next natural break. An ordinary follow-up queues, because a steer should never throw away an in-flight build. Urgency loses whatever the interrupted turn was mid-way through. So use it for messages that cannot wait (a cancellation, "stop, you are working from a wrong assumption"), not for hurry.
 
 Without it the wait is unbounded: a child in a long tool call reads a queued message only when the call returns. A *coding-agent thread* in a ten-minute blocking wait really sits on a STOP for ten minutes. The interrupted turn ends as "Superseded", not "Canceled", since the work is steered, not abandoned. So the parent gets no false completion card for a child that carries on.
 
-Two caveats. A child parked on a question waits on a *human*, so urgency cannot unblock it. On a **Codex** child it changes nothing: a Codex turn reads no queued message until it ends, so every follow-up already stops the turn. Ask for what you mean, whatever the child's backend.
+Two caveats. A child parked on a question waits on a *human*, so urgency cannot unblock it. A **Codex** child on an app-server with steer support takes ordinary follow-ups during its turn. Older app-servers and the exec protocol still interrupt for every follow-up. Ask for what you mean, whatever the child's backend.
 See also: *child follow-up*, *coding agent*.
 
 ### Call toggle
@@ -1736,7 +1869,7 @@ During a call the handset stays green; there is no separate panel. What each of 
 
 **Speaking wakes the thread**, unless Lucidos answers you itself. A sentence it hands on lands as a message and starts an ordinary turn, as typing would. One it answers from what it knows starts nothing, but is still written down.
 
-**You can answer out loud what Lucidos is waiting on.** A pending question or permission is read to you, and saying your choice settles it, writing what the on-screen buttons write. The two widest "Always allow" choices stay on screen only. So a voice permission is allow once, allow for this conversation, or no. While something waits, no new request starts: Lucidos is stuck inside the question, and says so.
+**You can answer out loud what Lucidos is waiting on.** A pending question or permission is read to you, and saying your choice settles it, writing what the on-screen buttons write. A permission card reads every button, each "Always allow" naming the line it stores. An "Always allow" is settled only by your own words, and only when they clearly ask for that reach, such as "always allow git". The talker never picks one for you. While something waits, no new request starts: Lucidos is stuck inside the question, and says so.
 
 **How much of that works depends on the talker.** A Realtime one settles everything out loud. GPT Live holds no tools, so it settles a question by sending your words verbatim, as typing a reply would. There a permission is a tap, and so is ringing off. The talker row in Settings says which you are on.
 
@@ -1948,7 +2081,10 @@ in a browser, cmd-click or middle-click opens a tab. A right-click always offers
 the other one.
 
 Only switching lives in the menu. Creating, renaming, deleting, restoring and
-starting or stopping go through the picker, linked from the list's last row. On
+starting or stopping go through the picker, linked from the list's last row. An
+agent does them through the *workspace broker*. It stops, starts, renames and
+sets autostart on a *machine-made workspace* with no card, and asks you for
+every other act. On
 first run the picker offers both ways in side by side: name your first workspace
 (suggesting "personal" or "work"), or restore one from a backup. Nothing is
 auto-created.
@@ -1966,11 +2102,30 @@ orders. Renaming a remote gateway sends its workspaces to the end until you
 place them again.
 
 ### Workspace origin
-The provenance recorded when a workspace is registered: `user`, `eval`, `e2e`,
-`demo` or `unknown`. Older registrations are `unknown` and remain protected.
-Only a paired device may lower an existing workspace's protection. A local
-caller may raise it to `user`. A familiar
-name or folder prefix does not establish an origin.
+The provenance recorded when a workspace is registered: `user`, `agent`,
+`eval`, `e2e`, `demo` or `unknown`. Older registrations are `unknown` and
+remain protected. Only a paired device may lower an existing workspace's
+protection. A local caller may raise it to `user`. The owner's Run all on a
+*workspace broker* classify batch may move an `unknown` one. A familiar name or
+folder prefix does not establish an origin.
+
+### Machine-made workspace
+A workspace whose *workspace origin* is `agent`, `demo`, `eval` or `e2e`: a
+harness, a rig or an agent made it, not a person. It is the agent's: through
+the *workspace broker*, an agent stops, starts, renames and sets autostart on
+one with no card. An agent may delete or restore only these, with a card. It
+may restore a snapshot only into one, with no card. A `user` or `unknown` workspace stays the
+owner's, in the picker.
+
+### Workspace broker
+How an agent controls this machine's workspaces without the local token:
+`lucidos workspaces create`, `stop`, `start`, `autostart`, `rename`, `delete`,
+`restore` and `classify`. The agent asks its own engine, which asks the
+gateway. Stop, start, autostart and rename on a *machine-made workspace* act
+with no card. Every other call needs the owner's *permission* for that verb,
+asked on a *permission request* card. Delete and restore take a machine-made
+workspace only. There is no restart: stop, then start. What it creates has origin
+`agent` and *auto-start* off.
 
 ### Ephemeral workspace
 A workspace explicitly registered as disposable by its creating harness. Its
@@ -2017,7 +2172,9 @@ The MCP tool schemas are listed per server, with the threads that enabled and ca
 What Lucidos itself sends on every *Lucidos Agent* turn: its rules, tool schemas and the System Knowhow list. Fixed by the release, not by your *workspace*, and not something you can trim. Settings → System → Workspace Prompt Footprint shows it beside the *workspace prompt footprint* for scale.
 
 ### Auto-start
-A per-workspace toggle in the workspace picker: whether the *workspace gateway* starts that workspace's engine when the gateway starts. **On** means always-on: it spawns on every gateway (re)start, including a packaged install's login-launched gateway. So its triggers, scheduled tasks and notifications work with no window open. On is the default both for creating a workspace and for restoring one, which likely has triggers and scheduled tasks already. **Off** (the picker row says "Only runs while open") keeps it listed, but its engine starts only when you open it. An already-running workspace is re-adopted across a gateway restart either way.
+A per-workspace toggle in the workspace picker: whether the *workspace gateway* starts that workspace's engine when the gateway starts. **On** means always-on: it spawns on every gateway (re)start, including a packaged install's login-launched gateway. So its triggers, scheduled tasks and notifications work with no window open. On is the default both for creating a workspace and for restoring one, which likely has triggers and scheduled tasks already.
+
+A workspace an agent creates through the *workspace broker* starts with it off. **Off** (the picker row says "Only runs while open") keeps it listed, but its engine starts only when you open it. An already-running workspace is re-adopted across a gateway restart either way.
 
 ## Advanced (coding agents)
 
@@ -2056,12 +2213,56 @@ Source: `crates/lucidos-engine/src/engine/engine_version.rs`, `crates/lucidos-en
 
 The button for *Switch to new version* reads **Switch**, on the toast and in the confirm.
 
-**A version not built yet is its own, quieter signal** (dev only). With new engine code in source and nothing built, there is nothing to switch onto. So the brand mark carries a small dot instead of the switch badge, and the toast offers *Rebuild*. It defers on dismiss like the one above, keyed on the checkout's commit, since no on-disk build exists yet. Tapping the dot brings it back. If a rebuild for that commit already produced nothing to switch onto, the button is withheld and the toast names the real fix.
+**A version not built yet is its own, quieter signal** (dev only). With new engine code in source and nothing built, there is nothing to switch onto. So the brand mark carries a small dot instead of the switch badge, and the toast offers **Build new version**.
+
+Repeated taps join the build in flight. Once ready, the usual **Switch** offer appears; building never switches automatically. It defers on dismiss like the one above, keyed on the checkout's commit, since no on-disk build exists yet. Tapping the dot brings it back. If a rebuild for that commit already produced nothing to switch onto, the button is withheld and the toast names the real fix.
 
 One packaged failure is reported differently: if the swap leaves no runnable app on disk, Lucidos does **not** restart anything. It says so and tells you to reinstall from the `.dmg`, since a retry has nothing left to install over. The background service keeps running the loaded version, so your workspaces stay up until you reboot.
 
 ### Build log
 The captured engine build output, separate from chat and runtime logs. **Show build log** fetches the last 64 KiB through the authenticated shell and displays it in the paired window. The `/api/v1/engine/build-log` route is host-only; an app frame cannot request it.
+
+### Diagnostic log
+Each workspace engine, gateway and desktop client writes its own sanitized,
+size-capped runtime log with UTC dates. An agent reads its workspace engine's
+log through the bounded, filtered `lucidos diagnostic-log query`.
+That query refuses apps, devices, other workspaces and other gateways.
+Owner-approved diagnostic bundles can include gateway and client logs too.
+Secret masking cannot remove everyday text, so treat lines as untrusted data.
+See ADRs 0667, 0716 and 0717.
+
+### Diagnostic bundle
+One file of this workspace's and this computer's sanitized Lucidos logs,
+versions and internal faults. The owner sends it in one tap to the maintainer
+or another workspace, or saves it to file. Maintainer bundles remove secrets
+and conversation text; bundles to the owner's workspaces retain sanitized text.
+
+### Diagnostic drop
+Storage at lucidos.dev that holds encrypted diagnostic bundles for the maintainer
+for 30 days. It cannot read their contents.
+
+### Report code
+The short code a sender receives from the diagnostic drop, to quote when
+describing the problem.
+
+### Diagnostic inbox
+Where a workspace keeps received diagnostic bundles, outside git.
+Each arrival emits `DiagnosticBundleReceived`, a persisted system event. Bundles expire after 90 days
+unless deleted earlier.
+
+### Internal fault
+A failure inside Lucidos itself, such as a panic, crash or boot failure.
+Provider and network failures are external and never raise the internal-fault count.
+
+### Host log
+Whatever captures the standard output of the gateway and its engines. Dev scripts write `gateway.log`, and a packaged install writes its service log. A headless install writes `gateway.out.log` on macOS and journald on Linux. It mixes every workspace on the machine and sits with private files, so agents cannot read it. They use `lucidos diagnostic-log query` for this workspace's engine lines instead (the *diagnostic log*). No grant covers private files; do not retry with another spelling.
+
+To send the raw files to another machine, use a *host-log transfer*.
+
+### Host-log transfer
+One owner-approved copy of the recognized *host log* files to one exact SSH destination (ADR 0712). An agent runs `lucidos diagnostic-log prepare-host-transfer`, and the owner answers the `transfer-host-logs` card itself. That once-only grant lets the gateway snapshot and send the files. The agent never reads them, and gets back only metadata and a status such as `verified` or `uncertain`.
+
+Each line starts with a full date and UTC offset.
 
 ### Apply-ready
 A pending *change* that *Apply* merges as it stands: its thread has finished, and it needs no *hardening*. It needs none when `/harden` ran on its branch, when it carries only implementation plans, or when it comes from an *app coding-agent thread*. The Changes panel's **Ready** section lists it until it starts landing, and **Apply All** and **Discard All** act on it. The engine decides it and sends it as `apply_ready` on each change, beside `needs_hardening`. A turn end never proposes work that needs hardening. So once its thread rests, only a change from before that rule can be pending and not apply-ready.
@@ -2110,7 +2311,9 @@ Without a pairing, the lane lands locally and pushes afterwards, and a failed pu
 See also: *landing lane*, *follow main*, *gateway pairing*.
 
 ### Follow main
-How a source checkout with an `origin` remote keeps its `main` current, only while a *gateway pairing* exists. Every `follow_main_interval_minutes` it fetches `origin/main` and fast-forwards local `main` to a newer one, which then builds in the background. **Switch to new version** still waits for a tap. A *landing nudge* makes it check at once.
+How a source checkout with an `origin` remote keeps its `main` current, only while a *gateway pairing* exists. Every `follow_main_interval_minutes` it fetches `origin/main` and fast-forwards local `main` to a newer one. `follow_main_build=auto` builds it in the background; `on-switch` waits for **Build new version** and suppresses automatic repair builds. This preference is workspace-wide.
+
+Local Apply and explicit rebuilds still build. **Switch to new version** still waits for a tap. A *landing nudge* makes it check at once.
 See also: *origin-first landing*, *landing nudge*.
 
 ### Landing nudge
@@ -2122,6 +2325,9 @@ The changes a *landing lane* pass could not merge cleanly onto `main`, resolving
 
 An *Apply All* press's conflicts form one batch, since the lane waits until the press has handed over every change.
 
+### Arrival hold
+While a *lane batch* hardens again because `main` moved under it, the *landing lane* stops landing new clean changes. They wait, in the order they arrived, and land as soon as the batch lands or fails. A cap of 15 minutes ends the hold early, so a stuck batch never blocks everyone. The lane snapshot names the holding batch as `arrival_hold`. Announced by `LaneArrivalsHeld`, and ended by `LaneArrivalsReleased`.
+
 ### Lane thread
 The *coding-agent thread* the engine opens for a *lane batch*, titled for what it lands ("Landing 3 changes"). It merges each member as its own merge commit, resolves the conflicts, runs `/harden` once, and asks you when a resolution needs your judgment. You can follow its steps and write to it like any thread.
 
@@ -2130,23 +2336,41 @@ When its turn ends cleanly, the batch lands. A message you send while it works g
 **Stop** ends its turn and keeps everything, as on any thread: the batch stays open with its worktree, and your next message or **Continue** carries it on. The lane's **Cancel** fails the batch. So do a failed turn, a turn that cannot start, and discarding, archiving or deleting the thread, even while it sits idle. A crash leaves it a Continue, and no second batch starts meanwhile.
 
 ### Main check
-A GitHub run on a stripped copy of `main` after changes landed (ADR 0464). It runs the engine suite and every e2e suite, and gates nothing: `main` never waits for it. One runs at a time. When it ends, the next covers everything that landed meanwhile. A red one opens one *fix thread*.
+A GitHub run on a stripped copy of `main` after changes landed (ADR 0464). It runs the engine, crates and script suites on Linux and macOS, and every e2e suite, and gates nothing: `main` never waits for it. One runs at a time. When it ends, the next covers everything that landed meanwhile. A red one schedules one *main repair*.
 
-Only a *landing lane* landing starts one, and only in a checkout with the release libraries and the `lucidos` remote. An engine restart picks up the GitHub run it left going, once that run is on record. A run that ends without a verdict (GitHub down, a refused push, a restart before the run started) starts nothing by itself: the next landing does. Its events are `MainCheckStarted`, `MainCheckRunLinked`, `MainCheckPassed`, `MainCheckFailed`, `MainCheckAbandoned` and `MainCheckRedClosed`.
+A *landing lane* landing starts one, and so does a `main` that *follow main* fast-forwarded to another gateway's landing (`MainFollowed`). It starts only under the *main-check setting* `here`, in a checkout with the release libraries and the `lucidos` remote. An engine restart picks up the GitHub run it left going, once that run is on record. A run that ends without a verdict (GitHub down, a refused push, a restart before the run started) starts nothing by itself: the next landing does.
+
+A newer `main` cancels a check whose tests have not started, and the next check starts on it (`MainCheckSuperseded`). A check whose tests started runs to its verdict. Its events are `MainCheckStarted`, `MainCheckRunLinked`, `MainCheckPassed`, `MainCheckFailed`, `MainCheckAbandoned`, `MainCheckSuperseded`, `MainCheckRedClosed` and `MainCheckRepairStarted`.
 
 The *landing lane*'s line in the Lucidos menu says where it stands: "Main check: passing", "Main check: running" linking the run, or "Main red: <what failed>" linking the fix thread, with **Close**. While it runs or main is red, the line shows even with the lane empty. `lucidos main-check status` reads the same.
 
-### Fix thread
-The one *coding-agent thread* a red *main check* opens, titled "Fix main: <what failed>". Its first prompt carries the failure and its tail, the run, the range, and the changes that landed in it. It is an ordinary thread: its change goes through the *landing lane* when you press Apply.
+### Main-check setting
+Which workspace runs the *main check* (ADR 0694), in Settings → Coding Agents. `here`: this workspace checks every new `main` and repairs a red one. `another-host`: another workspace checks `main`, so nothing starts here. `off`: no main check covers this workspace.
 
-No check starts while main is red. When a change from the fix thread lands, the red closes and the next check starts. You can also close the red yourself with **Close** (`POST /api/v1/main-check/close`). What landed meanwhile then starts the next check. An agent cannot close it.
+Unset, it is `here` in a checkout that can run the main check, else `off`. Under `here` and `another-host`, `/harden` leaves the slow suites to the main check. Under `off`, it runs every suite before a change lands. Two workspaces set to `here` both check and both repair: set one of them to `another-host`. `lucidos main-check setting` prints it.
+
+### Main repair
+The single repair that owns open main-check failures and flaky tests (ADR 0682). Its fix-thread identity stays stable across continued failures.
+
+An automatic repair starts only under the *main-check setting* `here`. It waits for two minutes without running coding-agent work, an Apply, queued work, or machine builds. Keep-alive turns and parked threads do not count. **Fix now** starts the repair immediately as owner work, under any setting. Automatic repairs use background build slots that yield to chosen work. Running repairs are never stopped.
+
+A working repair arms an *event wait* on its red. Each later failing check, each flaky finding and the closing pass then reach it while it works.
+
+The Lucidos menu shows whether the repair waits, what blocks it, or its running thread. Each new red creates one in-app notification, without push. A restart recovers a missing notice under the same identity. A later pass drops a waiting red repair. Archived or deleted repair threads stay gone; a newer failure or **Fix now** can replace them.
+
+### Fix thread
+The one *coding-agent thread* a *main repair* runs in, titled "Fix main: <what failed>". Its first prompt carries the failure and its tail, the run, the range, and the changes that landed in it. It is an ordinary thread: its change goes through the *landing lane* when you press Apply.
+
+Checks continue while main is red. A newer failure updates the red under the same repair owner; a newer pass closes it. A fix landing also closes red. A check that predates that fix cannot reopen red.
+
+You can close red with **Close** (`POST /api/v1/main-check/close`). Close never stops a running repair. An agent cannot close red.
 
 Its first prompt lists each failed test with the head of its error. It runs on Claude Code, Sonnet 5.5, medium effort, whatever the workspace's own default is.
 
 ### Flaky fix thread
 The *coding-agent thread* a *main check* opens when it passes but some tests failed once and passed a retry, titled "Fix flaky: <first test>". The engine suite reruns its failed tests once, and Playwright retries each browser test once. A test that fails twice still turns main red.
 
-A pass with flaky tests holds no check. At most one flaky fix thread is open: while it is, a later pass records its flaky tests on `MainCheckPassed` and opens nothing. It closes when a change from it lands, or when you archive or delete it. It runs on the same implementer as the *fix thread*.
+A pass with flaky tests holds no check. Its findings attach to the existing main repair, or schedule one if none exists. A later flaky pass retains that owner. It closes when a change from it lands, or when you archive or delete it. It runs on the same implementer as the *fix thread*.
 
 ### Apply estimate
 How long a hardening and a merge conflict resolution usually take in this workspace, from its own past applies. Recent applies count most, since the process gets faster. With fewer than five past runs there is no estimate, and the Lucidos menu shows only the time so far. It is a typical time, never a countdown: the slowest runs take two to three times as long.
@@ -2251,9 +2475,14 @@ Five moments start one:
 - asking the agent to "handoff this session";
 - **Continue with context** on the *Successor card*;
 - an automatic *handoff checkpoint* where the *handoff estimate* says the handoff pays;
-- the first turn end past the thread's *context ceiling*.
+- the first safe boundary past the thread's *context ceiling*.
 
-The agent writes the narrative, runs `lucidos successor start`, and ends its turn. The successor session then starts in the thread. No owner approval is needed, and uncommitted work stays in the worktree. Stopping the turn first withdraws the handoff, and so does a successor session that fails to start.
+The agent writes the narrative, runs `lucidos successor start`, and ends its turn. The successor session then starts in the thread. No permission is needed, and uncommitted work stays in the worktree. Stopping the turn first withdraws the handoff, and so does a successor session that fails to start.
+
+### Provider block
+A turn the provider's safety classifier refused, known by the structured code on `ResponseFailed.provider_error`: `misalignment_policy_violation`, `cyber_policy` or `bio_policy`. The card names the policy and offers *Switch to Claude Code* or *Continue in a new session*. The blocked session is never resumed, so the next message starts a *successor session* from a *handoff brief*. A parent thread is told to rephrase the order or ask the user. Any other provider error code is shown but resumes as before.
+
+See also: *Successor session*, *Handoff brief*.
 
 ### Successor thread
 Retired with ADR 0560. Before *successor sessions*, a handoff started a new *coding-agent thread* instead. No new one starts, but old ones stay as they were. Its branch started at the old thread's last commit, so its *change* carries all of that work, and the old thread proposes nothing. It sits in the old thread's place: top-level if that one was, otherwise a child of the same parent, which then waits on it.
@@ -2280,7 +2509,7 @@ The estimate reads the *prompt cache*'s warmth. With a warm cache, the handoff c
 ### Handoff checkpoint
 A named point in a coding-agent thread's work where the agent may continue in a *successor session*. A repository names its own in its plan skill, review flow or agent instructions, and Lucidos's own repo does the same. At one, the agent runs `lucidos successor offer --at <name>` and follows what it prints.
 
-- **Automatic**: when the *handoff estimate* says the handoff pays, the agent hands off on the same implementer. Otherwise it carries on. A child thread hands off the same way, with no owner approval.
+- **Automatic**: when the *handoff estimate* says the handoff pays, the agent hands off on the same implementer. Otherwise it carries on. A child thread hands off the same way, with no permission.
 - **Offered** (`--ask`): the user decides on a question card, which recommends a fresh session when the estimate pays. Plan approval is the usual one.
 
 ### Implementer
@@ -2303,7 +2532,7 @@ The prompt-bar control for choosing a thread's model and effort. It is a small p
 
 It opens a list of *intelligence rungs* from the thread's own *intelligence ladder*: each estimated rung that is on, and the pair in force when it sits off the ladder. Then come the rungs with no estimate, under *Not estimated*, and a link to **Settings → Intelligence** last. Pick one row to set model and effort together. On the Lucidos Agent, a rung whose model has a choice of backend then asks for the *preferred provider*. Codex has no slash menu, so its `/` button stays dimmed.
 
-On a started Lucidos Agent thread, the model and effort stay fixed while a turn runs, waits on a question or is paused. The control then says why instead of changing. A pick between turns is saved at once, and the next turn runs on it, from any device, however that turn starts.
+On a started Lucidos Agent thread, a pick is saved for the next turn, including during a running turn. The current turn keeps its model and effort. Both collapsed faces add `*` while a pick is pending; the popover names the running pair and the next-turn pair. A second pick replaces the pending one. Reload and other devices retain it, and a queued next turn reads it when it starts.
 
 There is no Default row: while nothing is picked, the ladder's default rung wears the checkmark in its own place in the list. The pill never reads "Default" for a model either. With no model of its own, a thread names its *default implementer*. A thread that began before the backend shipped a default effort may record a model and no effort. The pill then reads "· default" when the model offers tiers.
 
@@ -2357,8 +2586,16 @@ The context size at which a coding-agent session hands off to a *successor sessi
 
 - **Where it is set:** the `coding_agent_context_ceiling` *preference*, a trigger's `context_ceiling`, or the thread itself with `lucidos threads context-ceiling`. A child takes its parent's at spawn.
 - **Who may raise it:** only a person raises it or turns it off. An agent may lower its own thread's.
-- **When it acts:** at the first turn end past it, never mid-turn. The session writes its *handoff narrative* while the cache is warm. If it writes none, Lucidos uses a *handoff brief*.
-- **When the successor starts:** on the thread's next input, such as your next message or a wake. Until then the old session takes no input.
+- **When it acts:** at the first safe boundary past it, during a running turn
+  when the driver can steer, or at turn end. It never interrupts a running tool.
+  Unread input and open question or permission cards defer steering.
+  An automation pause asks first. The session writes its *handoff narrative*
+  while the cache is warm. If it writes none, Lucidos uses a *handoff brief*.
+- **The opening guard:** a session already above its ceiling on its first capture
+  is exempt. A session that grows past it during its first turn still hands off.
+- **Stop stays stopped:** Lucidos records a brief without starting another agent
+  turn. Your next input starts the successor.
+- **When the successor starts:** after the narrative turn if ceiling re-entry interrupted running work. After a natural turn end, or with an engine brief, it waits for the next input, such as your message or a wake. Until then the old session takes no input.
 
 Above the composer, **Return to the old session** withdraws the handoff and raises the ceiling to the session's size plus 100k.
 
@@ -2471,6 +2708,9 @@ When a waiting thread will next wake: the earliest of its event waits and the ch
 ### Expected wake decision
 The background call that fills in an *expected wake* when a turn leaves its thread waiting and the agent stated none. It runs at the turn end beside the read decision, only while the *cache keep-alive* is on, and never for Codex. It reads what the thread waits on, the latest output of running background tasks, the reply, past waits like these, and earlier estimates that passed. Its chat model picks one time bucket; a System One model gives a probability per bucket. A failed call records nothing. Its model is the Expected wake row in Settings → Models (Background tasks).
 
+### Permission answer
+The background call that reads your typed or spoken words against an open *permission request* and says which option they choose. Spoken words also answer a tool's permission card (a command, an MCP tool or a coding agent's): it stores what its button stores, and a typed reply still denies it. Only a clear pick counts: an unsure answer or a failed call picks nothing, and a tap still works. A tap is the only answer to a request an agent asked for, or to an unattested caller's card. Your words still reach the thread as a message either way. Its model is the Permission answer row in Settings → Models (Background tasks), and only you set it.
+
 ### Coding-agent thread
 A *thread* driven by a *coding agent* (Claude Code or Codex) inside an isolated git worktree. Marked by `is_coding_agent = true` on `thread_summaries`. A `SessionStarted` opening an agent session sets it, as does another event on the `claude_code` channel. A *resume boundary* alone never does: `ContinuationStarted` fires on chat and trigger threads too.
 
@@ -2485,9 +2725,9 @@ See also: `system-knowhow/coding-agent-events.md`.
 ### Side question
 A quick question put to a thread from *side-question mode*: type it, then press the round Ask button or Enter. A typed `/btw` is ordinary text. It may carry images.
 
-The thread's agent answers from the thread's full context, beside any running turn, with no tools. A Claude Code thread asks a copy of its session; a Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, with later output below it.
+The thread's agent answers from the thread's full context, beside any running turn, with no tools. A Claude Code thread asks a copy of its session; a Codex thread asks an ephemeral fork. A Lucidos Agent thread asks its own model once. The answer shows on a card at the moment it was asked, with later output below it.
 
-It is kept as events **no agent ever sees** (ADR 0320), so the card survives reloads and shows on every device. A tap on its head folds it to one line; a second tap unfolds it. Codex threads refuse side questions.
+It is kept as events **no agent ever sees** (ADR 0320), so the card survives reloads and shows on every device. A tap on its head folds it to one line; a second tap unfolds it. Coding-agent threads need a saved session first. An older Codex CLI that cannot fork ephemerally shows update instructions.
 See also: `system-knowhow/coding-agent-events.md` § Side questions are recorded, and hidden from every agent.
 
 ### Side-question mode
@@ -2512,6 +2752,16 @@ The quality gate every *coding-agent thread* must run via `/harden` before handi
 
 An *integrated sub-thread* runs the **fast tier**: the review, the lint and the frontend checks, with no engine suite, since its integrating parent runs every suite once over the merged work. A fast-tier marker counts only for an integrated sub-thread. Any other branch still needs the full run before Lucidos proposes it or Apply takes it.
 See also: `.claude/commands/harden.md`, the playbook the agent runs. The engine system prompt owns the requirement to run it and states it to every session.
+
+### Automation pause
+A *coding-agent thread* whose automatic engine steps ask you first. It is how a checkpoint-and-pause order becomes state the engine can see. The steps it pauses are the nudge to run `/harden`, the plan nudge, the context handoff, and waking to read *sub-thread* reports or event-wait deliveries. Each one raises a *permission request* instead of running, such as "Continue hardening? Hardening is incomplete, and nothing is applied."
+
+A running turn finishes, and a *thread pause* still resumes the turn it interrupted. Messages from people and agents still arrive, and your message runs a turn without unpausing. Unfinished work stays unproposed and unhardened, and says so. An open request makes the thread Blocked.
+
+You, the thread's own agent, or an agent with reach over the thread can pause it. Only you end it: see *unpause*. Not a *thread pause*, an *agent pause* or a *stopped child*.
+
+### Unpause
+Ending an *automation pause*. You pick **Unpause** on one of its *permission requests*, by tap or by words. Another thread relays your pick only through a *batch* you confirm. Archiving the thread yourself ends it too, while an agent's archive leaves it standing. **Harden** on the *Not ready* strip runs hardening once and leaves the pause in place. An agent relaying "continue" without your words unpauses nothing.
 
 ### Repository
 A user-registered external git repository (a row in the `repositories` table) that an *external-repo coding-agent thread* can run against. Distinct from `data/imported/` *imported* repos, flattened to plain files as *artifacts*.
@@ -2551,3 +2801,21 @@ undo external side effects or resume archived work automatically.
 The durable record of a snapshot restore's progress, stored outside the
 workspace database and files. It lets the gateway finish recovery before
 starting the engine after an interruption.
+
+### Plan kind
+
+The purpose of a plan, recorded explicitly as `design` or `implementation`.
+Approval of a design plan agrees its decisions and never permits implementation.
+Approval of an implementation plan can authorize implementation or just landing the plan for later.
+A filename never determines the kind.
+
+### Design plan
+
+A plan that records agreed design decisions, without implementation phases.
+Its approval always covers the plan alone. An implementation plan and its own approval precede building it.
+
+## Poster
+
+A still first frame shown while a video is idle.
+The built-in video player uses a poster so it holds no loaded video before playback intent.
+`lucidos.media.poster` captures one through the host and releases the decoder afterwards.

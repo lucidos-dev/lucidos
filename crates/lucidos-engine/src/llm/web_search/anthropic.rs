@@ -177,6 +177,14 @@ pub struct AnthropicServerToolSearch {
 }
 
 impl AnthropicServerToolSearch {
+    fn billing_provider(&self) -> crate::runtime::billing_provider::BillingProvider {
+        use crate::runtime::billing_provider::BillingProvider;
+        match self.auth {
+            AnthropicAuth::ApiKey(_) => BillingProvider::Anthropic,
+            AnthropicAuth::OAuthBearer(_) => BillingProvider::AnthropicSubscription,
+        }
+    }
+
     /// `model` MUST be a model **Anthropic** serves — the caller resolves it via
     /// `provider_build::search_model_for`, which uses the user's chat model only
     /// when that model routes to Anthropic and a known Anthropic id otherwise.
@@ -206,6 +214,7 @@ impl WebSearchProvider for AnthropicServerToolSearch {
         max_results: usize,
         _call: CallToken,
     ) -> Result<WebSearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::Anthropic).await?;
         let (auth_name, auth_value) = auth_header(&self.auth);
         let mut request = self
             .client
@@ -224,10 +233,23 @@ impl WebSearchProvider for AnthropicServerToolSearch {
             .send()
             .await?;
 
+        let error_headers = response.headers().clone();
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(format!("Anthropic search API error ({status}): {body}").into());
+            if let Some(cap) = crate::llm::metered::http_spend_cap(
+                crate::llm::ProviderKind::Anthropic,
+                status.as_u16(),
+                &error_headers,
+                &body,
+            )
+            .await
+            {
+                return Err(cap.into());
+            }
+            return Err(
+                crate::llm::ProviderError::from_http("Anthropic", status.as_u16(), &body).into(),
+            );
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
@@ -236,6 +258,7 @@ impl WebSearchProvider for AnthropicServerToolSearch {
             text: parse_response(&parsed, max_results)?,
             usage: crate::llm::usage_wire::from_json(&parsed),
             model: self.model.clone(),
+            provider: Some(self.billing_provider()),
         })
     }
 
@@ -251,6 +274,19 @@ impl WebSearchProvider for AnthropicServerToolSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_billing_distinguishes_key_and_subscription_auth() {
+        for (auth, expected) in [
+            (AnthropicAuth::ApiKey("fixture".into()), "anthropic"),
+            (
+                AnthropicAuth::OAuthBearer("fixture".into()),
+                "anthropic-subscription",
+            ),
+        ] {
+            let search = AnthropicServerToolSearch::new(auth, "model".into()).unwrap();
+            assert_eq!(search.billing_provider().id(), expected);
+        }
+    }
 
     /// The tool version must match the model family or the API 400s.
     #[test]

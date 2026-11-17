@@ -44,6 +44,7 @@ const REMOTE_DEFAULTS = {
   onAddRemote: NOOP,
   onCancelRemote: NOOP,
   pairedRemote: null,
+  remoteAwaitingOwner: false,
 };
 
 function ws(id: string, name = id): WorkspaceStatus {

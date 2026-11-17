@@ -69,7 +69,7 @@ impl BranchWorkScope<'_> {
         .fetch_optional(self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[BranchWork] session lookup for {}: {}", thread_id, e);
+            log_legacy!("[BranchWork] session lookup for {}: {}", thread_id, e);
             None
         });
         let (Some(branch_name), kind) = session? else {
@@ -79,7 +79,7 @@ impl BranchWorkScope<'_> {
             return None;
         }
         if is_lane_branch(&branch_name) {
-            log!(
+            log_legacy!(
                 "[BranchWork] Skipping lane branch {} for thread {}: the landing lane lands it",
                 branch_name,
                 thread_id
@@ -122,7 +122,7 @@ impl BranchWorkScope<'_> {
         .fetch_optional(self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[BranchWork] wait-release lookup for {}: {}", thread_id, e);
+            log_legacy!("[BranchWork] wait-release lookup for {}: {}", thread_id, e);
             None
         });
         if released != Some(true) {
@@ -172,7 +172,7 @@ impl BranchWorkScope<'_> {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[BranchWork] Integrated children of {}: {}",
                     parent_thread_id,
                     e
@@ -189,7 +189,7 @@ impl BranchWorkScope<'_> {
             {
                 Ok(true) => set_aside += 1,
                 Ok(false) => {}
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[BranchWork] Failed to set aside work on integrated thread {}: {}",
                     child,
                     e
@@ -211,7 +211,7 @@ impl BranchWorkScope<'_> {
             Ok(Some(successor)) => successor,
             Ok(None) => return false,
             Err(e) => {
-                log!("[BranchWork] successor of {}: {}", thread_id, e);
+                log_legacy!("[BranchWork] successor of {}: {}", thread_id, e);
                 return false;
             }
         };
@@ -230,7 +230,7 @@ impl BranchWorkScope<'_> {
             Ok(Some(base)) if base == head => return true,
             Ok(_) => {}
             Err(e) => {
-                log!("[BranchWork] handoff base of {}: {}", thread_id, e);
+                log_legacy!("[BranchWork] handoff base of {}: {}", thread_id, e);
                 return false;
             }
         }
@@ -252,7 +252,7 @@ impl BranchWorkScope<'_> {
                 Ok(Some(old)) => old,
                 Ok(None) => return false,
                 Err(e) => {
-                    log!("[BranchWork] predecessor of {}: {}", successor_thread_id, e);
+                    log_legacy!("[BranchWork] predecessor of {}: {}", successor_thread_id, e);
                     return false;
                 }
             };
@@ -263,7 +263,7 @@ impl BranchWorkScope<'_> {
         {
             Ok(set_aside) => set_aside,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[BranchWork] Failed to set aside residue on thread {}: {}",
                     old,
                     e
@@ -287,7 +287,7 @@ impl BranchWorkScope<'_> {
             return Ok(false);
         };
         if self.carried_by_successor(thread_id, &work).await {
-            log!(
+            log_legacy!(
                 "[BranchWork] Thread {}'s branch {} rides on its successor's branch: nothing to set aside",
                 thread_id,
                 work.branch_name
@@ -318,6 +318,7 @@ impl BranchWorkScope<'_> {
             .emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::ChangeProposed {
+                    content: crate::engine::thread_events::ChangeContent::from_files(&work.files),
                     change_id: Uuid::new_v4().to_string(),
                     description: Some(details.description),
                     requires_restart: details.requires_restart,
@@ -338,7 +339,7 @@ impl BranchWorkScope<'_> {
                 },
             })
             .await?;
-        log!(
+        log_legacy!(
             "[BranchWork] Set aside unproposed work on thread {} (branch {}, {:?})",
             thread_id,
             work.branch_name,
@@ -371,7 +372,7 @@ impl BranchWorkScope<'_> {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[BranchWork] Startup candidates: {}", e);
+                log_legacy!("[BranchWork] Startup candidates: {}", e);
                 return 0;
             }
         };
@@ -388,7 +389,7 @@ impl BranchWorkScope<'_> {
             match self.set_aside_archived_branch_work(thread_id).await {
                 Ok(true) => set_aside += 1,
                 Ok(false) => {}
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[BranchWork] Failed to set aside work on thread {}: {}",
                     thread_id,
                     e
@@ -396,7 +397,7 @@ impl BranchWorkScope<'_> {
             }
         }
         if set_aside > 0 {
-            log!(
+            log_legacy!(
                 "[BranchWork] Set aside unproposed work on {} archived thread(s)",
                 set_aside
             );
@@ -439,7 +440,7 @@ impl LucidosEngine {
     /// proposal, credited to whoever canceled it. A delivery or an expiry
     /// re-opens the thread instead, and that turn's idle proposes.
     ///
-    /// A waiting child's card for its parent defers to this, so the card can
+    /// The card a child holding a wait owes its parent defers to this, so the card can
     /// list the change. It is sent after the proposal, whether that landed or
     /// not.
     pub(crate) async fn propose_work_a_canceled_wait_held(
@@ -488,7 +489,7 @@ impl LucidosEngine {
                 | ProposeOutcome::Unfinished
                 | ProposeOutcome::AwaitingLanding(_),
             ) => {}
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[BranchWork] Failed to propose work on {}: {}",
                 work.branch_name,
                 e
@@ -536,11 +537,11 @@ impl LucidosEngine {
         match (held, unsettled) {
             (Ok(held), Ok(unsettled)) => held && unsettled.is_empty(),
             (Err(e), _) => {
-                log!("[BranchWork] change-state read for {}: {}", thread_id, e);
+                log_legacy!("[BranchWork] change-state read for {}: {}", thread_id, e);
                 false
             }
             (_, Err(e)) => {
-                log!("[BranchWork] unsettled read for {}: {}", thread_id, e);
+                log_legacy!("[BranchWork] unsettled read for {}: {}", thread_id, e);
                 false
             }
         }
@@ -711,7 +712,7 @@ async fn record_branch_work(engine: &LucidosEngine, thread_id: Uuid, moment: Bra
     match moment {
         BranchWorkMoment::Archived => {
             if let Err(e) = engine.set_aside_archived_branch_work(thread_id).await {
-                log!(
+                log_legacy!(
                     "[BranchWork] Failed to set aside work on thread {}: {}",
                     thread_id,
                     e

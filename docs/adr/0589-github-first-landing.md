@@ -81,6 +81,22 @@ This keeps a checkout that cannot push landing as it did before: an
 `install.sh --dev` clone of the public repository, or a `main` that requires
 pull requests.
 
+### Manual builds of followed source
+
+`follow_main_build` is a workspace-wide agent-access preference. `auto` is
+its default and retains automatic follow builds and self-heal. `on-switch`
+keeps following and nudging on the same schedule but starts neither follow
+builds nor automatic self-heal builds. Local Apply and explicit rebuilds
+keep their behavior. Another workspace sharing the checkout can still build
+the shared binary.
+
+The existing pending-source version status keeps an unbuilt newer engine
+visible. **Build new version** joins or starts a build of current source.
+Repeated taps join the same build. Once ready, the existing **Switch** offer
+appears; no restart happens automatically. The explicit force-rebuild request
+still restarts a hung build. No deferred timer or pending in-memory state is
+needed, so manual mode survives engine recovery through its stored preference.
+
 ## Rationale
 
 The point of a shared `main` is that every gateway can follow it by

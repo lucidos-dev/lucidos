@@ -227,7 +227,7 @@ The CLI reads `$LUCIDOS_WORKSPACE`, `$LUCIDOS_THREAD_ID`, `$LUCIDOS_EVENT_ID`, a
   `--wake-mode` decides what the report does. `wake` wakes the parent, and `wake-when-all-done` wakes it for a failure or when the batch is done. `no-wake` files every report, a failure too, for the parent's next turn.
 - **`--relation top` (default) — top-thread, fire-and-forget.** The CLI emits `caller_workspace` + `caller_thread_id` + `caller_event_id`. There is no callback, no progress signal, no completion notification. The thread appears in the target workspace's UI as an independent top-level thread; that's the only confirmation you get. Works for both same-workspace and cross-workspace targets.
 
-  **`top` needs no permission.** Any thread may create a top-thread, in any turn, with no owner approval (ADR 0475). It sits under the workspace rather than under you, so you gain no reach over it.
+  **`top` needs no permission.** Any thread may create a top-thread, in any turn, with no card (ADR 0475). It sits under the workspace rather than under you, so you gain no reach over it.
 
 #### `--integrated`: fold a follow-up of your own work into your branch
 

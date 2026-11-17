@@ -35,7 +35,7 @@ pub(crate) async fn thread_is_integrated(pool: &sqlx::PgPool, thread_id: Uuid) -
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[Integrated] integrated flag for {}: {}", thread_id, e);
+        crate::log_legacy!("[Integrated] integrated flag for {}: {}", thread_id, e);
         None
     })
     .unwrap_or(false)
@@ -74,7 +74,7 @@ pub(crate) async fn expected_harden_tier(pool: &sqlx::PgPool, branch_name: &str)
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[Integrated] expected tier for {}: {}", branch_name, e);
+        crate::log_legacy!("[Integrated] expected tier for {}: {}", branch_name, e);
         None
     });
     if integrated == Some(true) {
@@ -124,7 +124,7 @@ pub(crate) async fn handed_up_branch(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Integrated] handed-up branch for {}: {}",
             child_thread_id,
             e

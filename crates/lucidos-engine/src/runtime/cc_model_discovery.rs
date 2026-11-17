@@ -13,6 +13,7 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 
 use super::claude_code::{offered_cc_model_options, CcMenuOption};
+use super::AccountPin;
 
 /// How long a discovered list stays fresh when nothing else says it moved.
 pub const CACHE_TTL: chrono::Duration = chrono::Duration::hours(24);
@@ -57,8 +58,66 @@ impl DiscoveredModel {
 pub struct CcModelCache {
     /// `claude --version` at probe time, when it answered.
     pub cc_version: Option<String>,
+    /// The account the probe ran under. `None` in a cache written before the
+    /// engine recorded it, or when `$HOME` was unset.
+    #[serde(default)]
+    pub account: Option<AccountPin>,
     pub discovered_at: DateTime<Utc>,
     pub models: Vec<DiscoveredModel>,
+}
+
+/// Base model ids Claude Code substituted for one account: a session that
+/// asked for one ran another. Persisted in `.lucidos/cc-refused-models.json`.
+///
+/// Dated by the version the refusing session reported, never by the probe
+/// cache: a session on a new Claude Code refuses before its probe lands.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CcModelRefusals {
+    pub cc_version: Option<String>,
+    pub account: Option<AccountPin>,
+    pub models: Vec<String>,
+}
+
+impl CcModelRefusals {
+    /// Record `model` as refused by Claude Code `cc_version` on `account`,
+    /// dropping refusals of another version or account first. False when
+    /// nothing changed.
+    pub fn refuse(
+        &mut self,
+        model: &str,
+        cc_version: Option<&str>,
+        account: Option<&AccountPin>,
+    ) -> bool {
+        if self.cc_version.as_deref() != cc_version || self.account.as_ref() != account {
+            *self = Self {
+                cc_version: cc_version.map(str::to_string),
+                account: account.cloned(),
+                models: Vec::new(),
+            };
+        }
+        let base = super::claude_code::cc_model_base(model);
+        if self.models.iter().any(|r| r == base) {
+            return false;
+        }
+        self.models.push(base.to_string());
+        true
+    }
+
+    /// Whether these refusals still hold for a probe of Claude Code
+    /// `cc_version`. An unknown version on either side never matches.
+    pub fn hold_for(&self, cc_version: Option<&str>) -> bool {
+        self.cc_version.is_some() && self.cc_version.as_deref() == cc_version
+    }
+}
+
+/// The offered list: the cache's rows, then the curated rest, minus refusals.
+/// With no cache it is the curated fallback, minus refusals.
+pub fn offered_list(
+    cache: Option<&CcModelCache>,
+    refusals: &CcModelRefusals,
+) -> Arc<[CcMenuOption]> {
+    let discovered = cache.map(|c| menu_options(&c.models));
+    offered_cc_model_options(discovered.as_deref(), &refusals.models)
 }
 
 /// Where the picker's list came from, for the commands route to report.
@@ -100,17 +159,24 @@ pub fn parse_initialize_models(body: &serde_json::Value) -> Result<Vec<Discovere
 /// `reported_version` is the version a session just reported. A mismatch means
 /// Claude Code updated under us, and an update is when its list moves. A cache
 /// with no recorded version has nothing to compare, so only its age counts.
+///
+/// `reported_account` is the live account that session saw. Another account
+/// offers other models, so a cache probed under another one is stale.
 pub fn needs_refresh(
     cache: Option<&CcModelCache>,
     last_failure: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
     reported_version: Option<&str>,
+    reported_account: Option<&AccountPin>,
 ) -> bool {
     if last_failure.is_some_and(|failed| now - failed < RETRY_AFTER_FAILURE) {
         return false;
     }
     let Some(cache) = cache else { return true };
     if now - cache.discovered_at > CACHE_TTL {
+        return true;
+    }
+    if reported_account.is_some_and(|live| cache.account.as_ref() != Some(live)) {
         return true;
     }
     match (reported_version, cache.cc_version.as_deref()) {
@@ -149,12 +215,12 @@ pub fn load_cache(workspace_path: &Path) -> Option<CcModelCache> {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            log!("[CcModels] ignoring unreadable {}: {e}", path.display());
+            log_legacy!("[CcModels] ignoring unreadable {}: {e}", path.display());
             return None;
         }
     };
     serde_json::from_slice(&bytes)
-        .map_err(|e| log!("[CcModels] ignoring unreadable {}: {e}", path.display()))
+        .map_err(|e| log_legacy!("[CcModels] ignoring unreadable {}: {e}", path.display()))
         .ok()
 }
 
@@ -165,23 +231,113 @@ pub fn save_cache(
     crate::core::write_json_atomic(&cache_path(workspace_path), cache)
 }
 
+pub fn refusals_path(workspace_path: &Path) -> PathBuf {
+    workspace_path.join(".lucidos/cc-refused-models.json")
+}
+
+/// The refusals on disk. Absent or unreadable reads as none: a refused model
+/// is then offered again, and the next session refuses it again.
+pub fn load_refusals(workspace_path: &Path) -> CcModelRefusals {
+    let path = refusals_path(workspace_path);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| log_legacy!("[CcModels] ignoring unreadable {}: {e}", path.display()))
+            .unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CcModelRefusals::default(),
+        Err(e) => {
+            log_legacy!("[CcModels] ignoring unreadable {}: {e}", path.display());
+            CcModelRefusals::default()
+        }
+    }
+}
+
+fn save_refusals(workspace_path: &Path, refusals: &CcModelRefusals) {
+    if let Err(e) = crate::core::write_json_atomic(&refusals_path(workspace_path), refusals) {
+        log_legacy!("[CcModels] Could not save the refused models: {e}");
+    }
+}
+
 /// This engine's discovered list. One engine serves one workspace, so a
 /// process-wide value is per workspace.
 struct Discovery {
     cache: Option<CcModelCache>,
+    refusals: CcModelRefusals,
     options: Option<Arc<[CcMenuOption]>>,
     error: Option<String>,
     last_failure: Option<DateTime<Utc>>,
     probing: bool,
 }
 
-static DISCOVERY: RwLock<Discovery> = RwLock::new(Discovery {
-    cache: None,
-    options: None,
-    error: None,
-    last_failure: None,
-    probing: false,
-});
+impl Discovery {
+    const fn new() -> Self {
+        Self {
+            cache: None,
+            refusals: CcModelRefusals {
+                cc_version: None,
+                account: None,
+                models: Vec::new(),
+            },
+            options: None,
+            error: None,
+            last_failure: None,
+            probing: false,
+        }
+    }
+
+    /// The offered list is `None`, the static curated rows, only while
+    /// there is neither a probe result nor a refusal to apply.
+    fn rebuild_options(&mut self) {
+        self.options = (self.cache.is_some() || !self.refusals.models.is_empty())
+            .then(|| offered_list(self.cache.as_ref(), &self.refusals));
+    }
+
+    /// Drop every refusal. False when there were none.
+    fn clear_refusals(&mut self) -> bool {
+        if self.refusals.models.is_empty() {
+            return false;
+        }
+        self.refusals = CcModelRefusals::default();
+        self.rebuild_options();
+        true
+    }
+
+    /// Take a probe's result. True when that dropped refusals of another
+    /// Claude Code version, which the caller must save.
+    fn install(&mut self, cache: CcModelCache) -> bool {
+        let stale = !self.refusals.hold_for(cache.cc_version.as_deref());
+        self.cache = Some(cache);
+        self.error = None;
+        self.last_failure = None;
+        let cleared = stale && self.clear_refusals();
+        self.rebuild_options();
+        cleared
+    }
+
+    /// Record a refusal by a session on `session`. Only a session on the live
+    /// account counts: the probe runs under it, so it owns the picker. True
+    /// when the refusals changed.
+    fn refuse(
+        &mut self,
+        model: &str,
+        cc_version: Option<&str>,
+        session: Option<&AccountPin>,
+        live: Option<&AccountPin>,
+    ) -> bool {
+        if session != live || !self.refusals.refuse(model, cc_version, live) {
+            return false;
+        }
+        self.rebuild_options();
+        true
+    }
+
+    /// A session reported `live` as the live account. Refusals another account
+    /// learned go. True when they did.
+    fn observe_live_account(&mut self, live: Option<&AccountPin>) -> bool {
+        self.refusals.account.as_ref() != live && self.clear_refusals()
+    }
+}
+
+static DISCOVERY: RwLock<Discovery> = RwLock::new(Discovery::new());
 
 /// A poisoned lock means a writer panicked between two plain assignments. The
 /// value is whole either way, so carry on rather than lose the picker.
@@ -193,21 +349,59 @@ fn write() -> std::sync::RwLockWriteGuard<'static, Discovery> {
     DISCOVERY.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The offered rows after a successful probe: Claude Code's list, then the
-/// curated rows it omitted. `None` until a probe has succeeded.
+/// The offered rows: Claude Code's list, then the curated rows it omitted,
+/// minus refusals. `None` while the static curated rows apply unchanged.
 pub fn offered_options() -> Option<Arc<[CcMenuOption]>> {
     read().options.clone()
 }
 
-/// Make `cache` the discovered half of the offered list. Clears any earlier
-/// probe error.
-pub fn install(cache: CcModelCache) {
-    let options = offered_cc_model_options(Some(&menu_options(&cache.models)));
+/// Serve what the last run left on disk. Called once at boot.
+pub fn load(workspace_path: &Path) {
+    let cache = load_cache(workspace_path);
+    let refusals = load_refusals(workspace_path);
     let mut state = write();
-    state.options = Some(options);
-    state.cache = Some(cache);
-    state.error = None;
-    state.last_failure = None;
+    state.cache = cache;
+    state.refusals = refusals;
+    state.rebuild_options();
+}
+
+// The three writers below save refusals under the lock, so an older state
+// can never overwrite a newer one on disk.
+
+/// Make a probe's result the discovered half of the offered list, and clear
+/// any earlier probe error. Refusals from another Claude Code version go.
+pub fn install(workspace_path: &Path, cache: CcModelCache) {
+    let mut state = write();
+    if state.install(cache) {
+        save_refusals(workspace_path, &state.refusals);
+    }
+}
+
+/// Stop offering `model`, refused by Claude Code `cc_version` in a session on
+/// `session`. False when nothing changed: the refusal was known, or the
+/// session ran on another account than the live one.
+pub fn record_refusal(
+    workspace_path: &Path,
+    model: &str,
+    cc_version: Option<&str>,
+    session: Option<&AccountPin>,
+    live: Option<&AccountPin>,
+) -> bool {
+    let mut state = write();
+    if !state.refuse(model, cc_version, session, live) {
+        return false;
+    }
+    save_refusals(workspace_path, &state.refusals);
+    true
+}
+
+/// A session reported `live` as the live account. Drops refusals another
+/// account learned, so a switch of account offers its models again.
+pub fn observe_live_account(workspace_path: &Path, live: Option<&AccountPin>) {
+    let mut state = write();
+    if state.observe_live_account(live) {
+        save_refusals(workspace_path, &state.refusals);
+    }
 }
 
 /// Record a failed probe. The last good list stays the picker, and the next
@@ -221,7 +415,7 @@ pub fn record_error(message: String) {
 pub fn provenance() -> Provenance {
     let state = read();
     Provenance {
-        source: if state.options.is_some() {
+        source: if state.cache.is_some() {
             ModelsSource::Discovered
         } else {
             ModelsSource::Fallback
@@ -235,13 +429,17 @@ pub fn provenance() -> Provenance {
 /// Claim the one probe slot when the list needs a probe. `None` when it does
 /// not, or when a probe is already running, so a burst of session starts
 /// spawns one probe, not one each. Checked and claimed under one lock.
-pub fn claim_refresh(reported_version: Option<&str>) -> Option<ProbeSlot> {
+pub fn claim_refresh(
+    reported_version: Option<&str>,
+    reported_account: Option<&AccountPin>,
+) -> Option<ProbeSlot> {
     let mut state = write();
     let due = needs_refresh(
         state.cache.as_ref(),
         state.last_failure,
         Utc::now(),
         reported_version,
+        reported_account,
     );
     if !due || state.probing {
         return None;

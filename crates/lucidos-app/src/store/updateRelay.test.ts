@@ -39,6 +39,13 @@ function relay(state: UpdateRelayRequest['state'], progress: UpdateRelayRequest[
 }
 
 describe('settleRelay', () => {
+  it('requires the requested prerelease and ignores metadata-only changes', () => {
+    const marker = { ...MARKER, fromVersion: '0.60.0-nightly.1', version: '0.60.0-rc.2' };
+    expect(settleRelay(marker, status('0.60.0-rc.2', null), 2_000).kind).toBe('succeeded');
+    expect(settleRelay(marker, status('0.60.0-nightly.2', null), 2_000).kind).toBe('did-not-run');
+    expect(settleRelay(marker, status('0.60.0-nightly.1+build', null), 2_000).kind).toBe('did-not-run');
+  });
+
   // The success the user waits for: the service came back on the new version.
   // The relay's own state died with it, so the version is the only proof.
   it('calls a newer running version a success, whatever the relay says', () => {

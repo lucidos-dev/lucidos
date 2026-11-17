@@ -113,7 +113,7 @@ fn a_seeded_file_names_its_origin_and_the_grants_survive_the_header() {
     m.migrate(&dev);
 
     let dir = grants::grants_dir(&dev);
-    let body = grants::read_raw(&dir, GrantFile::AgentCommands).unwrap();
+    let body = std::fs::read_to_string(dir.join(GrantFile::AgentCommands.file_name())).unwrap();
     assert!(body.starts_with("# Inherited on "), "body was: {body}");
     assert!(body.contains(GrantFile::AgentCommands.file_name()));
     assert_eq!(
@@ -192,7 +192,7 @@ fn a_fresh_install_with_no_global_files_seeds_nothing_and_still_closes_the_door(
     for file in GrantFile::ALL {
         assert!(grants::patterns(&dir, file).is_empty());
         assert!(
-            !grants::exists(&dir, file),
+            !dir.join(file.file_name()).exists(),
             "{} must not be created with nothing to put in it",
             file.file_name()
         );
@@ -371,10 +371,9 @@ fn a_global_file_with_no_grants_seeds_no_file() {
 
     m.migrate(&dev);
 
-    assert!(!grants::exists(
-        &grants::grants_dir(&dev),
-        GrantFile::AgentCommands
-    ));
+    assert!(!grants::grants_dir(&dev)
+        .join(GrantFile::AgentCommands.file_name())
+        .exists());
 }
 
 /// One workspace named twice cannot be seeded twice, whichever way the registry

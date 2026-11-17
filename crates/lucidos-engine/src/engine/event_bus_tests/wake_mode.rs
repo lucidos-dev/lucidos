@@ -159,7 +159,9 @@ async fn a_failed_no_wake_child_files_its_report() {
         child_id,
         ThreadEvent::ResponseFailed {
             error: "boom".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
     )
     .await;

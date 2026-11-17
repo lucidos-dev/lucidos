@@ -387,7 +387,7 @@ impl WorktreeCleanup {
     /// stalled on the database just delays the next one. A wake during a pass
     /// is kept, and starts the next pass as soon as this one returns.
     async fn run_loop(self) {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] starting (interval={:?}, tier1_idle={:?}, tier2_idle={:?}, soft_cap={} bytes, hard_cap={} bytes)",
             self.interval,
             TIER_1_IDLE,
@@ -425,7 +425,7 @@ impl WorktreeCleanup {
         let exemptions = match exemptions {
             Ok(paths) => paths,
             Err(()) => {
-                log!("[WorktreeCleanup] cannot verify restore exemptions; skipping cleanup");
+                log_legacy!("[WorktreeCleanup] cannot verify restore exemptions; skipping cleanup");
                 return;
             }
         };
@@ -433,7 +433,7 @@ impl WorktreeCleanup {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] cannot read worktrees dir {}: {}",
                     dir.display(),
                     e
@@ -464,7 +464,7 @@ impl WorktreeCleanup {
             // commits live on its branch, so only the bytes are left.
             if name.starts_with(RECLAIMING_PREFIX) {
                 if is_safe_subpath(&dir, &path) && remove_reclaiming_dir(&path).await {
-                    log!(
+                    log_legacy!(
                         "[WorktreeCleanup] removed {}, left by an interrupted removal",
                         path.display()
                     );
@@ -492,7 +492,7 @@ impl WorktreeCleanup {
             };
 
             if !is_safe_subpath(&dir, &path) {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] refusing to act on path outside worktrees dir: {}",
                     path.display()
                 );
@@ -517,7 +517,7 @@ impl WorktreeCleanup {
                     // next cleanup cycle picks up where this one left off
                     // once the session ends.
                     if self.active_threads.is_active(thread_id).await {
-                        log!(
+                        log_legacy!(
                             "[WorktreeCleanup] skipping thread {} — live agent session active",
                             thread_id
                         );
@@ -655,7 +655,7 @@ impl WorktreeCleanup {
             return None;
         }
         let keep = |reason: String| {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] keeping archived thread {}'s worktree: {}",
                 thread_id,
                 reason
@@ -683,7 +683,7 @@ impl WorktreeCleanup {
             BranchDisposal::WhenMerged,
         )
         .await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] archived removal freed {} bytes for thread {} (branch_deleted={})",
             outcome.freed_bytes,
             thread_id,
@@ -774,7 +774,7 @@ impl WorktreeCleanup {
         if dirty().await? {
             return Err("changes remain after the snapshot, such as in a submodule".into());
         }
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] committed archived thread {}'s uncommitted changes on {}",
             thread_id,
             head
@@ -811,7 +811,7 @@ impl WorktreeCleanup {
             BranchDisposal::WhenMerged,
         )
         .await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] tier-0 freed {} bytes for thread {} (branch_deleted={})",
             outcome.freed_bytes,
             thread_id,
@@ -843,7 +843,7 @@ impl WorktreeCleanup {
             }
             let pressure = self.disk_pressure();
             let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size).await?;
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] stranded orphan-path freed {} bytes at {} (git admin dir missing)",
                 freed,
                 worktree.display()
@@ -880,7 +880,7 @@ impl WorktreeCleanup {
             BranchDisposal::WhenMerged,
         )
         .await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] orphan-path freed {} bytes at {} (branch_deleted={})",
             outcome.freed_bytes,
             worktree.display(),
@@ -913,7 +913,7 @@ impl WorktreeCleanup {
             return None;
         }
         let freed = remove_stranded_worktree(worktrees_dir, worktree, pre_size).await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] stranded freed {} bytes for thread {} (git admin dir missing)",
             freed,
             thread_id
@@ -945,7 +945,7 @@ impl WorktreeCleanup {
         pre_size: u64,
     ) -> Option<(u64, DiskPressure)> {
         if !is_safe_subpath(worktrees_dir, worktree) {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] refusing to act on temp path outside worktrees dir: {}",
                 worktree.display()
             );
@@ -964,7 +964,7 @@ impl WorktreeCleanup {
             Ok(Some(change)) if change.is_pending() => return None,
             Ok(_) => {}
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] temp sweep get_by_id({}): {} — skipping defensively",
                     change_id,
                     e
@@ -988,7 +988,7 @@ impl WorktreeCleanup {
             BranchDisposal::WhenMerged,
         )
         .await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] temp worktree freed {} bytes at {} (branch_deleted={})",
             outcome.freed_bytes,
             worktree.display(),
@@ -1022,7 +1022,7 @@ impl WorktreeCleanup {
             return None;
         }
         let freed = prune_build_artifacts(worktree).await?;
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] tier-1 freed {} bytes for thread {}",
             freed,
             thread_id
@@ -1039,7 +1039,7 @@ impl WorktreeCleanup {
             Ok(pending) if pending.is_empty() => {}
             Ok(_) => return false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] pending_for_thread({}) failed: {}; keeping build artifacts",
                     thread_id,
                     e
@@ -1053,7 +1053,7 @@ impl WorktreeCleanup {
         match thread_is_saved(&self.pool, thread_id).await {
             Ok(saved) => !saved,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] is_saved lookup failed for thread {}: {}; keeping build artifacts",
                     thread_id,
                     e
@@ -1080,7 +1080,7 @@ impl WorktreeCleanup {
         // Don't reclaim a parent that still owes a child fan-in resume — it would
         // have nothing to resume into (ADR 0011, B2).
         if has_pending_fan_in(&self.pool, thread_id).await {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] tier-2 skipped for thread {} — outstanding child fan-in obligation",
                 thread_id
             );
@@ -1094,7 +1094,7 @@ impl WorktreeCleanup {
             }
             Ok(false) => {}
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] is_saved lookup failed for thread {}: {} — skipping tier 2",
                     thread_id,
                     e
@@ -1106,7 +1106,7 @@ impl WorktreeCleanup {
         // Dirty worktrees keep their work — the user may have uncommitted
         // edits we'd silently lose.
         if is_worktree_dirty(worktree).await {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] tier-2 skipped for thread {} — worktree {} is dirty",
                 thread_id,
                 worktree.display()
@@ -1128,7 +1128,7 @@ impl WorktreeCleanup {
         )
         .await?;
 
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] tier-2 freed {} bytes for thread {} (branch_deleted={})",
             outcome.freed_bytes,
             thread_id,
@@ -1156,7 +1156,7 @@ impl WorktreeCleanup {
             Ok(Some((state,))) => state == "archived",
             Ok(None) => false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] is_archived lookup failed for thread {}: {} — keeping worktree",
                     thread_id,
                     e
@@ -1194,7 +1194,7 @@ impl WorktreeCleanup {
     /// we actually freed bytes. Fires per cycle that does work, so the user
     /// sees ongoing progress while disk recovers.
     async fn emit_auto_cleanup_alert(&self, free_bytes: u64, freed_bytes: u64) {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] auto-cleanup reclaimed {:.1} GB (free now {:.1} GB), emitting NotificationCreated",
             freed_bytes as f64 / BYTES_PER_GB,
             free_bytes as f64 / BYTES_PER_GB,

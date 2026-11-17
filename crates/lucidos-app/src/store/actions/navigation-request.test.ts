@@ -295,10 +295,10 @@ describe('handleNavigationRequest — file target', () => {
       repositories.value = { status: 'not-loaded' };
     });
 
-    it('opens the file under the repository id, line and all', () => {
+    it('opens the file under the repository id, line and all', async () => {
       repositories.value = { status: 'loaded', data: [{ id: REPO_ID, name: 'example-repo', path: '/src/example' }] };
       handleNavigationRequest({ target: 'file', file_path: 'repo:example-repo:file#main:docs/x.md', line: 7 });
-      expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file#main:docs/x.md`);
+      await vi.waitFor(() => expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(`repo:${REPO_ID}:file#main:docs/x.md`));
       expect(openEncodedRepoFilePreview).not.toHaveBeenCalledWith(expect.stringContaining('example-repo'));
       expect(selectedLines.value).toEqual({ start: 7, end: 7 });
     });

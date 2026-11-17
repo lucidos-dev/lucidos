@@ -492,7 +492,7 @@ async fn recent_matchable_payloads(pool: &sqlx::PgPool, event_type: &str) -> Vec
     {
         Ok(rows) => rows,
         Err(e) => {
-            crate::log!("[EventSubscription] payload sample for {event_type} failed: {e}");
+            crate::log_legacy!("[EventSubscription] payload sample for {event_type} failed: {e}");
             return Vec::new();
         }
     };

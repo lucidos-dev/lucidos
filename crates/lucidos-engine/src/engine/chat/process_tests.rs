@@ -1442,6 +1442,100 @@ fn chat_prompt_forbids_faking_repeated_actions() {
 
 use super::run::message_can_answer_pending_question;
 use super::run::resolve_route_overrides;
+
+#[tokio::test]
+async fn saved_draft_execution_keeps_absent_effort_after_defaults_change() {
+    use crate::core::{ModelDefaults, ResolvedModelSelection};
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let registry = crate::llm::model_registry::empty();
+    let accepted = ResolvedModelSelection {
+        model: Some("gpt-5".into()),
+        reasoning_effort: None,
+        provider: Some("openai".into()),
+    };
+    let origin = MessageOrigin::SavedDraft {
+        submission_event_id: Uuid::new_v4(),
+        submitted_by_thread_id: Uuid::new_v4(),
+    };
+    for effort in ["high", "low"] {
+        crate::test_support::seed_preference(
+            &pool,
+            crate::core::prefs::CHAT_REASONING_EFFORTS.key(),
+            &format!("gpt-5={effort}"),
+        )
+        .await
+        .unwrap();
+        let ordinary = resolve_route_overrides(
+            &pool,
+            ModelDefaults {
+                registry: &registry,
+                fallback_model: "gpt-5",
+            },
+            |_| true,
+            Some(false),
+            None,
+            None,
+            accepted.clone(),
+        );
+        let resolved = super::run::resolve_input_settings(
+            Some(&origin),
+            Some(false),
+            accepted.clone(),
+            ordinary,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            resolved, accepted,
+            "the accepted absence must not inherit a later default"
+        );
+    }
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db).await;
+}
+#[tokio::test]
+async fn saved_draft_execution_requires_frozen_chat_settings_only() {
+    use crate::core::ResolvedModelSelection;
+    let origin = MessageOrigin::SavedDraft {
+        submission_event_id: Uuid::new_v4(),
+        submitted_by_thread_id: Uuid::new_v4(),
+    };
+    let ordinary = ResolvedModelSelection {
+        model: Some("ordinary-model".into()),
+        reasoning_effort: Some("high".into()),
+        provider: Some("openai".into()),
+    };
+    for (origin, coding) in [(None, false), (Some(&origin), true)] {
+        assert_eq!(
+            super::run::resolve_input_settings(origin, Some(coding), Default::default(), async {
+                ordinary.clone()
+            })
+            .await
+            .unwrap(),
+            ordinary
+        );
+    }
+    for requested in [
+        ResolvedModelSelection::default(),
+        ResolvedModelSelection {
+            model: None,
+            ..ordinary.clone()
+        },
+        ResolvedModelSelection {
+            provider: None,
+            ..ordinary.clone()
+        },
+    ] {
+        let error =
+            super::run::resolve_input_settings(Some(&origin), Some(false), requested, async {
+                panic!("saved chat must not read defaults")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "saved_draft_chat_settings_unresolved");
+    }
+}
+
 use super::PreEmittedOrigin;
 use crate::core::prefs;
 use crate::engine::thread_events::ActorMode;
@@ -1898,11 +1992,25 @@ fn human_follow_up_can_answer_pending_question() {
         "repo is private, not public",
         false,
         ActorMode::Human,
+        false,
         None,
     ));
 }
 
 /// Images alone are an answer: a screenshot can be the whole reply.
+#[test]
+fn unattested_follow_up_cannot_answer_pending_question() {
+    // A typed device id is no person, so its message never answers a card.
+    assert!(!message_can_answer_pending_question(
+        false,
+        "allow it",
+        false,
+        ActorMode::Human,
+        true,
+        None,
+    ));
+}
+
 #[test]
 fn image_only_follow_up_can_answer_pending_question() {
     assert!(message_can_answer_pending_question(
@@ -1910,6 +2018,7 @@ fn image_only_follow_up_can_answer_pending_question() {
         "",
         true,
         ActorMode::Human,
+        false,
         None,
     ));
 }
@@ -1926,6 +2035,7 @@ fn pre_emitted_message_cannot_also_answer_pending_question() {
         "repo is private, not public",
         false,
         ActorMode::Human,
+        false,
         Some(PreEmittedOrigin::Message(Uuid::new_v4())),
     ));
 }
@@ -1944,6 +2054,7 @@ fn child_completion_wake_cannot_answer_pending_question() {
         "[CHILD THREAD COMPLETED] 59328631… success\nSession summary…",
         false,
         ActorMode::Agent,
+        false,
         None,
     ));
 }
@@ -1957,6 +2068,7 @@ fn engine_driven_message_cannot_answer_pending_question() {
         "engine recovery note",
         false,
         ActorMode::Engine,
+        false,
         None,
     ));
 }
@@ -1970,6 +2082,7 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
         "first message on a brand-new thread",
         false,
         ActorMode::Human,
+        false,
         None,
     ));
     assert!(!message_can_answer_pending_question(
@@ -1977,6 +2090,7 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
         "",
         false,
         ActorMode::Human,
+        false,
         None,
     ));
 }
@@ -2479,4 +2593,113 @@ fn trigger_started_carries_retry_provenance() {
         panic!("expected TriggerStarted");
     };
     assert_eq!(actual, Some(retry_of));
+}
+
+/// An existing coding-agent thread runs its coding agent whatever the caller
+/// asked. Every other thread keeps the caller's choice (ADR 0678).
+#[tokio::test]
+async fn a_coding_agent_thread_decides_its_lane() {
+    use super::run::resolve_coding_agent_lane;
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    let (bus, _rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let coding = crate::test_support::seed_coding_thread(&bus, None).await;
+    let chat = crate::test_support::seed_chat_thread(&bus, "hello").await;
+    for requested in [None, Some(false), Some(true)] {
+        assert_eq!(
+            resolve_coding_agent_lane(&pool, coding, requested)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_coding_agent_lane(&pool, chat, requested)
+                .await
+                .unwrap(),
+            requested
+        );
+        assert_eq!(
+            resolve_coding_agent_lane(&pool, uuid::Uuid::new_v4(), requested)
+                .await
+                .unwrap(),
+            requested
+        );
+    }
+    sqlx::query("UPDATE thread_summaries SET state = 'composing' WHERE thread_id = $1")
+        .bind(coding)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for requested in [None, Some(false), Some(true)] {
+        assert_eq!(
+            resolve_coding_agent_lane(&pool, coding, requested)
+                .await
+                .unwrap(),
+            requested,
+            "a draft's lagged source cannot override the first send"
+        );
+    }
+    pool.close().await;
+    assert!(
+        resolve_coding_agent_lane(&pool, coding, None)
+            .await
+            .is_err(),
+        "an unreadable row is an unknown lane, never the caller's choice"
+    );
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+/// The first orphan starts a run; its older batch tail must precede any
+/// message queued while that run was being claimed, without awaiting its exit.
+#[test]
+fn an_orphan_batch_precedes_newer_inputs_on_a_starting_run() {
+    crate::test_support::run_on_engine_runtime(
+        "engine::chat::process::tests::an_orphan_batch_precedes_newer_inputs_on_a_starting_run",
+        orphan_batch_on_starting_run_case,
+    );
+}
+
+async fn orphan_batch_on_starting_run_case() {
+    use crate::engine::{AgentInputKind, AgentUserInput};
+    let (_pool, db) = crate::test_support::setup_test_db().await;
+    let (engine, _workspace) = crate::test_support::boot_mock_engine(&db).await;
+    let thread_id = crate::test_support::seed_coding_thread(&engine.event_bus, None).await;
+    let mut claim = engine
+        .claim_thread_for_spawn(thread_id, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let batch_id = uuid::Uuid::new_v4();
+    let newer_id = uuid::Uuid::new_v4();
+    let input = |text: &str, id| AgentUserInput {
+        text: text.into(),
+        images: None,
+        origin_event_id: Some(id),
+        kind: AgentInputKind::User,
+        completion: None,
+    };
+    assert!(
+        engine
+            .route_to_live_run(thread_id, input("newer", newer_id))
+            .await
+    );
+    let mut batch = vec![input("older batch tail", batch_id)];
+    super::run::prepend_claimed_followups(&engine, &mut claim, &mut batch).await;
+    assert!(batch.is_empty(), "the claimed run now owns the batch");
+    for (text, id) in [("older batch tail", batch_id), ("newer", newer_id)] {
+        let queued = claim.entry.msg_rx.try_recv().unwrap();
+        assert_eq!(queued.text, text);
+        assert_eq!(queued.origin_event_id, Some(id));
+        assert_eq!(queued.kind, AgentInputKind::User);
+    }
+    assert!(
+        claim.entry.msg_rx.try_recv().is_err(),
+        "each input queues once"
+    );
+    let sessions = engine.agent_sessions.lock().await;
+    let session = sessions.get(&thread_id).unwrap();
+    assert!(session.unforwarded_inputs.contains(&batch_id));
+    assert!(session.unforwarded_inputs.contains(&newer_id));
+    drop(sessions);
+    drop(claim);
+    crate::test_support::teardown_test_db(&db).await;
 }

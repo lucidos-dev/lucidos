@@ -14,7 +14,8 @@ use uuid::Uuid;
 use super::{turn_ended_as_redirect_sql, BusEvent, EmittedEvent, EventBus, ParentCallback};
 use crate::engine::agent_recovery::ENGINE_RESTART_INTERRUPT_REASON;
 use crate::engine::thread_events::{
-    CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ThreadEvent, WakeMode,
+    CancelCause, ChildCompletionStatus, EventMeta, EventWaitCancelCause, ProviderError,
+    ThreadEvent, WakeMode,
 };
 use crate::engine::thread_lifecycle::{ArchiveState, ChangeStateKind, ThreadStatus};
 
@@ -160,6 +161,23 @@ fn cap_summary(summary: String, cap: usize) -> String {
     format!("{}… (truncated)", &summary[..cut])
 }
 
+/// The failure card's text. A provider policy block keeps the provider's own
+/// words and adds what the parent must do next. Its tail never falls to the
+/// cut, so the provider's words give way to fit `cap`. Every other failure
+/// relays `error` as it is.
+fn failure_summary(error: &str, provider_error: Option<&ProviderError>, cap: usize) -> String {
+    let Some(policy) = provider_error.and_then(ProviderError::policy_name) else {
+        return cap_summary(error.to_string(), cap);
+    };
+    let explanation = format!(
+        "OpenAI blocked this turn: {policy}. The next message starts a new session. \
+         Rephrase the order or ask the user, never resend it."
+    );
+    let budget = cap.saturating_sub(explanation.len() + 1);
+    let words = &error[..error.floor_char_boundary(budget)];
+    format!("{words} {explanation}")
+}
+
 /// Whether a child is mid-turn, by the one in-flight definition the counters
 /// use. A child mid-turn is not owed a settle: its own terminal will report.
 fn in_flight(status: ThreadStatus) -> bool {
@@ -197,7 +215,7 @@ impl ChildSettle {
     }
 
     /// Whether this act ends the child's event waits. Archive and delete do.
-    /// A discard does not, so a waiting child wakes again and its turn reports.
+    /// A discard does not, so a child holding a wait wakes again and its turn reports.
     fn ends_waits(self) -> bool {
         !matches!(self, Self::Discarded)
     }
@@ -338,7 +356,7 @@ impl EventBus {
         .await {
             Ok(row) => row,
             Err(e) => {
-                crate::log!("[EventBus] Failed to query children counts for {}: {}", parent_id, e);
+                crate::log_legacy!("[EventBus] Failed to query children counts for {}: {}", parent_id, e);
                 return;
             }
         };
@@ -427,7 +445,7 @@ impl EventBus {
             Ok(true) => {}
             Ok(false) => return,
             Err(error) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Restore boundary unavailable; refusing parent callback: {}",
                     error
                 );
@@ -452,7 +470,7 @@ impl EventBus {
         // too: the counter comes down through the in-tx reconcile either way,
         // and `ContinuationRequested` puts it back.
         if self.auto_resume_holds.is_held(child_thread_id) {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Child {} ended on a terminal the engine is auto-resuming: \
                  withholding the parent's completion card until the real terminal",
                 child_thread_id
@@ -539,7 +557,7 @@ impl EventBus {
                     | ThreadEvent::SessionEnded { .. }
             )
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Child {} ended a turn holding an event wait: no card until the \
                  turn the wait wakes ends",
                 child_thread_id
@@ -553,7 +571,7 @@ impl EventBus {
         if matches!(event, ThreadEvent::CodingAgentIdled { .. })
             && self.turn_ended_as_redirect(child_thread_id).await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Child {} idled after a redirect: no card until the redirected turn ends",
                 child_thread_id
             );
@@ -721,9 +739,13 @@ impl EventBus {
                 last_response.clone().unwrap_or_default(),
                 SUCCESS_SUMMARY_CAP,
             ),
-            ThreadEvent::ResponseFailed { error, .. } => (
+            ThreadEvent::ResponseFailed {
+                error,
+                provider_error,
+                ..
+            } => (
                 ChildCompletionStatus::Failure,
-                error.clone(),
+                failure_summary(error, provider_error.as_ref(), FAILURE_SUMMARY_CAP),
                 FAILURE_SUMMARY_CAP,
             ),
             // A cancel that ended the child. Pull the
@@ -772,7 +794,7 @@ impl EventBus {
             .fetch_optional(&self.pool)
             .await
             .unwrap_or_else(|e| {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to look up child {}: {}",
                     child_thread_id,
                     e
@@ -792,7 +814,7 @@ impl EventBus {
             .fetch_one(&self.pool)
             .await
             .unwrap_or_else(|e| {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to read child {}'s last terminal: {}",
                     child_thread_id,
                     e
@@ -813,7 +835,7 @@ impl EventBus {
         .fetch_optional(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Failed to fetch child response for {}: {}",
                 child_thread_id,
                 e
@@ -822,7 +844,7 @@ impl EventBus {
         })
     }
 
-    /// Deliver the card a waiting child held back, once its last event wait
+    /// Deliver the card a child holding a wait held back, once its last event wait
     /// ends without waking it (ADR 0254).
     ///
     /// A delivery or an expiry wakes the child, and that turn reports. Stop
@@ -888,7 +910,7 @@ impl EventBus {
         if status != ThreadStatus::Idle {
             return;
         }
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Child {}'s last event wait ended without waking it: sending its \
              parent {} the card it held back",
             child_thread_id,
@@ -991,7 +1013,7 @@ impl EventBus {
 
     /// Deliver a card [`Self::owed_child_card`] decided is owed.
     pub(crate) async fn deliver_owed_child_card(&self, card: OwedChildCard) {
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Child {} settled by the user: sending its parent {} the canceled card",
             card.0.child_thread_id,
             card.0.parent_id
@@ -1001,9 +1023,31 @@ impl EventBus {
 
     /// Deliver one report to the parent: wake it with a
     /// `ChildThreadCompleted`, or file a `ChildReportFiled`.
-    async fn deliver_child_completion(&self, card: ChildCompletion) {
+    async fn deliver_child_completion(&self, mut card: ChildCompletion) {
+        // File before raising the permission request, so an immediate answer
+        // can read the report. Stop holds silently on both lanes.
+        let held_parent = card.delivery == Delivery::Wake
+            && (crate::engine::thread_stop::thread_is_stopped(&self.pool, card.parent_id).await
+                || (card.parent_is_coding_agent == Some(true)
+                    && crate::engine::automation_pause::automation_is_paused(
+                        &self.pool,
+                        card.parent_id,
+                    )
+                    .await));
+        if held_parent {
+            card.delivery = Delivery::File;
+        }
         if card.delivery == Delivery::File {
+            let parent_id = card.parent_id;
             self.file_child_report(card).await;
+            if held_parent {
+                Box::pin(crate::engine::automation_pause::ask_before_step(
+                    self,
+                    parent_id,
+                    crate::engine::permission::Action::ReadWaitingReports,
+                ))
+                .await;
+            }
             return;
         }
         let ChildCompletion {
@@ -1067,7 +1111,7 @@ impl EventBus {
         {
             Ok(Some(r)) => r,
             Ok(None) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] ChildThreadCompleted emit returned None for parent {}; \
                      skipping wake-up kick — see notify_parent_if_child error path.",
                     parent_id
@@ -1076,7 +1120,7 @@ impl EventBus {
                 return;
             }
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to emit ChildThreadCompleted for parent {}: {}; \
                      skipping wake-up kick — driving the parent against a non-persisted \
                      event would attribute its response to a phantom card. Next terminal \
@@ -1105,7 +1149,7 @@ impl EventBus {
         // row is later repaired) — accepted as the lesser evil vs. a
         // permanently silent parent.
         let Some(parent_is_cc) = parent_is_coding_agent else {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Parent {} for child {} missing from thread_summaries — \
                  skipping wake-up kick; typed event already persisted. Leaving \
                  the parent callback pending so the next terminal event retries.",
@@ -1119,7 +1163,7 @@ impl EventBus {
             .execute(&self.pool)
             .await
             {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to re-mark the pending callback for child {}: {}",
                     child_thread_id,
                     e
@@ -1162,7 +1206,7 @@ impl EventBus {
         let integrated_branch = self
             .reported_integrated_branch(child_thread_id, status)
             .await;
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Child {}'s report does not wake its parent {}: filing it",
             child_thread_id,
             parent_id
@@ -1225,7 +1269,7 @@ impl EventBus {
             {
                 Ok(v) => v.into_iter().map(|c| c.id.to_string()).collect(),
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[FanOut] pending_for_thread({}): {}; the report lists no \
                          pending_change_ids",
                         child_thread_id,
@@ -1244,7 +1288,7 @@ impl EventBus {
             {
                 Ok(v) => v,
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[FanOut] sub_thread_pending_changes({}): {}; the report lists none",
                         child_thread_id,
                         e
@@ -1268,7 +1312,7 @@ impl EventBus {
     /// is the recoverable direction. `refire_unprocessed_child_completions`
     /// passes `None` for the same reason.
     pub(crate) async fn announce_withheld_completion(&self, child_thread_id: Uuid, error: String) {
-        crate::log!(
+        crate::log_legacy!(
             "[FanOut] Child {} was not resumed after all: announcing the completion card its \
              terminal held back",
             child_thread_id
@@ -1278,7 +1322,9 @@ impl EventBus {
             None,
             &ThreadEvent::ResponseFailed {
                 error,
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             },
             None,
         ))
@@ -1355,7 +1401,7 @@ impl EventBus {
         {
             Ok(opt) => opt,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to update parent {} after child terminal: {}",
                     parent_id,
                     e
@@ -1370,7 +1416,7 @@ impl EventBus {
             match crate::core::store::fetch_thread_aggregate(&self.pool, parent_id).await {
                 Ok(agg) => agg,
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[FanOut] Failed to fetch aggregate for parent {}: {}",
                         parent_id,
                         e
@@ -1425,7 +1471,7 @@ impl EventBus {
         .execute(pool)
         .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Failed to undo the wake for parent {} after a lost card: {}",
                 parent_id,
                 e
@@ -1447,7 +1493,7 @@ impl EventBus {
         .execute(&self.pool)
         .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Failed to clear the pending callback for child {}: {}",
                 child_thread_id,
                 e
@@ -1486,7 +1532,7 @@ impl EventBus {
         let floor = match crate::core::snapshot::boundary::read(&self.pool).await {
             Ok(boundary) => boundary.map_or(0, |boundary| boundary.event_sequence),
             Err(error) => {
-                crate::log!("[FanOut] restore boundary unavailable: {}", error);
+                crate::log_legacy!("[FanOut] restore boundary unavailable: {}", error);
                 return 0;
             }
         };
@@ -1548,7 +1594,7 @@ impl EventBus {
         {
             Ok(rows) => rows,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] refire_unprocessed_child_completions query failed: {} — \
                      skipping recovery sweep this boot",
                     e
@@ -1563,7 +1609,7 @@ impl EventBus {
                 parent_str.parse::<Uuid>(),
                 child_str.as_deref().map(str::parse::<Uuid>),
             ) else {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Skipping unprocessed ChildThreadCompleted {} — \
                      malformed parent ({:?}) or child ({:?}) id",
                     event_id,
@@ -1572,7 +1618,7 @@ impl EventBus {
                 );
                 continue;
             };
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Re-firing lost parent wake: child {} completed, parent {} never resumed (event {})",
                 child_id,
                 parent_id,
@@ -1599,7 +1645,7 @@ impl EventBus {
             refired += 1;
         }
         if refired > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Re-fired {} unprocessed child-completion wake(s) lost to engine restart",
                 refired
             );
@@ -1628,7 +1674,7 @@ impl EventBus {
             return true;
         };
         if let Err(e) = self.parent_callback_tx.send(callback) {
-            crate::log!(
+            crate::log_legacy!(
                 "[FanOut] Failed to send parent callback for child {}: {}",
                 child_thread_id,
                 e
@@ -1636,5 +1682,58 @@ impl EventBus {
             return false;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block(code: &str) -> ProviderError {
+        ProviderError {
+            code: code.to_string(),
+            detail: None,
+        }
+    }
+
+    const OPENAI_WORDS: &str = "This request was blocked by our safety systems.";
+
+    #[test]
+    fn a_policy_block_keeps_the_providers_words_and_says_what_to_do() {
+        for (code, policy) in [
+            (
+                "misalignment_policy_violation",
+                "potentially unintended activity",
+            ),
+            ("cyber_policy", "cybersecurity policy"),
+            ("bio_policy", "biosecurity policy"),
+        ] {
+            let summary = failure_summary(OPENAI_WORDS, Some(&block(code)), FAILURE_SUMMARY_CAP);
+            assert!(summary.starts_with(OPENAI_WORDS), "{summary}");
+            assert!(summary.contains(policy), "{summary}");
+            assert!(summary.contains("new session"), "{summary}");
+            assert!(summary.contains("never resend"), "{summary}");
+            assert!(summary.len() <= FAILURE_SUMMARY_CAP, "{summary}");
+        }
+    }
+
+    #[test]
+    fn a_long_provider_text_gives_way_but_the_instruction_stays() {
+        let long = "x".repeat(900);
+        let summary = failure_summary(&long, Some(&block("cyber_policy")), FAILURE_SUMMARY_CAP);
+        assert!(summary.ends_with("never resend it."), "{summary}");
+        assert!(summary.len() <= FAILURE_SUMMARY_CAP, "{summary}");
+    }
+
+    #[test]
+    fn any_other_provider_code_relays_the_error_unchanged() {
+        for code in ["usage_limit_exceeded", "something_new"] {
+            let summary = failure_summary("it broke", Some(&block(code)), FAILURE_SUMMARY_CAP);
+            assert_eq!(summary, "it broke");
+        }
+        assert_eq!(
+            failure_summary("it broke", None, FAILURE_SUMMARY_CAP),
+            "it broke"
+        );
     }
 }

@@ -105,6 +105,8 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 /// Mirrored for coding agents by `agent_session::prompts::{ASK_USER_QUESTION_RULE,
 /// CODEX_ASK_USER_QUESTION_RULE}` and by the `ask_user_question` tool
 /// description in `llm::tools::misc`. Change them together.
+/// Composer answers consume compose state in their answer append transaction.
+/// A device-held, unconfirmed pick grants no authority and does not resolve the question.
 pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      Use `ask_user_question` for any question with 2-4 discrete answers, \
      including a binary yes/no. The Lucidos UI renders the options as \
@@ -175,6 +177,16 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      to subscribe to, call this with EXACTLY ONE option whose label is the \
      user-perspective wake prompt (\"Show results\", \"Stop sweep\") and your \
      context in `question`.";
+
+/// The agent sandbox's limit on this platform alone (ADR 0645).
+#[cfg(target_os = "macos")]
+const AGENT_SANDBOX_PLATFORM_LIMIT: &str =
+    " On macOS nothing in it can run `sandbox-exec`, so a nested seatbelt fails.";
+#[cfg(target_os = "linux")]
+const AGENT_SANDBOX_PLATFORM_LIMIT: &str =
+    " On Linux it cannot create a top-level entry in `$HOME` or a workspace.";
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const AGENT_SANDBOX_PLATFORM_LIMIT: &str = "";
 
 /// Stops the chat agent from naming things to the user by their raw
 /// identifier. No Lucidos surface is labelled with a change id or a sha, so a
@@ -327,13 +339,14 @@ pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
      - a new file under knowhow/ -> `system-knowhow/building-knowhow`\n\
      - plugins, ANY action (package, publish, update) -> \
      `system-knowhow/plugins`\n\
+     Fit caveats persist; fit-only renderers grant no Device/owner authority.\n\
      To run an existing trigger off-schedule, use triggers(action=\"run\"). Do \
      not improvise a substitute: resuming a paused trigger does not run it, \
      and a run_thread carrying a copy of the trigger's intent is not a run.\n\
      Each knowhow has a \"Questions to settle with the user before creating\" \
      section, which is the source of truth for what to ask. The ACTION FIRST \
      rule below does NOT apply to workspace assets: load the knowhow, ask what \
-     it says to ask, then act. Skip a load you already did in this thread.";
+     it says to ask, then act. Load once per thread.";
 
 /// Routes a plugin *setup thread* to the `plugin-setup` knowhow.
 ///
@@ -464,6 +477,8 @@ SCRIPT FILES (under apps/, triggers/, knowhow/scripts/):
 
 ENGINE HOST: run_bash and run_python run on a `__ENGINE_HOST_OS__` (`__ENGINE_HOST_ARCH__`) host, which need not be the user's device. Never assume it is.
 
+AGENT SANDBOX: the OS hides `~/.lucidos/private` unless the owner opted out.__AGENT_SANDBOX_PLATFORM_LIMIT__ No grant permits private reads or alternate spellings. Engine log: `lucidos diagnostic-log query`. Sandbox errors: load_knowhow('system-knowhow/agent-sandbox').
+
 FILE FORMATTING:
 Clean structured markdown: ## headings, bullet lists, **bold** for key values.
 
@@ -525,7 +540,7 @@ OAUTH SETUP:
 - connect_oauth_account opens that modal when needed. After the form reports completed, call again to authorize. For unknown providers, web_search registration steps and endpoints; pass endpoints explicitly. The shipped registry is read-only.
 
 LOOKING UP SPECIFIC DATA (numbers, ids, dates, amounts, addresses):
-- Find the file with list_files, or glob_files / grep_files on a larger workspace, then read_file it. A memory summary says WHAT a file contains, never the exact values inside it.
+- Use list_files or glob_files/grep_files, then read_file. Summaries omit exact values; unattended trigger artifacts stay out of memory.
 - A PDF is stored as a binary artifact with no text extraction, and read_file says so (unless a legacy .txt sidecar exists, which it surfaces automatically).
 
 SEARCHING FILES, AND WORKING ON CODE:
@@ -573,7 +588,8 @@ EVENTS (the `events` tool):
 - App UIs reach the platform through the Lucidos SDK (<script src="/api/v1/sdk.js">): lucidos.data.*, lucidos.events.*, lucidos.preferences.*, lucidos.ui.*, lucidos.sse.on, lucidos.proxy(name).fetch. Details: load_knowhow('system-knowhow/js-sdk').
 
 PARALLEL WORK (FAN-OUT):
-- run_coding_agent starts a coding-agent thread for code work; run_thread starts a Lucidos thread for non-code work; follow_up_child_thread steers a child you already spawned, and `threads` 'detach_child' stops waiting for one. You can only address your own DIRECT children, which the `threads` tool's 'list' action lists with `my_children: true`.
+- Code: run_coding_agent; non-code: run_thread. Steer: follow_up_child_thread. Stop waiting: `threads` 'detach_child'. Address only your DIRECT children: `threads` 'list' with `my_children: true`.
+- Ordinary follow-ups steer capable Codex turns. Use urgent to interrupt active work.
 - A DIRECT CHILD REPORTS BACK ON ITS OWN: when it finishes, fails, is canceled or is cut by an engine crash, its status, summary and pending change ids reach THIS thread. The spawn's `wake_mode` decides: 'wake' re-opens it for any report, 'wake-when-all-done' for a failure or once the last such child finishes, 'no-wake' FILES every report for your next turn. Default: 'no-wake' from the home thread, 'wake' elsewhere. The mode lasts the child's life. Say what you're waiting for and END YOUR TURN.
 - WON'T ACT ON THE RESULT? relation='top': a child's report costs you a turn.
 - NEVER `await_event` ON YOUR OWN CHILD's `CodingAgentIdled`, `ResponseGenerated` or `ChildThreadCompleted`: a second wake for one finish.
@@ -675,6 +691,10 @@ fn static_prompt_body(
         .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
         .replace("__ENGINE_HOST_OS__", std::env::consts::OS)
         .replace("__ENGINE_HOST_ARCH__", std::env::consts::ARCH)
+        .replace(
+            "__AGENT_SANDBOX_PLATFORM_LIMIT__",
+            AGENT_SANDBOX_PLATFORM_LIMIT,
+        )
         .replace("__MAX_TOOL_CALLS__", &max_tool_calls.to_string())
         .replace(
             "__MAX_CONCURRENT_CHILDREN_PER_THREAD__",
@@ -755,7 +775,7 @@ fn setup_or_language_section(missing_instructions: &[&str], user_language: &str)
             user_language, user_language
         );
     }
-    log!(
+    log_legacy!(
         "[Chat] Setup required, missing preferences: {}",
         missing_instructions.join(", ")
     );
@@ -810,7 +830,7 @@ impl LucidosEngine {
             let value = match pref.try_stored(&self.pool, did).await {
                 Ok(v) => v,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] preference read failed for '{}': {}. Treating as configured so the turn is not refused",
                         key,
                         e
@@ -904,7 +924,7 @@ impl LucidosEngine {
         ) {
             Ok(section) => section,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Chat] app list read failed ({}); this turn's prompt names no apps",
                     e
                 );
@@ -1763,7 +1783,25 @@ mod tests {
     /// the `fit` action on the `widgets` tool, and one widget rule naming its
     /// note and the ellipsis ban. The stale title-bar clause was cut, and both
     /// texts trimmed, first.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 134_929;
+    ///
+    /// Raised by 8 for `people`, a `settings_view` of its own. People left
+    /// the Devices page, where `devices` used to reach it.
+    ///
+    /// Raised by 618 to a measured 135,555 on a `macos` build for the agent
+    /// sandbox (ADR 0645): the AGENT SANDBOX line and the `agent-sandbox`
+    /// routing entry. Without them a permission error reads as a bug to work
+    /// around. Both were cut first, and the Linux limit is the shorter one.
+    ///
+    /// Raised by 490 to a measured 136,045 for `threads` 'submit_draft' (ADR
+    /// 0651): a summary and three properties. Without it a chat agent the
+    /// owner told to send a saved draft had no way to. Both texts were cut
+    /// first.
+    ///
+    /// Raised by 157 to a measured 136,202 for thread liveness (ADR 0679): the
+    /// look rule's thread-verdict bullet and the `events` query naming its
+    /// header. A working thread was called stalled from a reply. Both texts,
+    /// and the `byte_limit` description, were cut first.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 136_202;
 
     /// The gate set the ratchet bills.
     ///
@@ -1797,23 +1835,6 @@ mod tests {
     /// The flat tool schemas the ratchet bills.
     fn flat_chat_tools() -> Vec<crate::llm::provider::ToolDefinition> {
         super::flat_chat_tools(&BILLED)
-    }
-
-    /// The always-loaded areas, measured separately so a regression report
-    /// says WHICH one grew.
-    fn always_loaded_areas() -> Vec<(&'static str, usize)> {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let ws = tempfile::tempdir().expect("temp workspace");
-        let built_in_widgets = crate::core::AppManager::new(ws.path())
-            .expect("app manager")
-            .with_system_widgets(Some(repo.join("system-widgets")))
-            .list_reusable_widgets()
-            .expect("built-in widgets load");
-        system_prompt_footprint(
-            &BILLED,
-            &crate::core::SystemKnowhowStore::load_summaries(&repo.join("system-knowhow")),
-            &built_in_widgets,
-        )
     }
 
     /// The `n` costliest tool schemas, so a breach names the tool that grew
@@ -1965,8 +1986,8 @@ mod tests {
         ),
         (
             "navigate_ui",
-            2_839,
-            "the two frozen enums the SDK is generated from (18 targets, 23 \
+            2_848,
+            "the two frozen enums the SDK is generated from (18 targets, 24 \
              settings views) are about 460 chars before a word of prose; the settings \
              gloss is routing information available on no other surface, and \
              it names only the views whose own value does not (`mcp` is not \
@@ -1988,7 +2009,8 @@ mod tests {
              destination, and the model chooses both while writing the call. \
              Raised from 2,822 by `providers` and the settings use of \
              `fragment`: a link to one provider's block is chosen while \
-             writing the call",
+             writing the call. Raised from 2,839 by `people`: People left the \
+             Devices page, where `devices` used to reach it",
         ),
         (
             "request_credential",
@@ -2050,7 +2072,7 @@ mod tests {
         ),
         (
             "threads",
-            3_614,
+            4_114,
             "five more actions on a domain whose two existing schemas \
              are almost entirely a spelled-out `status` enum pinned to \
              `ThreadStatus::ALL` by a test, repeated across both because \
@@ -2066,7 +2088,10 @@ mod tests {
              (ADR 0400). Raised from 3,172 for `cache_keep_alive`, one clause \
              and a two-value `state` enum (ADR 0554). Raised from 3,369 for \
              `context_ceiling`, one cut clause and a `ceiling` string, the \
-             prompt-first path to the Settings ceiling (ADR 0629)",
+             prompt-first path to the Settings ceiling (ADR 0629). Raised \
+             from 3,614 for `submit_draft`, a summary and three integer or \
+             uuid properties, the prompt-first path to sending a saved draft \
+             (ADR 0651)",
         ),
         (
             "events",
@@ -2190,7 +2215,7 @@ mod tests {
             ("no capability at all", ToolCapabilities::default()),
         ] {
             let (n, chars) = wire(&caps);
-            println!("{label}: {n} schemas, {chars} wire chars");
+            crate::log_legacy!("{label}: {n} schemas, {chars} wire chars");
         }
     }
 
@@ -2206,7 +2231,7 @@ mod tests {
     #[test]
     #[ignore]
     fn print_full_tool_schema_ranking() {
-        println!(
+        crate::log_legacy!(
             "{}\n\n{}",
             full_ranking("flat tool schemas", &flat_chat_tools()),
             full_ranking(
@@ -2254,44 +2279,12 @@ mod tests {
         tools.sort_by(|a, b| a.name.cmp(&b.name));
 
         for tool in &tools {
-            println!(
+            crate::log_legacy!(
                 "{}\t{}",
                 tool.name,
                 serde_json::to_string(&strip(&tool.parameters)).expect("schema serializes")
             );
         }
-    }
-
-    /// Makes a prompt-budget regression visible at `cargo test` rather than in
-    /// a token bill.
-    ///
-    /// Prints the per-area breakdown on failure AND on success under
-    /// `--nocapture`, so re-measuring after a deliberate addition costs one
-    /// command rather than a fresh harness.
-    #[test]
-    fn always_loaded_context_stays_under_budget() {
-        let areas = always_loaded_areas();
-        let total: usize = areas.iter().map(|(_, n)| n).sum();
-
-        let breakdown = areas
-            .iter()
-            .map(|(name, n)| format!("  {n:>7} chars  {name}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        println!(
-            "always-loaded context:\n{breakdown}\n  {total:>7} chars  TOTAL\n\nlargest tool schemas:\n{}",
-            largest_tool_schemas(10)
-        );
-
-        assert!(
-            total <= ALWAYS_LOADED_BUDGET_CHARS,
-            "always-loaded chat context is {total} chars, over the \
-             {ALWAYS_LOADED_BUDGET_CHARS} ceiling. Every character is billed on \
-             every request of every thread, so trim somewhere else or raise \
-             ALWAYS_LOADED_BUDGET_CHARS in a change that says why:\n{breakdown}\n\n\
-             largest tool schemas:\n{}",
-            largest_tool_schemas(10)
-        );
     }
 
     /// I12: the trigger rules stay system-tier, where an injected intent body
@@ -2309,106 +2302,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Every `system-knowhow/<id>` the resident context routes to must resolve
-    /// to a real file, or `load_knowhow` answers with the not-found sentinel
-    /// and the agent proceeds unguided on exactly the request the pointer
-    /// exists to catch.
-    ///
-    /// The per-rule versions of this
-    /// (`workspace_assets_rule_names_only_live_knowhow_ids`,
-    /// `setup_interview_rule_routes_to_a_live_knowhow_id`) check a hand-listed
-    /// set. This one sweeps everything the model is handed, the whole assembled
-    /// prompt body AND every tool schema, so a pointer added later is covered
-    /// the moment it is written. Schemas are in scope because they route too.
-    ///
-    /// Ids are filename-derived, so a knowhow rename is what breaks them.
-    #[test]
-    fn every_knowhow_id_the_resident_context_routes_to_resolves() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-
-        let mut haystack = format!(
-            "{}{}{}",
-            static_prompt_body(true, 500, CHILD_CAP, ContextMode::Off, false, ""),
-            static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, ""),
-            static_prompt_body(true, 500, CHILD_CAP, ContextMode::On, false, "")
-        );
-        let mut tools = flat_chat_tools();
-        tools.extend(crate::capability_manifest::llm_tools());
-        for tool in &tools {
-            haystack.push_str(&serde_json::to_string(tool).expect("a tool schema serializes"));
-        }
-
-        let pointer =
-            regex::Regex::new(r"system-knowhow/([a-z0-9-]+)").expect("static pattern compiles");
-        let ids: std::collections::BTreeSet<&str> = pointer
-            .captures_iter(&haystack)
-            .map(|c| c.get(1).expect("group 1 always matches").as_str())
-            .collect();
-        assert!(
-            !ids.is_empty(),
-            "the resident context routes to no knowhow at all, the scan is \
-             broken rather than the routes being clean"
-        );
-
-        let missing: Vec<&str> = ids
-            .iter()
-            .copied()
-            .filter(|id| {
-                !repo
-                    .join("system-knowhow")
-                    .join(format!("{id}.md"))
-                    .exists()
-            })
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "the resident prompt or a tool schema routes to knowhow id(s) with \
-             no backing file, so load_knowhow would return the not-found \
-             sentinel: {missing:?}"
-        );
-    }
-
-    /// Every placeholder token in the prompt template must have a matching
-    /// `.replace(...)` in the substitution chain, or the raw token ships to the
-    /// model verbatim.
-    ///
-    /// Nothing else catches this. The tokens are plain text inside a raw string
-    /// literal, so a dropped `.replace` compiles clean, passes clippy, and only
-    /// shows up as gibberish in the LLM's context. The substitution chain is
-    /// also a standing merge-conflict site: two branches that each add a rule
-    /// collide on the same line, and resolving by picking one side silently
-    /// drops the other's substitution while leaving its token in the template.
-    ///
-    /// Reads its own source rather than a hand-maintained token list, so a new
-    /// rule is covered the moment it is added and there is no second list to
-    /// keep in sync.
-    #[test]
-    fn every_prompt_placeholder_is_substituted() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-
-        let token = regex::Regex::new(r"__[A-Z][A-Z_]*__").expect("static pattern compiles");
-        let tokens: std::collections::BTreeSet<&str> =
-            token.find_iter(&src).map(|m| m.as_str()).collect();
-        assert!(
-            !tokens.is_empty(),
-            "found no placeholders at all, the scan is broken rather than the template being clean"
-        );
-
-        let missing: Vec<&str> = tokens
-            .iter()
-            .copied()
-            .filter(|t| !src.contains(&format!("\"{t}\"")))
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "placeholder(s) in the prompt template with no matching .replace(\"…\", …) \
-             in the substitution chain, so the raw token would reach the model: {missing:?}"
-        );
     }
 
     /// The first chat turn asks for technical literacy. Every value the
@@ -2665,265 +2558,6 @@ mod tests {
         );
     }
 
-    /// A direct child's completion is the one state change nobody has to
-    /// subscribe to: the ADR 0011 fan-in re-opens the parent with the child's
-    /// result whether or not a wait exists. Subscribing to it anyway spends a
-    /// subscription and arms a timeout for a wake the thread gets regardless.
-    ///
-    /// **The carve-out is a redundancy, not a limit, and the section has to say
-    /// so in that order.** Worded as a bare "not for a thread you spawned" it
-    /// generalises into "cross-thread waits are unreliable", which is false:
-    /// matching is workspace-wide (see
-    /// `a_wait_matches_a_child_completion_belonging_to_another_thread`). So the
-    /// positive claim leads and the exclusion follows it.
-    ///
-    /// **The condition it names has to be one that exists.** `child_thread_id`
-    /// is a field on `ChildThreadCompleted`, which only the parent/child fan-in
-    /// emits, so scoping someone else's coding-agent session with it matches
-    /// nothing and the wait never fires. `thread_id` is the field that exists,
-    /// on every thread event, supplied by the *matchable payload*
-    /// (`a_wait_scopes_to_one_coding_agent_session_on_every_path`).
-    ///
-    /// Source-scanned rather than asserted against a const, like
-    /// `every_prompt_placeholder_is_substituted` above: this section is plain
-    /// text inside [`SYSTEM_PROMPT_BASE`], and extracting it would only move the
-    /// same text somewhere else. Scoped to the section itself, not the whole
-    /// file, so this test's own prose cannot satisfy or break its assertions.
-    #[test]
-    fn the_state_change_section_excludes_the_threads_own_child() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-
-        let heading = "WAITING FOR A STATE CHANGE IN LUCIDOS";
-        let from = src
-            .find(heading)
-            .unwrap_or_else(|| panic!("the prompt no longer has a '{heading}' section"));
-        let section = &src[from..];
-        // The section is one unbroken run of bullets, so the next blank line
-        // ends it.
-        let section = &section[..section.find("\n\n").unwrap_or(section.len())];
-
-        assert!(
-            section.contains("IT WATCHES THE WHOLE WORKSPACE"),
-            "another thread's lifecycle is a first-class wait, and the resident \
-             prompt has to say so, or the exclusion below reads as 'a wait on a \
-             thread that is not mine might not fire':\n{section}"
-        );
-        assert!(
-            section.contains("NOT YOUR OWN CHILD"),
-            "the resident prompt must exclude the caller's own child, or the \
-             fan-in is invisible at the moment the model picks a mechanism:\n{section}"
-        );
-        assert!(
-            section.contains("a second wake"),
-            "the exclusion's reason must be redundancy, never impossibility:\n{section}"
-        );
-        assert!(
-            !section.contains("coding agent finishing"),
-            "a coding agent's finish must not be listed as a reason to subscribe: \
-             for the caller's own child that is the redundant case the last bullet \
-             forbids:\n{section}"
-        );
-
-        // The defect: a recipe naming a condition the event does not carry.
-        assert!(
-            section.contains("thread_id"),
-            "the section must name the condition that scopes a wait to one \
-             thread, or 'watch someone else's session' has no mechanism:\n{section}"
-        );
-        assert!(
-            !section.contains("child_thread_id"),
-            "`child_thread_id` is a field on ChildThreadCompleted only, which the \
-             parent/child fan-in alone emits. Naming it here sends a thread to \
-             scope a coding-agent session with a condition that matches nothing, \
-             and the wait then never fires:\n{section}"
-        );
-
-        // A set discovered at wait time, and the trap inside it.
-        assert!(
-            section.contains("RE-CHECK ON EVERY WAKE"),
-            "one subscription is spent by one event, so waiting on everything \
-             currently running is a loop: without the re-check the thread reports \
-             'all done' when the FIRST agent finished:\n{section}"
-        );
-        assert!(
-            section.contains("status [\"running\"]"),
-            "the set has to be discovered before it can be waited on, and the \
-             section must name the filter that lists it:\n{section}"
-        );
-
-        // A condition read as a green light. "Release the patch when the coding
-        // agents are done, auto approved" was acted on immediately.
-        assert!(
-            section.contains("PRECONDITION, NOT A GO-AHEAD"),
-            "a 'when X finishes' clause is something to wait for; a \
-             pre-approval attached to it covers the action once X has happened \
-             rather than replacing X:\n{section}"
-        );
-    }
-
-    /// The FILE REFERENCES block, read out of this file's own source. Both
-    /// tests below assert on the same section, so they take it from here: a
-    /// second copy of the extraction can go stale against the first and report
-    /// green on a section that no longer parses.
-    ///
-    /// Source-scanned and scoped to the section, like
-    /// `the_state_change_section_excludes_the_threads_own_child`: this is plain
-    /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps a caller's own
-    /// prose from satisfying its assertions.
-    fn file_references_section() -> String {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
-        let src = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-
-        // The heading, not the cross-reference to it in NAMES_NOT_IDS_RULE.
-        let from = src
-            .find("FILE REFERENCES:\n")
-            .expect("the prompt no longer has a FILE REFERENCES section");
-        let section = &src[from..];
-        section[..section.find("\n\n").unwrap_or(section.len())].to_string()
-    }
-
-    /// A trigger was the one first-class thing the agent names in a reply with
-    /// no link form of its own. So it linked the Triggers PANEL, and when told
-    /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
-    /// The section has to carry the form AND keep the two destinations apart.
-    #[test]
-    fn the_file_references_section_links_a_trigger_not_just_the_panel() {
-        let section = file_references_section();
-        let section = section.as_str();
-
-        assert!(
-            section.contains("(trigger:<id>)"),
-            "without the link form the agent has nothing to write but the panel \
-             link, which is the reported bug:\n{section}"
-        );
-        assert!(
-            section.contains("`triggers` action 'list'"),
-            "a link form the agent cannot fill in is not a link form: the \
-             section must say where the id comes from:\n{section}"
-        );
-        assert!(
-            section.contains("[Triggers](triggers)` is the LIST"),
-            "both links exist and mean different things, so the section must \
-             say which is which or the panel link keeps winning:\n{section}"
-        );
-        // Says WHY the trigger link is worth writing: the row carries the
-        // actions. Drop this and the two links read as interchangeable.
-        assert!(
-            section.contains("Run once"),
-            "the section must name what the trigger link lands on:\n{section}"
-        );
-    }
-
-    /// Asked to show an image, the agent read a PNG, saw it, and wrote the
-    /// bare path. The user got a link and asked "can you not inline it?". It
-    /// then spent eight tool calls grepping this repo and `renderMarkdown.ts`
-    /// to rediscover a capability it already had. That recovery only worked
-    /// because the machine happened to have the Lucidos source checked out.
-    ///
-    /// The section taught "a full path becomes a clickable link" and stopped,
-    /// so a link was the whole vocabulary. Mirrored for coding agents by
-    /// `agent_session::prompts::SHOWING_AN_IMAGE_RULE`, tuned there to
-    /// `lucidos data write` because a worktree cannot write `data/` directly.
-    /// Change both together.
-    #[test]
-    fn the_file_references_section_says_an_image_is_drawn_not_linked() {
-        let section = file_references_section();
-        let section = section.as_str();
-
-        // The syntax itself. Naming the concept without the leading `!` is
-        // what left the agent writing a path and calling it shown.
-        assert!(
-            section.contains("![what it shows](artifacts/branding/card.png)"),
-            "the section must show the image form, not just name it:\n{section}"
-        );
-        // Why a path is not enough. Without the contrast the link rule above
-        // it keeps reading as the complete answer.
-        assert!(
-            section.contains("is a LINK"),
-            "the section must tell a link apart from a drawn image:\n{section}"
-        );
-        // The half the transcript proves the agent does not know: looking at
-        // an image is not showing it.
-        assert!(
-            section.contains("shows it to YOU"),
-            "the section must say a read reaches the agent, not the user:\n{section}"
-        );
-        // A coding agent saved a mockup, wrote "I've drawn out the options",
-        // and drew nothing. Saving is not showing either, and a choice between
-        // pictures puts them on the card.
-        assert!(
-            section.contains("Saving one shows nothing either"),
-            "the section must say a saved image reaches nobody:\n{section}"
-        );
-        assert!(
-            section.contains("in an option's description"),
-            "the section must put pictures on the question card:\n{section}"
-        );
-        // On Opus 5.5, text followed by any tool call may arrive only as a
-        // summary, which drops the `![...]` line. "Draw it in your reply" sent
-        // pictures there (docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md).
-        assert!(
-            section.contains("text that ENDS your turn")
-                && section.contains("the card's `message`")
-                && section.contains("followed by any tool call"),
-            "the section must name every place a picture shows:\n{section}"
-        );
-        assert!(
-            !section.contains("draw it in your reply"),
-            "a reply followed by a tool call loses the picture:\n{section}"
-        );
-        // A coding agent drew colour options in ASCII, then put one sheet of
-        // all four on every option. Mirrors `SHOWING_AN_IMAGE_RULE`.
-        assert!(
-            section.contains("never ASCII art")
-                && section.contains("its own picture of only that option"),
-            "the section must show a visual choice as one picture per option:\n{section}"
-        );
-        // An option's picture belongs on its own option, never in `message`.
-        assert!(
-            section.contains("only that option, in its description, not in `message`"),
-            "an option's picture must go on its own option:\n{section}"
-        );
-    }
-
-    /// An app link named the app and nothing inside it. So an agent writing a
-    /// per-item artifact into a shared app could only link the app and hope.
-    /// The reader then landed on whatever item they saw last.
-    ///
-    /// Same shape as the image line above, and the same reason it lives here
-    /// rather than in knowhow: writing the link IS the moment the choice is
-    /// made, and nothing prompts a lookup first. The *app fragment* entry in
-    /// `docs/glossary.md` carries the mechanism.
-    #[test]
-    fn the_file_references_section_links_inside_an_app_not_only_at_it() {
-        let section = file_references_section();
-        let section = section.as_str();
-
-        // The form itself. Naming the capability without the `#` leaves the
-        // agent nothing to write.
-        assert!(
-            section.contains("(app:pr-understanding#pr-1645)"),
-            "the section must show the fragment form, not just name it:\n{section}"
-        );
-        // Where it arrives. Without this the agent cannot tell whether an app
-        // it wrote itself would even see the target.
-        assert!(
-            section.contains("location.hash"),
-            "the section must say how the fragment reaches the app:\n{section}"
-        );
-        // The caveat. An app that reads no hash ignores one, so a fragment is
-        // worth writing only where the app answers it.
-        assert!(
-            section.contains("when the app reads one"),
-            "the section must gate the fragment on the app reading it:\n{section}"
-        );
-    }
-
     /// Scoped to "Before creating", the block leaves "run my digest trigger
     /// now" with no route. The agent then guesses and resumes a paused trigger,
     /// which only restores the schedule and runs nothing. Narrowing the trigger
@@ -2984,56 +2618,6 @@ mod tests {
         }
     }
 
-    /// Every id in the routing block must be a real `system-knowhow/<id>`, or
-    /// `load_knowhow` answers with the not-found sentinel and the agent
-    /// proceeds unguided. The ids are filename-derived, so a knowhow rename
-    /// silently invalidates them.
-    #[test]
-    fn workspace_assets_rule_names_only_live_knowhow_ids() {
-        let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-
-        for id in ["triggers", "building-an-app", "building-knowhow", "plugins"] {
-            assert!(
-                rule.contains(&format!("`system-knowhow/{id}`")),
-                "routing block must still name system-knowhow/{id}:\n{rule}"
-            );
-            assert!(
-                repo.join("system-knowhow")
-                    .join(format!("{id}.md"))
-                    .exists(),
-                "routed id system-knowhow/{id} has no backing file, so \
-                 load_knowhow would return the not-found sentinel"
-            );
-        }
-        for stale in ["building-a-trigger", "building-a-plugin"] {
-            assert!(
-                !rule.contains(stale),
-                "renamed knowhow id {stale} still routed:\n{rule}"
-            );
-        }
-    }
-
-    /// The setup interview's discovery route must name a knowhow id that
-    /// actually resolves. Same failure mode as
-    /// `workspace_assets_rule_names_only_live_knowhow_ids`: the id is
-    /// filename-derived, so renaming the file leaves the route pointing at
-    /// nothing and `load_knowhow` answers with the not-found sentinel, at which
-    /// point the button fires and the agent improvises an interview.
-    #[test]
-    fn setup_interview_rule_routes_to_a_live_knowhow_id() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        assert!(
-            SETUP_INTERVIEW_RULE.contains("`system-knowhow/setup-interview`"),
-            "the route must name the knowhow id:\n{SETUP_INTERVIEW_RULE}"
-        );
-        assert!(
-            repo.join("system-knowhow/setup-interview.md").exists(),
-            "routed id system-knowhow/setup-interview has no backing file, so \
-             load_knowhow would return the not-found sentinel"
-        );
-    }
-
     /// The route has to survive the ACTION FIRST rule that follows it in the
     /// prompt. That rule says "Don't ask clarifying questions" and excepts only
     /// workspace assets, so without an explicit carve-out the agent reads the
@@ -3046,54 +2630,6 @@ mod tests {
             SETUP_INTERVIEW_RULE.contains("ACTION FIRST rule below does NOT apply"),
             "the interview must except itself from ACTION FIRST, or the agent \
              skips the questions:\n{SETUP_INTERVIEW_RULE}"
-        );
-    }
-
-    /// Cross-layer pin for the entry point's discovery. The welcome CTA and the
-    /// header help button send a FIXED sentence as an ordinary user message
-    /// (`SETUP_INTERVIEW_PROMPT` in `store/actions/compose.ts`), and the route
-    /// only fires if the prompt says something the route recognises. Reading
-    /// the real sources is what makes this a check on the set rather than three
-    /// assertions that the same string equals itself.
-    ///
-    /// The knowhow's frontmatter `description` is the third arm because it is
-    /// the SECOND discovery path: retrieval, for a user who types the request
-    /// rather than pressing the button. A description that no longer mentions
-    /// the sentence leaves the feature alive on the hardcoded route alone.
-    #[test]
-    fn setup_interview_route_matches_the_frontend_seeded_prompt() {
-        const ANCHOR: &str = "help me get the most out of lucidos";
-
-        assert!(
-            SETUP_INTERVIEW_RULE.to_lowercase().contains(ANCHOR),
-            "the route must recognise the phrase the button actually sends:\n{SETUP_INTERVIEW_RULE}"
-        );
-
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let read = |rel: &str| {
-            let path = repo.join(rel);
-            std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-                .to_lowercase()
-        };
-
-        assert!(
-            read("crates/lucidos-app/src/store/actions/compose.ts").contains(ANCHOR),
-            "the frontend's seeded prompt no longer carries the phrase the \
-             system-prompt route keys on, so clicking the button would start an \
-             ordinary chat instead of the setup interview"
-        );
-
-        let knowhow = read("system-knowhow/setup-interview.md");
-        let description = knowhow
-            .split("\n---")
-            .next()
-            .expect("split always yields at least one element");
-        assert!(
-            description.contains(ANCHOR),
-            "the setup-interview knowhow's frontmatter description no longer \
-             carries the seeded phrase, so a user who TYPES the request has to \
-             rely on the hardcoded route matching instead of retrieval"
         );
     }
 
@@ -3281,6 +2817,20 @@ mod tests {
         assert!(
             LOOK_BEFORE_ASSESSING_RULE.contains("Absence from your context is not absence"),
             "it must say WHY, or it reads as a style note:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+    }
+
+    /// A thread verdict needs a liveness read in the same turn. The Home agent
+    /// once called a working thread stalled from its own earlier reply.
+    #[test]
+    fn the_look_rule_bans_a_thread_verdict_from_history() {
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("without its `liveness` from THIS turn"),
+            "it must name the liveness read:\n{LOOK_BEFORE_ASSESSING_RULE}"
+        );
+        assert!(
+            LOOK_BEFORE_ASSESSING_RULE.contains("Your earlier messages are history"),
+            "it must ban the claim from history:\n{LOOK_BEFORE_ASSESSING_RULE}"
         );
     }
 
@@ -3622,5 +3172,510 @@ mod tests {
             "the prompt must name the policy's cap as a limit at one moment"
         );
         assert!(!body.contains("__MAX_CONCURRENT_CHILDREN_PER_THREAD__"));
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The always-loaded areas, measured separately so a regression report
+        /// says WHICH one grew.
+        fn always_loaded_areas() -> Vec<(&'static str, usize)> {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let ws = tempfile::tempdir().expect("temp workspace");
+            let built_in_widgets = crate::core::AppManager::new(ws.path())
+                .expect("app manager")
+                .with_system_widgets(Some(repo.join("system-widgets")))
+                .list_reusable_widgets()
+                .expect("built-in widgets load");
+            system_prompt_footprint(
+                &BILLED,
+                &crate::core::SystemKnowhowStore::load_summaries(&repo.join("system-knowhow")),
+                &built_in_widgets,
+            )
+        }
+
+        /// Makes a prompt-budget regression visible at `cargo test` rather than in
+        /// a token bill.
+        ///
+        /// Prints the per-area breakdown on failure AND on success under
+        /// `--nocapture`, so re-measuring after a deliberate addition costs one
+        /// command rather than a fresh harness.
+        #[test]
+        fn always_loaded_context_stays_under_budget() {
+            let areas = always_loaded_areas();
+            let total: usize = areas.iter().map(|(_, n)| n).sum();
+
+            let breakdown = areas
+                .iter()
+                .map(|(name, n)| format!("  {n:>7} chars  {name}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            crate::log_legacy!(
+                "always-loaded context:\n{breakdown}\n  {total:>7} chars  TOTAL\n\nlargest tool schemas:\n{}",
+                largest_tool_schemas(10)
+            );
+
+            assert!(
+                total <= ALWAYS_LOADED_BUDGET_CHARS,
+                "always-loaded chat context is {total} chars, over the \
+             {ALWAYS_LOADED_BUDGET_CHARS} ceiling. Every character is billed on \
+             every request of every thread, so trim somewhere else or raise \
+             ALWAYS_LOADED_BUDGET_CHARS in a change that says why:\n{breakdown}\n\n\
+             largest tool schemas:\n{}",
+                largest_tool_schemas(10)
+            );
+        }
+
+        /// Every `system-knowhow/<id>` the resident context routes to must resolve
+        /// to a real file. Otherwise `load_knowhow` answers with the not-found
+        /// sentinel, and the agent goes unguided on the request the pointer exists
+        /// to catch.
+        ///
+        /// The per-rule versions of this
+        /// (`workspace_assets_rule_names_only_live_knowhow_ids`,
+        /// `setup_interview_rule_routes_to_a_live_knowhow_id`) check a hand-listed
+        /// set. This one sweeps everything the model is handed: the whole assembled
+        /// prompt body AND every tool schema. A pointer added later is covered the
+        /// moment it is written. Schemas are in scope because they route too.
+        ///
+        /// Ids are filename-derived, so a knowhow rename is what breaks them.
+        #[test]
+        fn every_knowhow_id_the_resident_context_routes_to_resolves() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+
+            let mut haystack = format!(
+                "{}{}{}",
+                static_prompt_body(true, 500, CHILD_CAP, ContextMode::Off, false, ""),
+                static_prompt_body(false, 500, CHILD_CAP, ContextMode::Off, false, ""),
+                static_prompt_body(true, 500, CHILD_CAP, ContextMode::On, false, "")
+            );
+            let mut tools = flat_chat_tools();
+            tools.extend(crate::capability_manifest::llm_tools());
+            for tool in &tools {
+                haystack.push_str(&serde_json::to_string(tool).expect("a tool schema serializes"));
+            }
+
+            let pointer =
+                regex::Regex::new(r"system-knowhow/([a-z0-9-]+)").expect("static pattern compiles");
+            let ids: std::collections::BTreeSet<&str> = pointer
+                .captures_iter(&haystack)
+                .map(|c| c.get(1).expect("group 1 always matches").as_str())
+                .collect();
+            assert!(
+                !ids.is_empty(),
+                "the resident context routes to no knowhow at all, the scan is \
+             broken rather than the routes being clean"
+            );
+
+            let missing: Vec<&str> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !repo
+                        .join("system-knowhow")
+                        .join(format!("{id}.md"))
+                        .exists()
+                })
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "the resident prompt or a tool schema routes to knowhow id(s) with \
+             no backing file, so load_knowhow would return the not-found \
+             sentinel: {missing:?}"
+            );
+        }
+
+        /// Every placeholder token in the prompt template must have a matching
+        /// `.replace(...)` in the substitution chain, or the raw token ships to the
+        /// model verbatim.
+        ///
+        /// Nothing else catches this. The tokens are plain text inside a raw string
+        /// literal. A dropped `.replace` compiles clean, passes clippy, and shows up
+        /// only as gibberish in the LLM's context.
+        ///
+        /// The substitution chain is also a standing merge-conflict site. Two
+        /// branches that each add a rule collide on the same line. Picking one side
+        /// drops the other's substitution and leaves its token in the template.
+        ///
+        /// Reads its own source rather than a hand-maintained token list. A new
+        /// rule is covered the moment it is added, with no second list to sync.
+        #[test]
+        fn every_prompt_placeholder_is_substituted() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let token = regex::Regex::new(r"__[A-Z][A-Z_]*__").expect("static pattern compiles");
+            let tokens: std::collections::BTreeSet<&str> =
+                token.find_iter(&src).map(|m| m.as_str()).collect();
+            assert!(
+                !tokens.is_empty(),
+                "found no placeholders at all, the scan is broken rather than the template being clean"
+            );
+
+            let missing: Vec<&str> = tokens
+                .iter()
+                .copied()
+                .filter(|t| !src.contains(&format!("\"{t}\"")))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "placeholder(s) in the prompt template with no matching .replace(\"…\", …) \
+             in the substitution chain, so the raw token would reach the model: {missing:?}"
+            );
+        }
+
+        /// A direct child's completion is the one state change nobody has to
+        /// subscribe to: the ADR 0011 fan-in re-opens the parent with the child's
+        /// result whether or not a wait exists. Subscribing to it anyway spends a
+        /// subscription and arms a timeout for a wake the thread gets regardless.
+        ///
+        /// **The carve-out is a redundancy, not a limit, and the section has to say
+        /// so in that order.** Worded as a bare "not for a thread you spawned" it
+        /// generalises into "cross-thread waits are unreliable", which is false:
+        /// matching is workspace-wide
+        /// (`a_wait_matches_a_child_completion_belonging_to_another_thread`).
+        ///
+        /// **The condition it names has to be one that exists.** `child_thread_id`
+        /// is a field on `ChildThreadCompleted`, which only the fan-in emits.
+        /// Scoping someone else's session with it matches nothing, and the wait
+        /// never fires. `thread_id` exists on every thread event, supplied by the
+        /// *matchable payload* (`a_wait_scopes_to_one_coding_agent_session_on_every_path`).
+        ///
+        /// Source-scanned like `every_prompt_placeholder_is_substituted`: the
+        /// section is plain text inside [`SYSTEM_PROMPT_BASE`]. Scoped to the
+        /// section, so this test's own prose cannot satisfy or break it.
+        #[test]
+        fn the_state_change_section_excludes_the_threads_own_child() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            let heading = "WAITING FOR A STATE CHANGE IN LUCIDOS";
+            let from = src
+                .find(heading)
+                .unwrap_or_else(|| panic!("the prompt no longer has a '{heading}' section"));
+            let section = &src[from..];
+            // The section is one unbroken run of bullets, so the next blank line
+            // ends it.
+            let section = &section[..section.find("\n\n").unwrap_or(section.len())];
+
+            assert!(
+                section.contains("IT WATCHES THE WHOLE WORKSPACE"),
+                "another thread's lifecycle is a first-class wait, and the resident \
+             prompt has to say so, or the exclusion below reads as 'a wait on a \
+             thread that is not mine might not fire':\n{section}"
+            );
+            assert!(
+                section.contains("NOT YOUR OWN CHILD"),
+                "the resident prompt must exclude the caller's own child, or the \
+             fan-in is invisible at the moment the model picks a mechanism:\n{section}"
+            );
+            assert!(
+                section.contains("a second wake"),
+                "the exclusion's reason must be redundancy, never impossibility:\n{section}"
+            );
+            assert!(
+                !section.contains("coding agent finishing"),
+                "a coding agent's finish must not be listed as a reason to subscribe: \
+             for the caller's own child that is the redundant case the last bullet \
+             forbids:\n{section}"
+            );
+
+            // The defect: a recipe naming a condition the event does not carry.
+            assert!(
+                section.contains("thread_id"),
+                "the section must name the condition that scopes a wait to one \
+             thread, or 'watch someone else's session' has no mechanism:\n{section}"
+            );
+            assert!(
+                !section.contains("child_thread_id"),
+                "`child_thread_id` is a field on ChildThreadCompleted only, which the \
+             parent/child fan-in alone emits. Naming it here sends a thread to \
+             scope a coding-agent session with a condition that matches nothing, \
+             and the wait then never fires:\n{section}"
+            );
+
+            // A set discovered at wait time, and the trap inside it.
+            assert!(
+                section.contains("RE-CHECK ON EVERY WAKE"),
+                "one subscription is spent by one event, so waiting on everything \
+             currently running is a loop: without the re-check the thread reports \
+             'all done' when the FIRST agent finished:\n{section}"
+            );
+            assert!(
+                section.contains("status [\"running\"]"),
+                "the set has to be discovered before it can be waited on, and the \
+             section must name the filter that lists it:\n{section}"
+            );
+
+            // A condition read as a green light. "Release the patch when the coding
+            // agents are done, auto approved" was acted on immediately.
+            assert!(
+                section.contains("PRECONDITION, NOT A GO-AHEAD"),
+                "a 'when X finishes' clause is something to wait for; a \
+             pre-approval attached to it covers the action once X has happened \
+             rather than replacing X:\n{section}"
+            );
+        }
+
+        /// The FILE REFERENCES block, read out of this file's own source. Both
+        /// tests below assert on the same section, so they take it from here: a
+        /// second copy of the extraction can go stale against the first and report
+        /// green on a section that no longer parses.
+        ///
+        /// Source-scanned and scoped to the section, like
+        /// `the_state_change_section_excludes_the_threads_own_child`: this is plain
+        /// text inside [`SYSTEM_PROMPT_BASE`], and the scoping keeps a caller's own
+        /// prose from satisfying its assertions.
+        fn file_references_section() -> String {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
+            let src = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+            // The heading, not the cross-reference to it in NAMES_NOT_IDS_RULE.
+            let from = src
+                .find("FILE REFERENCES:\n")
+                .expect("the prompt no longer has a FILE REFERENCES section");
+            let section = &src[from..];
+            section[..section.find("\n\n").unwrap_or(section.len())].to_string()
+        }
+
+        /// A trigger was the one first-class thing the agent names in a reply with
+        /// no link form of its own. So it linked the Triggers PANEL, and when told
+        /// to link the trigger it invented `trigger:<id>`, which nothing claimed.
+        /// The section has to carry the form AND keep the two destinations apart.
+        #[test]
+        fn the_file_references_section_links_a_trigger_not_just_the_panel() {
+            let section = file_references_section();
+            let section = section.as_str();
+
+            assert!(
+                section.contains("(trigger:<id>)"),
+                "without the link form the agent has nothing to write but the panel \
+             link, which is the reported bug:\n{section}"
+            );
+            assert!(
+                section.contains("`triggers` action 'list'"),
+                "a link form the agent cannot fill in is not a link form: the \
+             section must say where the id comes from:\n{section}"
+            );
+            assert!(
+                section.contains("[Triggers](triggers)` is the LIST"),
+                "both links exist and mean different things, so the section must \
+             say which is which or the panel link keeps winning:\n{section}"
+            );
+            // Says WHY the trigger link is worth writing: the row carries the
+            // actions. Drop this and the two links read as interchangeable.
+            assert!(
+                section.contains("Run once"),
+                "the section must name what the trigger link lands on:\n{section}"
+            );
+        }
+
+        /// Asked to show an image, the agent read a PNG, saw it, and wrote the
+        /// bare path. The user got a link and asked "can you not inline it?". It
+        /// then spent eight tool calls grepping this repo and `renderMarkdown.ts`
+        /// to rediscover a capability it already had. That recovery only worked
+        /// because the machine happened to have the Lucidos source checked out.
+        ///
+        /// The section taught "a full path becomes a clickable link" and stopped,
+        /// so a link was the whole vocabulary. Mirrored for coding agents by
+        /// `agent_session::prompts::SHOWING_AN_IMAGE_RULE`, tuned there to
+        /// `lucidos data write` because a worktree cannot write `data/` directly.
+        /// Change both together.
+        #[test]
+        fn the_file_references_section_says_an_image_is_drawn_not_linked() {
+            let section = file_references_section();
+            let section = section.as_str();
+
+            // The syntax itself. Naming the concept without the leading `!` is
+            // what left the agent writing a path and calling it shown.
+            assert!(
+                section.contains("![what it shows](artifacts/branding/card.png)"),
+                "the section must show the image form, not just name it:\n{section}"
+            );
+            // Why a path is not enough. Without the contrast the link rule above
+            // it keeps reading as the complete answer.
+            assert!(
+                section.contains("is a LINK"),
+                "the section must tell a link apart from a drawn image:\n{section}"
+            );
+            // The half the transcript proves the agent does not know: looking at
+            // an image is not showing it.
+            assert!(
+                section.contains("shows it to YOU"),
+                "the section must say a read reaches the agent, not the user:\n{section}"
+            );
+            // A coding agent saved a mockup, wrote "I've drawn out the options",
+            // and drew nothing. Saving is not showing either, and a choice between
+            // pictures puts them on the card.
+            assert!(
+                section.contains("Saving one shows nothing either"),
+                "the section must say a saved image reaches nobody:\n{section}"
+            );
+            assert!(
+                section.contains("in an option's description"),
+                "the section must put pictures on the question card:\n{section}"
+            );
+            // On Opus 5.5, text followed by any tool call may arrive only as a
+            // summary, which drops the `![...]` line. "Draw it in your reply" sent
+            // pictures there (docs/plans/2026-10-06-chat-pictures-go-in-the-card-message.md).
+            assert!(
+                section.contains("text that ENDS your turn")
+                    && section.contains("the card's `message`")
+                    && section.contains("followed by any tool call"),
+                "the section must name every place a picture shows:\n{section}"
+            );
+            assert!(
+                !section.contains("draw it in your reply"),
+                "a reply followed by a tool call loses the picture:\n{section}"
+            );
+            // A coding agent drew colour options in ASCII, then put one sheet of
+            // all four on every option. Mirrors `SHOWING_AN_IMAGE_RULE`.
+            assert!(
+                section.contains("never ASCII art")
+                    && section.contains("its own picture of only that option"),
+                "the section must show a visual choice as one picture per option:\n{section}"
+            );
+            // An option's picture belongs on its own option, never in `message`.
+            assert!(
+                section.contains("only that option, in its description, not in `message`"),
+                "an option's picture must go on its own option:\n{section}"
+            );
+        }
+
+        /// An app link named the app and nothing inside it. So an agent writing a
+        /// per-item artifact into a shared app could only link the app and hope.
+        /// The reader then landed on whatever item they saw last.
+        ///
+        /// Same shape as the image line above, and the same reason it lives here
+        /// rather than in knowhow: writing the link IS the moment the choice is
+        /// made, and nothing prompts a lookup first. The *app fragment* entry in
+        /// `docs/glossary.md` carries the mechanism.
+        #[test]
+        fn the_file_references_section_links_inside_an_app_not_only_at_it() {
+            let section = file_references_section();
+            let section = section.as_str();
+
+            // The form itself. Naming the capability without the `#` leaves the
+            // agent nothing to write.
+            assert!(
+                section.contains("(app:pr-understanding#pr-1645)"),
+                "the section must show the fragment form, not just name it:\n{section}"
+            );
+            // Where it arrives. Without this the agent cannot tell whether an app
+            // it wrote itself would even see the target.
+            assert!(
+                section.contains("location.hash"),
+                "the section must say how the fragment reaches the app:\n{section}"
+            );
+            // The caveat. An app that reads no hash ignores one, so a fragment is
+            // worth writing only where the app answers it.
+            assert!(
+                section.contains("when the app reads one"),
+                "the section must gate the fragment on the app reading it:\n{section}"
+            );
+        }
+
+        /// Every id in the routing block must be a real `system-knowhow/<id>`, or
+        /// `load_knowhow` answers with the not-found sentinel and the agent
+        /// proceeds unguided. The ids are filename-derived, so a knowhow rename
+        /// silently invalidates them.
+        #[test]
+        fn workspace_assets_rule_names_only_live_knowhow_ids() {
+            let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+
+            for id in ["triggers", "building-an-app", "building-knowhow", "plugins"] {
+                assert!(
+                    rule.contains(&format!("`system-knowhow/{id}`")),
+                    "routing block must still name system-knowhow/{id}:\n{rule}"
+                );
+                assert!(
+                    repo.join("system-knowhow")
+                        .join(format!("{id}.md"))
+                        .exists(),
+                    "routed id system-knowhow/{id} has no backing file, so \
+                 load_knowhow would return the not-found sentinel"
+                );
+            }
+            for stale in ["building-a-trigger", "building-a-plugin"] {
+                assert!(
+                    !rule.contains(stale),
+                    "renamed knowhow id {stale} still routed:\n{rule}"
+                );
+            }
+        }
+
+        /// The setup interview's discovery route must name a knowhow id that
+        /// actually resolves. Same failure mode as
+        /// `workspace_assets_rule_names_only_live_knowhow_ids`: the id is
+        /// filename-derived. Renaming the file leaves the route pointing at
+        /// nothing, and `load_knowhow` answers with the not-found sentinel. The
+        /// button then fires and the agent improvises an interview.
+        #[test]
+        fn setup_interview_rule_routes_to_a_live_knowhow_id() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            assert!(
+                SETUP_INTERVIEW_RULE.contains("`system-knowhow/setup-interview`"),
+                "the route must name the knowhow id:\n{SETUP_INTERVIEW_RULE}"
+            );
+            assert!(
+                repo.join("system-knowhow/setup-interview.md").exists(),
+                "routed id system-knowhow/setup-interview has no backing file, so \
+             load_knowhow would return the not-found sentinel"
+            );
+        }
+
+        /// Cross-layer pin for the entry point's discovery. The welcome CTA and the
+        /// header help button send a FIXED sentence as an ordinary user message:
+        /// `SETUP_INTERVIEW_PROMPT` in `store/actions/compose.ts`. The route only
+        /// fires if the prompt says something it recognises. Reading the real
+        /// sources makes this a check on the set, not three self-equal strings.
+        ///
+        /// The knowhow's frontmatter `description` is the third arm because it is
+        /// the SECOND discovery path: retrieval, for a user who types the request
+        /// rather than pressing the button. A description that no longer mentions
+        /// the sentence leaves the feature alive on the hardcoded route alone.
+        #[test]
+        fn setup_interview_route_matches_the_frontend_seeded_prompt() {
+            const ANCHOR: &str = "help me get the most out of lucidos";
+
+            assert!(
+                SETUP_INTERVIEW_RULE.to_lowercase().contains(ANCHOR),
+                "the route must recognise the phrase the button actually sends:\n{SETUP_INTERVIEW_RULE}"
+            );
+
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let read = |rel: &str| {
+                let path = repo.join(rel);
+                std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                    .to_lowercase()
+            };
+
+            assert!(
+                read("crates/lucidos-app/src/store/actions/compose.ts").contains(ANCHOR),
+                "the frontend's seeded prompt no longer carries the phrase the \
+             system-prompt route keys on, so clicking the button would start an \
+             ordinary chat instead of the setup interview"
+            );
+
+            let knowhow = read("system-knowhow/setup-interview.md");
+            let description = knowhow
+                .split("\n---")
+                .next()
+                .expect("split always yields at least one element");
+            assert!(
+                description.contains(ANCHOR),
+                "the setup-interview knowhow's frontmatter description no longer \
+             carries the seeded phrase, so a user who TYPES the request has to \
+             rely on the hardcoded route matching instead of retrieval"
+            );
+        }
     }
 }

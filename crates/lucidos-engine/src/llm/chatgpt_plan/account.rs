@@ -525,7 +525,7 @@ impl EndedSignIn {
             Ok(token) => {
                 tokio::spawn(revoke(auth.clone(), self.client_id, token));
             }
-            Err(e) => crate::log!("[ChatGptPlan] Signed out without revoking: {e}"),
+            Err(e) => crate::log_legacy!("[ChatGptPlan] Signed out without revoking: {e}"),
         }
     }
 }

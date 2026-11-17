@@ -32,7 +32,7 @@ use crate::core::{prefs, PreferenceStore};
 use crate::engine::event_bus::{EventBus, LagReplay, ReplayScope};
 use crate::triggers::{
     replay_trigger_events, replay_trigger_group_events, TriggerConfig, TriggerEventRow,
-    TriggerGroup, TriggerGroupEventRow, TriggerRun,
+    TriggerGroupEventRow, TriggerGroupProjection, TriggerRun,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -203,9 +203,17 @@ pub(crate) fn stored_trigger_dispatch(row: &StoredTriggerCarrier) -> Option<Trig
 /// Boot and a lagged subscriber both rebuild the registry from this.
 pub(crate) async fn load_trigger_groups(
     pool: &PgPool,
-) -> Result<HashMap<String, TriggerGroup>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, serde_json::Value, chrono::DateTime<chrono::Utc>)>(
-        "SELECT event_type, payload, created FROM events
+) -> Result<TriggerGroupProjection, sqlx::Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            serde_json::Value,
+            chrono::DateTime<chrono::Utc>,
+        ),
+    >(
+        "SELECT sequence, event_type, payload, created FROM events
          WHERE aggregate = 'trigger_group'
          ORDER BY sequence ASC",
     )
@@ -213,7 +221,8 @@ pub(crate) async fn load_trigger_groups(
     .await?;
     Ok(replay_trigger_group_events(
         rows.into_iter()
-            .map(|(event_type, payload, created)| TriggerGroupEventRow {
+            .map(|(seq, event_type, payload, created)| TriggerGroupEventRow {
+                seq,
                 event_type,
                 payload,
                 created,
@@ -243,7 +252,7 @@ pub struct SchedulerManager {
     /// In-memory trigger groups, rebuilt from events on startup and kept
     /// up-to-date via EventBus subscription. Source of truth for the panel's
     /// "Group" sections.
-    trigger_groups: Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
+    trigger_groups: Arc<std::sync::RwLock<TriggerGroupProjection>>,
 }
 
 impl SchedulerManager {
@@ -331,7 +340,7 @@ impl SchedulerManager {
 
         // Start the scheduler
         self.scheduler.start().await?;
-        log!("[Scheduler] Started");
+        log_legacy!("[Scheduler] Started");
 
         Ok(())
     }
@@ -353,8 +362,22 @@ impl SchedulerManager {
             })
         })?;
 
+        let inbox_bus = self.engine.event_bus.clone();
+        self.scheduler
+            .add(Job::new_async("0 0 * * * *", move |_uuid, _lock| {
+                let bus = inbox_bus.clone();
+                Box::pin(async move {
+                    if let Err(error) = bus.expire_diagnostic_bundles().await {
+                        crate::log!(
+                            "[Diagnostics] inbox expiry failed: {}",
+                            lucidos_diagnostic_log::private(error.to_string())
+                        );
+                    }
+                })
+            })?)
+            .await?;
         self.scheduler.add(health_job).await?;
-        log!("[Scheduler] Registered system task: task_health_monitor");
+        log_legacy!("[Scheduler] Registered system task: task_health_monitor");
 
         // Daily 03:00 UTC: disable push on devices not seen in 30 days. UTC
         // because `Job::new_async` schedules there, and a staleness sweep needs
@@ -374,7 +397,7 @@ impl SchedulerManager {
             })
         })?;
         self.scheduler.add(prune_job).await?;
-        log!(
+        log_legacy!(
             "[Scheduler] Registered system task: prune_devices (daily 03:00 UTC, push off >{}d, one-off removed >{}d)",
             STALE_DEVICE_DAYS,
             ONE_OFF_DEVICE_DAYS
@@ -396,7 +419,9 @@ impl SchedulerManager {
             })
         })?;
         self.scheduler.add(deliveries_job).await?;
-        log!("[Scheduler] Registered system task: prune_webhook_deliveries (daily 03:10 UTC)");
+        log_legacy!(
+            "[Scheduler] Registered system task: prune_webhook_deliveries (daily 03:10 UTC)"
+        );
 
         let engine_plugin_updates = self.engine.clone();
         let pool_plugin_updates = self.pool.clone();
@@ -409,7 +434,7 @@ impl SchedulerManager {
                 })
             })?;
         self.scheduler.add(plugin_update_job).await?;
-        log!(
+        log_legacy!(
             "[Scheduler] Registered system task: plugin_marketplace_update_check ({})",
             MARKETPLACE_UPDATE_CHECK_CRON
         );
@@ -433,7 +458,7 @@ impl SchedulerManager {
             })
         })?;
         self.scheduler.add(ingress_job).await?;
-        log!(
+        log_legacy!(
             "[Scheduler] Registered system task: webhook_ingress_check ({})",
             WEBHOOK_INGRESS_CRON
         );
@@ -452,7 +477,7 @@ impl SchedulerManager {
             })
         })?;
         self.scheduler.add(refusal_job).await?;
-        log!(
+        log_legacy!(
             "[Scheduler] Registered system task: webhook_refusal_check ({})",
             WEBHOOK_REFUSAL_CRON
         );
@@ -460,18 +485,18 @@ impl SchedulerManager {
         // A sweep, not a timer per gate, so a restart loses no escalation.
         let engine_gates = self.engine.clone();
         let gate_job = Job::new_async(
-            crate::engine::thread_people::GATE_ESCALATION_CRON,
+            crate::engine::thread_users::GATE_ESCALATION_CRON,
             move |_uuid, _lock| {
                 let engine = engine_gates.clone();
                 Box::pin(async move {
-                    crate::engine::thread_people::escalate_overdue_gates(&engine).await;
+                    crate::engine::thread_users::escalate_overdue_gates(&engine).await;
                 })
             },
         )?;
         self.scheduler.add(gate_job).await?;
-        log!(
+        log_legacy!(
             "[Scheduler] Registered system task: gate_escalation ({})",
-            crate::engine::thread_people::GATE_ESCALATION_CRON
+            crate::engine::thread_users::GATE_ESCALATION_CRON
         );
 
         Ok(())
@@ -503,7 +528,7 @@ impl SchedulerManager {
                 .execute(pool)
                 .await
             {
-                log!(
+                log_legacy!(
                     "[Scheduler] Failed to drop legacy trigger_crons table: {}",
                     e
                 );
@@ -552,7 +577,7 @@ impl SchedulerManager {
 
         let count = rows.len();
         for (id, name, legacy_target, _args, cron_json, timezone, enabled, _last_run) in rows {
-            let schedule = legacy_schedule(id, cron_json, |w| log!("{w}"));
+            let schedule = legacy_schedule(id, cron_json, |w| log_legacy!("{w}"));
             let trigger_id_str = id.to_string();
             let payload = serde_json::json!({
                 "trigger_id": trigger_id_str,
@@ -586,7 +611,7 @@ impl SchedulerManager {
             }
         }
 
-        log!(
+        log_legacy!(
             "[Scheduler] Migrated {} trigger(s) from trigger_crons to events",
             count
         );
@@ -631,7 +656,7 @@ impl SchedulerManager {
         }
 
         if count > 0 {
-            log!(
+            log_legacy!(
                 "[Scheduler] Replayed {} trigger events → {} triggers ({} active)",
                 count,
                 total,
@@ -641,23 +666,19 @@ impl SchedulerManager {
         Ok(())
     }
 
-    /// Rebuild the trigger-group registry from its events.
-    ///
-    /// Unlike `replay_triggers_from_events`, a failed read degrades to no
-    /// groups: they schedule nothing and prune nothing, so the panel shows
-    /// flat sections and startup goes on.
+    /// Merge persisted trigger groups; a failed read preserves current state.
     async fn replay_trigger_groups_from_events(&self) {
         let groups = load_trigger_groups(&self.pool).await.unwrap_or_else(|e| {
-            log!("[Scheduler] Failed to replay trigger_group events: {}", e);
-            HashMap::new()
+            log_legacy!("[Scheduler] Failed to replay trigger_group events: {}", e);
+            TriggerGroupProjection::default()
         });
         if !groups.is_empty() {
-            log!(
+            log_legacy!(
                 "[Scheduler] Replayed trigger_group events → {} groups",
                 groups.len()
             );
         }
-        *self.trigger_groups.write().unwrap() = groups;
+        self.trigger_groups.write().unwrap().merge(groups);
     }
 
     /// Migrate triggers whose prompt text is a stale placeholder like `"Run trigger ..."` or `"Run skill ..."`.
@@ -721,7 +742,7 @@ impl SchedulerManager {
                     .emit_trigger_write(TriggerWrite::Updated, &config.id, payload.clone(), None)
                     .await
                 {
-                    log!(
+                    log_legacy!(
                         "[Scheduler] Failed to emit TriggerUpdated for {}: {}",
                         config.id,
                         e
@@ -730,19 +751,19 @@ impl SchedulerManager {
                 }
 
                 updated += 1;
-                log!(
+                log_legacy!(
                     "[Scheduler] Fixed stale trigger prompt: {} ({})",
                     config.name,
                     config.id
                 );
             } else {
-                log!("[Scheduler] WARN: Trigger '{}' ({}) has stale prompt — no matching prompt or script found",
+                log_legacy!("[Scheduler] WARN: Trigger '{}' ({}) has stale prompt — no matching prompt or script found",
                     config.name, config.id);
             }
         }
 
         if updated > 0 {
-            log!("[Scheduler] Migrated {} stale trigger prompt(s)", updated);
+            log_legacy!("[Scheduler] Migrated {} stale trigger prompt(s)", updated);
         }
     }
 
@@ -755,7 +776,7 @@ impl SchedulerManager {
         let configs = self.trigger_configs.read().unwrap();
         for config in configs.values() {
             if let Some(problem) = config.schedule_error() {
-                log!(
+                log_legacy!(
                     "[Scheduler] Trigger '{}' ({}) has a schedule that can never fire: {}. It stays registered but will not run until its cron is fixed.",
                     config.name,
                     config.id,
@@ -806,7 +827,7 @@ impl SchedulerManager {
         )
         .await;
 
-        log!(
+        log_legacy!(
             "[Scheduler] Registered trigger: {} ({} in {})",
             config.name,
             config.schedule.join(", "),
@@ -916,7 +937,7 @@ impl SchedulerManager {
                 PreferenceStore::set(&self.pool, bus, schedule_key, "off", actor.clone()).await?;
                 PreferenceStore::set(&self.pool, bus, provider_key, provider, actor).await?;
                 stop_backup_runner(&self.backup_runner);
-                log!("[Scheduler] Backup schedule disabled");
+                log_legacy!("[Scheduler] Backup schedule disabled");
             }
         }
 
@@ -929,7 +950,7 @@ impl SchedulerManager {
     /// 2. Waits up to 60s for in-flight task executions to complete
     /// 3. Aborts any remaining task handles
     pub async fn shutdown(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        log!("[Scheduler] Shutting down...");
+        log_legacy!("[Scheduler] Shutting down...");
 
         // Normally already set by `begin_teardown`, so this matters only for a
         // caller that shuts the scheduler down alone. Runners finish their
@@ -950,7 +971,7 @@ impl SchedulerManager {
                     .filter(|t| !t.handle.is_finished())
                     .map(|t| t.task_name.as_str())
                     .collect();
-                log!(
+                log_legacy!(
                     "[Scheduler] {} task(s) still executing ({}), waiting for completion...",
                     active,
                     running.join(", ")
@@ -959,12 +980,12 @@ impl SchedulerManager {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
                 if ACTIVE_TASK_COUNT.load(Ordering::Relaxed) == 0 {
-                    log!("[Scheduler] All in-flight tasks completed");
+                    log_legacy!("[Scheduler] All in-flight tasks completed");
                     break;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     let remaining = ACTIVE_TASK_COUNT.load(Ordering::Relaxed);
-                    log!(
+                    log_legacy!(
                         "[Scheduler] Timeout waiting for {} task(s), aborting",
                         remaining
                     );
@@ -983,7 +1004,7 @@ impl SchedulerManager {
         }
 
         self.scheduler.shutdown().await?;
-        log!("[Scheduler] Shutdown complete");
+        log_legacy!("[Scheduler] Shutdown complete");
         Ok(())
     }
 }
@@ -1002,7 +1023,7 @@ async fn backup_timezone(engine: &SharedEngine) -> chrono_tz::Tz {
         return chrono_tz::UTC;
     }
     tz.parse().unwrap_or_else(|_| {
-        log!(
+        log_legacy!(
             "[Scheduler] Invalid timezone '{}' for backup schedule, using UTC",
             tz
         );
@@ -1080,7 +1101,7 @@ async fn catch_up_missed_backup(
     let floor = match backup::load_backup_catch_up_floor(engine.pool()).await {
         Ok(floor) => floor,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] Could not read the backup catch-up floor: {}",
                 e
             );
@@ -1090,7 +1111,9 @@ async fn catch_up_missed_backup(
     if !backup_catch_up_due(schedule, tz, floor, chrono::Utc::now()) {
         return;
     }
-    log!("[Scheduler] A scheduled backup passed while Lucidos was not running, running it now");
+    log_legacy!(
+        "[Scheduler] A scheduled backup passed while Lucidos was not running, running it now"
+    );
     run_scheduled_backup(engine.clone(), provider_id.to_string(), cancel).await;
 }
 
@@ -1119,7 +1142,7 @@ async fn run_backup_loop(
             return;
         }
         let Some(next) = next_backup_fire(&schedule, tz, chrono::Utc::now()) else {
-            log!("[Scheduler] Backup schedule has no further occurrences, stopping");
+            log_legacy!("[Scheduler] Backup schedule has no further occurrences, stopping");
             return;
         };
         loop {
@@ -1170,7 +1193,7 @@ async fn arm_backup_runner(
         let mut slot = backup_runner.lock().unwrap();
         if let Some(prev) = slot.replace(cancel.clone()) {
             prev.cancel();
-            log!("[Scheduler] Stopped backup runner");
+            log_legacy!("[Scheduler] Stopped backup runner");
         }
     }
 
@@ -1182,7 +1205,7 @@ async fn arm_backup_runner(
         cancel,
         arm,
     ));
-    log!(
+    log_legacy!(
         "[Scheduler] Armed backup runner: {} (provider: {}, tz: {})",
         cron_expr,
         provider_id,
@@ -1197,7 +1220,7 @@ fn stop_backup_runner(backup_runner: &BackupRunner) {
     let prev = backup_runner.lock().unwrap().take();
     if let Some(cancel) = prev {
         cancel.cancel();
-        log!("[Scheduler] Stopped backup runner");
+        log_legacy!("[Scheduler] Stopped backup runner");
     }
 }
 
@@ -1221,7 +1244,7 @@ pub(crate) async fn reload_backup_schedule(
         // A preference read that could not run is UNKNOWN, not "the user turned
         // backups off". It still falls through to the disabled branch below, so
         // say so loudly: otherwise a DB hiccup ends scheduled backups in silence.
-        log!(
+        log_legacy!(
             "[Scheduler] Could not read {}, treating the backup schedule as \
              disabled for this reload: {}",
             prefs::BACKUP_SCHEDULE.key(),
@@ -1238,7 +1261,7 @@ pub(crate) async fn reload_backup_schedule(
     };
     let read_provider = prefs::BACKUP_PROVIDER.try_stored(pool).await;
     if let Err(e) = &read_provider {
-        log!(
+        log_legacy!(
             "[Scheduler] Could not read {}, so the backup runner stays disarmed \
              for this reload: {}",
             prefs::BACKUP_PROVIDER.key(),
@@ -1255,7 +1278,7 @@ pub(crate) async fn reload_backup_schedule(
         }
     };
     if let Err(e) = arm_backup_runner(backup_runner, engine, &cron, &provider, arm).await {
-        log!("[Scheduler] Failed to reload backup schedule: {}", e);
+        log_legacy!("[Scheduler] Failed to reload backup schedule: {}", e);
     }
 }
 
@@ -1264,54 +1287,6 @@ mod task_runner;
 #[cfg(test)]
 pub(crate) use task_runner::assert_snapshot_catch_up_excluded;
 use task_runner::{check_task_health_and_restart, register_and_track, TrackedTask};
-
-/// Apply a trigger-group lifecycle event to the in-memory registry. Groups
-/// don't schedule anything, so this is just a write to the shared map. Called
-/// from the EventBus subscriber so every connected SSE consumer (and the
-/// engine's own registry) converges on the same state.
-///
-/// The `create` and `rename` helpers in
-/// [`crate::engine::trigger_group_writes`] also call this synchronously,
-/// under [`crate::engine::LucidosEngine::trigger_group_write_lock`], so the
-/// case-insensitive unique-name invariant survives concurrent requests — the
-/// broadcast subscriber's apply happens too late for that. The reorder
-/// handler (`POST /trigger-groups/reorder`) also calls this synchronously
-/// after each emit, because callers expect a follow-up `GET /trigger-groups`
-/// to reflect the new ordering. Delete still rides only on the broadcast
-/// subscriber today (no read-after-write API contract on delete); if one is
-/// added, route it through this same function as well.
-pub(crate) fn handle_trigger_group_event(
-    event_type: &str,
-    group_id: &str,
-    payload: &serde_json::Value,
-    trigger_groups: &Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>,
-) {
-    match event_type {
-        "TriggerGroupCreated" => {
-            if let Ok(group) = TriggerGroup::from_created_payload(payload, chrono::Utc::now()) {
-                let mut g = trigger_groups.write().unwrap();
-                g.insert(group_id.to_string(), group);
-            }
-        }
-        "TriggerGroupRenamed" => {
-            let mut g = trigger_groups.write().unwrap();
-            if let Some(group) = g.get_mut(group_id) {
-                group.apply_renamed_payload(payload);
-            }
-        }
-        "TriggerGroupReordered" => {
-            let mut g = trigger_groups.write().unwrap();
-            if let Some(group) = g.get_mut(group_id) {
-                group.apply_reordered_payload(payload);
-            }
-        }
-        "TriggerGroupDeleted" => {
-            let mut g = trigger_groups.write().unwrap();
-            g.remove(group_id);
-        }
-        _ => {}
-    }
-}
 
 mod backup;
 use backup::run_scheduled_backup;
@@ -1331,11 +1306,11 @@ use webhook_refusal::{run_webhook_refusal_check, WEBHOOK_REFUSAL_CRON};
 pub(crate) async fn prune_webhook_deliveries(pool: PgPool) {
     match crate::core::DeliveryLedger::prune(&pool).await {
         Ok(0) => {}
-        Ok(gone) => log!(
+        Ok(gone) => log_legacy!(
             "[Scheduler] Pruned {} expired webhook delivery record(s)",
             gone
         ),
-        Err(e) => log!("[Scheduler] prune_webhook_deliveries failed: {}", e),
+        Err(e) => log_legacy!("[Scheduler] prune_webhook_deliveries failed: {}", e),
     }
 }
 
@@ -1353,12 +1328,12 @@ async fn prune_devices(pool: &PgPool, event_bus: &EventBus) {
 async fn remove_one_off_devices(pool: &PgPool, event_bus: &EventBus, older_than_days: i32) {
     match crate::core::DeviceStore::remove_one_off(pool, event_bus, older_than_days).await {
         Ok(removed) if removed.is_empty() => {}
-        Ok(removed) => log!(
+        Ok(removed) => log_legacy!(
             "[Scheduler] Removed {} one-off device(s) (>{}d)",
             removed.len(),
             older_than_days
         ),
-        Err(e) => log!("[Scheduler] remove_one_off_devices failed: {}", e),
+        Err(e) => log_legacy!("[Scheduler] remove_one_off_devices failed: {}", e),
     }
 }
 
@@ -1369,7 +1344,7 @@ async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cuto
     let stale = match crate::core::DeviceStore::list_stale_push_enabled(pool, cutoff_days).await {
         Ok(ids) => ids,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Scheduler] disable_push_on_stale_devices: list failed: {}",
                 e
             );
@@ -1379,7 +1354,7 @@ async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cuto
     if stale.is_empty() {
         return;
     }
-    log!(
+    log_legacy!(
         "[Scheduler] Disabling push on {} stale device(s) (>{}d)",
         stale.len(),
         cutoff_days
@@ -1396,7 +1371,7 @@ async fn disable_push_on_stale_devices(pool: &PgPool, event_bus: &EventBus, cuto
                 // Disappeared between SELECT and UPDATE — benign race.
             }
             Err(e) => {
-                log!("[Scheduler] set_push_enabled({}) failed: {}", device_id, e);
+                log_legacy!("[Scheduler] set_push_enabled({}) failed: {}", device_id, e);
             }
         }
     }

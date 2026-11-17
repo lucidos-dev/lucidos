@@ -2,7 +2,8 @@
  *  restores a thread the previous session died showing. So a thread whose
  *  render kills the page cannot lock the device out of the app.
  *
- *  Focusing a thread arms a window-scoped marker naming it and this window.
+ *  Focusing a thread while visible arms a window-scoped marker naming it and
+ *  this window.
  *  The marker clears once the page has stayed visible for the survival window,
  *  on `pagehide`, or on a hidden visibility change. A launch that finds the
  *  marker naming the stored focus withholds that focus. When another window
@@ -71,9 +72,10 @@ export function takeWithheldThread(): WithheldThread | null {
 }
 
 /** Name the focused thread in the marker and start the survival window. A
- *  `null` focus has nothing to guard, so it clears the marker instead. */
+ *  hidden page or a `null` focus has nothing to guard, so it clears the marker
+ *  instead. Background focus updates must not undo the visibility cleanup. */
 export function armRestoreGuard(threadId: string | null): void {
-  if (threadId === null) {
+  if (threadId === null || document.visibilityState === 'hidden') {
     disarmRestoreGuard();
     return;
   }

@@ -131,18 +131,17 @@ enum LaneThreadRole {
     },
 }
 
-/// A lane thread whose batch ended takes no run while its integration branch
-/// is still there: a run without the batch would work on that branch as if
-/// it were the thread's own, and propose it as a change.
-pub(crate) const LANE_THREAD_ENDED: &str = "This lane thread's batch has ended, and the lane is \
-     still removing its integration branch. Send again in a moment.";
+/// Closed lane conversations retain their batch identity (ADR 0662).
+pub(crate) const LANE_THREAD_ENDED: &str = "This landing batch has ended. \
+    Apply any pending source changes again to start a new landing batch.";
 
-async fn lane_thread_role(
+/// The newest batch `thread_id` is the lane thread of: its id, its base sha,
+/// and whether it landed or failed.
+async fn lane_batch_of_thread(
     pool: &sqlx::PgPool,
-    workspace: &Path,
     thread_id: Uuid,
-) -> Result<LaneThreadRole, sqlx::Error> {
-    let row: Option<(String, String, bool)> = sqlx::query_as(
+) -> Result<Option<(String, String, bool)>, sqlx::Error> {
+    sqlx::query_as(
         "SELECT s.aggregate_id, s.payload->'data'->>'base_sha', EXISTS ( \
              SELECT 1 FROM events e \
              WHERE e.aggregate = 'landing_lane' AND e.aggregate_id = s.aggregate_id \
@@ -154,8 +153,26 @@ async fn lane_thread_role(
     )
     .bind(thread_id.to_string())
     .fetch_optional(pool)
-    .await?;
-    let Some((batch, base_sha, ended)) = row else {
+    .await
+}
+
+/// Whether `thread_id` is the lane thread of a batch that landed or failed:
+/// a closed lane thread, which runs no session again (ADR 0662).
+pub(crate) async fn lane_batch_ended(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    Ok(lane_batch_of_thread(pool, thread_id)
+        .await?
+        .is_some_and(|(batch, _, ended)| ended && Uuid::parse_str(&batch).is_ok()))
+}
+
+async fn lane_thread_role(
+    pool: &sqlx::PgPool,
+    workspace: &Path,
+    thread_id: Uuid,
+) -> Result<LaneThreadRole, sqlx::Error> {
+    let Some((batch, base_sha, ended)) = lane_batch_of_thread(pool, thread_id).await? else {
         return Ok(LaneThreadRole::NotLane);
     };
     let Ok(batch_id) = Uuid::parse_str(&batch) else {
@@ -204,11 +221,8 @@ async fn is_lane_turn(pool: &sqlx::PgPool, request_event_id: Uuid) -> Result<boo
 /// while the turn waits for its worktree. Run anyway, it would merge every
 /// member as an ordinary thread and propose them again.
 ///
-/// Any other run on a thread whose batch ended runs as an ordinary thread once
-/// its integration branch is gone. The run holds the thread's claim here, so
-/// no lane-thread run works in the lane worktree, and it retires what the lane
-/// left. `Err` refuses the run when the branch stays: each later run tries
-/// again, so a removal that timed out cannot refuse the thread for good.
+/// A closed lane thread never becomes an ordinary worker. The run holds the
+/// thread claim, so it can retire the integration branch before refusing.
 pub(crate) async fn lane_duty_for_run(
     pool: &sqlx::PgPool,
     workspace: &Path,
@@ -231,35 +245,28 @@ pub(crate) async fn lane_duty_for_run(
             .await
             // An unknown tries the removal, which refuses on its own unknown.
             .or_unknown(true);
-            if !still_there
-                || super::integration::retire_lane_worktree(pool, repo_root, &worktree).await
-            {
-                Ok(None)
-            } else {
-                Err(LANE_THREAD_ENDED.into())
+            if still_there {
+                super::integration::retire_lane_worktree(pool, repo_root, &worktree).await;
             }
+            Err(LANE_THREAD_ENDED.into())
         }
     }
 }
 
-/// The batch whose lane-thread session a stale session on `thread_id` is.
-/// `session_branch` is the branch its latest `SessionStarted` recorded.
-///
-/// An open batch's lane thread always qualifies. So does a closed batch's,
-/// while its last session still ran on the integration branch. A former lane
-/// thread that has since run as an ordinary thread on its own branch gets
-/// `None`, so its own teardown runs.
+/// Stale cleanup never proposes a historical lane conversation's work.
+/// Explicit Discard may still clean up a historical ordinary branch.
 pub(crate) async fn lane_batch_of_stale_session(
     pool: &sqlx::PgPool,
     workspace: &Path,
     thread_id: Uuid,
     session_branch: Option<&str>,
+    discard: bool,
 ) -> Result<Option<Uuid>, sqlx::Error> {
     Ok(match lane_thread_role(pool, workspace, thread_id).await? {
         LaneThreadRole::NotLane => None,
         LaneThreadRole::Resolving(duty) => Some(duty.batch_id),
         LaneThreadRole::Ended { batch_id, worktree } => {
-            (session_branch == Some(worktree.branch.as_str())).then_some(batch_id)
+            (!discard || session_branch == Some(worktree.branch.as_str())).then_some(batch_id)
         }
     })
 }

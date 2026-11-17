@@ -32,6 +32,11 @@ const WIDGET_HTML = `<!doctype html><html><head><script src="/api/v1/sdk.js"></s
   read();
 </script></body></html>`;
 
+const THREAD_LIST = /\/api\/v1\/threads(\?.*)?$/;
+const APP_DOCUMENT = (url: URL) => url.pathname === '/';
+const SLOW_LIST_MS = 3_000;
+const SLOW_RELOAD_MS = 5_000;
+
 let written: string[] = [];
 let seededThreads: string[] = [];
 let appId = '';
@@ -56,13 +61,31 @@ function event(type: string, threadId: string, payload: string, now: string): st
     + `VALUES ('${randomUUID()}', '${type}', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`;
 }
 
+// A service worker answers the shell itself, out of reach of `page.route`.
+test.use({ serviceWorkers: 'block' });
+
 test.describe('The focused thread in the SDK', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
     written = [];
     seededThreads = [];
     appId = `e2e-focused-thread-${randomUUID().slice(0, 8)}`;
-    await page.goto('/');
+    // A cold engine answers the first thread list and the reload late, as a
+    // busy runner does. The first page opens Home when its list lands. That
+    // can be after the spec seeded a focus and before the reload commits.
+    ensureHomeThread();
+    let documents = 0;
+    await page.route(THREAD_LIST, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, SLOW_LIST_MS));
+      await route.continue();
+    });
+    await page.route(APP_DOCUMENT, async (route) => {
+      if (documents++ > 0) await new Promise((resolve) => setTimeout(resolve, SLOW_RELOAD_MS));
+      await route.continue();
+    });
+    // Let the first load finish its cold start. It opens Home once the thread
+    // list lands, and that write replaces the focus the test seeds below.
+    await navigateToApp(page);
   });
 
   test.afterEach(async ({ page }) => {

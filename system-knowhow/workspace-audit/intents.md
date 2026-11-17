@@ -17,6 +17,12 @@ so it adds no row to the receipts.
 
 ## Checks
 
+- **Thread assessments from old replies.** An intent asking about thread progress must read current liveness before a verdict.
+  See `system-knowhow/glossary.md` § Thread liveness; earlier replies are history.
+
+An intent that reads unattended trigger output must name a file read rather than rely on workspace memory.
+See `docs/system-events.md` § Artifact provenance and provider holds.
+
 For each finding, capture: **location**, **what's wrong**, **which reference owns the rule** (link, don't quote), **suggested fix**.
 
 Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-registry.md`): `apps/<id>/intents/`, `apps/<id>/triggers/`, and `triggers/<slug>/`. Trigger `.md` files are intents too. If an ID in the engine's "Available Intents" list has no file under `intents/`, look in the sibling `triggers/` directory before calling it a phantom.
@@ -35,3 +41,8 @@ Scope is **every `.md` file the registry reads** (per `system-knowhow/intent-reg
   the renamed id.
 - Reads in user terms, not engineer terms (same test as triggers).
 - **Do not flag** a missing `data/triggers/<slug>/<slug>.md` for a *standalone scheduled trigger*. Its `run.intent` (in the `TriggerCreated` payload) is enough for scheduled firing. An on-disk procedure file is warranted only for dual use: scheduled firing **and** an on-demand run through `load_knowhow`. A pure scheduled orchestrator nothing calls manually is correct as-is.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

@@ -434,8 +434,8 @@ assert_eq "only the reclaimable one was stopped" \
 # verification, so every case below puts the comeback beyond the old 10.
 
 COLDRUN_WS=/home/u/.lucidos/gateway/workspaces/coldrun
-RESPAWN_LINE="09:36:59 [pid:1101] [Gateway] respawning 'coldrun' after 6 missed probe(s) (outcome=Unreachable, alive=false)"
-LAZY_LINE="09:37:02 [pid:1101] [Gateway] lazy-starting 'coldrun' on demand"
+RESPAWN_LINE="2026-11-11T09:36:59+01:00 [pid:1101] [Gateway] respawning 'coldrun' after 6 missed probe(s) (outcome=Unreachable, alive=false)"
+LAZY_LINE="2026-11-11T09:37:02+01:00 [pid:1101] [Gateway] lazy-starting 'coldrun' on demand"
 
 echo "preflight_reclaim: a supervisor respawn inside the window fails the step"
 reset_host

@@ -245,7 +245,9 @@ pub(crate) async fn last_used_device(
     match newest {
         Ok(found) => found.or(fallback),
         Err(e) => {
-            log!("[AgentContext] last used device lookup failed for thread {thread_id}: {e}");
+            log_legacy!(
+                "[AgentContext] last used device lookup failed for thread {thread_id}: {e}"
+            );
             fallback
         }
     }
@@ -280,7 +282,7 @@ pub(crate) async fn build_user_device_preferences_context_for_origin(
         Ok(Some(row)) => device_from_event_row(&row),
         Ok(None) => None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to load origin event {} for device/preferences context: {}",
                 origin_id,
                 e
@@ -348,7 +350,7 @@ async fn build_known_devices(pool: &PgPool) -> Vec<SeenDevice> {
     match DeviceStore::recently_seen(pool, KNOWN_DEVICES_LIMIT, KNOWN_DEVICES_WITHIN_DAYS).await {
         Ok(devices) => devices,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to list known devices for agent context: {}",
                 e
             );
@@ -401,7 +403,7 @@ async fn build_preference_lines(pool: &PgPool, device_id: Option<&str>) -> Vec<S
     let prefs = match prefs {
         Ok(prefs) => prefs,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentContext] Failed to load user-facing preferences for agent context: {}",
                 e
             );
@@ -592,6 +594,18 @@ mod tests {
             None,
             "a finished child thread is not a user action"
         );
+    }
+
+    /// A Continue routed into a live run forwards and renders as a user input
+    /// did before it had a kind of its own.
+    #[test]
+    fn a_routed_continue_renders_like_a_user_input() {
+        use crate::engine::{AgentInputKind, AgentUserInput};
+        let requested = Uuid::new_v4();
+        let input = AgentUserInput::continuation("Continue".into(), requested);
+        assert_eq!(input.kind, AgentInputKind::Continuation);
+        assert_eq!(input.user_origin(), Some(requested));
+        assert!(input.kind.writes_prompt_sent());
     }
 
     /// The agent picks a device on purpose from this list. So each row carries

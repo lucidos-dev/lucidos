@@ -18,26 +18,34 @@
 //! `LUCIDOS_ENGINE_BIN` (its own `current_exe` is the gateway, so the engine
 //! path must be explicit).
 
-/// Timestamped log line, `[pid:N]`-tagged like the engine's. Messages carry
-/// their own `[Gateway]` prefix (kept consistent across the crate), so this is a
-/// thin wrapper — no module-label derivation. Duplicated from the engine on
-/// purpose (ADR 0014 §1: the gateway must not link the engine for a 6-line
-/// macro).
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
+/// Compile-checked values, with the same timestamped host output as legacy logs.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
-        println!("{} [pid:{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            std::process::id(),
-            format_args!($($arg)*))
+        $crate::diagnostic_log::typed(::lucidos_diagnostic_log::line!($($arg)*))
     };
 }
+
+/// Migration bridge: maintainer bundles exclude the whole unstructured message.
+#[macro_export]
+macro_rules! log_legacy {
+    ($($arg:tt)*) => {
+        $crate::diagnostic_log::legacy(format!($($arg)*))
+    };
+}
+
+mod diagnostic_bundle;
+mod diagnostic_log;
+mod diagnostic_transport;
 
 mod atomic_file;
 mod auth;
 mod auth_api;
 mod boot_failure;
 mod boot_phase;
+mod broker;
 mod build_id;
 /// The one test that needs a live engine, run by `./scripts/e2e-api.sh`.
 #[cfg(test)]
@@ -46,21 +54,29 @@ mod cleanup;
 mod cleanup_audit;
 mod cleanup_process;
 mod control;
+mod disposable;
 mod engine_hop;
+mod engine_signal;
 mod error;
 mod external_address;
 mod file_backup;
 mod gateway_event_log;
+mod gateway_identity;
 mod gateway_protocol;
 mod hook_socket;
+mod host_logs;
 mod installs;
+mod local_updates;
+mod manage_hop;
 mod net_config;
 mod next_boot;
+#[cfg(test)]
+mod notification_count_tests;
 mod nudge;
 mod oauth_callback;
-mod operators_api;
 mod pairing;
 mod pairing_qr;
+mod pairing_requests;
 mod peer_connection;
 mod peers;
 mod postgres;
@@ -70,17 +86,22 @@ mod proxy;
 mod registry;
 mod relay;
 mod release_check;
+mod remote_browser;
 mod remote_gateways;
 mod remote_workspaces;
 mod server;
 mod shell_env;
 mod slowness;
 mod stack;
+mod stamp_handover;
 mod tls;
 mod trash;
+mod update_channels;
 mod update_relay;
+mod users_api;
 #[cfg(test)]
 mod value_pins_tests;
+mod workspace_calls;
 mod workspace_order;
 
 /// Lucidos umbrella release version (e.g. "0.7"), sourced from the repo-root
@@ -122,16 +143,18 @@ fn boot_failure_line(err: impl std::fmt::Display) -> String {
 /// a path-bearing reason reached the log unreadable and reached the user not at
 /// all.
 fn main() -> std::process::ExitCode {
-    match boot() {
+    let outcome = match boot() {
         Ok(server::RunOutcome::Stopped) => std::process::ExitCode::SUCCESS,
         Ok(server::RunOutcome::AlreadyRunning) => {
             std::process::ExitCode::from(server::ALREADY_RUNNING_EXIT)
         }
         Err(e) => {
-            eprintln!("{}", boot_failure_line(e));
+            diagnostic_log::boot_failure(&boot_failure_line(e));
             std::process::ExitCode::FAILURE
         }
-    }
+    };
+    lucidos_diagnostic_log::flush(std::time::Duration::from_secs(1));
+    outcome
 }
 
 fn boot() -> Result<server::RunOutcome, BoxError> {
@@ -141,11 +164,11 @@ fn boot() -> Result<server::RunOutcome, BoxError> {
         .skip(1)
         .any(|a| a == "--version" || a == "-V")
     {
-        println!(
+        diagnostic_log::probe(format_args!(
             "Lucidos {} (lucidos-gateway {})",
             LUCIDOS_RELEASE,
             env!("CARGO_PKG_VERSION"),
-        );
+        ));
         return Ok(server::RunOutcome::Stopped);
     }
 
@@ -155,21 +178,29 @@ fn boot() -> Result<server::RunOutcome, BoxError> {
     // single bare line on stdout (no log prefix), like `--version`. See
     // `server::gateway_build_id` and `docs/plans/2026-06-18-gateway-reload-control.md`.
     if std::env::args().skip(1).any(|a| a == "--build-id") {
-        println!("{}", server::GATEWAY_BUILD_ID);
+        diagnostic_log::probe(format_args!("{}", server::GATEWAY_BUILD_ID));
         return Ok(server::RunOutcome::Stopped);
     }
 
     // Above the runtime build: both set process env, which is sound only while
     // this process is single-threaded. The take comes first, so the login shell
     // inherits no lock. A test below pins the order.
+    let disposable = disposable::from_args(std::env::args_os().skip(1).collect())?;
     let inherited_lock_fd = server::take_inherited_lock_fd();
-    shell_env::hydrate_login_shell_env();
+    let inherited_stamp_keys = stamp_handover::take_inherited();
+    if disposable.is_none() {
+        shell_env::hydrate_login_shell_env();
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_THREAD_STACK_SIZE)
         .build()?;
-    rt.block_on(server::run(inherited_lock_fd))
+    rt.block_on(server::run(
+        inherited_lock_fd,
+        inherited_stamp_keys,
+        disposable,
+    ))
 }
 
 #[cfg(test)]
@@ -202,8 +233,9 @@ mod tests {
         let runtime = boot
             .find("tokio::runtime::Builder")
             .expect("boot() builds the runtime");
-        let [take, hydrate] = [
+        let [take, take_keys, hydrate] = [
             "server::take_inherited_lock_fd();",
+            "stamp_handover::take_inherited();",
             "shell_env::hydrate_login_shell_env();",
         ]
         .map(|env_writer| {
@@ -217,8 +249,11 @@ mod tests {
             at
         });
         assert!(
-            take < hydrate,
-            "hydration spawns the login shell, which must not inherit the reload's lock"
+            take < hydrate && take_keys < hydrate,
+            "hydration spawns the login shell, which must not inherit the reload's lock or keys"
         );
     }
 }
+
+#[cfg(test)]
+mod diagnostic_logging_tests;

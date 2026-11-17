@@ -44,6 +44,7 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: "c1".into(),
             description: Some("Fix".into()),
             files: vec!["a.rs".into()],
@@ -65,6 +66,7 @@ async fn cc_idle_no_changes_from_inbox_stays_inbox() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: "c1".into(),
             requires_restart: false,
             client_update: false,
@@ -365,6 +367,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sess-1".into(),
             branch: "claude-code/branch".into(),
@@ -397,6 +400,7 @@ async fn test_cc_activity_after_idled_bumps_status_back_to_running() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -496,6 +500,7 @@ async fn test_cc_text_streamed_after_idled_bumps_status_back_to_running() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -621,7 +626,9 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: "Unknown error".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: EventMeta::NONE,
     })

@@ -206,3 +206,16 @@ fn a_refusal_says_which_wall_it_hit() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert!(body.contains("/api/v1/backup/key/reveal-token"), "{body}");
 }
+
+#[test]
+fn any_device_session_header_refuses_secret_reveal() {
+    for (_, rule) in BOTH_RULES {
+        for value in ["", "invalid-session"] {
+            let h = headers(&[
+                (lucidos_gateway_stamp::HEADER_DEVICE_SESSION, value),
+                ("referer", "https://localhost/work/"),
+            ]);
+            assert!(!reveal_request_allowed(&h, rule));
+        }
+    }
+}

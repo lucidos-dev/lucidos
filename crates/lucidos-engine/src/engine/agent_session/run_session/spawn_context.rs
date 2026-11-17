@@ -31,7 +31,7 @@ async fn link_node_modules_tree(src: &Path, dst: &Path, label: &str) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Skipping {} link — failed to clear stale dir: {}",
                 label,
                 e
@@ -39,14 +39,14 @@ async fn link_node_modules_tree(src: &Path, dst: &Path, label: &str) {
             return;
         }
     }
-    log!("[AgentSession] Linking {} to worktree...", label);
+    log_legacy!("[AgentSession] Linking {} to worktree...", label);
     // Try hardlinks first (instant, zero disk space); fall back to a full copy.
     let hl = tokio::process::Command::new("cp")
         .args(["-al", &src.to_string_lossy(), &dst.to_string_lossy()])
         .output()
         .await;
     if matches!(&hl, Ok(o) if o.status.success()) {
-        log!("[AgentSession] {} hardlinked to worktree", label);
+        log_legacy!("[AgentSession] {} hardlinked to worktree", label);
         return;
     }
     match tokio::process::Command::new("cp")
@@ -54,13 +54,13 @@ async fn link_node_modules_tree(src: &Path, dst: &Path, label: &str) {
         .output()
         .await
     {
-        Ok(o) if o.status.success() => log!("[AgentSession] {} copied to worktree", label),
-        Ok(o) => log!(
+        Ok(o) if o.status.success() => log_legacy!("[AgentSession] {} copied to worktree", label),
+        Ok(o) => log_legacy!(
             "[AgentSession] cp {} failed: {}",
             label,
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[AgentSession] Failed to copy {}: {}", label, e),
+        Err(e) => log_legacy!("[AgentSession] Failed to copy {}: {}", label, e),
     }
 }
 
@@ -80,15 +80,15 @@ pub(crate) async fn provision_generated_files(wt_path: &Path) {
         .output()
         .await
     {
-        Ok(o) if o.status.success() => log!(
+        Ok(o) if o.status.success() => log_legacy!(
             "[AgentSession] generated files provisioned: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[AgentSession] codegen --cached-only failed in worktree: {}",
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!("[AgentSession] Failed to run codegen in worktree: {}", e),
+        Err(e) => log_legacy!("[AgentSession] Failed to run codegen in worktree: {}", e),
     }
 }
 
@@ -101,7 +101,7 @@ async fn provision_node_modules(repo_root: &Path, wt_path: &Path) {
     {
         // At the workspace root, so every member installs. `npm ci` wipes
         // node_modules itself, so a stale Vite cache here does no harm.
-        log!("[AgentSession] No node_modules in main repo to copy, running npm ci...");
+        log_legacy!("[AgentSession] No node_modules in main repo to copy, running npm ci...");
         match tokio::process::Command::new("npm")
             .args(["ci", "--prefer-offline"])
             .current_dir(wt_path)
@@ -109,13 +109,13 @@ async fn provision_node_modules(repo_root: &Path, wt_path: &Path) {
             .await
         {
             Ok(o) if o.status.success() => {
-                log!("[AgentSession] node_modules installed in worktree");
+                log_legacy!("[AgentSession] node_modules installed in worktree");
             }
-            Ok(o) => log!(
+            Ok(o) => log_legacy!(
                 "[AgentSession] npm ci failed in worktree: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ),
-            Err(e) => log!("[AgentSession] Failed to run npm ci in worktree: {}", e),
+            Err(e) => log_legacy!("[AgentSession] Failed to run npm ci in worktree: {}", e),
         }
     }
     link_node_modules(repo_root, wt_path).await;
@@ -231,7 +231,7 @@ impl LucidosEngine {
             branch_created,
         ) = if let Some((wt_path, branch)) = recovery_worktree {
             // Recovery mode: reuse an orphaned worktree from a previous session
-            log!(
+            log_legacy!(
                 "[AgentSession] Starting recovery session on orphaned worktree: {} (branch {})",
                 wt_path.display(),
                 branch
@@ -343,12 +343,12 @@ impl LucidosEngine {
                 _ => None,
             };
             if let Some(ref caller) = caller_worktree {
-                log!(
+                log_legacy!(
                     "[AgentSession] Using caller-supplied worktree path for resume: {}",
                     caller.display()
                 );
             } else if let Some(ref skipped) = resume_worktree_path {
-                log!(
+                log_legacy!(
                     "[AgentSession] Caller-supplied worktree path {} is missing or not a live linked worktree — falling back to branch lookup",
                     skipped.display()
                 );
@@ -393,7 +393,7 @@ impl LucidosEngine {
                 Some(resolved_path.clone())
             } else {
                 if resolved_path.exists() {
-                    log!(
+                    log_legacy!(
                             "[AgentSession] worktree path {} exists but is not a live linked worktree (stranded) — recreating instead of running against the enclosing repo",
                             resolved_path.display()
                         );
@@ -402,7 +402,7 @@ impl LucidosEngine {
             };
 
             let wt_path = if let Some(ref existing) = existing_worktree {
-                log!(
+                log_legacy!(
                     "[AgentSession] Reusing existing worktree at {} for branch {}",
                     existing.display(),
                     branch_name
@@ -466,7 +466,7 @@ impl LucidosEngine {
                             };
                             match continuing {
                                 Some(new_branch) if is_external_repo => {
-                                    log!(
+                                    log_legacy!(
                                         "[AgentSession] Adopting renegade branch '{}' (was expecting '{}') for thread {}",
                                         new_branch,
                                         branch_name,
@@ -478,7 +478,7 @@ impl LucidosEngine {
                                     new_branch
                                 }
                                 Some(side_branch) => {
-                                    log!(
+                                    log_legacy!(
                                         "[AgentSession] Resuming thread {} on its side branch '{}', still tracking '{}'",
                                         thread_id,
                                         side_branch,
@@ -493,7 +493,7 @@ impl LucidosEngine {
                                     branch_name
                                 }
                                 None => {
-                                    log!(
+                                    log_legacy!(
                                         "[AgentSession] Refusing spawn for thread {}: {}",
                                         thread_id,
                                         mismatch
@@ -526,7 +526,7 @@ impl LucidosEngine {
                     } else {
                         match worktree_current_branch(existing).await {
                             Some(a) if a != branch_name => {
-                                log!(
+                                log_legacy!(
                                 "[AgentSession] Worktree {} is on branch {} (expected {}) — overriding",
                                 wt_path.display(),
                                 a,
@@ -612,7 +612,10 @@ impl LucidosEngine {
                     .await
                     {
                         Err(e) => {
-                            log!("[AgentSession] Failed to create sparse app worktree: {}", e);
+                            log_legacy!(
+                                "[AgentSession] Failed to create sparse app worktree: {}",
+                                e
+                            );
                             return Err(format!(
                                 "Failed to create sparse-checkout app worktree: {e}"
                             )
@@ -620,7 +623,7 @@ impl LucidosEngine {
                         }
                         Ok(created) => {
                             app_branch_created = Some(created);
-                            log!(
+                            log_legacy!(
                                 "[AgentSession] {} sparse app worktree at {} on {} branch {} (app={})",
                                 if created { "Created" } else { "Resumed" },
                                 wt_path.display(),
@@ -654,13 +657,13 @@ impl LucidosEngine {
                         Ok(name) => {
                             branch_name = name;
                             if reusing_branch {
-                                log!(
+                                log_legacy!(
                                     "[AgentSession] Resumed worktree at {} on existing branch {}",
                                     wt_path.display(),
                                     branch_name
                                 );
                             } else {
-                                log!(
+                                log_legacy!(
                                     "[AgentSession] Created worktree at {} on branch {}{}",
                                     wt_path.display(),
                                     branch_name,
@@ -672,7 +675,7 @@ impl LucidosEngine {
                             }
                         }
                         Err(e) => {
-                            log!("[AgentSession] Failed to create worktree: {}", e);
+                            log_legacy!("[AgentSession] Failed to create worktree: {}", e);
                             return Err(format!(
                                 "Failed to create git worktree for coding-agent isolation: {}",
                                 e
@@ -683,7 +686,7 @@ impl LucidosEngine {
                 } // end non-app spawn branch
             }
 
-            log!(
+            log_legacy!(
                 "[AgentSession] [TIMING] worktree created: {:?}",
                 cc_start.elapsed()
             );
@@ -702,7 +705,7 @@ impl LucidosEngine {
             // A stale git registration at that path is pruned by `worktree_add`
             // itself, so there is nothing to clear first.
             if !wt_path.exists() {
-                log!(
+                log_legacy!(
                     "[AgentSession] worktree {} still missing after setup — recreating from branch {} before spawn",
                     wt_path.display(),
                     branch_name
@@ -733,7 +736,7 @@ impl LucidosEngine {
                     )
                     .into());
                 }
-                log!(
+                log_legacy!(
                     "[AgentSession] recreated missing worktree {} from branch {}",
                     wt_path.display(),
                     branch_name
@@ -755,7 +758,7 @@ impl LucidosEngine {
                 provision_generated_files(&wt_path).await;
             }
 
-            log!(
+            log_legacy!(
                 "[AgentSession] [TIMING] node_modules and generated files done: {:?}",
                 cc_start.elapsed()
             );
@@ -772,7 +775,7 @@ impl LucidosEngine {
                 _ => ws_id,
             };
             if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
-                log!("[AgentSession] Failed to write workspace marker: {}", e);
+                log_legacy!("[AgentSession] Failed to write workspace marker: {}", e);
             }
 
             // Add engine-injected paths to the worktree's git exclude so external
@@ -846,7 +849,7 @@ impl LucidosEngine {
         if conflict_change.is_none() && lane_duty.is_none() {
             if let Some(ref wt_path) = worktree_path {
                 if let Err(e) = install_coding_agent_diff_hook(repo_root, wt_path).await {
-                    log!(
+                    log_legacy!(
                         "[AgentSession] Failed to install coding-agent diff hook for {}: {}",
                         wt_path.display(),
                         e
@@ -909,7 +912,7 @@ impl LucidosEngine {
             .app_manager
             .list_reusable_widgets()
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[AgentSession] The reusable widgets could not be read: {}",
                     e
                 );
@@ -941,7 +944,7 @@ impl LucidosEngine {
         {
             Ok(view) => crate::engine::summary_tree::view::coding_agent_section(&view),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[AgentSession] The workspace memory view could not be read: {}",
                     e
                 );

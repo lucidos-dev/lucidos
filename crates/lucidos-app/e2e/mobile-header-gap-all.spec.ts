@@ -53,6 +53,52 @@ test.describe('Mobile header gap regression', () => {
     expect(cssVarPx).toBeGreaterThan(0);
   });
 
+  test('resume reconciles a missed header resize while scrolled', async ({ page }) => {
+    await page.addInitScript(() => {
+      const Observer = window.ResizeObserver;
+      // Model a suspended browser that delivered no header observer callback.
+      window.ResizeObserver = class extends Observer {
+        constructor(callback: ResizeObserverCallback) {
+          super((entries, observer) => {
+            const others = entries.filter(entry => !entry.target.matches('.app-header'));
+            if (others.length) callback(others, observer);
+          });
+        }
+      };
+    });
+    await navigateToApp(page);
+    await sendMessage(page, `Say exactly: "${uniqueMessage('resume-gap')}"`);
+    await waitForResponse(page);
+    await ensureOnThreadPane(page);
+    // Let the mount-only measurement poll finish before the missed resize.
+    await page.waitForTimeout(700);
+    await page.evaluate(() => {
+      const header = document.querySelector<HTMLElement>('.app-header')!;
+      header.style.paddingBottom = '100px';
+      window.dispatchEvent(new Event('resize'));
+      const scroller = document.querySelector<HTMLElement>('.mobile-swipe-pane .thread-content.visible')!;
+      const filler = document.createElement('div');
+      filler.dataset.resumeAnchor = '';
+      filler.style.height = '2000px';
+      scroller.append(filler);
+      scroller.scrollTop = 300;
+    });
+    await page.waitForTimeout(100);
+    const anchor = page.locator('[data-resume-anchor]');
+    const before = await anchor.evaluate(el => el.getBoundingClientRect().top);
+    await page.evaluate(() => {
+      document.querySelector<HTMLElement>('.app-header')!.style.removeProperty('padding-bottom');
+      window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await expect.poll(() => page.evaluate(() => {
+      const header = document.querySelector('.app-header')!.getBoundingClientRect();
+      const title = document.querySelector('.mobile-swipe-pane .mobile-thread-title-row')!.getBoundingClientRect();
+      return Math.abs(title.top - header.bottom);
+    })).toBeLessThan(1);
+    expect(await anchor.evaluate(el => el.getBoundingClientRect().top)).toBeCloseTo(before, 0);
+  });
+
   test('thread title bar sits flush against header bottom when sticky', async ({ page }) => {
     await navigateToApp(page);
 

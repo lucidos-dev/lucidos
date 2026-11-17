@@ -255,28 +255,6 @@ mod tests {
         }
     }
 
-    /// Approval follows authorship, so there is no tool for it. Otherwise an
-    /// app wanting a script blessed would only have to talk the agent into
-    /// pressing the button. Knowhow it wrote is one way to try.
-    ///
-    /// The agent CAN still make a script runnable, by writing the content
-    /// itself through `write_file` or `edit_file`. That is the same power as
-    /// `run_python`, which it already has, so it is not what this guards.
-    #[test]
-    fn the_llm_tool_surface_knows_nothing_about_approving() {
-        let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
-            .into_iter()
-            .filter(|(rel, text)| {
-                rel.starts_with("llm/tools/") && text.to_lowercase().contains("handshake approve")
-            })
-            .map(|(rel, _)| rel)
-            .collect();
-        assert!(
-            offenders.is_empty(),
-            "an approve tool would let an app launder a script through the agent: {offenders:?}"
-        );
-    }
-
     #[test]
     fn a_path_outside_the_script_tree_is_refused() {
         let ws = std::path::Path::new("/ws");
@@ -289,6 +267,31 @@ mod tests {
             "scripts/auth/x.py\nscripts/auth/y.py",
         ] {
             assert!(approval_key(ws, bad).is_err(), "{bad} must be refused");
+        }
+    }
+
+    mod guard_tests {
+        /// Approval follows authorship, so there is no tool for it. Otherwise an
+        /// app wanting a script blessed would only have to talk the agent into
+        /// pressing the button. Knowhow it wrote is one way to try.
+        ///
+        /// The agent CAN still make a script runnable, by writing the content
+        /// itself through `write_file` or `edit_file`. That is the same power as
+        /// `run_python`, which it already has, so it is not what this guards.
+        #[test]
+        fn the_llm_tool_surface_knows_nothing_about_approving() {
+            let offenders: Vec<String> = crate::test_support::source_scan::production_sources()
+                .into_iter()
+                .filter(|(rel, text)| {
+                    rel.starts_with("llm/tools/")
+                        && text.to_lowercase().contains("handshake approve")
+                })
+                .map(|(rel, _)| rel)
+                .collect();
+            assert!(
+                offenders.is_empty(),
+                "an approve tool would let an app launder a script through the agent: {offenders:?}"
+            );
         }
     }
 }

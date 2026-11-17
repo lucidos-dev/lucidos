@@ -67,6 +67,14 @@ The `push_notifications` **preference** (the "on" switch in settings) only recor
 - The browser handshake runs first. A refused permission leaves the flag off rather than recording an opt-in the OS will never honour.
 - Turning it on **from a phone** also offers to turn it off on the user's OTHER phones and tablets. One notification then stops buzzing several handsets. A desktop is never part of that offer, since a laptop and a phone are complementary surfaces. Cancelling leaves every device as it was.
 
+### Remote workspace web push
+
+Remote workspaces register the connecting gateway's installed worker at `/~/sw.js?workspace=<slug@peer>`.
+Its scope is exactly that remote workspace; it handles push without intercepting requests or modifying caches.
+Notification taps remain inside the selected remote workspace.
+Startup waits for an active worker before refreshing the subscription.
+Trusted entry retires legacy foreign workers and remote cached assets while preserving local workspace data.
+
 ## §2: The fan-out rule
 
 **Step 0: the audience (team workspaces only).** Every notification records who it is for, as device ids on `NotificationCreated` and its row (ADR 0623). A producer may name them. Otherwise, a notification that opens a thread is for its *root thread*'s audience. The engine finds the thread from the tap's thread target, else from `event_id`. The audience is the devices of the root thread's *driver* and *watchers*.
@@ -76,23 +84,23 @@ The `push_notifications` **preference** (the "on" switch in settings) only recor
 - The inbox still lists every notification, but one outside your audience reads as read: it never lights your bell badge or your app badge.
 - A lookup that fails reaches the whole team.
 
-**Read state is per person on a team gateway.** With two or more people, a read from a device a person holds is that person's: it clears the notification on their other devices and leaves everyone else's unread. Mark all read works the same way, and so does clearing the in-app toast and the desktop banner: `NativePushDismissRequested` carries the reader's devices as `audience`. A caller no person holds reads and writes the team's shared flag, and so does the agent's `notifications` tool. With one person, everything reads the shared flag, as before. Each device's push badge counts what its own person has not read.
+**Read state is per user on a team gateway.** With two or more users, a read from a device a user holds is that user's: it clears the notification on their other devices and leaves everyone else's unread. Mark all read works the same way, and so does clearing the in-app toast and the desktop banner: `NativePushDismissRequested` carries the reader's devices as `audience`. A caller no user holds reads and writes the team's shared flag, and so does the agent's `notifications` tool. With one user, everything reads the shared flag, as before. Each device's push badge counts what its own user has not read.
 
-**People-only messages (team workspaces only, ADR 0649).** A *people-only message* raises one notification for its mentioned people plus the root thread's driver and watchers, never the sender's own person. A message that wakes the agent and mentions people tells only the mentioned. Either way a mentioned person with no role becomes a watcher first.
+**User-only messages (team workspaces only, ADR 0649).** A *user-only message* raises one notification for its mentioned users plus the root thread's driver and watchers, never the sender's own user. A message that wakes the agent and mentions users tells only the mentioned. Either way a mentioned user with no role becomes a watcher first.
 
-A people-only message's notification records a *push group* on `NotificationCreated` and its row. Every push in the group carries the tag `people-<thread_id>`, so a burst replaces one banner, and an **Unwatch** action (see Layer 1). iOS draws no action buttons, so there it is a plain banner.
+A user-only message's notification records a *push group* on `NotificationCreated` and its row. Every push in the group carries the tag `user-<thread_id>`, so a burst replaces one banner, and an **Unwatch** action (see Layer 1). iOS draws no action buttons, so there it is a plain banner.
 
-**Thread people notices (team workspaces only).** Three notifications reach one or a few people besides the gates:
+**Thread users notices (team workspaces only).** Three notifications reach one or a few users besides the gates:
 
 | Notice | Sent when | For |
 |---|---|---|
-| "Kim answered your gate" | someone answers a gate on a root thread another person drives, and so takes it over | the person who drove it |
-| "Kim took over" | someone taps **Take** on a root thread another person drives | the person who drove it |
+| "Kim answered your gate" | someone answers a gate on a root thread another user drives, and so takes it over | the user who drove it |
+| "Kim took over" | someone taps **Take** on a root thread another user drives | the user who drove it |
 | "Thread done" | the root thread is archived | its driver and watchers, except whoever archived it |
 
-Each opens the root thread. Nobody hears one on a gateway with fewer than two people, and nobody whose person holds no device.
+Each opens the root thread. Nobody hears one on a gateway with fewer than two users, and nobody whose user holds no device.
 
-**Config change notices (team workspaces only).** A *config change* posts a notification naming who made it: a repository, trigger, MCP server or credential added, changed or removed (`engine/config_change.rs`). It reaches everyone but the person who made it. A change by an agent, or by a device no person holds, reaches the whole team. A change nobody made posts nothing: an engine write, an identity collapse, a one-shot trigger deleting itself.
+**Config change notices (team workspaces only).** A *config change* posts a notification naming who made it: a repository, trigger, MCP server or credential added, changed or removed (`engine/config_change.rs`). It reaches everyone but the user who made it. A change by an agent, or by a device no user holds, reaches the whole team. A change nobody made posts nothing: an engine write, an identity collapse, a one-shot trigger deleting itself.
 
 Where the event recorded enough to invert it, the tap is `{"kind": "undo-config-change", "event_id": "<uuid>"}`. Tapping it, or **Undo** in the detail, asks to confirm and then calls `POST /api/v1/config-changes/:event_id/undo`. The engine writes the inverse through the same store, as the tapping device, so an undo is a config change of its own. It answers 409 `moved_on` when a later change touched the same thing, or the thing is already gone or already back. So an undo never overwrites someone's later edit. It answers 409 `not_undoable` for:
 
@@ -448,6 +456,54 @@ One set of constructors (`store/actions/visitKeys.ts`) spells both the place a t
 
 The Tauri desktop app embeds a WKWebView, which has no service worker and can't subscribe to Web Push. The native banner fills that gap, driven page-side from the same SSE stream.
 
+Ordinary packaged Cmd-W and red-button closes hide every app window, retaining
+its page and existing workspace connection. Close to Menu Bar hides all app
+windows through the same operation. Each hide marks only its own window
+inactive for notification presence and records its watchdog hide intent.
+The last visible app window disappearing leaves the client in the menu bar.
+Reopen reuses retained windows; a notification tap targets only its workspace.
+
+Native hide/show intent also has its own per-window bridge:
+`get_native_window_shown` seeds it and `native-window-shown` publishes transitions.
+It stays separate from focus: an unfocused window can still be shown.
+The listener registers before the seed so a concurrent transition takes precedence.
+
+A newer frontend can run inside an older installed desktop shell.
+Only an exact missing-command or ACL-denied response for this command marks the protocol unsupported.
+Those shells keep unknown native visibility and the previous eligibility policy, while retaining shared claims, locks and receipts.
+They cannot exclude hidden windows using a protocol they lack.
+Other initialization failures remain actionable errors; Retry starts a fresh attempt and concurrent callers share it.
+
+Window peers announce that state while retaining their connections and life locks.
+Interactive forms, navigation, push-enable prompts and OAuth toasts prefer shown
+peers before thread, authorization and recency preferences. All-hidden windows
+keep existing routing. Captures and widget-fit targeting keep their existing policy;
+browser and PWA selection does too.
+
+These interactive requests use shared claims in a workspace/device IndexedDB
+journal, serialized by Web Locks (ADR 0721). BroadcastChannel wakes peers after
+commits; delayed announcements cannot acknowledge or discard a request.
+Forms share one request identity between live SSE and pending-request sync.
+
+Sync queues open forms newest first and checks earlier journal entries for persisted resolution events.
+`GET /api/v1/form-requests/resolved` checks up to 100 comma-separated `request_ids` per call, including archived threads.
+Absence from the pending list alone never proves resolution, since archiving also hides a form there.
+This retires receipts for forms answered while the client was offline without resolving newly arriving requests.
+Archived forms remain suspended in the journal until the server offers them again.
+
+Other requests use the SSE envelope event identity, separate from notification tap targets.
+
+Acceptance records presentation before waiting for a form answer or push permission.
+A resolved form leaves a tombstone even when its request arrives later.
+A crash between UI acceptance and receipt commit produces an uncertain delivery toast with Retry.
+Retry can repeat a presentation, so use it only when the request still needs attention.
+
+Unavailable storage, coordination capabilities or native visibility produce an actionable error.
+Native visibility transitions and window state changes reconsider pending work automatically.
+
+Development and deliberate teardown keep genuine closes. Retention does not
+guarantee WebKit execution or native banner delivery (ADR 0718).
+
 **This whole surface needs the client process to exist.** The engine records notifications with no client running, but the client shows the banner (`show_native_notification`). So the packaged build installs a *login agent* (`com.lucidos.client`, see `docs/desktop-app.md`) beside the always-on service, and a restarted Mac still gets banners. A login-started client is menu-bar-only with a hidden window (the trayed state below), so it takes the native-banner branch.
 
 - On the **push-allowed branch** (`push_allowed = true`, §3 "Decision") the engine emits a `NativePushRequested` SSE *alongside* the web-push fan-out. It carries the same toast content as the `PresenceCheck` (`title` / `body` / `thread_id` / `event_id` / `app_id` / `tap` / `sent_at_ms`).
@@ -566,7 +622,9 @@ The unread count is mirrored onto the installed app **icon** (surface 3 in §1),
 
 `refreshOtherWorkspacesUnread()` re-reads the rows at startup, on resume, on a slow visible-only interval, and when the Lucidos menu opens. A notification in another workspace already repaints the icon through its own push, so the interval is a backstop. It is best-effort: a gateway blip keeps the last-good rows rather than flashing a wrong total. It no-ops on a direct-engine origin and in the picker. It does NOT no-op under Tauri. That client badges its dock from Rust, but its page still draws the two in-app surfaces below.
 
-**The same total is mirrored in-app, from the same computed.** Two surfaces read `crossWorkspaceUnreadTotal`, so neither can show a number the icon does not. The *Lucidos mark* carries it as a count badge (`UnreadBrandBadge`). That is the only unread count on the thread pane and the threads drawer. The bell lives in the content pane's header and never reaches either.
+**The header counts the notification rows in its menu.** `notificationsMenuUnreadTotal` sums the shared `notifyRows` selector, including reachable paired remote gateways. The *Lucidos mark* uses this total for its count badge (`UnreadBrandBadge`), accessible label and tooltip. The OS icon retains its origin-scoped total, so the header can show more unreads than the icon.
+
+The mark carries the only unread count on the thread pane and the threads drawer. The bell lives in the content pane's header and never reaches either.
 
 **The mark's badge takes the glyph's BOTTOM-right corner**, not the top-right the bell and the filter button use. The artwork's sparkle is top-right, and a resident badge there leaves the brand as three plain squares. The engine-state badge (busy, ready, pending) keeps the top corner, so the two coexist.
 
@@ -578,11 +636,15 @@ The unread count is mirrored onto the installed app **icon** (surface 3 in §1),
 
 **The push payload's `app_badge` follows the same origin rule, per subscription.** The engine resolves it in `app_badge_for` (`scheduler/push.rs`) from the subscription's recorded `scope_url`:
 
-- **A path deeper than `/`** means the gateway served that page. The payload carries the cross-workspace total, read once per fan-out from `GET /~/api/v1/control/unread-total`.
+- **A path deeper than `/`** means the gateway served that page. Normal and wake pushes carry that recipient's cross-workspace total. The engine requests `GET /~/api/v1/control/unread-total?recipient-device-id=<device>` once per distinct recipient in each fan-out. Only authenticated local processes may select a recipient. Browser callers without that parameter receive their own authenticated count; they cannot override the recipient.
 - **A root scope** (direct engine) or a legacy row with no `scope_url` carries the workspace's own count.
 - **A remote workspace route** (`/<slug>@<gateway>/`) as the first segment means another gateway relayed the page. That origin's icon counts workspaces this engine cannot see, so the payload omits `app_badge` and leaves the icon alone. The tap still uses that scope, so it opens the page on the relaying gateway's origin.
 
-The hop is bounded and best-effort, and falls back to the own count, so a push is never delayed or dropped for a badge refinement. This is also why `sw.js` needs no cross-workspace logic of its own: it mirrors `app_badge` verbatim, and iOS reads the same field natively.
+Recipient requests run concurrently within the existing 1500 ms deadline. A failed count falls back only to that recipient's own workspace count. Missing or unknown recipients supply no personal aggregate; they never select the machine-wide total.
+
+A successful zero clears the badge. Before the gateway user list is known, own-count fallback stays unknown rather than guessing a shared reader. Legacy direct-engine subscriptions without a device retain their own count on single-reader installs.
+
+This is also why `sw.js` needs no cross-workspace logic of its own: it mirrors `app_badge` verbatim, and iOS reads the same field natively.
 
 **Re-assert, never diff (the bell and the icon must never disagree about THIS workspace).** The icon badge is an **externally written surface**, written while the page is backgrounded or closed. iOS writes it from the push payload's `app_badge` in its parent process, without running the page. The SW `push` handler writes it on Chrome/Android.
 
@@ -598,11 +660,11 @@ That gap left an iOS PWA showing **icon 1 / bell 0**. It followed a notification
 
 **Known boundary: a CLOSED PWA's icon can go stale.** Reads emit no push, and iOS only updates a web app's badge from a visible push. So a read on another device, while this PWA is closed, leaves its home-screen icon at the last pushed count. It corrects on the next push (which carries a fresh `app_badge`), or when the user opens or resumes the app (which re-asserts as above). Nothing on the engine side can close that window without sending a spurious visible notification.
 
-**The aggregate is running workspaces only.** The gateway holds no DB handle (ADR 0014 §1), so it gets each count by HTTP-polling running engines. It reuses the count-only `GET /api/v1/notifications?limit=0` probe in its supervise loop. A stopped workspace reports no count and contributes 0.
+**The aggregate is running workspaces only.** The gateway holds no DB handle (ADR 0014 §1), so it gets each count by HTTP-polling running engines. Personal listings and push totals use fresh, stamped `GET /api/v1/notifications?limit=0` probes as the inbox reader. Shared supervisor counts remain health observations and never substitute for a failed personal read. A stopped workspace reports no count and contributes 0. An unreachable healthy workspace makes the personal aggregate unknown.
 
 A gateway install DOES navigate into a workspace, which is what the `scope: "/"` re-stamp is for. Its badge stays the total by construction rather than by confinement: the page adds the others to its own count, and a push carries the total for a gateway-scoped subscription. The Tauri count comes from a Rust loop independent of the loaded page. It likewise stays the total even when the webview is inside one workspace.
 
-That loop reads the **fresh** on-demand aggregate, `/~/api/v1/control/unread-total`, a live count fan-out over running engines. It does not read the supervise loop's cached `last_unread`, because at nudge time (right after a read) the cached value still shows the pre-read count. The nudge and the periodic tick both use the fresh endpoint, which also avoids a flicker where a stale tick overwrites a freshly nudged value.
+That desktop loop reads the **fresh** on-demand aggregate, `/~/api/v1/control/unread-total`, without a recipient parameter. Authenticated local processes retain this machine-wide count for desktop compatibility. It does not read the supervise loop's cached `last_unread`, because at nudge time (right after a read) the cached value still shows the pre-read count. The nudge and the periodic tick both use the fresh endpoint, which also avoids a flicker where a stale tick overwrites a freshly nudged value.
 
 **Tray title and dock badge** (macOS): the menu-bar tray-icon title carries the unread count at all times, so it never depends on a window being open. Closing all client windows drops the app to the menu-bar tray. That is the Accessory activation policy, out of the Dock and Cmd+Tab (see `crates/lucidos-app/src/activation.rs` `set_menu_bar_only` / `apply_unread_indicator`). There is no dock tile there, so the tray title is the only surface showing it. Reopening a window (Regular) brings the dock badge back alongside the unchanged tray title. `apply_unread_indicator` re-applies the last known count (`LAST_UNREAD`) on each transition, so the dock tile that just appeared or vanished agrees with the tray.
 
@@ -626,7 +688,7 @@ Every push payload the engine emits conforms to the [W3C Push API "Declarative W
     "title": "...",
     "body": "...",
     "navigate": "https://host/<slug>/?notification=...&thread=...&event=...&tap=...",
-    "tag": "<notification_id, people-<thread_id> for a push group, or lucidos-notification>",
+    "tag": "<notification_id, user-<thread_id> for a push group, or lucidos-notification>",
     "actions": [{ "action": "unwatch", "title": "Unwatch" }],
     "data": {
       "notification_id": "...",
@@ -642,7 +704,7 @@ Every push payload the engine emits conforms to the [W3C Push API "Declarative W
 }
 ```
 
-Built by `build_push_payload` in `crates/lucidos-engine/src/scheduler/push.rs`. `actions` and `unwatch_thread_id` appear only for a people-only message's push group, which `PushGroup::apply` stamps on inside the size fitting. The thread's driver gets the tag without the action, since a driver cannot unwatch. The SW passes `actions` to `showNotification`. A tap on Unwatch POSTs `/api/v1/threads/:thread_id/people/unwatch` and marks the notification read, and opens nothing.
+Built by `build_push_payload` in `crates/lucidos-engine/src/scheduler/push.rs`. `actions` and `unwatch_thread_id` appear only for a user-only message's push group, which `PushGroup::apply` stamps on inside the size fitting. The thread's driver gets the tag without the action, since a driver cannot unwatch. The SW passes `actions` to `showNotification`. A tap on Unwatch POSTs `/api/v1/threads/:thread_id/users/unwatch` and marks the notification read, and opens nothing.
 
 The top-level `web_push: 8030` is the Push API spec's opt-in for declarative parsing (homage to RFC 8030). Safari 18.5+ recognizes the declarative fields. On iOS the SW `push` handler still fires and must still call `showNotification()` for a visible banner (see Net behaviour). On tap, the only reliable field before page JS runs is `notification.navigate`. `notificationclick` is not a reliable channel for installed iOS PWAs.
 
@@ -685,6 +747,8 @@ The symptom was a tab that focused and marked the notification read (the SW-side
 
 **The shell test is an exact path match against `SCOPE_PATH`, never a prefix.** Another workspace's tab fails it, and so does a popped-out app tab (`/dev/app/<id>/`). The popout is same-scope and top-level, but serves the app's own HTML and listens for no deep link. With no shell tab open, the handler falls through to `clients.openWindow()` at the scope-resolved deep link, on the raising workspace. At the legacy root scope `/`, only a tab at `/` matches.
 
+**A remote workspace's popout is a shell tab.** It opens the workspace shell at `/<slug>@<gateway>/#app=<id>` (ADR 0726), so it passes the shell test. A deep link can land in that tab, over the popped-out app.
+
 **Stored subscription scope is load-bearing for iOS.** The page records the concrete service-worker scope URL (`scope_url`) when it subscribes or refreshes a push subscription.
 - The API keeps it only when it matches the request's workspace prefix and, when the browser sends `Origin`, the same origin. It ignores malformed or cross-workspace values.
 - The engine builds the absolute iOS `notification.navigate` URL from it, keeping `/<slug>/` behind the gateway.
@@ -710,6 +774,10 @@ Safari honors `navigate` deterministically only inside the declarative envelope,
 
 ### Layer 2: Liveness probe + recovery (full-wedge coverage)
 
+Ordinary API reads bypass the service worker; immutable blobs and the marked health probe still use it.
+The page retries GET transport failures once. Resume requests a worker update only when the served build differs.
+Worker pongs carry a temporary instance mark for diagnostics; recovery thresholds stay unchanged.
+
 Every push calls `showNotification` with `requireInteraction: true`, so a dropped click leaves the notification on screen for a retry.
 
 The page periodically pings the SW controller with `{ type: 'lucidos:ping' }`, and the SW replies `{ type: 'lucidos:pong' }`. The recovery is `recoverServiceWorker()`: `unregister`, re-register, re-subscribe push. It runs only after **two silent windows in a row** of `SW_PROBE_TIMEOUT_MS` (5 s) each, with the page awake through both. The rules live in `crates/lucidos-app/src/utils/swLivenessProbe.ts`. `SW_RECOVERY_COOLDOWN_MS` (60 s) gates the recovery, so flapping cannot churn the subscription endpoint. On success the page shows the toast *"Notifications repaired: the service worker was unresponsive"*.
@@ -731,6 +799,13 @@ The page periodically pings the SW controller with `{ type: 'lucidos:ping' }`, a
 - `sw.js` skips the plain request but forwards the one marked `?sw-fetch-probe=1` (`FETCH_PROBE_PARAM`) through its `fetch()`.
 - Plain answered and marked still silent after 4 s, in two windows in a row, page awake throughout: the page unregisters the worker and reloads. Both windows end inside the boot splash's 15 s cap. A failed plain request means the network is down, which proves nothing.
 - A sessionStorage guard allows one such reload per 60 s, so an unfixable wedge never loops. The page logs a `sw` / `fetch_path_slow` breadcrumb when the first window misses, and `sw` / `fetch_path_wedged` before the reload.
+
+**Admission stall.** Restore admission holds every gated request until the stream's hello passes a chain of device database steps (`store/restoreRuntime.ts`). A stall there also strands the boot splash, but the service worker is healthy.
+- **Signature:** only the bootstrap URLs reach the engine (`/health`, `/devices/register`, `/internal/client-log`). No thread list or other read arrives.
+- **Device database bounds** (`store/deviceDatabase.ts`): an open and each admission step may take 5 s (`DEVICE_DATABASE_STALL_MS`). A stalled step aborts its transaction and fails. Each stall doubles that database's bound, up to 80 s. A stall also closes its connection, so the next step opens a fresh one instead of reusing a wedged handle. The local-records step first waits for queued upload and unsent-message writes, up to the same 5 s. A stall there fails the step but leaves those writes running.
+- **Retry:** a failed step reconnects after 3 s, and the new hello retries admission. A stall never opens admission. A first device storage stall retries silently. A repeat shows one "Device storage" warning with Retry, which admission removes. Any other failed step toasts "Workspace restore recovery could not finish".
+- **Watchdog** (`store/restoreAdmissionWatchdog.ts`): a connection still waiting after 10 s counts as stalled. While it still waits for the hello, it restarts the stream once per connection.
+- **Breadcrumbs:** `[Client/restore-admission]` logs `failed` (with the step), `stalled` (with the phase and wait) and `admitted_after_stall` (with the total wait). `[Client/device-database]` logs `open_blocked` when another connection blocks an upgrade.
 
 ### Layer 3: Engine-scheduled wake-push (partial-wedge coverage, proactive)
 
@@ -879,6 +954,27 @@ The rules above are current. Code and docs cite these iterations by ordinal, so 
 - **Twenty-fourth**: moved the quiet-cover decision into `<head>` (Net behaviour, mitigation 3), so a tap no longer flashes one frame of the blue launch splash. Coverage: "decides in <head>, before the splash markup can paint" in the `notification tap (boot-splash-quiet)` suite.
 - **Twenty-fifth**: reversed the sixth. A page that hid after answering lost both surfaces: its answer suppressed the push, and it dropped the later toast frame. Now the `PresenceCheck` carries the toast, and the page acts before it answers with an outcome. A desktop window that came forward since answering gets the toast, not a dropped banner. Why: ADR 0440. Coverage: `__tests__/presence-check-races.test.ts`.
 
+### User-only message recovery
+
+Recorded user mentions retain delivery intent across engine shutdown.
+Recovery freezes each recipient user's key and devices before applying watches.
+Each user has a separate stable notification identity and presence decision.
+Handling a toast on one user's devices cannot suppress another user's OS push.
+Each web subscription has a separate completion receipt, so a failed subscription never replays completed targets.
+
+A native desktop client acknowledges `/api/v1/notification/native-receipt` after OS acceptance or in-app handling.
+Updated native clients must return explicit OS acceptance.
+Older clients retain their successful-command completion behavior, including the risk of losing an OS-rejected banner.
+
+A dropped broadcast or rejected native banner remains pending for recovery.
+Unread pending delivery has no expiry; a receipt or reading the notification ends retry.
+Recovery preserves the first PresenceCheck decision, so retries do not repeat in-app toasts.
+Delayed Chromium wakes target only subscriptions newly delivered in that attempt, preserving receipt boundaries across scopes.
+
+Completion receipts survive engine shutdown. External acceptance followed by a lost receipt can repeat an alert, with the same notification identity.
+Stable identities replace existing entries rather than stacking them.
+Thread deletion serializes with recovery before locking its family rows, preventing deleted threads from being reannounced.
+
 ## §5: Verification
 
 Use the test files below as the coverage map. Test titles may change;
@@ -939,3 +1035,10 @@ The design removed code paths the old one relied on:
 - **Older pages fall back to push.** An open page can retain an earlier bundle.
   A missing pong, or an old pong without the required `outcome`, times out to
   push-allowed. The next page load fetches the current bundle.
+
+## Diagnostic evidence
+
+Service-worker breadcrumbs retain a separate diagnostic code.
+Only recognized codes are shareable; notification text and breadcrumb data remain private.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

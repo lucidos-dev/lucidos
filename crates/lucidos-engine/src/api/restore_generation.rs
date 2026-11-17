@@ -7,7 +7,7 @@ use axum::response::{IntoResponse, Response};
 
 use super::{error::ApiError, AppState};
 
-const GENERATION: &str = "x-lucidos-restore-generation";
+pub(super) const GENERATION: &str = "x-lucidos-restore-generation";
 const CALLER_KIND: &str = "x-lucidos-caller-kind";
 
 fn browser_shaped(headers: &HeaderMap) -> bool {

@@ -10,9 +10,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::error::ApiError;
-use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
+use crate::api::thread_reach::refuse_without_authority;
 use crate::api::AppState;
 use crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON;
+use crate::engine::permission::Action;
 
 use super::{extract_thread_uuid, parse_thread_id};
 
@@ -47,6 +48,8 @@ pub(in crate::api) struct AnswerThreadQuestionBody {
     input_chain: Option<String>,
     #[serde(default)]
     input_seq: Option<i64>,
+    #[serde(default)]
+    compose_epoch: Option<i64>,
 }
 
 /// POST /api/v1/threads/:thread_id/answer-question — answer a pending question
@@ -97,18 +100,18 @@ pub(in crate::api) async fn answer_thread_question(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        ThreadReachVerb::AnswerQuestion,
+        Action::AnswerQuestion,
     )
     .await?;
-    let actor = crate::api::owner_approval::answering_actor(
+    let actor = crate::api::permission_requests::answering_actor(
         &state.pool,
         &headers,
         thread_uuid,
         &body.tool_use_id,
     )
     .await?;
-    use crate::engine::agent_question::{answer_pending_question_with_event_id, AnswerResult};
-    use crate::engine::{overtaken_message, InputAdmission, InputPosition, OVERTAKEN_REASON};
+    use crate::engine::agent_question::{answer_pending_question_placed, AnswerResult};
+    use crate::engine::InputPosition;
     let position =
         InputPosition::from_wire(body.input_chain.as_deref(), body.input_seq, body.event_id)
             .map_err(ApiError::bad_request)?;
@@ -121,87 +124,58 @@ pub(in crate::api) async fn answer_thread_question(
             .await
             .map_err(ApiError::db)?;
     let position = position.filter(|_| thread_exists);
-    let composer = composer_submission(&body.answer);
-    let device_id = headers
-        .get(crate::api::actor::HEADER_DEVICE_ID)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
     let engine = state.engine.clone();
     let answering = tokio::spawn(async move {
-        match engine
-            .input_order
-            .admit(engine.pool(), thread_uuid, position, body.event_id)
-            .await
-        {
-            // Placed, and released at once: see the doc comment.
-            Ok(InputAdmission::Admitted(_)) => {}
-            Ok(InputAdmission::Overtaken) => {
-                return Err(
-                    ApiError::new(StatusCode::CONFLICT, overtaken_message(thread_uuid))
-                        .with_reason(OVERTAKEN_REASON),
-                );
-            }
-            Err(e) => {
-                return Err(ApiError::internal(format!(
-                    "Could not admit the answer to thread {thread_uuid}: {e}"
-                )));
-            }
-        }
-        match answer_pending_question_with_event_id(
+        match answer_pending_question_placed(
             &engine,
             thread_uuid,
-            body.tool_use_id,
-            body.answer,
-            actor,
+            body.tool_use_id.clone(),
+            body.answer.clone(),
+            actor.clone(),
             body.event_id,
+            Some((position, body.compose_epoch)),
+            crate::engine::permission::PickedBy::Tap,
         )
         .await
         {
             AnswerResult::Resumed => {}
-            AnswerResult::Conflict(msg) => return Err(ApiError::new(StatusCode::CONFLICT, msg)),
-        }
-        // An answer typed into the composer consumes the thread's compose slot
-        // before the endpoint responds, as a send's accept does (ADR 0450). It
-        // runs once the answer is recorded, so a refused or repeated answer
-        // never consumes. The answer stands even if the consume fails.
-        if let Some((text, image_hashes)) = composer {
-            if let Err(e) = crate::api::threads_compose::consume_and_announce_compose_slot(
-                &state,
-                thread_uuid,
-                &text,
-                &image_hashes,
-                device_id,
-            )
-            .await
-            {
-                log!(
-                    "[Threads] Answer on {} recorded, but its compose slot was not consumed: {}",
-                    thread_uuid,
-                    e
-                );
+            AnswerResult::Conflict(msg) => {
+                let mut error = ApiError::new(StatusCode::CONFLICT, msg.clone());
+                for reason in [
+                    "compose_snapshot_stale",
+                    "compose_fence_required",
+                    "overtaken",
+                ] {
+                    if msg.contains(reason) {
+                        let message = match reason {
+                            "compose_snapshot_stale" => "Another send was accepted before this answer. Retry to send the answer again.".to_string(),
+                            "compose_fence_required" => "This answer needs a current draft version. Retry it to send it again.".to_string(),
+                            _ => crate::engine::overtaken_message(thread_uuid),
+                        };
+                        error = ApiError::new(StatusCode::CONFLICT, message).with_reason(reason);
+                        break;
+                    }
+                }
+                return Err(error);
             }
         }
-        Ok(Json(serde_json::json!({ "ok": true })))
+        // An unattested caller's act runs on the owner's Allow once.
+        crate::api::owner_door::act_on_card_answer(
+            &state,
+            thread_uuid,
+            &body.tool_use_id,
+            &body.answer,
+            actor,
+        )
+        .await;
+        let compose: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT payload->'compose' FROM events WHERE thread_id=$1 AND event_type='UserQuestionAnswered' AND payload->>'tool_use_id'=$2",
+        ).bind(thread_uuid).bind(&body.tool_use_id).fetch_one(&state.pool).await.map_err(ApiError::db)?;
+        Ok(Json(serde_json::json!({ "ok": true, "compose": compose })))
     });
     answering
         .await
         .map_err(|e| ApiError::internal(format!("The answer could not be dispatched: {e}")))?
-}
-
-/// The composer content an answer submitted, or `None` for one that carried
-/// none (an option click). Multi-select folds the prompt's text and images in
-/// beside the toggled options.
-fn composer_submission(
-    answer: &crate::engine::thread_events::AnswerKind,
-) -> Option<(String, Vec<String>)> {
-    use crate::engine::thread_events::AnswerKind;
-    let text = match answer {
-        AnswerKind::FreeText { text, .. } => text.clone(),
-        AnswerKind::MultiSelected { text, .. } => text.clone().unwrap_or_default(),
-        _ => return None,
-    };
-    let image_hashes = answer.image_hashes().to_vec();
-    (!text.trim().is_empty() || !image_hashes.is_empty()).then_some((text, image_hashes))
 }
 
 /// The body a pin or unpin answers with: the row's `summary_version` once the
@@ -266,7 +240,7 @@ pub(in crate::api) async fn save_thread(
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to save thread: {}", e);
+            log_legacy!("[API] Failed to save thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to save thread: {}", e),
@@ -316,7 +290,7 @@ pub(in crate::api) async fn unsave_thread(
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to unsave thread: {}", e);
+            log_legacy!("[API] Failed to unsave thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to unsave thread: {}", e),
@@ -355,7 +329,7 @@ pub(in crate::api) async fn rename_thread(
         })
         .await
         .map_err(|e| {
-            log!("[API] Failed to rename thread: {}", e);
+            log_legacy!("[API] Failed to rename thread: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to rename thread: {}", e),
@@ -399,7 +373,7 @@ pub(in crate::api) async fn suggest_title(
         .get_thread_messages(thread_id)
         .await
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[API] Failed to get thread messages for title suggestion: {}",
                 e
             );
@@ -441,7 +415,7 @@ pub(in crate::api) async fn suggest_title(
     let title = crate::engine::generate_thread_title(&call, &summary, None, &capture)
         .await
         .map_err(|e| {
-            log!("[API] Failed to generate title suggestion: {}", e);
+            log_legacy!("[API] Failed to generate title suggestion: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to generate title: {}", e),
@@ -484,7 +458,7 @@ pub(in crate::api) async fn continue_thread(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        ThreadReachVerb::Continue,
+        Action::Continue,
     )
     .await
     .map_err(|e| (e.status_code(), e.to_string()))?;
@@ -497,7 +471,7 @@ pub(in crate::api) async fn continue_thread(
             .fetch_optional(&state.pool)
             .await
             .map_err(|e| {
-                log!("[API] Failed to read thread type for continue: {}", e);
+                log_legacy!("[API] Failed to read thread type for continue: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to read thread: {}", e),
@@ -522,7 +496,7 @@ pub(in crate::api) async fn continue_thread(
             })
             .await
             .map_err(|e| {
-                log!("[API] Failed to emit ContinuationRequested: {}", e);
+                log_legacy!("[API] Failed to emit ContinuationRequested: {}", e);
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("Failed to emit ContinuationRequested: {}", e),
@@ -540,7 +514,7 @@ pub(in crate::api) async fn continue_thread(
         .continue_chat(thread_uuid, actor)
         .await
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[API] continue_chat failed for thread {}: {}",
                 thread_uuid,
                 e
@@ -571,7 +545,7 @@ pub(in crate::api) async fn harden_thread(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        ThreadReachVerb::Continue,
+        Action::Continue,
     )
     .await
     .map_err(|e| (e.status_code(), e.to_string()))?;
@@ -587,7 +561,7 @@ pub(in crate::api) async fn harden_thread(
         .harden_held_work(thread_uuid, actor)
         .await
         .map_err(|e| {
-            log!("[API] harden failed for thread {}: {}", thread_uuid, e);
+            log_legacy!("[API] harden failed for thread {}: {}", thread_uuid, e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to start hardening: {}", e),
@@ -630,7 +604,7 @@ pub(in crate::api) async fn cancel_thread_event_wait(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        ThreadReachVerb::Cancel,
+        Action::Cancel,
     )
     .await
     .map_err(|e| (e.status_code(), e.to_string()))?;
@@ -881,7 +855,7 @@ pub(in crate::api) async fn get_thread_messages(
         .get_thread_messages(&thread_id)
         .await
         .map_err(|e| {
-            log!("[API] Failed to get thread messages: {}", e);
+            log_legacy!("[API] Failed to get thread messages: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get thread messages: {}", e),
@@ -894,7 +868,7 @@ pub(in crate::api) async fn get_thread_messages(
         .get_thread_timeline_events(&thread_id)
         .await
         .map_err(|e| {
-            log!("[API] Failed to get thread timeline events: {}", e);
+            log_legacy!("[API] Failed to get thread timeline events: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to get thread timeline events: {}", e),
@@ -909,7 +883,7 @@ pub(in crate::api) async fn get_thread_messages(
 
 #[cfg(test)]
 mod composer_submission_tests {
-    use super::composer_submission;
+    use crate::engine::agent_question::composer_submission;
     use crate::engine::thread_events::AnswerKind;
 
     #[test]

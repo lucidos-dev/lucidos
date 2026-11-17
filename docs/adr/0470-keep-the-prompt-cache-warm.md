@@ -49,7 +49,8 @@ Keep the cache warm rather than lengthen it:
   A long command runs as a *polled background task*: `lucidos background-task
   run --poll`, then `wait <id>` until it finishes. Only an open-ended wait,
   such as a run queued behind a held lock, keeps the watched task and ends
-  the turn. The engine kills every background task after an hour at most.
+  the turn. The engine kills every background task at its timeout: an hour
+  by default, 4 h at most for a coding agent.
 - **The engine runs a *cache keep-alive*.** It applies while an idle Claude
   Code session waits on a keep-warm event wait or on a working child thread.
   The engine then resumes it about every 4 minutes with a hidden nudge. It

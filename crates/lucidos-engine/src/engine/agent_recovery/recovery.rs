@@ -9,6 +9,7 @@ use super::super::git_ops::{
     describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd, git_ran_ok,
     main_worktree, proposal_files_for_branch, worktrees_dir, WorktreeLookup,
 };
+use super::super::permission::PermissionRequest;
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin, QuestionOption};
 use super::super::thread_lifecycle::ThreadStatus;
 use super::super::LucidosEngine;
@@ -147,7 +148,7 @@ impl LucidosEngine {
         match self.is_external_repo_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Recovery] Failed to check external repo status for thread {}: {}",
                     thread_id,
                     e
@@ -178,7 +179,7 @@ impl LucidosEngine {
             .await
         {
             Ok(ProposeOutcome::Proposed(_)) => {
-                log!(
+                log_legacy!(
                     "[Recovery] Proposed change from stale session (branch {})",
                     branch_name
                 );
@@ -189,7 +190,7 @@ impl LucidosEngine {
                 | ProposeOutcome::AwaitingLanding(_),
             ) => {}
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Recovery] Failed to propose change from stale session: {}",
                     e
                 );
@@ -225,10 +226,11 @@ impl LucidosEngine {
             self.workspace_path(),
             thread_id,
             session_branch,
+            discard,
         )
         .await?
         {
-            self.end_stale_lane_thread(thread_id, batch_id, discard)
+            self.end_stale_lane_thread(thread_id, batch_id, discard, session_branch)
                 .await;
             return Ok(());
         }
@@ -266,6 +268,7 @@ impl LucidosEngine {
                                 worktree_path: None,
                                 worktree_head_sha: None,
                                 bg_bash_pending: false,
+                                turn_end: None,
                             },
                             meta: crate::engine::thread_events::EventMeta::NONE,
                         },
@@ -276,7 +279,7 @@ impl LucidosEngine {
             }
         };
 
-        log!(
+        log_legacy!(
             "[Recovery] Ending stale waiting session for thread {} (branch {})",
             thread_id,
             branch_name
@@ -299,7 +302,7 @@ impl LucidosEngine {
         let mut branch_has_work = false;
         match &repo {
             StaleSessionRepo::External => {
-                log!(
+                log_legacy!(
                     "[Recovery] External repo branch {}: keeping branch, no change proposed",
                     branch_name
                 );
@@ -327,7 +330,7 @@ impl LucidosEngine {
                             {
                                 Ok(true) => self.broadcast_changes_updated().await,
                                 Ok(false) => {}
-                                Err(e) => log!(
+                                Err(e) => log_legacy!(
                                     "[Recovery] Could not withdraw the handed-off change on {}: {}",
                                     branch_name,
                                     e
@@ -349,7 +352,7 @@ impl LucidosEngine {
                         // work the user still wants. An orphaned empty branch is
                         // just a ref, and the cleanup sweep collects it once it
                         // is fully merged.
-                        None => log!(
+                        None => log_legacy!(
                             "[Recovery] Branch {} has no proposable diff, keeping branch (discard=false)",
                             branch_name
                         ),
@@ -363,7 +366,7 @@ impl LucidosEngine {
         // gone. Pending rows are DB state, so they clear whichever repo owns the
         // branch, an external one included.
         if discard {
-            log!(
+            log_legacy!(
                 "[Recovery] Discarding stale session changes (branch {})",
                 branch_name
             );
@@ -378,7 +381,7 @@ impl LucidosEngine {
             // behind: the removal above is skipped, and the branch survives the
             // Discard with its commits.
             if let Err(e) = git_ran_ok(&["branch", "-D", &branch_name], delete_root).await {
-                log!("[Recovery] Failed to delete branch {}: {}", branch_name, e);
+                log_legacy!("[Recovery] Failed to delete branch {}: {}", branch_name, e);
             }
         }
 
@@ -410,6 +413,7 @@ impl LucidosEngine {
                         // off until a real turn populates the field.
                         worktree_head_sha: None,
                         bg_bash_pending: false,
+                        turn_end: None,
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },
@@ -426,19 +430,31 @@ impl LucidosEngine {
         Ok(())
     }
 
-    /// End a lane thread's stale session. Its branch and worktree are the
-    /// lane's, never a change, so nothing here proposes, resets or deletes
-    /// them. The lane hears the answer a run would give: a Stop keeps the
-    /// batch open, and a Discard fails it, so the lane removes the worktree.
-    /// For a batch already closed, either answer retires what the lane left.
-    async fn end_stale_lane_thread(&self, thread_id: Uuid, batch_id: Uuid, discard: bool) {
+    /// End lane duty without proposing work. Preserve historical ordinary
+    /// sessions separately from the integration tree the lane cleans up.
+    async fn end_stale_lane_thread(
+        &self,
+        thread_id: Uuid,
+        batch_id: Uuid,
+        discard: bool,
+        session_branch: Option<&str>,
+    ) {
+        let historical_branch = preserve_historical_lane_session(
+            &self.event_bus,
+            &main_worktree().await,
+            thread_id,
+            batch_id,
+            discard,
+            session_branch,
+        )
+        .await;
         use crate::engine::landing_lane::{LaneThreadEnd, LANE_THREAD_CLOSED};
         let end = if discard {
             LaneThreadEnd::Failed(LANE_THREAD_CLOSED.to_string())
         } else {
             LaneThreadEnd::Stopped
         };
-        log!(
+        log_legacy!(
             "[Recovery] Ending stale lane thread {} of batch {}: {:?}",
             thread_id,
             batch_id,
@@ -451,15 +467,18 @@ impl LucidosEngine {
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
                     event: crate::engine::thread_events::ThreadEvent::CodingAgentIdled {
-                        has_changes: false,
+                        has_changes: historical_branch.is_some(),
                         is_external_repo: false,
                         requires_restart: false,
                         cc_session_id: None,
                         coding_agent,
-                        reason: None,
+                        reason: historical_branch.map(|branch| format!(
+                            "This landing batch has ended. Historical work is preserved on branch {branch}. Start a new coding-agent thread to recover it; this closed lane cannot run again."
+                        )),
                         worktree_path: None,
                         worktree_head_sha: None,
                         bg_bash_pending: false,
+                        turn_end: None,
                     },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },
@@ -496,7 +515,7 @@ impl LucidosEngine {
         let restored_branches = match restored_recovery_branches(self.pool()).await {
             Ok(branches) => branches,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Recovery] Restore boundary unavailable, refusing worktree recovery: {}",
                     e
                 );
@@ -520,7 +539,7 @@ impl LucidosEngine {
         let external_repos = crate::core::repositories::RepositoryStore::list(self.pool())
             .await
             .unwrap_or_else(|e| {
-                log!("[Recovery] Failed to list external repos: {}", e);
+                log_legacy!("[Recovery] Failed to list external repos: {}", e);
                 Vec::new()
             });
         let repos_to_scan =
@@ -548,7 +567,7 @@ impl LucidosEngine {
             let wt_output = match listed {
                 Ok(o) => o,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Recovery] Failed to list worktrees for {}: {}",
                         repo_root.display(),
                         e
@@ -591,11 +610,11 @@ impl LucidosEngine {
                                                 repo_root.clone(),
                                             ));
                                         } else {
-                                            log!("[Recovery] Skipping worktree {} — owned by workspace {}", wt, owner);
+                                            log_legacy!("[Recovery] Skipping worktree {} — owned by workspace {}", wt, owner);
                                         }
                                     }
                                     Err(_) => {
-                                        log!(
+                                        log_legacy!(
                                             "[Recovery] Skipping worktree {} — no workspace marker",
                                             wt
                                         );
@@ -620,7 +639,7 @@ impl LucidosEngine {
         // Best-effort: a DB error degrades to "nothing pending" rather than
         // blocking boot, and is logged so the partial sweep is visible.
         let pending_changes_list = proj.list_pending().await.unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[Recovery] list_pending: {} — recovery proceeds without pending change context",
                 e
             );
@@ -665,7 +684,7 @@ impl LucidosEngine {
         // so log the error even though recovery proceeds with degraded data.
         fn unwrap_logged<T: Default, E: std::fmt::Display>(label: &str, r: Result<T, E>) -> T {
             r.unwrap_or_else(|e| {
-                log!("[Recovery] {} query failed: {}", label, e);
+                log_legacy!("[Recovery] {} query failed: {}", label, e);
                 T::default()
             })
         }
@@ -721,7 +740,7 @@ impl LucidosEngine {
         }
 
         let t_classified = t0.elapsed();
-        log!("[Recovery] Worktree scan: {}ms, DB classification: {}ms (worktrees={}, idle={}, running={})",
+        log_legacy!("[Recovery] Worktree scan: {}ms, DB classification: {}ms (worktrees={}, idle={}, running={})",
             t_worktree_scan.as_millis(),
             (t_classified - t_worktree_scan).as_millis(),
             to_recover.len(),
@@ -749,7 +768,7 @@ impl LucidosEngine {
                 // a live question card. Answering still resumes, even with the
                 // worktree unrecoverable.
                 if thread_has_unanswered_question(engine.pool(), thread_id).await {
-                    log!(
+                    log_legacy!(
                         "[Recovery] Preserving stuck thread {} — parked on an unanswered question (no idle emitted)",
                         thread_id
                     );
@@ -776,6 +795,7 @@ impl LucidosEngine {
                             // No worktree, so no SHA to snapshot.
                             worktree_head_sha: None,
                             bg_bash_pending: false,
+                            turn_end: None,
                         },
                         meta: crate::engine::thread_events::EventMeta::NONE,
                     },
@@ -860,7 +880,7 @@ impl LucidosEngine {
                         // The shared path is occupied by another branch's live
                         // worktree, so skip it. The occupant recovers on its own
                         // pass.
-                        log!(
+                        log_legacy!(
                             "[Recovery] Skipping lost branch {} — shared worktree {} is live on a different branch (not reused, not deleted)",
                             branch,
                             wt_path.display()
@@ -869,7 +889,7 @@ impl LucidosEngine {
                     }
 
                     let prepared = if on_our_branch {
-                        log!(
+                        log_legacy!(
                             "[Recovery] Reusing existing valid worktree for lost session: {} (branch {})",
                             wt_path.display(),
                             branch
@@ -897,7 +917,7 @@ impl LucidosEngine {
                         .await
                         {
                             Ok(()) => {
-                                log!(
+                                log_legacy!(
                                     "[Recovery] Created fresh {} worktree for lost session: {} (branch {})",
                                     if app_spawn_id.is_some() { "sparse app" } else { "full" },
                                     wt_path.display(),
@@ -906,7 +926,7 @@ impl LucidosEngine {
                                 true
                             }
                             Err(e) => {
-                                log!(
+                                log_legacy!(
                                     "[Recovery] Failed to create worktree for branch {}: {}",
                                     branch,
                                     e
@@ -924,7 +944,7 @@ impl LucidosEngine {
                             ws_id.clone()
                         };
                         if let Err(e) = tokio::fs::write(&marker, &marker_content).await {
-                            log!(
+                            log_legacy!(
                                 "[Recovery] Failed to write workspace marker for {}: {}",
                                 branch,
                                 e
@@ -935,7 +955,7 @@ impl LucidosEngine {
                         add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
                         to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
                     } else if let Some(&thread_id) = branch_to_thread.get(branch) {
-                        log!(
+                        log_legacy!(
                             "[Recovery] Ending stuck session for thread {}: worktree unavailable",
                             thread_id
                         );
@@ -958,7 +978,7 @@ impl LucidosEngine {
                         .await
                         {
                             Some((repo_root, wt_path)) => {
-                                log!(
+                                log_legacy!(
                                     "[Recovery] Recovered branch {} for thread {} from surviving worktree — routing into resume instead of ending session",
                                     branch,
                                     thread_id
@@ -968,7 +988,7 @@ impl LucidosEngine {
                                 to_recover.push((wt_path, branch.clone(), None, repo_root));
                             }
                             None => {
-                                log!("[Recovery] Ending stuck session for thread {} — branch {} not found in any repo and no recoverable worktree", thread_id, branch);
+                                log_legacy!("[Recovery] Ending stuck session for thread {} — branch {} not found in any repo and no recoverable worktree", thread_id, branch);
                                 end_stuck_session(self, thread_id).await;
                             }
                         }
@@ -989,7 +1009,7 @@ impl LucidosEngine {
                     // may not cover the commits its turn made. Withdraw it
                     // without asking git, which a busy boot can time out, then
                     // withhold the branch's work (ADR 0400).
-                    log!("[Recovery] Resuming active session with pending change {} for branch {} — withdrawing it and withholding its unfinished work", pending_change.id, branch_name);
+                    log_legacy!("[Recovery] Resuming active session with pending change {} for branch {} — withdrawing it and withholding its unfinished work", pending_change.id, branch_name);
                     let tid = branch_to_thread.get(&branch_name).copied();
                     if let Some(tid) = tid {
                         // A queued change is frozen (ADR 0463), and an
@@ -1012,7 +1032,7 @@ impl LucidosEngine {
                             )
                             .await
                             {
-                                log!("[Recovery] {}", e);
+                                log_legacy!("[Recovery] {}", e);
                             }
                         }
                         if let Err(e) = self
@@ -1025,7 +1045,7 @@ impl LucidosEngine {
                             )
                             .await
                         {
-                            log!(
+                            log_legacy!(
                                 "[Recovery] Failed to withhold unfinished work on {}: {}",
                                 branch_name,
                                 e
@@ -1033,7 +1053,7 @@ impl LucidosEngine {
                         }
                     }
                 } else {
-                    log!(
+                    log_legacy!(
                         "[Recovery] Skipping worktree {} — already has pending change",
                         wt_path.display()
                     );
@@ -1047,7 +1067,7 @@ impl LucidosEngine {
             if !actively_running_branches.contains(&branch_name)
                 && already_recovered.contains(&branch_name)
             {
-                log!(
+                log_legacy!(
                     "[Recovery] Skipping worktree {} — recovery thread already exists",
                     wt_path.display()
                 );
@@ -1055,7 +1075,7 @@ impl LucidosEngine {
             }
             let has_pending_change = pending_by_branch.contains_key(&branch_name);
             if !branch_awaits_recovery(&branch_name, &idle_branches, has_pending_change) {
-                log!(
+                log_legacy!(
                     "[Recovery] Skipping clean worktree {} — branch {} has no in-flight signal; cleanup worker will reclaim",
                     wt_path.display(),
                     branch_name
@@ -1063,14 +1083,14 @@ impl LucidosEngine {
                 continue;
             }
             let Some(thread_id) = orphan_recovery_target(&branch_to_thread, &branch_name) else {
-                log!(
+                log_legacy!(
                     "[Recovery] No originating thread for orphaned worktree {} (branch {}) — skipping; cleanup worker will reclaim",
                     wt_path.display(),
                     branch_name
                 );
                 continue;
             };
-            log!(
+            log_legacy!(
                 "[Recovery] Reusing original thread {} for branch {}",
                 thread_id,
                 branch_name
@@ -1081,7 +1101,7 @@ impl LucidosEngine {
             // intact, so the card stays answerable. Deliberately not added to
             // `recovering_threads`: the catch-all settle only touches `running`.
             if thread_has_unanswered_question(self.pool(), thread_id).await {
-                log!(
+                log_legacy!(
                     "[Recovery] Preserving thread {} — parked on an unanswered question (branch {})",
                     thread_id,
                     branch_name
@@ -1092,7 +1112,7 @@ impl LucidosEngine {
             // Prevent duplicate recovery for the same thread (e.g., two branches
             // mapping to the same thread_id from stale resume retries).
             if !recovering_threads.insert(thread_id) {
-                log!("[Recovery] Skipping duplicate recovery for thread {} (branch {}) — already recovering", thread_id, branch_name);
+                log_legacy!("[Recovery] Skipping duplicate recovery for thread {} (branch {}) — already recovering", thread_id, branch_name);
                 cleanup_stale_worktree(&wt_path).await;
                 continue;
             }
@@ -1115,7 +1135,7 @@ impl LucidosEngine {
             // `engine_restart_interrupt`, and let the user's Continue re-enter
             // through `--resume`. The worktree stays on disk: Tier 0 of the
             // cleanup worker leaves it until the thread reaches a terminal idle.
-            log!("[Recovery] Surfacing interrupted Claude Code session for user-driven continue: {} (branch {}, thread {}{}, cc_session: {})",
+            log_legacy!("[Recovery] Surfacing interrupted Claude Code session for user-driven continue: {} (branch {}, thread {}{}, cc_session: {})",
                 wt_path.display(), branch_name, thread_id,
                 marker_repo_id.as_ref().map(|r| format!(", repo {}", r)).unwrap_or_default(),
                 cc_session_id.as_deref().unwrap_or("none"));
@@ -1172,9 +1192,11 @@ impl LucidosEngine {
             // after the apply recoveries that read the queue. A crash left
             // no boundary, so offer Continue instead and never auto-resume: work
             // that crashed the engine must not loop.
-            if switch_was_user_initiated(self.pool(), thread_id).await {
+            if switch_was_user_initiated(self.pool(), thread_id).await
+                && !crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await
+            {
                 self.enqueue_switch_resume(thread_id);
-                log!(
+                log_legacy!(
                     "[Recovery] Queued auto-resume after user switch for thread {} (branch {})",
                     thread_id,
                     branch_name
@@ -1198,6 +1220,7 @@ impl LucidosEngine {
                                 worktree_head_sha:
                                     crate::engine::agent_session::external_edits_for_recovery_head_sha(&wt_path).await,
                                 bg_bash_pending: false,
+                                turn_end: None,
                             },
                             meta,
                         },
@@ -1208,14 +1231,17 @@ impl LucidosEngine {
         }
 
         for thread_id in unengaged_switch_resume_candidates(self.pool()).await {
+            if crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await {
+                continue;
+            }
             self.enqueue_switch_resume(thread_id);
-            log!(
+            log_legacy!(
                 "[Recovery] Queued auto-resume after user switch for thread {} (agent read nothing)",
                 thread_id
             );
         }
 
-        log!(
+        log_legacy!(
             "[Recovery] Lost-branch pass: {}ms, worktree pass: {}ms ({} recovering)",
             (t_lost_branches - t_classified).as_millis(),
             (t0.elapsed() - t_lost_branches).as_millis(),
@@ -1236,12 +1262,39 @@ impl LucidosEngine {
 /// branch is still proposed from whatever did land.
 pub(crate) async fn rescue_stale_worktree(wt: &Path) {
     if let Err(e) = commit_worktree_or_err(wt, "Coding agent changes (auto-committed)").await {
-        log!(
+        log_legacy!(
             "[Recovery] Could not auto-commit {} before ending the stale session: {}",
             wt.display(),
             e
         );
     }
+}
+
+/// Rescue historical ordinary work without offering a second landing.
+async fn preserve_historical_lane_session<'a>(
+    bus: &crate::engine::event_bus::EventBus,
+    repo: &Path,
+    thread_id: Uuid,
+    batch_id: Uuid,
+    discard: bool,
+    session_branch: Option<&'a str>,
+) -> Option<&'a str> {
+    let branch = session_branch.filter(|branch| {
+        !discard && !branch.is_empty() && *branch != crate::engine::git_ops::lane_branch(batch_id)
+    })?;
+    let lookup = find_worktree_for_branch(repo, branch).await;
+    settle_stale_worktree(repo, branch, thread_id, false, lookup).await;
+    if let Some(files) = proposal_files_for_branch(repo, branch).await {
+        crate::engine::change_ops::emit_proposal_withheld(
+            bus,
+            thread_id,
+            branch,
+            &files,
+            crate::engine::thread_events::UnproposedReason::TurnIncomplete,
+        )
+        .await;
+    }
+    Some(branch)
 }
 
 /// Act on a stale session's worktree, given what git said about its branch.
@@ -1271,7 +1324,7 @@ pub(crate) async fn settle_stale_worktree(
             }
         }
         WorktreeLookup::NotFound => {}
-        WorktreeLookup::Unknown => log!(
+        WorktreeLookup::Unknown => log_legacy!(
             "[Recovery] Thread {}: git worktree list gave no answer for branch {}; leaving its \
              worktree alone rather than removing or committing on a guess",
             thread_id,
@@ -1288,7 +1341,7 @@ pub(crate) async fn settle_stale_worktree(
 /// keeps.
 pub(crate) async fn remove_discarded_stale_worktree(repo_root: &Path, wt: &Path) {
     let Some(wt_str) = wt.to_str() else {
-        log!(
+        log_legacy!(
             "[Recovery] skipped worktree remove (non-UTF8 path): {}",
             wt.display()
         );
@@ -1296,12 +1349,12 @@ pub(crate) async fn remove_discarded_stale_worktree(repo_root: &Path, wt: &Path)
     };
     match git_cmd(&["worktree", "remove", "--force", wt_str], repo_root).await {
         Ok(o) if o.status.success() => {}
-        Ok(o) => log!(
+        Ok(o) => log_legacy!(
             "[Recovery] git worktree remove failed for {}: {}",
             wt.display(),
             String::from_utf8_lossy(&o.stderr).trim()
         ),
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[Recovery] git worktree remove errored for {}: {}",
             wt.display(),
             e
@@ -1350,7 +1403,7 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
     thread_parked_on_question(pool, thread_id)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[Recovery] Could not read whether thread {} is parked on a question: {}",
                 thread_id,
                 e
@@ -1403,7 +1456,7 @@ pub(crate) async fn preserve_question_park_at_shutdown(
     if !is_shutdown || !thread_has_unanswered_question(pool, thread_id).await {
         return false;
     }
-    log!(
+    log_legacy!(
         "[Shutdown] {}: preserving session {}, parked on an unanswered question \
          (no interrupt, no terminal, no text flush)",
         site,
@@ -1441,7 +1494,7 @@ pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
 /// Split out so the yes/no guard above and [`newest_open_question`] below
 /// cannot drift on what "still parked" means. They differ in what they select
 /// and in nothing else.
-fn unanswered_question_predicate_sql(id_expr: &str) -> String {
+pub(crate) fn unanswered_question_predicate_sql(id_expr: &str) -> String {
     format!(
         "uqa.aggregate_id = {id} AND uqa.event_type = 'UserQuestionAsked' \
            AND NOT EXISTS ( \
@@ -1471,9 +1524,39 @@ pub(crate) struct OpenQuestion {
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub multi_select: bool,
-    /// An *owner approval card* (ADR 0387), whose Allow once only a tap on
-    /// screen may give.
-    pub owner_approval: bool,
+    /// A *permission request* (ADR 0664): read back, settled only by the
+    /// caller's own words.
+    pub permission_request: Option<OpenRequest>,
+}
+
+/// A permission request a thread is parked on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OpenRequest {
+    /// An agent prepared it, so the agent's question tool waits on the answer.
+    pub awaited: bool,
+    /// The owner's words can answer it. See [`PermissionRequest::words_answer`].
+    pub words_answer: bool,
+}
+
+impl OpenRequest {
+    /// The request a `UserQuestionAsked` payload carries, if any.
+    fn of(payload: &serde_json::Value) -> Option<Self> {
+        let request = payload.get("permission_request").filter(|r| !r.is_null())?;
+        let has = |key: &str| request.get(key).is_some_and(|v| !v.is_null());
+        Some(Self {
+            awaited: has("prepared"),
+            words_answer: !has("prepared") && !has("unattested_act"),
+        })
+    }
+}
+
+impl From<&PermissionRequest> for OpenRequest {
+    fn from(request: &PermissionRequest) -> Self {
+        Self {
+            awaited: request.prepared.is_some(),
+            words_answer: request.words_answer(),
+        }
+    }
 }
 
 /// The question this thread is parked on, or `None` when it is not parked.
@@ -1507,7 +1590,7 @@ pub(crate) async fn newest_open_question(
     {
         Ok(payload) => payload?,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] Could not read {}'s open question: {}",
                 thread_id,
                 e
@@ -1537,7 +1620,7 @@ pub(crate) async fn newest_open_question(
             .get("multi_select")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
-        owner_approval: payload.get("owner_approval").is_some(),
+        permission_request: OpenRequest::of(&payload),
     })
 }
 
@@ -1979,7 +2062,7 @@ pub(crate) async fn unengaged_switch_resume_candidates(pool: &sqlx::PgPool) -> V
     {
         Ok(ids) => ids,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] unengaged switch-resume scan failed: {}. \
                  Affected threads keep their manual Continue",
                 e
@@ -2058,7 +2141,7 @@ pub(crate) async fn settle_unresumed_switch_threads(
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] unresumed-switch sweep query failed: {}. \
                  Affected threads keep their paused status with no Continue",
                 e
@@ -2071,7 +2154,7 @@ pub(crate) async fn settle_unresumed_switch_threads(
         if resumed.contains(&thread_id) {
             continue;
         }
-        log!(
+        log_legacy!(
             "[Recovery] Switch-interrupted thread {} was not resumed by this boot. \
              Withdrawing the resume promise so its Continue affordance returns",
             thread_id
@@ -2087,7 +2170,7 @@ pub(crate) async fn settle_unresumed_switch_threads(
             .and_then(|v| match serde_json::from_value::<MessageOrigin>(v) {
                 Ok(origin) => Some(origin),
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Recovery] Switch abort on thread {} has an unreadable actor: {}. \
                          Withdrawal falls back to the system actor",
                         thread_id,
@@ -2191,7 +2274,7 @@ pub async fn settle_orphaned_running_threads(
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recovery] orphaned-running settle sweep query failed: {}",
                 e
             );
@@ -2203,7 +2286,7 @@ pub async fn settle_orphaned_running_threads(
             continue;
         }
         if let Err(e) = settle_one_orphaned_running_thread(pool, bus, tid).await {
-            log!(
+            log_legacy!(
                 "[Recovery] Failed to settle orphaned running thread {}: {}",
                 tid,
                 e
@@ -2245,7 +2328,7 @@ async fn settle_one_orphaned_running_thread(
         start_channel(stamped_channel.as_deref(), Some(start_type.as_str())),
     )
     .await?;
-    log!(
+    log_legacy!(
         "[Recovery] Settled orphaned `running` thread {}: the restart interrupted its turn",
         tid
     );
@@ -2311,7 +2394,7 @@ pub async fn settle_stranded_trigger_runs(
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[Recovery] stranded trigger run sweep query failed: {}", e);
+                log_legacy!("[Recovery] stranded trigger run sweep query failed: {}", e);
                 return;
             }
         };
@@ -2325,15 +2408,165 @@ pub async fn settle_stranded_trigger_runs(
         )
         .await
         {
-            Ok(()) => log!(
+            Ok(()) => log_legacy!(
                 "[Recovery] Settled stranded trigger run {}: a restart cut it off",
                 tid
             ),
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Recovery] Failed to settle stranded trigger run {}: {}",
                 tid,
                 e
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod open_request_tests {
+    use super::OpenRequest;
+
+    /// An agent's prepared request parks its question tool. One the engine
+    /// raised parks nobody, and a plain question is no request. Words answer
+    /// only an engine-raised request that no unattested caller waits on.
+    #[test]
+    fn a_request_is_awaited_only_when_an_agent_prepared_it() {
+        let card = |request: serde_json::Value| {
+            OpenRequest::of(&serde_json::json!({ "question": "q", "permission_request": request }))
+        };
+        assert_eq!(
+            card(serde_json::json!({ "action": "create-workspace", "prepared": "req-1" })),
+            Some(OpenRequest {
+                awaited: true,
+                words_answer: false
+            })
+        );
+        assert_eq!(
+            card(serde_json::json!({ "action": "run-batch" })),
+            Some(OpenRequest {
+                awaited: false,
+                words_answer: true
+            })
+        );
+        assert_eq!(
+            card(serde_json::json!({
+                "action": "act-for-unattested-caller",
+                "unattested_act": { "verb": "start" }
+            })),
+            Some(OpenRequest {
+                awaited: false,
+                words_answer: false
+            })
+        );
+        assert_eq!(card(serde_json::Value::Null), None);
+        assert_eq!(
+            OpenRequest::of(&serde_json::json!({ "question": "q" })),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod historical_lane_tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    #[tokio::test]
+    async fn historical_lane_cleanup_rescues_dirty_work_and_withholds_it() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let repo = tempfile::tempdir().unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        git_ran_ok(&["init", "-b", "main"], repo.path())
+            .await
+            .unwrap();
+        git_ran_ok(&["config", "user.name", "Test User"], repo.path())
+            .await
+            .unwrap();
+        git_ran_ok(&["config", "user.email", "test@example.com"], repo.path())
+            .await
+            .unwrap();
+        git_ran_ok(&["commit", "--allow-empty", "-m", "base"], repo.path())
+            .await
+            .unwrap();
+        git_ran_ok(
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "historical-work",
+                wt.path().to_str().unwrap(),
+            ],
+            repo.path(),
+        )
+        .await
+        .unwrap();
+        std::fs::write(wt.path().join("work.txt"), "recover this work").unwrap();
+        let thread = Uuid::new_v4();
+        crate::test_support::start_cc_session(&bus, thread, "historical-work", None).await;
+
+        let batch = Uuid::new_v4();
+        for (discard, branch) in [
+            (true, Some("historical-work")),
+            (false, None),
+            (false, Some("")),
+        ] {
+            assert_eq!(preserve_historical_lane_session(
+                &bus, repo.path(), thread, batch, discard, branch,
+            ).await, None);
+        }
+        let lane = crate::engine::git_ops::lane_branch(batch);
+        assert_eq!(
+            preserve_historical_lane_session(&bus, repo.path(), thread, batch, false, Some(&lane),)
+                .await,
+            None
+        );
+        let dirty = git_cmd(&["status", "--porcelain"], wt.path())
+            .await
+            .unwrap();
+        assert!(
+            !dirty.stdout.is_empty(),
+            "excluded sessions must not be committed"
+        );
+        assert_eq!(
+            preserve_historical_lane_session(
+                &bus,
+                repo.path(),
+                thread,
+                batch,
+                false,
+                Some("historical-work"),
+            )
+            .await,
+            Some("historical-work")
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(wt.path().join("work.txt")).unwrap(),
+            "recover this work"
+        );
+        let status = git_cmd(&["status", "--porcelain"], wt.path())
+            .await
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty(), "uncommitted work must be rescued");
+        let files = proposal_files_for_branch(repo.path(), "historical-work")
+            .await
+            .unwrap();
+        assert_eq!(files, vec!["work.txt"]);
+        let events: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events WHERE thread_id = $1 \
+             AND event_type IN ('ProposalWithheld', 'ChangeProposed') ORDER BY sequence",
+        )
+        .bind(thread)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            events,
+            vec!["ProposalWithheld"],
+            "work is visible without a duplicate proposal"
+        );
+        teardown_test_db(&db).await;
     }
 }

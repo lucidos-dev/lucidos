@@ -11,6 +11,7 @@ import { isImageRetryPending } from '../../utils/markdownImageRetry';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
 import { isElementVisible, unmeasurableBox } from '../../utils/elementVisibility';
 import { EVENT_RESOLVE_DEADLINE_MS } from './deepLinkBudget';
+import { readLineBlock } from './scrollAnchor';
 import type { DeepLinkTarget } from '../../store/thread-events/exchange-anchors';
 
 /** Shared scroll-position signals for the chat area.
@@ -461,6 +462,12 @@ const _follow = signal<FollowState>('off');
 /** Is the standing follow armed, riding or parked? Read by the follow toggle,
  *  which RENDERS it. `ReadonlySignal` on the way out on purpose: see above. */
 export const followingLiveEdge: ReadonlySignal<boolean> = computed(() => _follow.value !== 'off');
+
+/** Offer a jump when away, unless a ride carries the reader back.
+ *  A deep-link claim pauses the ride, so it keeps the jump available. */
+export const showScrollToBottom: ReadonlySignal<boolean> = computed(
+  () => awayFromBottom.value && (_follow.value !== 'riding' || deepLinkTarget.value !== null),
+);
 
 /** Is the thread on screen live streaming? Pushed in from the thread
  *  projection by `watchTranscriptLiveness` (`store/transcriptLiveness.ts`), its
@@ -2454,10 +2461,13 @@ function glideToSubmittedTurn(el: HTMLElement): boolean {
  *
  *  It ends on anything the reader does, a ride taking over, or the target
  *  leaving the DOM (docs/glossary.md § Arrival hold lists them). Otherwise it ends
- *  once no correction has moved the transcript for `ARRIVAL_HOLD_QUIET_MS` and no
+ *  after correcting the current round, once no correction has moved it for `ARRIVAL_HOLD_QUIET_MS` and no
  *  image above the target is still loading, or at `ARRIVAL_HOLD_MAX_MS`. A
  *  transcript image reserves no height, and on a phone it can decode seconds
  *  after the landing.
+ *
+ *  A restore holds a block inside a turn, which a re-set reply replaces. So it
+ *  carries the turn as `fallback`, re-measured each round, and moves to it then.
  *
  *  `quietUntil` and `endsBy` are `nowMs()` deadlines. `imagesLoading` is read
  *  at the end of each round, because the round an image's decode triggers
@@ -2465,9 +2475,13 @@ function glideToSubmittedTurn(el: HTMLElement): boolean {
 let _arrivalHold: {
   target: HTMLElement;
   relTop: number | null;
+  fallback: HTMLElement | null;
+  fallbackRelTop: number | null;
   quietUntil: number;
   endsBy: number;
   imagesLoading: boolean;
+  /** Told when the hold runs its course, never when something took it. */
+  onSettled?: () => void;
 } | null = null;
 
 /** Where `target` sits in `c`'s viewport, measured from its top. */
@@ -2488,11 +2502,13 @@ function imageAboveStillLoading(target: HTMLElement, c: HTMLElement): boolean {
 
 /** Arm the hold on an arrival's target. The baseline is taken once the
  *  arrival has come to rest, since its own motion is not a shift. */
-function armArrivalHold(target: HTMLElement): void {
+function armArrivalHold(target: HTMLElement, fallback: HTMLElement | null = null): void {
   const now = nowMs();
   _arrivalHold = {
     target,
     relTop: null,
+    fallback,
+    fallbackRelTop: null,
     quietUntil: now + ARRIVAL_HOLD_QUIET_MS,
     endsBy: now + ARRIVAL_HOLD_MAX_MS,
     imagesLoading: false,
@@ -2501,16 +2517,32 @@ function armArrivalHold(target: HTMLElement): void {
 function settleArrivalHold(target: HTMLElement, c: HTMLElement | null = resolveTarget()): void {
   if (!c || _arrivalHold?.target !== target) return;
   _arrivalHold.relTop = viewportTopOf(target, c);
+  _arrivalHold.fallbackRelTop = _arrivalHold.fallback ? viewportTopOf(_arrivalHold.fallback, c) : null;
   _arrivalHold.quietUntil = nowMs() + ARRIVAL_HOLD_QUIET_MS;
   _arrivalHold.imagesLoading = imageAboveStillLoading(target, c);
 }
 
-/** Hold `target`, which a restore has just put back where the reader left it,
- *  while the transcript `c` settles. The restore is one write with no motion,
- *  so the hold is armed and settled in the same step. */
-export function holdRestoredPlace(c: HTMLElement, target: HTMLElement): void {
-  armArrivalHold(target);
+/** Hold `target`, the block on the line a restore has just put back where the
+ *  reader left it, while the transcript `c` settles. The restore is one write
+ *  with no motion, so the hold is armed and settled in the same step.
+ *
+ *  `fallback` is the turn holding `target`, held instead once `target` leaves
+ *  the DOM. `onSettled` runs once the hold has run its course on a later growth
+ *  round. A reader's gesture, a ride or a lost target ends it without the call. */
+export function holdRestoredPlace(c: HTMLElement, target: HTMLElement, onSettled?: () => void, fallback: HTMLElement | null = null): void {
+  armArrivalHold(target, fallback === target ? null : fallback);
+  if (_arrivalHold) _arrivalHold.onSettled = onSettled;
   settleArrivalHold(target, c);
+}
+
+/** Move a hold whose target left the DOM onto its fallback, at the place the
+ *  fallback sat after the last round. */
+function fallBackIfReplaced(hold: NonNullable<typeof _arrivalHold>): void {
+  const { fallback, fallbackRelTop } = hold;
+  if (hold.target.isConnected !== false || !fallback || fallback.isConnected === false || fallbackRelTop === null) return;
+  hold.target = fallback;
+  hold.relTop = fallbackRelTop;
+  hold.fallback = null;
 }
 
 /** Put an arrival's target back where it rested in the viewport, after one
@@ -2528,28 +2560,36 @@ function holdTheArrival(el: HTMLElement): boolean {
   const hold = _arrivalHold;
   if (!hold) return false;
   const now = nowMs();
-  // The saved reading covers an image that decoded this round. The fresh one
-  // covers an image inserted since the saved reading was taken.
-  const settled = now >= hold.quietUntil && !hold.imagesLoading
-    && !imageAboveStillLoading(hold.target, el);
-  if (
-    settled || now >= hold.endsBy
-    || hold.target.isConnected === false || _follow.value === 'riding'
-  ) {
+  fallBackIfReplaced(hold);
+  const taken = hold.target.isConnected === false || _follow.value === 'riding';
+  if (taken) {
     _arrivalHold = null;
     return false;
   }
-  if (_scrollAnimRaf !== null || hold.relTop === null) return true;
-  // Against the resting place itself, so shifts too small to act on alone add
-  // up across rounds instead of being dropped one at a time.
-  const shift = viewportTopOf(hold.target, el) - hold.relTop;
-  if (Math.abs(shift) > 1) {
-    const before = el.scrollTop;
-    markAnchorScroll(el, before + shift);
-    // A write the browser clamped moved nothing, so the transcript is still.
-    if (el.scrollTop !== before) hold.quietUntil = now + ARRIVAL_HOLD_QUIET_MS;
+  // Correct this round before testing either deadline. A late resize can be
+  // the first notice of growth since the quiet window elapsed.
+  if (now <= hold.endsBy && _scrollAnimRaf === null && hold.relTop !== null) {
+    // Against the resting place itself, so shifts too small to act on alone add
+    // up across rounds instead of being dropped one at a time.
+    const shift = viewportTopOf(hold.target, el) - hold.relTop;
+    if (Math.abs(shift) > 1) {
+      const before = el.scrollTop;
+      markAnchorScroll(el, before + shift);
+      // A write the browser clamped moved nothing, so the transcript is still.
+      if (el.scrollTop !== before) hold.quietUntil = now + ARRIVAL_HOLD_QUIET_MS;
+    }
+    if (hold.fallback) hold.fallbackRelTop = viewportTopOf(hold.fallback, el);
   }
-  hold.imagesLoading = imageAboveStillLoading(hold.target, el);
+  // The saved reading covers an image that decoded this round. The fresh one
+  // covers an image inserted since the saved reading was taken.
+  const imagesLoading = imageAboveStillLoading(hold.target, el);
+  const settled = now >= hold.quietUntil && !hold.imagesLoading && !imagesLoading;
+  if (settled || now >= hold.endsBy) {
+    _arrivalHold = null;
+    hold.onSettled?.();
+    return false;
+  }
+  hold.imagesLoading = imagesLoading;
   return true;
 }
 
@@ -3919,8 +3959,8 @@ export function makeScrollObservers(el: HTMLElement) {
    *  mutations.
    *
    *  The anchor must describe the layout BEFORE the reflow, and a ResizeObserver
-   *  only runs after it. So both handlers keep a running snapshot of which child
-   *  the reader is parked on, and where its top sat. Two MEASURED positions are
+   *  only runs after it. So both handlers keep a running snapshot of the block
+   *  on the reader's line, and where its top sat. Two MEASURED positions are
    *  all the correction needs, which makes it immune to the browser clamping
    *  `scrollTop`. A correction derived from a delta would read that clamp as the
    *  reader having scrolled.
@@ -3931,44 +3971,33 @@ export function makeScrollObservers(el: HTMLElement) {
   let lastHeight = el.clientHeight;
   let anchorChild: HTMLElement | null = null;
   let anchorRelTop = 0;
+  let lineTurn: HTMLElement | null = null;
+  let lineTurnRelTop = 0;
 
   function viewportTop() {
     return el.getBoundingClientRect().top;
   }
 
-  /** Snapshot which child the reader is parked on: the last one whose top is at
-   *  or above the viewport top, with the offset it sat at. Scanned from the END,
-   *  since the reader is normally near the newest turn, so the loop usually
-   *  stops on its first step. Children with no box are skipped, because on
-   *  desktop the mobile title row reports an all-zero rect that would otherwise
-   *  read as "far above".
+  /** Snapshot the block on the reader's line and the offset its top sat at
+   *  (`readLineBlock`). That is the paragraph, not only its turn, so a re-wrap
+   *  inside the turn above the line is undone too.
    *
    *  The ResizeObserver only sees the geometry AFTER the change, and the
    *  question is about before it.
+   *
+   *  A reader above every turn gets no anchor. No content above them can
+   *  grow, so a null keeps the reflow correction a no-op, the right answer.
+   *  The turn is kept too, for a block a re-set reply has replaced since.
    *
    *  Cheap on the scroll path despite the rect reads. Both callers run
    *  `isElementVisible(el)` first, which already forces any pending layout
    *  flush, so these reads hit a clean tree rather than triggering one. */
   function recordAnchor() {
-    anchorChild = null;
-    // The turns sit inside `.thread-feed`, exactly as `scrollAnchor.ts` reads
-    // them. Anchored on the feed box, a re-wrap above the reader shifts nothing.
-    const feed = typeof el.querySelector === 'function' ? el.querySelector('.thread-feed') : null;
-    const kids = (feed ?? el).children;
-    if (!kids || typeof el.getBoundingClientRect !== 'function') return;
-    const top = viewportTop();
-    for (let i = kids.length - 1; i >= 0; i--) {
-      const kid = kids[i] as HTMLElement;
-      const rect = kid.getBoundingClientRect();
-      if (rect.height <= 0) continue;
-      if (rect.top - top > 0) continue;
-      anchorChild = kid;
-      anchorRelTop = rect.top - top;
-      return;
-    }
-    // Nothing starts at or above the viewport top: the reader is at the very top
-    // of the transcript, where no content above can grow. Leaving the anchor
-    // null keeps the reflow correction a no-op, which is the right answer there.
+    const line = readLineBlock(el);
+    anchorChild = line?.block ?? null;
+    anchorRelTop = line?.relTop ?? 0;
+    lineTurn = line?.turn ?? null;
+    lineTurnRelTop = line?.turnRelTop ?? 0;
   }
 
   /** Put the reader back where the width change moved them. Runs inside the
@@ -3986,9 +4015,9 @@ export function makeScrollObservers(el: HTMLElement) {
    *  carve-out `withScrollAnchor` makes on the DOM side, and it is a request
    *  term rather than a proximity one. */
   function restoreAfterReflow() {
-    const child = anchorChild;
+    const [child, relTop] = anchorChild?.isConnected !== false ? [anchorChild, anchorRelTop] : [lineTurn, lineTurnRelTop];
     if (!child || child.isConnected === false) return;
-    const shift = (child.getBoundingClientRect().top - viewportTop()) - anchorRelTop;
+    const shift = (child.getBoundingClientRect().top - viewportTop()) - relTop;
     if (shift === 0) return;
     // An ANCHOR write, which is what keeps the mobile header still across it.
     // Unmarked, a wide reflow slid the chrome by its own delta and covered the
@@ -4076,9 +4105,9 @@ export function makeScrollObservers(el: HTMLElement) {
   function onResize() {
     if (!isElementVisible(el)) return;
     // The transcript's OWN BOX changing is a different event from its content
-    // growing, and only the first moves the reader relative to what they were
-    // reading. Content growth needs no correction. The content above the reader
-    // is unchanged, so the same `scrollTop` shows them the same thing.
+    // growing, and only the box change is corrected here. Content growth
+    // outside an arrival hold moves nobody. While the transcript settles after
+    // a restore or a deep link, `holdTheArrival` corrects growth above the line.
     const width = el.clientWidth;
     const height = el.clientHeight;
     const boxChanged = width !== lastWidth || height !== lastHeight;

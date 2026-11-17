@@ -1,119 +1,23 @@
 import {
   showToast,
-  applyingNowThreadIds,
-  applyNowRequests,
-  discardingCCThreadIds,
   threadMap,
   markThreadAnswering,
   clearThreadAnswering,
   focusedThreadId,
-  TOAST_AUTO_DISMISS_MS,
 } from '../store';
-import { archiveRequestInFlight } from '../rowIntents';
-import { applyNow, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
+import { answerThreadQuestion as apiAnswerThreadQuestion, sendControlRequest, ApiError, type AnswerPlacement } from '../../api/client';
+import { persistSendingMessage, forgetUnsentMessageRecord, markUnsentMessageRecordUnsent } from '../unsentMessageRecords';
 import { pendingAnswers, unsentPicks } from '../pendingDecisions';
-import { answerIsQuiet, askedOptions } from '../quietAnswer';
-import { sendFailureOf, withQuietRetries } from './sendRetry';
-import { inSendChain } from './sendChain';
+import { answerIsQuiet, askedOptions, questionAnswerText } from '../quietAnswer';
+import { inputRefusalOf, sendFailureOf, withQuietRetries } from './sendRetry';
+import { enterSendChain } from './sendChain';
+import { knownComposeEpoch, parseComposeReport, acceptComposeReport } from '../composeSync';
 import type { AnswerKind } from '../thread-events';
 import { markThreadRerenderStart, clearThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
-import { changeToastMessage } from './changeToast';
-import { focusThread } from './threads';
 import { errorDetail } from '../../utils/errorDetail';
 import { generateUuid } from '../../utils/uuid';
 import { probeStreamAfterSend } from './send-probe';
-
-/** End the click's bridge: the engine refused it, or it failed to send. */
-function dropApplyNowRequest(threadId: string): void {
-  const next = new Map(applyNowRequests.value);
-  next.delete(threadId);
-  applyNowRequests.value = next;
-}
-
-/** Refusal slugs that mean something other than an apply holds the session.
- *  The engine sends one as `reason` beside the message on an Apply Now 409. */
-const NOT_APPLYING_REFUSALS = new Set([
-  'discard_in_progress',
-  'session_stopping',
-  'question_open',
-  'question_unknown',
-]);
-
-/** Whether an Apply Now 409 means an apply is genuinely running. An older
- *  engine sends no slug, and its only 409s were apply-held. */
-function refusalMeansApplying(e: ApiError): boolean {
-  const slug = (e.body as { reason?: unknown } | undefined)?.reason;
-  return typeof slug !== 'string' || !NOT_APPLYING_REFUSALS.has(slug);
-}
-
-/** Apply a coding-agent thread's change. The engine owns the apply and
- *  projects it on the thread's row as `applyInFlight` (ADR 0437). The click
- *  shows "applying" at once, and holds until the row reaches the version the
- *  engine answered with. No timer and no other event ends it. */
-export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
-  if (applyingNowThreadIds.value.has(threadId)) return; // Already in progress
-  if (archiveRequestInFlight(threadId)) return; // Can't apply while archiving
-  if (discardingCCThreadIds.value.has(threadId)) return; // Can't apply while discarding
-  // An engine that predates the version: hold until any row newer than this
-  // one. Read before the request, since its frame can beat the response.
-  const legacyVersion = (threadMap.value.get(threadId)?.meta.summaryVersion ?? 0) + 1;
-  applyNowRequests.value = new Map(applyNowRequests.value).set(threadId, null);
-  try {
-    const { summary_version } = await applyNow(threadId);
-    applyNowRequests.value = new Map(applyNowRequests.value).set(threadId, summary_version ?? legacyVersion);
-  } catch (e) {
-    dropApplyNowRequest(threadId);
-    if (e instanceof ApiError && e.httpCode === 409) {
-      // The engine's message names what refused the apply. Keyed under the
-      // apply's result toast, which replaces it once the apply resolves. A
-      // running apply already shows on the row, so nothing else is held.
-      const key = `applying-${threadId}`;
-      const onClick = () => focusThread(threadId);
-      if (refusalMeansApplying(e)) {
-        showToast(changeToastMessage('Already applying', threadId, e.reason), 'info', { key, onClick, autoDismissMs: TOAST_AUTO_DISMISS_MS });
-      } else {
-        // A Discard, a stop ending the session, or a question that may still
-        // be waiting on the user: nothing is applying.
-        showToast(changeToastMessage('Not applied', threadId, e.reason), 'warning', { key, onClick });
-      }
-      return;
-    }
-    // Every keyed error toast in this file names its thread and its cause. A
-    // bare "Failed to start apply" says neither which thread failed nor why:
-    // an auth refusal, a 5xx and a worktree conflict all read alike, and two
-    // threads applying at once become indistinguishable.
-    showToast(changeToastMessage('Failed to start apply', threadId, errorDetail(e)), 'error', {
-      key: `applying-${threadId}`,
-    });
-  }
-}
-
-/** Discard all CC changes for a thread with optimistic state tracking.
- *  Guards against concurrent apply/dismiss — mutual exclusivity with the other actions. */
-export async function handleDiscardCCChanges(threadId: string): Promise<void> {
-  if (discardingCCThreadIds.value.has(threadId)) return;
-  if (applyingNowThreadIds.value.has(threadId)) return;
-  if (archiveRequestInFlight(threadId)) return;
-  discardingCCThreadIds.value = new Set([...discardingCCThreadIds.value, threadId]);
-  // autoDismissMs is a safety net for the rare zero-pending-changes case
-  // where the engine emits no ChangeDiscarded event and the spinner has no
-  // SSE handler to replace it. Successful discards re-key with 4s.
-  showToast(changeToastMessage('Discarding changes', threadId), 'info', { key: `discarding-${threadId}`, onClick: () => focusThread(threadId), spinning: true, autoDismissMs: 30_000 });
-  try {
-    await discardCCChanges(threadId);
-    // Success toast fires from the SSE ChangeDiscarded handler — same key replaces the spinner.
-  } catch (e) {
-    // Keyed, so it replaces the named spinner above. Same rule as apply.
-    showToast(changeToastMessage('Failed to discard changes', threadId, errorDetail(e)), 'error', {
-      key: `discarding-${threadId}`,
-    });
-  } finally {
-    const next = new Set(discardingCCThreadIds.value);
-    next.delete(threadId);
-    discardingCCThreadIds.value = next;
-  }
-}
 
 /** Why the engine refused an answer, said once and naming the cause.
  *
@@ -168,7 +72,10 @@ export async function answerThreadQuestion(
   threadId: string,
   toolUseId: string,
   answer: AnswerKind,
+  retryPlacement?: AnswerPlacement,
 ): Promise<AnswerOutcome> {
+  const wireAnswer = structuredClone(answer);
+  const composerAnswer = wireAnswer.kind === 'FreeText' || (wireAnswer.kind === 'MultiSelected' && (!!wireAnswer.text || !!wireAnswer.image_hashes?.length));
   // Perf: stamp the re-render span for the `thread-rerender` mark — answering a
   // question on the focused thread flips `answeringThreadIds`, busting every
   // exchange memo → full re-render. ThreadView fires once on the next render.
@@ -191,24 +98,56 @@ export async function answerThreadQuestion(
   // In the thread's send chain, so a message typed after the tap cannot reach
   // the engine first and be taken as the card's answer. Every quiet retry is
   // the same input, so it resends the same id and place.
-  const eventId = generateUuid();
-  const result = await inSendChain(threadId, (position) =>
-    withQuietRetries(
-      () => apiAnswerThreadQuestion(threadId, toolUseId, answer, { event_id: eventId, ...position }),
-      { path: 'answer' },
-    ));
+  const eventId = retryPlacement?.event_id ?? generateUuid();
+  const slot = enterSendChain(threadId, retryPlacement ? retryPlacement.compose_epoch : knownComposeEpoch(threadId));
+  let placement: AnswerPlacement | undefined = retryPlacement ? { ...retryPlacement } : undefined;
+  const persistAnswer = (posting: AnswerPlacement) => {
+    if (!composerAnswer) return;
+    persistSendingMessage({
+      eventId, threadId, body: { message: questionAnswerText(wireAnswer, askedOptions(threadMap.peek().get(threadId), toolUseId)), image_hashes: 'image_hashes' in wireAnswer ? wireAnswer.image_hashes : undefined, thread_id: threadId, event_id: eventId, mode: 'human' },
+      settlement: { kind: 'follow-up' }, sentAt: new Date().toISOString(),
+      questionPick: { toolUseId, answer: wireAnswer, placement: posting },
+    });
+  };
+  persistAnswer(placement ?? { event_id: eventId, ...slot.position, compose_epoch: knownComposeEpoch(threadId) });
+  const result = await (async () => {
+    try {
+      if (slot.waitForTurn) await slot.waitForTurn;
+      const posting = placement ?? { event_id: eventId, ...slot.position, compose_epoch: slot.epochForPost() };
+      placement = posting;
+      persistAnswer(posting);
+      return await withQuietRetries(
+        () => apiAnswerThreadQuestion(threadId, toolUseId, wireAnswer, posting, (wire) => {
+          if (wire) {
+            acceptComposeReport(threadId, parseComposeReport(wire));
+            if (!retryPlacement) slot.accepted(wire.compose_epoch ?? undefined);
+          }
+        }),
+        { path: 'answer' },
+      );
+    } finally {
+      slot.release();
+    }
+  })();
   // A 409 after a dropped attempt almost always means that attempt arrived:
   // the engine 409s a repeated answer. SSE shows what was recorded.
-  if (result.kind === 'done' && (result.value || result.attempts > 1)) {
+  if (result.kind === 'done' && (result.value || (!composerAnswer && result.attempts > 1))) {
+    if (composerAnswer) forgetUnsentMessageRecord(eventId);
     probeStreamAfterSend(threadId, () => questionAnswerRecorded(threadId, toolUseId));
     return 'sent';
   }
   clearThreadAnswering(threadId);
   clearThreadRerenderStart(threadId); // no render coming → don't mis-fire later
-  if (result.kind === 'gave-up') {
-    unsentPicks.set(toolUseId, { threadId, answer, failure: sendFailureOf(result) });
+  const refusal = result.kind === 'refused' ? inputRefusalOf(result.error) : undefined;
+  if (result.kind !== 'landed' && (composerAnswer || result.kind === 'gave-up' || refusal)) {
+    if (composerAnswer) markUnsentMessageRecordUnsent(eventId, 0, refusal);
+    unsentPicks.set(toolUseId, { threadId, answer: wireAnswer, placement, refusal,
+      ...('error' in result ? { failure: sendFailureOf(result) } : {}),
+    });
+    if (result.kind === 'done') probeStreamAfterSend(threadId, () => questionAnswerRecorded(threadId, toolUseId));
     return 'unsent';
   }
+  if (composerAnswer) forgetUnsentMessageRecord(eventId);
   showToast(answerFailureMessage(result.kind === 'refused' ? { kind: 'error', err: result.error } : { kind: 'conflict' }), 'error');
   return 'refused';
 }
@@ -219,7 +158,7 @@ export async function retryUnsentPick(toolUseId: string): Promise<AnswerOutcome 
   const pick = unsentPicks.map.value.get(toolUseId);
   if (!pick) return null;
   pendingAnswers.set(toolUseId, pick.answer);
-  const outcome = await answerThreadQuestion(pick.threadId, toolUseId, pick.answer);
+  const outcome = await answerThreadQuestion(pick.threadId, toolUseId, pick.answer, pick.refusal ? undefined : pick.placement);
   if (outcome !== 'sent') pendingAnswers.clear(toolUseId);
   return outcome;
 }

@@ -1,3 +1,4 @@
+import { retryTransportRead } from './_transport';
 /**
  * Internal fetch wrapper. Single point for:
  * - Base URL resolution
@@ -194,11 +195,11 @@ async function directFetch(
   const requestHeaders = new Headers({ ...headers, ...headersToRecord(init?.headers) });
   requestHeaders.set('x-lucidos-restore-generation', generation.header);
   try {
-    const response = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
+    const response = await retryTransportRead(() => fetch(`${_baseUrl}${API_V1}${normalized}`, {
       ...init,
       signal,
       headers: Object.fromEntries(requestHeaders.entries()),
-    });
+    }), { ...init, signal }, () => generation.assertCurrent());
     if (generation.wait) await generation.wait();
     generation.assertCurrent();
     return response;

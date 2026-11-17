@@ -83,6 +83,12 @@ export default defineConfig({
         // loads is localhost). This prevents the wedge at the source rather than
         // recovering from it via retry.
         proxy: { server: 'http://127.0.0.1:1', bypass: 'localhost,127.0.0.1,::1' },
+        // Once a service worker controls a WebKit page, no route sees the
+        // page's requests. The harness then cannot stamp them as a gateway
+        // would (`e2e/harnessStamp.ts`). Chromium routes them, and keeps its
+        // worker. A spec that needs the worker opts in with
+        // `KEEPS_THE_SERVICE_WORKER`.
+        serviceWorkers: 'block',
       },
     },
   ],

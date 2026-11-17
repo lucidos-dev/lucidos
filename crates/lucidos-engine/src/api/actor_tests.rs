@@ -1,4 +1,9 @@
 use super::*;
+use crate::api::gateway_stamp::test_support::{
+    insert_stamped_device, stamped_device_headers, stamped_workspace_call_headers,
+};
+use crate::api::owner_door::OnUnattested;
+use crate::engine::thread_events::SpawnVerdict;
 
 fn headers_with(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
     let mut h = axum::http::HeaderMap::new();
@@ -25,11 +30,17 @@ fn caller(
     })
 }
 
+/// The headers the gateway forwards for an allowed call from `name`'s thread.
+fn allowed_call(name: &str, thread_id: Option<Uuid>) -> axum::http::HeaderMap {
+    stamped_workspace_call_headers(name, thread_id, &SpawnVerdict::Allowed)
+}
+
 #[test]
 fn build_origin_user_with_caller_yields_workspace() {
     let src_thread = Uuid::new_v4();
     let src_event = Uuid::new_v4();
-    let h = headers_with(&[("user-agent", "lucidos-engine/0.1")]);
+    let mut h = allowed_call("dev", Some(src_thread));
+    h.insert("user-agent", "lucidos-engine/0.1".parse().unwrap());
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
@@ -46,11 +57,13 @@ fn build_origin_user_with_caller_yields_workspace() {
             event_id,
             user_agent,
             mode: _,
+            verdict,
         }) => {
             assert_eq!(workspace, "dev");
             assert_eq!(thread_id, Some(src_thread));
             assert_eq!(event_id, Some(src_event));
             assert_eq!(user_agent.as_deref(), Some("lucidos-engine/0.1"));
+            assert_eq!(verdict, Some(SpawnVerdict::Allowed));
         }
         other => panic!("expected Workspace, got {:?}", other),
     }
@@ -58,7 +71,7 @@ fn build_origin_user_with_caller_yields_workspace() {
 
 #[test]
 fn build_origin_user_caller_takes_precedence_over_device() {
-    let h = headers_with(&[]);
+    let h = allowed_call("myws", None);
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
@@ -73,7 +86,7 @@ fn build_origin_user_caller_takes_precedence_over_device() {
 
 #[test]
 fn build_origin_user_with_device_id_yields_the_device_id_only() {
-    let h = headers_with(&[]);
+    let h = stamped_device_headers("dev-1");
     let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
     match origin {
         Some(origin @ MessageOrigin::Device { .. }) => {
@@ -85,6 +98,53 @@ fn build_origin_user_with_device_id_yields_the_device_id_only() {
         }
         other => panic!("expected Device, got {:?}", other),
     }
+}
+
+/// Invariant 1 of the unattested-callers plan: a typed device id is a claim.
+/// With no stamp it builds `UnattestedCaller`, carrying the id as a hint.
+#[test]
+fn a_typed_device_id_with_no_stamp_is_an_unattested_caller() {
+    let h = headers_with(&[("user-agent", "curl/8")]);
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
+    assert_eq!(
+        serde_json::to_value(&origin).unwrap(),
+        serde_json::json!({
+            "kind": "unattested_caller",
+            "mode": "human",
+            "user_agent": "curl/8",
+            "claimed_device_id": "dev-1",
+        }),
+    );
+}
+
+/// A stamp vouches for one device. Naming another beside it proves nothing.
+#[test]
+fn a_stamp_for_another_device_is_an_unattested_caller() {
+    let h = stamped_device_headers("dev-1");
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-2"), None, None, None, None);
+    assert!(
+        matches!(
+            &origin,
+            Some(MessageOrigin::UnattestedCaller { claimed_device_id: Some(id), .. }) if id == "dev-2"
+        ),
+        "{origin:?}"
+    );
+}
+
+/// A stamp this engine's key did not sign is no stamp at all.
+#[test]
+fn a_forged_stamp_is_an_unattested_caller() {
+    let forged = format!(
+        "v1.{}.{}",
+        lucidos_gateway_stamp::now_unix(),
+        "0".repeat(64)
+    );
+    let h = headers_with(&[(lucidos_gateway_stamp::HEADER_GATEWAY_STAMP, forged.as_str())]);
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
+    assert!(
+        matches!(origin, Some(MessageOrigin::UnattestedCaller { .. })),
+        "{origin:?}"
+    );
 }
 
 /// A bare curl is nobody, not the owner. Stamping it human is the inversion
@@ -100,29 +160,29 @@ fn a_caller_with_no_credential_yields_no_actor_at_all() {
     );
 }
 
-/// The engine's own build-watch. It belongs to no thread, so it carries no
-/// origin token, and it is not a person. The machine-local token is the
-/// credential ADR 0169 gives it, and `Engine` mode is what the chip reads as
-/// "Lucidos Engine".
+/// Invariant 1 of the unattested-callers plan. The build-watch holds the
+/// machine-local token and no origin token, and so does any subprocess that
+/// reads the file. So the token alone is an unattested caller, in the
+/// `Engine` mode ADR 0169 gave it.
 #[test]
-fn the_machine_local_token_names_the_engines_own_machinery() {
+fn the_machine_local_token_alone_is_an_unattested_caller() {
     let token = crate::api::local_auth::publish_test_local_token();
     let h = headers_with(&[
         ("user-agent", "lucidos-cli"),
         (lucidos_local_token::HEADER_LOCAL_TOKEN, token),
     ]);
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None);
-    match origin {
-        Some(MessageOrigin::Api {
-            mode,
-            source_thread_id,
-            ..
-        }) => {
-            assert_eq!(mode, ActorMode::Engine);
-            assert_eq!(source_thread_id, None, "a machine belongs to no thread");
-        }
-        other => panic!("expected Api, got {:?}", other),
-    }
+    assert_eq!(
+        origin,
+        Some(MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Engine,
+            user_agent: Some("lucidos-cli".into()),
+            claimed_device_id: None,
+            claimed_local_token: true,
+            claimed_workspace: None,
+            claimed_thread_id: None,
+        })
+    );
 }
 
 /// A device names a person and the local token names a machine, so the person
@@ -130,12 +190,35 @@ fn the_machine_local_token_names_the_engines_own_machinery() {
 #[test]
 fn a_device_outranks_the_machine_local_token() {
     let token = crate::api::local_auth::publish_test_local_token();
-    let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    let mut h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    insert_stamped_device(&mut h, "dev-1");
     let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
     match origin {
         Some(MessageOrigin::Device { device_id }) => assert_eq!(device_id, "dev-1"),
         other => panic!("expected Device, got {:?}", other),
     }
+}
+
+/// The local token does not lend a typed device id the stamp it lacks. The
+/// pair is an unattested caller, never the owner's device.
+#[test]
+fn the_machine_local_token_does_not_attest_a_typed_device() {
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    let origin = build_message_origin(&h, ActorMode::Human, Some("dev-1"), None, None, None, None);
+    assert!(
+        matches!(
+            &origin,
+            Some(MessageOrigin::UnattestedCaller {
+                mode: ActorMode::Human,
+                claimed_device_id: Some(id),
+                claimed_local_token: true,
+                claimed_workspace: None,
+                ..
+            }) if id == "dev-1"
+        ),
+        "{origin:?}"
+    );
 }
 
 /// The thread-bound origin token still wins. An agent holding the machine
@@ -169,7 +252,7 @@ fn a_thread_bound_token_outranks_the_machine_local_token() {
 
 #[test]
 fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
-    let h = headers_with(&[]);
+    let h = allowed_call("dev", None);
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
@@ -194,7 +277,7 @@ fn build_origin_human_mode_with_caller_yields_workspace_human_mode() {
 fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
     // CallerOrigin carries the upstream mode — the calling workspace's
     // actor (Agent here) flows straight into the Workspace branch.
-    let h = headers_with(&[]);
+    let h = allowed_call("dev", None);
     let origin = build_message_origin(
         &h,
         ActorMode::Agent,
@@ -212,7 +295,7 @@ fn build_origin_agent_mode_with_caller_yields_workspace_agent_mode() {
 
 #[test]
 fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
-    let h = headers_with(&[]);
+    let h = allowed_call("dev", None);
     let origin = build_message_origin(
         &h,
         ActorMode::Engine,
@@ -226,6 +309,111 @@ fn build_origin_engine_mode_with_caller_yields_workspace_engine_mode() {
         Some(MessageOrigin::Workspace { mode, .. }) => assert_eq!(mode, ActorMode::Engine),
         other => panic!("expected Workspace engine mode, got {:?}", other),
     }
+}
+
+/// Invariant 1: a `caller_workspace` with no stamp is a claim, so it builds
+/// an unattested caller carrying the name, never `Workspace`.
+#[test]
+fn an_unstamped_caller_workspace_is_an_unattested_caller() {
+    let thread_id = Uuid::new_v4();
+    let origin = build_message_origin(
+        &headers_with(&[]),
+        ActorMode::Agent,
+        None,
+        None,
+        None,
+        None,
+        caller("dev", Some(thread_id), None, ActorMode::Agent),
+    );
+    assert_eq!(
+        origin,
+        Some(MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Agent,
+            user_agent: None,
+            claimed_device_id: None,
+            claimed_local_token: false,
+            claimed_workspace: Some("dev".into()),
+            claimed_thread_id: Some(thread_id),
+        })
+    );
+}
+
+/// Every claim stacked, as a forged `curl` would send them, builds one
+/// unattested caller that keeps each claim as a hint.
+#[test]
+fn stacked_claims_beside_a_caller_workspace_keep_every_hint() {
+    let token = crate::api::local_auth::publish_test_local_token();
+    let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
+    let origin = build_message_origin(
+        &h,
+        ActorMode::Human,
+        Some("typed-device"),
+        None,
+        None,
+        None,
+        caller("dev", None, None, ActorMode::Human),
+    );
+    assert_eq!(
+        origin,
+        Some(MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Human,
+            user_agent: None,
+            claimed_device_id: Some("typed-device".into()),
+            claimed_local_token: true,
+            claimed_workspace: Some("dev".into()),
+            claimed_thread_id: None,
+        })
+    );
+}
+
+/// A stamp for another caller or thread vouches for nothing here.
+#[test]
+fn a_stamp_for_another_caller_workspace_is_unattested() {
+    let thread = Uuid::new_v4();
+    for (headers, claimed) in [
+        (
+            allowed_call("work2", Some(thread)),
+            caller("dev", Some(thread), None, ActorMode::Agent),
+        ),
+        (
+            allowed_call("dev", Some(Uuid::new_v4())),
+            caller("dev", Some(thread), None, ActorMode::Agent),
+        ),
+    ] {
+        let origin =
+            build_message_origin(&headers, ActorMode::Agent, None, None, None, None, claimed);
+        assert!(
+            matches!(
+                origin,
+                Some(MessageOrigin::UnattestedCaller {
+                    claimed_workspace: Some(ref w),
+                    ..
+                }) if w == "dev"
+            ),
+            "{origin:?}"
+        );
+    }
+}
+
+/// B honors A's verdict as signed: a refused call stays refused.
+#[test]
+fn a_stamped_refusal_rides_the_workspace_origin() {
+    let refused = SpawnVerdict::Refused {
+        reason: "no grant".into(),
+    };
+    let origin = build_message_origin(
+        &stamped_workspace_call_headers("dev", None, &refused),
+        ActorMode::Agent,
+        None,
+        None,
+        None,
+        None,
+        caller("dev", None, None, ActorMode::Agent),
+    );
+    assert!(
+        matches!(origin, Some(MessageOrigin::Workspace { verdict: Some(ref v), .. }) if *v == refused),
+        "{origin:?}"
+    );
 }
 
 #[test]
@@ -296,7 +484,7 @@ fn build_origin_engine_mode_with_parent_thread_yields_thread_link_engine_mode() 
 
 #[test]
 fn user_actor_convenience_passes_through_to_build_message_origin() {
-    let h = headers_with(&[("user-agent", "curl/8")]);
+    let h = stamped_device_headers("dev-1");
     let actor = user_actor(&h, Some("dev-1"));
     match actor {
         Some(MessageOrigin::Device { device_id }) => {
@@ -308,7 +496,7 @@ fn user_actor_convenience_passes_through_to_build_message_origin() {
 
 #[test]
 fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
-    let h = headers_with(&[("x-lucidos-device-id", "abcdef0123456789")]);
+    let h = stamped_device_headers("abcdef0123456789");
     let actor = user_actor(&h, None);
     match actor {
         Some(MessageOrigin::Device { device_id }) => {
@@ -320,13 +508,19 @@ fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
 
 #[test]
 fn user_actor_explicit_id_takes_precedence_over_header() {
-    let h = headers_with(&[("x-lucidos-device-id", "dev-from-header")]);
+    let h = stamped_device_headers("dev-from-header");
     let actor = user_actor(&h, Some("dev-from-arg"));
     match actor {
-        Some(MessageOrigin::Device { device_id }) => {
-            assert_eq!(device_id, "dev-from-arg");
+        Some(MessageOrigin::UnattestedCaller {
+            claimed_device_id, ..
+        }) => {
+            assert_eq!(
+                claimed_device_id.as_deref(),
+                Some("dev-from-arg"),
+                "the explicit id is the claim, and the stamp does not name it"
+            );
         }
-        other => panic!("expected explicit Device, got {:?}", other),
+        other => panic!("expected an unattested explicit id, got {:?}", other),
     }
 }
 
@@ -373,28 +567,52 @@ async fn a_registered_device_passes_the_same_gate() {
         .await
         .unwrap();
 
-    let h = headers_with(&[(HEADER_DEVICE_ID, "gate-device")]);
+    let h = stamped_device_headers("gate-device");
     let actor = require_user_actor(&h, &pool, None)
         .await
         .expect("a registered device identifies itself");
     assert!(matches!(actor, MessageOrigin::Device { .. }));
 
+    // Typed with no stamp, the same registered id is identity but not the
+    // owner's device.
+    let typed = headers_with(&[(HEADER_DEVICE_ID, "gate-device")]);
+    let actor = require_user_actor(&typed, &pool, None)
+        .await
+        .expect("a registered id still identifies the caller");
+    assert!(
+        matches!(actor, MessageOrigin::UnattestedCaller { .. }),
+        "{actor:?}"
+    );
+
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// The gate's whole point. Attribution stamps any non-empty id as a `Device`,
-/// so a bare curl could otherwise type one header and be recorded as the owner.
-/// That id is the evidence ADR 0168 clause 4 will read, so it must name a row.
+/// A stamp is evidence on its own: a paired device the engine has not yet
+/// registered is still that device.
+#[tokio::test]
+async fn a_stamped_device_needs_no_registration() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = stamped_device_headers("fresh-device");
+    let actor = require_user_actor(&h, &pool, None)
+        .await
+        .expect("a stamped device identifies itself");
+    assert!(matches!(actor, MessageOrigin::Device { .. }), "{actor:?}");
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// The gate's whole point. Attribution records any non-empty id, so a bare
+/// curl could otherwise type one header and be identified. An unstamped id
+/// must at least name a row.
 #[tokio::test]
 async fn an_unregistered_device_id_is_not_evidence() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[(HEADER_DEVICE_ID, "never-registered")]);
 
-    // Attribution still stamps it, which is the behaviour the gate must not
-    // inherit. A device that was removed keeps its name on what it already did.
+    // Attribution still records the claim, as an unattested caller. The gate
+    // must not inherit even that.
     assert!(matches!(
         user_actor(&h, None),
-        Some(MessageOrigin::Device { .. })
+        Some(MessageOrigin::UnattestedCaller { .. })
     ));
 
     let refusal = require_user_actor(&h, &pool, None)
@@ -407,7 +625,7 @@ async fn an_unregistered_device_id_is_not_evidence() {
 
 /// An unregistered id is suppressed, not fatal. The caller falls through to
 /// whatever else it holds. So a script sending a stale device id and the
-/// machine token is still the engine's own machinery.
+/// machine token reads as the token alone.
 #[tokio::test]
 async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -420,10 +638,11 @@ async fn an_unregistered_device_id_falls_through_to_the_machine_token() {
     let actor = require_user_actor(&h, &pool, None)
         .await
         .expect("the machine token still identifies the caller");
-    match actor {
-        MessageOrigin::Api { mode, .. } => assert_eq!(mode, ActorMode::Engine),
-        other => panic!("expected Api, got {:?}", other),
-    }
+    assert_eq!(
+        actor,
+        crate::api::local_auth::local_process_origin(None),
+        "{actor:?}"
+    );
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -445,7 +664,7 @@ async fn a_blank_override_does_not_swallow_a_real_device_header() {
     .await
     .unwrap();
 
-    let h = headers_with(&[(HEADER_DEVICE_ID, "blank-test-device")]);
+    let h = stamped_device_headers("blank-test-device");
     let actor = require_user_actor(&h, &pool, Some("   "))
         .await
         .expect("the header is the surviving source");
@@ -1111,11 +1330,18 @@ async fn the_owners_registered_device_may_delete() {
         .await
         .unwrap();
 
-    let h = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
-    let actor = require_owner_device(&h, &pool)
+    let h = stamped_device_headers("owner-phone");
+    let actor = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect("the owner's own device is exactly who this is for");
     assert!(matches!(actor, MessageOrigin::Device { .. }));
+
+    // The same registered id, typed with no stamp, is an unattested caller.
+    let typed = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+    let refusal = require_owner_device(&typed, &pool, OnUnattested::Refuse)
+        .await
+        .expect_err("a typed device id is not the owner's device");
+    assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -1137,7 +1363,7 @@ async fn a_verified_agent_origin_token_may_not_delete() {
         SubprocessOrigin::Subprocess { .. }
     ));
 
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("no agent may press this button");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
@@ -1165,9 +1391,15 @@ async fn a_route_specific_owner_refusal_names_its_own_act() {
         .expect("the secret is installed, so a token mints");
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
 
-    let refusal = require_owner_device_for(&h, &pool, None, "The backup key is the owner's")
-        .await
-        .expect_err("no agent may change the backup recipient");
+    let refusal = require_owner_device_for(
+        &h,
+        &pool,
+        None,
+        "The backup key is the owner's",
+        OnUnattested::Refuse,
+    )
+    .await
+    .expect_err("no agent may change the backup recipient");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
     assert_eq!(refusal.message, "The backup key is the owner's");
 
@@ -1198,7 +1430,7 @@ async fn an_agent_token_beside_a_real_device_header_is_still_refused() {
         (HEADER_DEVICE_ID, "owner-laptop"),
         (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("borrowing the owner's device id does not make an agent a person");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
@@ -1214,7 +1446,7 @@ async fn the_machine_local_token_may_not_delete() {
     let token = crate::api::local_auth::publish_test_local_token();
     let h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, token)]);
 
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("the engine's own machinery is not the owner");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
@@ -1229,7 +1461,7 @@ async fn an_unattributed_caller_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[("user-agent", "curl/8")]);
 
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("a bare curl is nobody");
     assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
@@ -1244,7 +1476,7 @@ async fn an_unregistered_device_may_not_delete() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let h = headers_with(&[(HEADER_DEVICE_ID, "never-registered")]);
 
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("an id naming no device is not the owner");
     assert_eq!(refusal.status, axum::http::StatusCode::UNAUTHORIZED);
@@ -1261,17 +1493,17 @@ async fn an_unregistered_device_may_not_delete() {
 #[tokio::test]
 async fn a_database_blip_cannot_promote_an_invented_device() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
-    let h = headers_with(&[(HEADER_DEVICE_ID, "invented")]);
+    let h = stamped_device_headers("invented");
 
-    // Attribution still stamps it, and `require_user_actor` still admits it,
-    // which is exactly the pair this gate must not inherit.
+    // `require_user_actor` admits the stamped id, which is exactly what this
+    // gate must not inherit while the device row cannot be read.
     pool.close().await;
     assert!(matches!(
         require_user_actor(&h, &pool, None).await,
         Ok(MessageOrigin::Device { .. })
     ));
 
-    let refusal = require_owner_device(&h, &pool)
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("an unconfirmable device must not delete a thread");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
@@ -1297,24 +1529,26 @@ async fn an_app_document_may_not_delete() {
     .await
     .unwrap();
 
-    let h = headers_with(&[
-        (HEADER_DEVICE_ID, "owner-tablet"),
+    let mut h = headers_with(&[
         ("sec-fetch-site", "same-origin"),
         ("referer", "https://localhost:5173/app/habit-tracker/"),
     ]);
-    let refusal = require_owner_device(&h, &pool)
+    insert_stamped_device(&mut h, "owner-tablet");
+    let refusal = require_owner_device(&h, &pool, OnUnattested::Refuse)
         .await
         .expect_err("an app must not press the owner's button with the owner's id");
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
 
     // The same device from the shell itself is fine, so the refusal is about the
     // document rather than about browsers.
-    let shell = headers_with(&[
-        (HEADER_DEVICE_ID, "owner-tablet"),
+    let mut shell = headers_with(&[
         ("sec-fetch-site", "same-origin"),
         ("referer", "https://localhost:5173/"),
     ]);
-    assert!(require_owner_device(&shell, &pool).await.is_ok());
+    insert_stamped_device(&mut shell, "owner-tablet");
+    assert!(require_owner_device(&shell, &pool, OnUnattested::Refuse)
+        .await
+        .is_ok());
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -1347,7 +1581,7 @@ fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
     assert_eq!(pairing_label_for(&blank, "phone-1"), None);
 }
 
-// ── refuse_agent_caller ────────────────────────────────────────────────
+// ── require_attested_owner ────────────────────────────────────────────────
 
 /// Regression: a human-only route asked only whether the caller was
 /// identified, and a verified origin token is an identity. So an agent could
@@ -1356,25 +1590,55 @@ fn pairing_label_for_refuses_a_device_the_header_does_not_name() {
 #[test]
 fn a_verified_origin_token_is_refused_as_an_agent() {
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_for(Some(Uuid::new_v4())))]);
-    let refusal = refuse_agent_caller(&h, "only the owner sends this").unwrap_err();
+    let refusal =
+        require_attested_owner(&h, "only the owner sends this", OnUnattested::Refuse).unwrap_err();
     assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN);
     assert_eq!(refusal.message, "only the owner sends this");
 }
 
-/// A device, the user's own terminal holding the machine-local token, and a
-/// token that does not verify all pass. The last one is no agent the engine
-/// can prove, and the identity gate answers it on its own.
+/// The device the gateway stamped passes, with the local token beside it as
+/// every proxied request carries.
 #[test]
-fn only_a_verified_origin_token_is_refused() {
+fn a_stamped_device_is_the_attested_owner() {
+    let local = crate::api::local_auth::publish_test_local_token();
+    let mut h = headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, local)]);
+    insert_stamped_device(&mut h, "device-abc");
+    assert!(require_attested_owner(&h, "refused", OnUnattested::Refuse).is_ok());
+    assert!(require_attested_owner(
+        &stamped_device_headers("device-abc"),
+        "refused",
+        OnUnattested::Refuse
+    )
+    .is_ok());
+}
+
+/// Invariant 1 of the unattested-callers plan, at the human-only routes. A
+/// typed device id, the machine-local token alone, a token that does not
+/// verify and no credential are claims, not the owner. They hear what to do
+/// instead, never the agent's refusal. Outside `api::owner_door`'s middleware
+/// nothing can park, so an asking door refuses as well.
+#[test]
+fn an_unattested_caller_is_refused_as_not_the_owner() {
     let local = crate::api::local_auth::publish_test_local_token();
     install_test_secret();
     for h in [
         headers_with(&[(HEADER_DEVICE_ID, "device-abc")]),
         headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, local)]),
+        headers_with(&[
+            (HEADER_DEVICE_ID, "device-abc"),
+            (lucidos_local_token::HEADER_LOCAL_TOKEN, local),
+        ]),
         headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, "not-a-token")]),
         headers_with(&[]),
     ] {
-        assert!(refuse_agent_caller(&h, "refused").is_ok(), "{h:?}");
+        for on_unattested in [
+            OnUnattested::Refuse,
+            OnUnattested::Ask(crate::api::owner_door::OwnerAct::new("send an email draft")),
+        ] {
+            let refusal = require_attested_owner(&h, "agent refusal", on_unattested).unwrap_err();
+            assert_eq!(refusal.status, axum::http::StatusCode::FORBIDDEN, "{h:?}");
+            assert_eq!(refusal.message, NOT_ATTESTED_AS_OWNER, "{h:?}");
+        }
     }
 }
 
@@ -1392,6 +1656,7 @@ async fn snapshot_policy_write_requires_registered_owner_device() {
     for headers in [
         headers_with(&[]),
         headers_with(&[(HEADER_DEVICE_ID, "unknown")]),
+        headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]),
         headers_with(&[(lucidos_local_token::HEADER_LOCAL_TOKEN, local)]),
         headers_with(&[
             (HEADER_AGENT_ORIGIN_TOKEN, &token),
@@ -1412,7 +1677,7 @@ async fn snapshot_policy_write_requires_registered_owner_device() {
             );
         }
     }
-    let owner = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+    let owner = stamped_device_headers("owner-phone");
     assert!(matches!(
         crate::api::settings::preference_write_actor(&owner, &pool, key, None)
             .await
@@ -1425,4 +1690,43 @@ async fn snapshot_policy_write_requires_registered_owner_device() {
             .is_ok()
     );
     crate::test_support::teardown_test_db(&name).await;
+}
+
+#[test]
+fn a_device_session_builds_the_standard_device_origin() {
+    let h = crate::api::gateway_stamp::test_support::session_device_headers("direct-device");
+    let origin = build_message_origin(
+        &h,
+        ActorMode::Human,
+        Some("direct-device"),
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(
+        serde_json::to_value(origin).unwrap(),
+        serde_json::json!({ "kind": "device", "device_id": "direct-device" })
+    );
+}
+
+#[tokio::test]
+async fn a_session_device_can_resolve_its_targeted_fit_answer() {
+    use crate::engine::pending_answers::{await_answer, resolve_answer, PendingAnswers};
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let h = crate::api::gateway_stamp::test_support::session_device_headers("direct-device");
+    let actor = require_user_actor(&h, &pool, Some("direct-device"))
+        .await
+        .unwrap();
+    let MessageOrigin::Device { device_id } = actor else {
+        panic!("expected the session device");
+    };
+    let pending: PendingAnswers<Vec<u8>> = Default::default();
+    let answer = await_answer(&pending, "fit-check", Some("direct-device"));
+    assert_eq!(
+        resolve_answer(&pending, "fit-check", Some(&device_id), vec![1]),
+        Ok(())
+    );
+    assert_eq!(answer.await.unwrap(), vec![1]);
+    crate::test_support::teardown_test_db(&db_name).await;
 }

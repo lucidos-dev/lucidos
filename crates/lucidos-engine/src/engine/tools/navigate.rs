@@ -158,7 +158,7 @@ pub(crate) async fn navigate_ui_impl(
 
     let who = recipient(pool, args, last_used).await?;
     let device_id = who.device_id();
-    log!("[Navigate] navigate_ui thread={thread_id} target={target} device={device_id:?}");
+    log_legacy!("[Navigate] navigate_ui thread={thread_id} target={target} device={device_id:?}");
     emit_navigation(bus, &payload, thread_id, who.actor())
         .await
         .map_err(|e| format!("Error: {e}"))?;
@@ -208,7 +208,9 @@ async fn new_chat_folder_note(
             let repos = match crate::core::repositories::RepositoryStore::list(pool).await {
                 Ok(repos) => repos,
                 Err(e) => {
-                    log!("[Navigate] could not list repositories for folder '{folder}': {e}");
+                    log_legacy!(
+                        "[Navigate] could not list repositories for folder '{folder}': {e}"
+                    );
                     return None;
                 }
             };
@@ -248,7 +250,7 @@ pub(super) async fn device_presence(pool: &PgPool, device_id: &str) -> Option<Se
     match crate::core::DeviceStore::seen(pool, device_id).await {
         Ok(seen) => seen,
         Err(e) => {
-            log!("[Navigate] presence lookup failed for device {device_id}: {e}");
+            log_legacy!("[Navigate] presence lookup failed for device {device_id}: {e}");
             None
         }
     }

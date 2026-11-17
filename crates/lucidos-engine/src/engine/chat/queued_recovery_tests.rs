@@ -177,6 +177,8 @@ async fn a_retracted_message_is_not_owed() {
         thread_id,
         ThreadEvent::QueuedMessageRemoved {
             removed_message_id: queued,
+            restore_to_compose: false,
+            compose: None,
         },
     )
     .await;

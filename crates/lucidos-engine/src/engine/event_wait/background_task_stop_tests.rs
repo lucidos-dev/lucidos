@@ -252,7 +252,7 @@ async fn a_kill_for_the_whole_thread_still_delivers() {
 /// The engine's own wait over two tasks, one of them stopped. The rest stays
 /// watched through a replacement that keeps the original watermark, so a
 /// completion that landed in between is still found. The replacement is
-/// written before the cancel, so a waiting child never reads as finished.
+/// written before the cancel, so a child holding a wait never reads as finished.
 #[tokio::test]
 async fn stopping_one_task_narrows_the_engines_wait_to_the_rest() {
     let s = Stores::new().await;

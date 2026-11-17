@@ -78,8 +78,9 @@ fn execute_intent_refusal(args: &serde_json::Value) -> String {
 }
 
 use super::LucidosEngine;
-use crate::api::thread_reach::ThreadReachVerb;
+use crate::engine::permission::Action;
 use crate::engine::thread_lifecycle::ThreadStatus;
+use crate::engine::thread_liveness::ThreadLiveness;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::llm::tool_names as tn;
 
@@ -156,7 +157,7 @@ impl LucidosEngine {
         &self,
         caller_thread_id: uuid::Uuid,
         target: Option<uuid::Uuid>,
-        verb: ThreadReachVerb,
+        verb: Action,
     ) -> Result<(), String> {
         crate::api::thread_reach::refuse_thread_without_authority(
             &self.event_bus,
@@ -187,7 +188,7 @@ impl LucidosEngine {
         {
             Ok(row) => row,
             Err(e) => {
-                log!("[Tools] Could not read the thread of change {change_id}: {e}");
+                log_legacy!("[Tools] Could not read the thread of change {change_id}: {e}");
                 // A probe that could not run must not wave the act past, so aim
                 // at the workspace and let the standing instruction decide.
                 Some(None)
@@ -206,6 +207,47 @@ impl LucidosEngine {
         request_id: uuid::Uuid,
         device_id: Option<&str>,
         thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        let sandbox = self.resolve_tool_sandbox(name).await?;
+        self.execute_tool_in_sandbox(
+            name,
+            args,
+            extraction_ctx,
+            request_id,
+            device_id,
+            thread_id,
+            sandbox.as_ref(),
+        )
+        .await
+    }
+
+    pub(crate) async fn resolve_tool_sandbox(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::runtime::agent_sandbox::Sandbox>, String> {
+        if matches!(
+            name,
+            tn::RUN_BASH | tn::RUN_BASH_BACKGROUND | tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND
+        ) {
+            crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), self.workspace_path())
+                .await
+                .map(Some)
+                .map_err(|e| e.to_string())
+        } else {
+            Ok(None)
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_tool_in_sandbox(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+        extraction_ctx: &str,
+        request_id: uuid::Uuid,
+        device_id: Option<&str>,
+        thread_id: uuid::Uuid,
+        sandbox: Option<&crate::runtime::agent_sandbox::Sandbox>,
     ) -> ToolOutcome {
         let name = dispatch_name(name, args)?;
         match name {
@@ -291,12 +333,35 @@ impl LucidosEngine {
                 self.execute_app_tool(name, args, thread_id, device_id)
                     .await,
             ),
-            tn::RUN_PYTHON => {
-                to_outcome(self.execute_python_tool(args, thread_id, device_id).await)
+            tn::RUN_PYTHON => to_outcome(
+                self.execute_python_tool(
+                    args,
+                    thread_id,
+                    device_id,
+                    sandbox.ok_or("Missing command sandbox")?,
+                )
+                .await,
+            ),
+            tn::RUN_PYTHON_BACKGROUND => {
+                self.execute_python_background_tool(
+                    args,
+                    thread_id,
+                    sandbox.ok_or("Missing command sandbox")?,
+                )
+                .await
             }
-            tn::RUN_PYTHON_BACKGROUND => self.execute_python_background_tool(args, thread_id).await,
-            tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
-            tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
+            tn::RUN_BASH => to_outcome(
+                self.execute_bash_tool(args, thread_id, sandbox.ok_or("Missing command sandbox")?)
+                    .await,
+            ),
+            tn::RUN_BASH_BACKGROUND => {
+                self.execute_bash_background_tool(
+                    args,
+                    thread_id,
+                    sandbox.ok_or("Missing command sandbox")?,
+                )
+                .await
+            }
             tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
             tn::BASH_KILL => self.execute_bash_kill_tool(args, thread_id).await,
             tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args, thread_id).await),
@@ -328,6 +393,7 @@ impl LucidosEngine {
             tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
             tn::SEARCH_THREADS => to_outcome(self.execute_search_threads(args).await),
             tn::LIST_DRAFTS => self.execute_list_drafts(args).await,
+            tn::SUBMIT_SAVED_DRAFT => self.execute_submit_draft(args, thread_id).await,
             tn::LIST_HELD_MESSAGES => self.execute_list_held_messages(args).await,
             tn::DETACH_CHILD_THREAD => self.execute_detach_child_thread(args, thread_id).await,
             tn::ARCHIVE_THREAD => self.execute_archive_thread(args, thread_id).await,
@@ -582,7 +648,7 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        count_events_impl(&self.event_store, args, thread_id).await
+        count_events_impl(&self.pool, args, thread_id).await
     }
 
     /// LLM tool: the event names this workspace can subscribe to.
@@ -986,6 +1052,7 @@ impl LucidosEngine {
             .await
             .map_err(|e| format!("Error: failed to list thread summaries: {}", e))?;
         crate::core::store::attach_reader_fields(&mut summaries, &self.workspace_name());
+        crate::engine::thread_liveness::attach(&self.pool, &mut summaries).await;
         unsent::list_rows_for_the_model(&summaries)
     }
 
@@ -1063,13 +1130,13 @@ impl LucidosEngine {
     ) -> ToolOutcome {
         let change_id = parse_required_uuid(args, "change_id")?;
         if let Some(target) = self.change_target(change_id).await {
-            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::SetAside)
+            self.refuse_tool_without_authority(thread_id, target, Action::SetAside)
                 .await?;
         }
         let refusal = crate::api::changes::change_action_refusal(
             self.pool(),
             change_id,
-            crate::engine::thread_lifecycle::Action::SetAside,
+            crate::engine::thread_lifecycle::ThreadAction::SetAside,
         )
         .await
         .map_err(|e| format!("Error: failed to check whether this change can be set aside: {e}"))?;
@@ -1091,7 +1158,7 @@ impl LucidosEngine {
     ) -> ToolOutcome {
         let change_id = parse_required_uuid(args, "change_id")?;
         if let Some(target) = self.change_target(change_id).await {
-            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::BringBack)
+            self.refuse_tool_without_authority(thread_id, target, Action::BringBack)
                 .await?;
         }
         let actor = agent_tool_actor(thread_id);
@@ -1116,7 +1183,7 @@ impl LucidosEngine {
         // applying its child's work stays in-subtree and needs nobody. A change
         // from anywhere else is the owner's button (ADR 0168 clause 4).
         if let Some(target) = self.change_target(change_id).await {
-            self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+            self.refuse_tool_without_authority(thread_id, target, Action::Apply)
                 .await?;
         }
         // The same gate the Apply button asks, because this is the same act.
@@ -1126,7 +1193,7 @@ impl LucidosEngine {
         let refusal = crate::api::changes::change_action_refusal(
             self.pool(),
             change_id,
-            crate::engine::thread_lifecycle::Action::Apply,
+            crate::engine::thread_lifecycle::ThreadAction::Apply,
         )
         .await
         .map_err(|e| format!("Error: failed to check whether this change can apply: {e}"))?;
@@ -1163,7 +1230,7 @@ impl LucidosEngine {
         let change_id = parse_optional_uuid(args, "change_id")?;
         // Arming an apply on a thread IS applying it, one settle later, so it
         // takes the same gate the immediate apply does.
-        self.refuse_tool_without_authority(thread_id, Some(target), ThreadReachVerb::Apply)
+        self.refuse_tool_without_authority(thread_id, Some(target), Action::Apply)
             .await?;
         let actor = agent_tool_actor(thread_id);
         let engine = self.clone_arc();
@@ -1193,7 +1260,7 @@ impl LucidosEngine {
     async fn execute_apply_as_they_settle(&self, thread_id: uuid::Uuid) -> ToolOutcome {
         // The sweep is Apply at workspace scope, so no subtree contains it and
         // it is the owner's button (ADR 0168 clause 4).
-        self.refuse_tool_without_authority(thread_id, None, ThreadReachVerb::Apply)
+        self.refuse_tool_without_authority(thread_id, None, Action::Apply)
             .await?;
         let actor = agent_tool_actor(thread_id);
         let engine = self.clone_arc();
@@ -1244,7 +1311,7 @@ impl LucidosEngine {
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
         let target = parse_optional_uuid(args, "thread_id")?;
-        self.refuse_tool_without_authority(thread_id, target, ThreadReachVerb::Apply)
+        self.refuse_tool_without_authority(thread_id, target, Action::Apply)
             .await?;
         let actor = Some(agent_tool_actor(thread_id));
         let reason = crate::engine::standing_apply::DISARMED_BY_OWNER;
@@ -1629,9 +1696,12 @@ pub(crate) const QUERY_EVENTS_LIMIT: ClampBounds<i64> = ClampBounds {
 /// the response is still valid — `events` will be empty and `truncated`
 /// will be true, telling the LLM to bump `byte_limit` or narrow the
 /// query.
+///
+/// `liveness` leads the wrapper and costs nothing from `byte_limit`.
 pub(crate) fn build_query_events_response(
     events: &[crate::core::EventRow],
     byte_limit: i64,
+    liveness: Option<&ThreadLiveness>,
 ) -> String {
     let mut included: Vec<serde_json::Value> = Vec::new();
     let mut running: i64 = 0;
@@ -1669,7 +1739,22 @@ pub(crate) fn build_query_events_response(
             );
         }
     }
-    wrapper.to_string()
+    thread_scoped_read(wrapper, liveness)
+}
+
+/// A thread-scoped `events` read: the thread's liveness first, then the body.
+/// A typed struct, since `serde_json::Value` sorts its keys.
+#[derive(serde::Serialize)]
+struct ThreadScopedRead<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    liveness: Option<&'a ThreadLiveness>,
+    #[serde(flatten)]
+    body: serde_json::Value,
+}
+
+fn thread_scoped_read(body: serde_json::Value, liveness: Option<&ThreadLiveness>) -> String {
+    serde_json::to_string(&ThreadScopedRead { liveness, body })
+        .expect("a JSON object and a plain struct serialize")
 }
 
 /// The narrowing arguments [`QUERY_EVENTS_TRUNCATION_HINT`] tells the model to
@@ -2068,16 +2153,29 @@ fn events_thread_id_arg(
 /// `query_events`. Without an `event_type` filter, it returns the per-type
 /// breakdown sorted by count desc. A sweep recipe (workspace-learning,
 /// workspace-audit) calls that "what's noisy this week" view before drilling.
+/// A count of one thread leads with its liveness.
 pub(crate) async fn count_events_impl(
-    event_store: &crate::core::store::EventStore,
+    pool: &sqlx::PgPool,
     args: &serde_json::Value,
     caller_thread_id: uuid::Uuid,
 ) -> ToolOutcome {
+    let event_store = crate::core::store::EventStore::new(pool.clone());
     let event_type = args.get("event_type").and_then(|v| v.as_str());
     let since = parse_time_filter(args, "since")?;
     let until = parse_time_filter(args, "until")?;
     let thread_id = events_thread_id_arg(args, caller_thread_id)?;
+    let body = count_events_body(&event_store, event_type, since, until, thread_id).await?;
+    let liveness = crate::engine::thread_liveness::header(pool, thread_id).await;
+    Ok(thread_scoped_read(body, liveness.as_ref()))
+}
 
+async fn count_events_body(
+    event_store: &crate::core::store::EventStore,
+    event_type: Option<&str>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    thread_id: Option<uuid::Uuid>,
+) -> Result<serde_json::Value, String> {
     if let Some(et) = event_type {
         match event_store
             .count_events(Some(et), since, until, thread_id)
@@ -2086,8 +2184,7 @@ pub(crate) async fn count_events_impl(
             Ok((count, byte_total)) => Ok(serde_json::json!({
                 "count": count,
                 "byte_total": byte_total,
-            })
-            .to_string()),
+            })),
             Err(e) => Err(format!("Error: failed to count events: {}", e)),
         }
     } else {
@@ -2112,8 +2209,7 @@ pub(crate) async fn count_events_impl(
                     "by_type": by_type,
                     "total_count": total_count,
                     "total_byte_total": total_byte_total,
-                })
-                .to_string())
+                }))
             }
             Err(e) => Err(format!("Error: failed to count events: {}", e)),
         }
@@ -2212,7 +2308,12 @@ pub(crate) async fn query_events_impl(
     crate::engine::engine_impl::mask_stored_events(pool, &mut events)
         .await
         .map_err(|e| format!("Error: events withheld, since they could not be masked: {e}"))?;
-    Ok(build_query_events_response(&events, byte_limit))
+    let liveness = crate::engine::thread_liveness::header(pool, thread_id).await;
+    Ok(build_query_events_response(
+        &events,
+        byte_limit,
+        liveness.as_ref(),
+    ))
 }
 
 #[cfg(test)]

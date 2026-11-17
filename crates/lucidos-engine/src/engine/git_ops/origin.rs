@@ -75,7 +75,9 @@ pub(crate) async fn push_to_origin_main(repo_root: &Path, sha: &str) -> PushOutc
     let _push_guard = ORIGIN_PUSH_MUTEX.lock().await;
     match push_sha(repo_root, sha).await {
         PushOutcome::Rejected(reason) if origin_holds(repo_root, sha).await => {
-            log!("[Changes] origin's main already holds {sha}, so nothing to push ({reason})");
+            log_legacy!(
+                "[Changes] origin's main already holds {sha}, so nothing to push ({reason})"
+            );
             PushOutcome::Pushed
         }
         outcome => outcome,

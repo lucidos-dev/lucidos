@@ -417,7 +417,7 @@ impl McpServerStore {
                     pointers.insert(var, name);
                     moved += 1;
                 } else {
-                    log!("[MCP] Kept {var} of server '{id}' in place: a credential is already named {name}");
+                    log_legacy!("[MCP] Kept {var} of server '{id}' in place: a credential is already named {name}");
                     kept.insert(var, value);
                 }
             }

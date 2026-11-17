@@ -120,7 +120,7 @@ impl UpdateCheckGuard {
                 .is_ok()
             {
                 if held != 0 {
-                    log!("[PluginUpdateCheck] Taking over a scan slot held since {held}");
+                    log_legacy!("[PluginUpdateCheck] Taking over a scan slot held since {held}");
                 }
                 return Some(Self(now));
             }
@@ -182,7 +182,7 @@ async fn run_one_pass(
 ) -> (PluginUpdateCheckReport, bool) {
     let (report, scanned) = check_marketplaces_for_updates(engine.clone(), pool.clone()).await;
     for line in report.failure_log_lines() {
-        log!("[PluginUpdateCheck] {line}");
+        log_legacy!("[PluginUpdateCheck] {line}");
     }
     (report, scanned)
 }
@@ -269,7 +269,7 @@ fn record_scan_if_live(workspace: &Path, guard: &UpdateCheckGuard, catalog: &Mar
         plugin_catalog_cache::record_scan(workspace, catalog, Utc::now());
         crate::core::plugin_marketplaces::prune_media_for(workspace, catalog);
     } else {
-        log!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
+        log_legacy!("[PluginUpdateCheck] Discarding a scan whose slot was taken over");
     }
 }
 
@@ -295,7 +295,7 @@ async fn check_marketplaces_for_updates(
         return (PluginUpdateCheckReport::default(), false);
     }
     let Some(guard) = UpdateCheckGuard::try_acquire(Utc::now().timestamp()) else {
-        log!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
+        log_legacy!("[PluginUpdateCheck] Skipping run; another marketplace sync is active");
         return (PluginUpdateCheckReport::default(), false);
     };
     // Cleared here, at the top of the pass that holds the slot, so everything
@@ -368,7 +368,7 @@ async fn check_marketplaces_for_updates(
         // Persist the (possibly shrunk) set so applied updates drop out of the
         // marker — nothing to notify here, so there's no notification at risk.
         write_notified_signature(&workspace, &current);
-        log!(
+        log_legacy!(
             "[PluginUpdateCheck] {} update(s) available; already notified",
             candidates.len()
         );
@@ -396,7 +396,7 @@ async fn check_marketplaces_for_updates(
             // transient emit failure retries on the next scan instead of being
             // silently swallowed by the marker.
             write_notified_signature(&workspace, &current);
-            log!(
+            log_legacy!(
                 "[PluginUpdateCheck] Notified user of {} available plugin update(s)",
                 candidates.len()
             );
@@ -472,7 +472,7 @@ fn write_notified_signature(workspace: &Path, signature: &BTreeSet<String>) {
     let path = marker_path(workspace);
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            log!("[PluginUpdateCheck] create marker dir failed: {e}");
+            log_legacy!("[PluginUpdateCheck] create marker dir failed: {e}");
             return;
         }
     }
@@ -480,10 +480,10 @@ fn write_notified_signature(workspace: &Path, signature: &BTreeSet<String>) {
     match serde_json::to_string(&entries) {
         Ok(json) => {
             if let Err(e) = std::fs::write(&path, json) {
-                log!("[PluginUpdateCheck] write update marker failed: {e}");
+                log_legacy!("[PluginUpdateCheck] write update marker failed: {e}");
             }
         }
-        Err(e) => log!("[PluginUpdateCheck] serialize update marker failed: {e}"),
+        Err(e) => log_legacy!("[PluginUpdateCheck] serialize update marker failed: {e}"),
     }
 }
 

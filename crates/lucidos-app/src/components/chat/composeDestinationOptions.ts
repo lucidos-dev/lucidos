@@ -32,11 +32,11 @@ export type DestinationOptionInputs = {
   /** Error text when the apps list failed to load (null = no error). */
   appsError: string | null;
   /** Teammates a new thread can be for. Empty off a team gateway (ADR 0649). */
-  people: readonly { id: string; name: string; has_device: boolean }[];
+  users: readonly { id: string; name: string; has_device: boolean }[];
 };
 
 export function buildDestinationOptions(inputs: DestinationOptionInputs): DropdownOption[] {
-  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError, people } = inputs;
+  const { dest, apps, externalRepos, packaged, listsPending, reposError, appsError, users } = inputs;
 
   const options: DropdownOption[] = [
     {
@@ -45,11 +45,11 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
       description: LUCIDOS_AGENT_BLURB,
     },
   ];
-  if (people.length > 0) {
-    options.push({ value: '__hdr-people', label: 'A teammate…', disabled: true });
-    for (const p of people) {
+  if (users.length > 0) {
+    options.push({ value: '__hdr-users', label: 'A teammate…', disabled: true });
+    for (const p of users) {
       options.push({
-        value: destinationToOptionValue({ kind: 'person', personId: p.id }),
+        value: destinationToOptionValue({ kind: 'user', userId: p.id }),
         label: p.name,
         description: p.has_device ? 'Starts with the agent paused' : 'No paired device, so no push reaches them',
       });
@@ -111,7 +111,7 @@ export function buildDestinationOptions(inputs: DestinationOptionInputs): Dropdo
   if (!listsPending && !options.some(o => o.value === value)) {
     const codingScope = dest.kind === 'coding' ? dest.scope : null;
     const unavailableName =
-      dest.kind === 'person' ? 'That teammate'
+      dest.kind === 'user' ? 'That teammate'
       : codingScope?.kind === 'lucidos' ? 'Lucidos source'
       : codingScope?.kind === 'app' ? codingScope.appId
       : codingScope?.kind === 'external' ? codingScope.repoId

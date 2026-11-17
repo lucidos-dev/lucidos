@@ -13,11 +13,16 @@
 //! password travels in `PGPASSWORD`, never in argv: a subprocess's argv is
 //! persisted in tool-call payloads and shown in the steps UI.
 //!
+//! A URL may name a password file instead (`passfile`, libpq's own parameter).
+//! The gateway hands its engines one, since any same-user process can read
+//! another's environment on macOS (ADR 0645). [`inline_passfile`] turns it
+//! into an in-memory password for sqlx, which reads no `passfile` parameter.
+//!
 //! [`PgUrl::read_only_url`] renders the URL the engine hands its agents as
 //! `LUCIDOS_DATABASE_URL` (ADR 0481), signed in as the database's
 //! [`agent_role`] (ADR 0509).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -150,12 +155,15 @@ impl PgUrl {
     /// [`PARAM_ENV`], such as `sslmode` as `PGSSLMODE`. A missing user or
     /// password is left out, so libpq applies its own default rather than an
     /// empty value.
+    ///
+    /// A URL naming a `passfile` never puts its password in the environment:
+    /// the child reads the file through `PGPASSFILE` instead.
     pub fn env(&self) -> Vec<(&'static str, String)> {
         let mut vars = Vec::with_capacity(5);
         if let Some(user) = &self.user {
             vars.push(("PGUSER", user.clone()));
         }
-        if let Some(password) = &self.password {
+        if let (Some(password), None) = (&self.password, self.passfile()) {
             vars.push(("PGPASSWORD", password.clone()));
         }
         let host = match &self.host {
@@ -183,12 +191,18 @@ impl PgUrl {
     /// a packaged engine: sqlx refuses an empty authority host. Every other
     /// parameter, such as `sslmode`, carries over, and an existing `options`
     /// gains the read-only flag at its end.
+    ///
+    /// A `passfile` does not carry over: the read-only URL signs in as a role
+    /// with its own password.
     pub fn read_only_url(&self) -> String {
         let enc = |text: &str| urlencoding::encode(text).into_owned();
         let database = enc(&self.database);
         let mut options = None;
         let mut tail = String::new();
         for (key, value) in &self.params {
+            if key == PASSFILE_PARAM {
+                continue;
+            }
             if key == "options" {
                 options = Some(value.as_str());
             } else {
@@ -226,6 +240,88 @@ impl PgUrl {
     }
 }
 
+impl PgUrl {
+    /// The password file this URL names, decoded.
+    pub fn passfile(&self) -> Option<PathBuf> {
+        self.params
+            .iter()
+            .find(|(key, _)| key == PASSFILE_PARAM)
+            .and_then(|(_, value)| decode(value).ok())
+            .map(PathBuf::from)
+    }
+}
+
+/// libpq's parameter naming a password file.
+pub const PASSFILE_PARAM: &str = "passfile";
+
+/// `url` with its `passfile` parameter replaced by the password the file
+/// holds for the URL's user, and the file's path. A URL with no `passfile`
+/// comes back unchanged.
+///
+/// The result holds a password, so it belongs in memory only, never in an
+/// environment or an argv.
+pub fn inline_passfile(url: &str) -> Result<(String, Option<PathBuf>), BoxError> {
+    let parsed = PgUrl::parse(url)?;
+    let Some(passfile) = parsed.passfile() else {
+        return Ok((url.to_string(), None));
+    };
+    let user = parsed.user.as_deref().unwrap_or_default();
+    let password = password_from_passfile(&passfile, user)
+        .map_err(|e| format!("cannot read the password file {}: {e}", passfile.display()))?
+        .ok_or_else(|| format!("{} holds no password for {user}", passfile.display()))?;
+    let (base, query) = url.split_once('?').unwrap_or((url, ""));
+    let mut pairs: Vec<String> = query
+        .split('&')
+        .filter(|pair| !pair.is_empty() && !pair.starts_with("passfile="))
+        .map(str::to_string)
+        .collect();
+    pairs.push(format!("password={}", urlencoding::encode(&password)));
+    Ok((format!("{base}?{}", pairs.join("&")), Some(passfile)))
+}
+
+/// The line of a libpq password file that signs `user` in with `password` on
+/// any host, port and database.
+pub fn passfile_line(user: &str, password: &str) -> String {
+    format!(
+        "*:*:*:{}:{}\n",
+        pgpass_escape(user),
+        pgpass_escape(password)
+    )
+}
+
+/// The password `path` holds for `user`, read as libpq reads it: the first
+/// line whose user field matches. Host, port and database must be `*`, the
+/// only shape [`passfile_line`] writes.
+pub fn password_from_passfile(path: &Path, user: &str) -> std::io::Result<Option<String>> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(text
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .map(pgpass_fields)
+        .find(|fields| {
+            fields.len() == 5 && fields[..3].iter().all(|f| f == "*") && fields[3] == user
+        })
+        .map(|mut fields| fields.remove(4)))
+}
+
+fn pgpass_escape(field: &str) -> String {
+    field.replace('\\', "\\\\").replace(':', "\\:")
+}
+
+/// Split a password file line at each unescaped `:`, dropping the escapes.
+fn pgpass_fields(line: &str) -> Vec<String> {
+    let mut fields = vec![String::new()];
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => fields.last_mut().unwrap().extend(chars.next()),
+            ':' => fields.push(String::new()),
+            c => fields.last_mut().unwrap().push(c),
+        }
+    }
+    fields
+}
+
 /// The URL parameters libpq also reads from the environment, and the variable
 /// for each. Dropping one would silently change the connection, such as
 /// `sslmode=require` falling back to libpq's default `prefer`.
@@ -239,6 +335,7 @@ pub const PARAM_ENV: &[(&str, &str)] = &[
     ("application_name", "PGAPPNAME"),
     ("connect_timeout", "PGCONNECT_TIMEOUT"),
     ("target_session_attrs", "PGTARGETSESSIONATTRS"),
+    (PASSFILE_PARAM, "PGPASSFILE"),
 ];
 
 /// The `options` flag that opens every session read-only, percent-encoded.
@@ -578,5 +675,58 @@ mod tests {
             "postgres://127.0.0.1:5432/lucidos"
         );
         assert_eq!(redact("not-a-url"), "not-a-url");
+    }
+
+    fn passfile_for(user: &str, password: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), passfile_line(user, password)).unwrap();
+        file
+    }
+
+    /// A child reads the file, so the password never enters its environment.
+    #[test]
+    fn a_passfile_reaches_a_child_as_a_path_never_as_a_password() {
+        let url = "postgres:///db?host=/run/pg&user=lucidos&password=pw&passfile=%2Frun%2Fpg%2Fp";
+        let env = env_map(url);
+        assert_eq!(env.get("PGPASSFILE").map(String::as_str), Some("/run/pg/p"));
+        assert!(!env.contains_key("PGPASSWORD"), "{env:?}");
+    }
+
+    #[test]
+    fn a_passfile_never_reaches_the_read_only_url() {
+        let url =
+            PgUrl::parse("postgres:///db?host=/run/pg&user=lucidos&passfile=%2Frun%2Fp").unwrap();
+        assert!(
+            !url.read_only_url().contains("passfile"),
+            "{}",
+            url.read_only_url()
+        );
+    }
+
+    #[test]
+    fn inlining_swaps_the_passfile_for_its_password() {
+        let file = passfile_for("lucidos", "s3:cr\\t&");
+        let path = urlencoding::encode(&file.path().to_string_lossy()).into_owned();
+        let url = format!("postgres:///db?host=%2Frun%2Fpg&port=5432&user=lucidos&passfile={path}");
+        let (inlined, passfile) = inline_passfile(&url).unwrap();
+        assert_eq!(passfile.as_deref(), Some(file.path()));
+        let parsed = PgUrl::parse(&inlined).unwrap();
+        assert_eq!(parsed.password.as_deref(), Some("s3:cr\\t&"));
+        assert_eq!(parsed.passfile(), None);
+        assert_eq!(parsed.host, Host::Socket("/run/pg".into()));
+    }
+
+    #[test]
+    fn a_url_with_no_passfile_inlines_to_itself() {
+        let url = "postgres://u:p@h:1/db?sslmode=disable";
+        assert_eq!(inline_passfile(url).unwrap(), (url.to_string(), None));
+    }
+
+    #[test]
+    fn a_passfile_without_the_user_is_refused() {
+        let file = passfile_for("someone-else", "pw");
+        let path = urlencoding::encode(&file.path().to_string_lossy()).into_owned();
+        let url = format!("postgres:///db?host=%2Frun&user=lucidos&passfile={path}");
+        assert!(inline_passfile(&url).is_err());
     }
 }

@@ -71,7 +71,7 @@ impl IntentStore {
     /// - First `.md` in `data/triggers/{id}/`
     pub fn load(data_dir: &Path, id: &str) -> Option<Intent> {
         if super::is_path_traversal(id) {
-            log!("[Intents] Rejected invalid intent id: {}", id);
+            log_legacy!("[Intents] Rejected invalid intent id: {}", id);
             return None;
         }
 
@@ -84,7 +84,7 @@ impl IntentStore {
             // `/bar.md`). Mirrors `knowhow.rs::app_scoped_knowhow_path`.
             if app_id.is_empty() || intent_name.is_empty() || super::is_path_traversal(intent_name)
             {
-                log!("[Intents] Rejected invalid intent id: {}", id);
+                log_legacy!("[Intents] Rejected invalid intent id: {}", id);
                 return None;
             }
             for subdir in APP_INTENT_SUBDIRS {
@@ -128,7 +128,7 @@ impl IntentStore {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Intents] Failed to read directory {}: {}",
                     dir.display(),
                     e
@@ -158,7 +158,7 @@ impl IntentStore {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                log!("[Intents] Failed to read {}: {}", path.display(), e);
+                log_legacy!("[Intents] Failed to read {}: {}", path.display(), e);
                 return None;
             }
         };
@@ -166,7 +166,7 @@ impl IntentStore {
         let (name, knowhow, content) = match parse_frontmatter(&text) {
             Some(parsed) => parsed,
             None => {
-                log!(
+                log_legacy!(
                     "[Intents] Missing or invalid frontmatter in {}",
                     path.display()
                 );

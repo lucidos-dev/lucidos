@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 
 /// Where a tap on this notification (OS push, in-app toast) should land.
 ///
@@ -378,6 +378,10 @@ pub struct SettingsPage {
 }
 
 impl SettingsPage {
+    pub const ACCESS: Self = Self {
+        path: "Settings → Access",
+        view: "access",
+    };
     pub const ACCOUNTS: Self = Self {
         path: "Settings → Accounts",
         view: "accounts",
@@ -390,14 +394,30 @@ impl SettingsPage {
         path: "Settings → System → Disk Usage",
         view: "disk-usage",
     };
+    pub const PROVIDERS: Self = Self {
+        path: "Settings → Providers",
+        view: "providers",
+    };
     pub const MEMORY: Self = Self {
         path: "Settings → System → Memory",
         view: "memory",
     };
+    pub const PERMISSIONS: Self = Self {
+        path: "Settings → Permissions",
+        view: "permissions",
+    };
 
     /// Every page above, for the test that holds each to a renderable view.
     #[cfg(test)]
-    pub const ALL: [Self; 4] = [Self::ACCOUNTS, Self::BACKUP, Self::DISK_USAGE, Self::MEMORY];
+    pub const ALL: [Self; 7] = [
+        Self::ACCESS,
+        Self::ACCOUNTS,
+        Self::BACKUP,
+        Self::DISK_USAGE,
+        Self::MEMORY,
+        Self::PERMISSIONS,
+        Self::PROVIDERS,
+    ];
 
     /// A tap that deep-links here, the same way the LLM's `navigate_ui` does.
     pub fn tap(self) -> Tap {
@@ -429,9 +449,9 @@ pub const UNWATCH_PUSH_ACTION: &str = "unwatch";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PushGroup {
-    /// People-only messages in one thread. The push offers Unwatch, except to
+    /// User-only messages in one thread. The push offers Unwatch, except to
     /// the thread's driver, who cannot unwatch it.
-    PeopleMessages {
+    UserOnlyMessages {
         thread_id: Uuid,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         to_driver: bool,
@@ -442,20 +462,20 @@ impl PushGroup {
     /// The push tag every notification in the group carries.
     pub fn tag(&self) -> String {
         match self {
-            Self::PeopleMessages { thread_id, .. } => format!("people-{thread_id}"),
+            Self::UserOnlyMessages { thread_id, .. } => format!("user-{thread_id}"),
         }
     }
 
-    /// Stamp the group onto a push envelope: its tag, and for people-only
+    /// Stamp the group onto a push envelope: its tag, and for user-only
     /// messages to a watcher an Unwatch action with the thread it leaves.
     pub fn apply(&self, payload: &mut serde_json::Value) {
         let notification = &mut payload["notification"];
         notification["tag"] = serde_json::Value::String(self.tag());
         match self {
-            Self::PeopleMessages {
+            Self::UserOnlyMessages {
                 to_driver: true, ..
             } => {}
-            Self::PeopleMessages {
+            Self::UserOnlyMessages {
                 thread_id,
                 to_driver: false,
             } => {
@@ -555,6 +575,19 @@ impl NotificationStore {
         })
     }
 
+    /// Whether this reader has already handled a notification.
+    pub async fn is_read(pool: &PgPool, id: Uuid, reader: &Reader) -> Result<bool, sqlx::Error> {
+        Ok(sqlx::query_scalar(&format!(
+            "SELECT {} FROM notifications n WHERE n.id = $1",
+            read_by("$2")
+        ))
+        .bind(id)
+        .bind(reader.devices())
+        .fetch_optional(pool)
+        .await?
+        .unwrap_or(true))
+    }
+
     /// Count what `reader` has not read (no cap: the real total).
     pub async fn count_unread(pool: &PgPool, reader: &Reader) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(&format!(
@@ -627,7 +660,7 @@ impl NotificationStore {
                     .execute(pool)
                     .await?
             }
-            Reader::Person { device_id, devices } => {
+            Reader::User { device_id, devices } => {
                 sqlx::query(&format!(
                     "INSERT INTO notification_reads (notification_id, device_id) \
                      SELECT n.id, $2 FROM notifications n WHERE n.id = $1 AND NOT {} \
@@ -656,7 +689,7 @@ impl NotificationStore {
                     .execute(pool)
                     .await?
             }
-            Reader::Person { device_id, devices } => {
+            Reader::User { device_id, devices } => {
                 sqlx::query(&format!(
                     "INSERT INTO notification_reads (notification_id, device_id) \
                      SELECT n.id, $1 FROM notifications n WHERE NOT {} \
@@ -768,9 +801,9 @@ impl NotificationStore {
 }
 
 /// Whether `notifications n` is read, for the reader whose devices bind at
-/// `devices` (a `text[]`, NULL for the team). A person has read what the
+/// `devices` (a `text[]`, NULL for the team). A user has read what the
 /// shared flag marks, what any of their devices read, and what was sent to
-/// other people only.
+/// other users only.
 fn read_by(devices: &str) -> String {
     format!(
         "(CASE WHEN {devices}::text[] IS NULL THEN n.read ELSE ( \
@@ -1188,18 +1221,18 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Per-person read state (ADR 0623)
+    // Per-user read state (ADR 0623)
     // -----------------------------------------------------------------------
 
     fn sam(device_id: &str) -> Reader {
-        Reader::Person {
+        Reader::User {
             device_id: device_id.into(),
             devices: vec!["sam-phone".into(), "sam-laptop".into()],
         }
     }
 
     fn kim() -> Reader {
-        Reader::Person {
+        Reader::User {
             device_id: "kim-phone".into(),
             devices: vec!["kim-phone".into()],
         }
@@ -1285,7 +1318,7 @@ mod tests {
         use crate::engine::event_bus::{BusEvent, SystemEvent};
         let (pool, db) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
-        let group = PushGroup::PeopleMessages {
+        let group = PushGroup::UserOnlyMessages {
             thread_id: Uuid::new_v4(),
             to_driver: false,
         };
@@ -1323,7 +1356,7 @@ mod tests {
     }
 
     /// A notification sent to Kim only is never unread for Sam, and one the
-    /// whole team read before operators existed stays read for everyone.
+    /// whole team read before users existed stays read for everyone.
     #[tokio::test]
     async fn a_notification_outside_the_audience_reads_as_read() {
         let (pool, db) = setup_test_db().await;

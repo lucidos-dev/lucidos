@@ -159,7 +159,7 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
 
   /**
    * A page relayed by another gateway carries the base `/<slug>@<gateway>/`.
-   * The service worker registers under that outside prefix and the stored
+   * A's worker registers for that outside prefix and the stored
    * scope names it, so B's pushes tap back through A's origin.
    */
   it('a relayed page registers and subscribes under its outside prefix', async () => {
@@ -200,15 +200,19 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
             return fakeRegistration;
           },
           ready: Promise.resolve(fakeRegistration),
+          getRegistration: async () => undefined,
         },
         configurable: true,
       });
       installPermissionStubs();
 
-      const { initPushSubscription } = await import('./push');
+      const { initPushSubscription, recoverServiceWorker } = await import('./push');
       expect(await initPushSubscription()).toBe(true);
 
-      expect(registrations).toContainEqual({ script: '/dev@cloud/sw.js', scope: '/dev@cloud/' });
+      expect(registrations).toContainEqual({ script: '/~/sw.js?workspace=dev%40cloud', scope: '/dev@cloud/' });
+      await recoverServiceWorker();
+      expect(registrations).toHaveLength(2);
+      expect(registrations[1]).toEqual(registrations[0]);
       const subscribe = seen.find((s) => s.url === '/dev@cloud/api/v1/push/subscribe');
       expect(subscribe, 'the subscribe POST must go under the outside prefix').toBeDefined();
       const payload = JSON.parse(subscribe!.body!) as Record<string, string>;

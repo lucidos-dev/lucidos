@@ -7,8 +7,9 @@
 //! *lane thread* resolves on an *integration branch* and lands whole. Later
 //! arrivals that merge cleanly keep landing. While an Apply All press is open
 //! the lane opens no batch, so the press's conflicts resolve in one (ADR
-//! 0480). App changes keep the Apply tiers, and external-repo threads propose
-//! nothing.
+//! 0480). While a batch hardens again after a catch-up, the lane holds clean
+//! arrivals until the batch ends or a cap passes (ADR 0694). App changes keep
+//! the Apply tiers, and external-repo threads propose nothing.
 //!
 //! - `state`: the pure queue, batch and press rules.
 //! - `landing`: landing merges, built without a worktree.
@@ -30,8 +31,8 @@ pub(crate) use driver::{settle_restored_lane, LaneMsg, Submission};
 #[cfg(test)]
 pub(crate) use landing::{publish_clean_pass, LandingInput};
 pub(crate) use lane_thread::{
-    lane_batch_of_stale_session, lane_duty_for_run, unanswered_run_end, LaneDuty, LaneThreadEnd,
-    LANE_THREAD_CLOSED,
+    lane_batch_ended, lane_batch_of_stale_session, lane_duty_for_run, unanswered_run_end, LaneDuty,
+    LaneThreadEnd, LANE_THREAD_CLOSED,
 };
 pub(crate) use snapshot::LaneSnapshot;
 pub(crate) use state::LaneRemoval;
@@ -46,6 +47,16 @@ use uuid::Uuid;
 pub struct LaneMember {
     pub change_id: Uuid,
     pub snapshot_sha: String,
+}
+
+/// What ended a hold on clean arrivals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LaneHoldRelease {
+    BatchLanded,
+    BatchFailed,
+    /// The hold reached its cap with the batch still open.
+    CapReached,
 }
 
 /// Whether a change lands through the lane. Only Lucidos source in the

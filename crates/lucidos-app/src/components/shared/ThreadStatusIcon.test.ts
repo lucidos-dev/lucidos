@@ -1,3 +1,4 @@
+import { EventWaitClockIcon } from './icons';
 import { describe, it, expect } from 'vitest';
 import { statusTooltip, ThreadStatusIcon } from './ThreadStatusIcon';
 import { resolveVisualStatus, visualStatusFor, type VisualStatus } from './threadVisualStatus';
@@ -6,26 +7,27 @@ import type { ThreadMeta } from '../../store/thread-events';
 describe('visualStatusFor', () => {
   const idle = {
     activeChildrenCount: 0,
-    waitingChildrenCount: 0,
+    awaitedChildrenCount: 0,
     codingAgentChangeState: { kind: 'none' },
     liveEventWaitCount: 0,
   } as ThreadMeta;
 
-  // The reported shape: every child idle on its own event wait. Each is
-  // unfinished (ADR 0254), so the parent must not read as finished.
-  it('reads a parent whose child waits as waiting', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 3 })).toBe('waiting');
+  // The reported shape: no child is running, but a grandchild is, and its
+  // finish wakes this thread through the child (ADR 0672).
+  it('reads a parent with an awaited child as waiting, with no child running', () => {
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1 })).toBe('waiting');
   });
 
-  it('reads a waiting child exactly as a running one', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1 }))
-      .toBe(visualStatusFor('idle', { ...idle, activeChildrenCount: 1 }));
+  // A running `no-wake` child will not wake its parent, so the parent is idle.
+  it('reads a running child the parent does not await as idle', () => {
+    const runningNoWakeChild: ThreadMeta = { ...idle, activeChildrenCount: 1 };
+    expect(visualStatusFor('idle', runningNoWakeChild)).toBe('idle');
   });
 
   // The child writes its own worktree, so the parent's change stays
   // applicable (ADR 0249), exactly as with a running child.
-  it('lets the parent\'s own change outrank a waiting child', () => {
-    expect(visualStatusFor('idle', { ...idle, waitingChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}))
+  it('lets the parent\'s own change outrank an awaited child', () => {
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}))
       .toBe('changes');
   });
 
@@ -35,7 +37,7 @@ describe('visualStatusFor', () => {
     const withheld = { kind: 'unproposed', reason: 'turn_incomplete' } as const;
     expect(visualStatusFor('idle', { ...idle, codingAgentChangeState: withheld }))
       .toBe('idle');
-    expect(visualStatusFor('idle', { ...idle, activeChildrenCount: 1, codingAgentChangeState: withheld }))
+    expect(visualStatusFor('idle', { ...idle, awaitedChildrenCount: 1, codingAgentChangeState: withheld }))
       .toBe('waiting');
   });
 
@@ -215,5 +217,22 @@ describe('read request and change marks', () => {
   it('draws the filled dot for a read request and the diff glyph for a change', () => {
     expect(classesOf('read-request').join(' ')).toContain('progress-dot-read-request');
     expect(classesOf('changes')).toEqual(['thread-status-changes-icon']);
+  });
+});
+
+
+describe('waiting clock', () => {
+  it('uses the shared static clock for either waiting cause', () => {
+    for (const [children, events] of [[true, false], [false, true]]) {
+      const status = resolveVisualStatus('idle', children, false, events);
+      const vnode = ThreadStatusIcon({ status }) as unknown as {
+        props: { children: ({ props?: { class?: string; children?: { type: unknown } } } | false)[] };
+      };
+      const marks = vnode.props.children.filter(c => !!c && c.props?.class);
+      expect(marks).toHaveLength(1);
+      const mark = marks[0] as { props: { class: string; children: { type: unknown } } };
+      expect(mark.props.class).toBe('thread-status-waiting-icon');
+      expect(mark.props.children.type).toBe(EventWaitClockIcon);
+    }
   });
 });

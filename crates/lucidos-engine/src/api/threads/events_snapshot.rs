@@ -150,12 +150,12 @@ pub(in crate::api) async fn get_thread_events_snapshot(
         has_more,
         max_sequence,
     } = events_res.map_err(|e| {
-        log!("[API] Failed to get thread events: {}", e);
+        log_legacy!("[API] Failed to get thread events: {}", e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
     // Missing stamps would silently show the account default on the rung pill.
     let pair_stamps = pair_stamps_res.map_err(|e| {
-        log!(
+        log_legacy!(
             "[API] Failed to read pair stamps for {}: {}",
             thread_uuid,
             e
@@ -164,7 +164,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     })?;
     // Missing sizes would silently draw a later card at the widget's default.
     let card_sizes = card_sizes_res.map_err(|e| {
-        log!("[API] Failed to read card sizes for {}: {}", thread_uuid, e);
+        log_legacy!("[API] Failed to read card sizes for {}: {}", thread_uuid, e);
         (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     })?;
 
@@ -194,7 +194,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     // Aggregate fetch is best-effort — absence just means no snapshot to apply
     // (frontend logs a warning).
     let current_aggregate = aggregate_res.unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[API] Failed to fetch ThreadAggregate for {}: {}",
             thread_uuid,
             e
@@ -366,7 +366,7 @@ pub(in crate::api) async fn get_context_capture(
         .get_event_by_id(event_uuid)
         .await
         .map_err(|e| {
-            log!("[API] get_context_capture: db error: {}", e);
+            log_legacy!("[API] get_context_capture: db error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
@@ -528,7 +528,7 @@ pub(in crate::api) async fn get_tool_result(
         .get_event_by_id(event_uuid)
         .await
         .map_err(|e| {
-            log!("[API] get_tool_result: db error: {}", e);
+            log_legacy!("[API] get_tool_result: db error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
@@ -590,7 +590,7 @@ pub(in crate::api) async fn get_tool_args(
         .get_event_by_id(event_uuid)
         .await
         .map_err(|e| {
-            log!("[API] get_tool_args: db error: {}", e);
+            log_legacy!("[API] get_tool_args: db error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
@@ -656,7 +656,7 @@ pub(in crate::api) async fn get_event_location(
         .get_event_by_id(event_uuid)
         .await
         .map_err(|e| {
-            log!("[API] get_event_location: db error: {}", e);
+            log_legacy!("[API] get_event_location: db error: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         })?
         .ok_or_else(|| {

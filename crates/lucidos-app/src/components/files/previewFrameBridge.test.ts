@@ -620,17 +620,17 @@ describe('routePreviewFrameMessage', () => {
     expect(mocks.openFilePreview).toHaveBeenCalledWith('artifacts/reports/pr-1573.md');
   });
 
-  it('routes a thread, an external page and a repo citation', () => {
+  it('routes a thread, an external page and a repo citation', async () => {
     repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     route(`thread:dev/${TID}`);
     route('https://example.com/docs');
     route('repo:repo-1:file:src/main.rs#L510-L520');
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('dev', TID);
     expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs');
-    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
       { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
       { source: 'a file preview' },
-    );
+    ));
   });
 
   it('honours the frame\'s base only when the artifact declared its own', () => {

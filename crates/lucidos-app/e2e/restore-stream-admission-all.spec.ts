@@ -19,7 +19,8 @@ declare const restore: typeof import('../src/store/restoreRuntime')
   & Pick<typeof import('../src/store/actions/unsentMessageRestore'), 'restoreUnsentMessages'>
   & { sdkRequest: typeof import('../../../packages/lucidos-sdk/src/_fetch').request;
       sdkSse: typeof import('../../../packages/lucidos-sdk/src/sse').sse }
-  & Pick<typeof import('../src/store/store'), 'backupProgress'>;
+  & Pick<typeof import('../src/store/store'), 'backupProgress'>
+  & Pick<typeof import('../src/utils/idlePrefetch'), 'startIdlePrefetch'>;
 const origin = 'http://localhost:43119';
 let bundle: string;
 test.beforeAll(async () => {
@@ -31,6 +32,7 @@ test.beforeAll(async () => {
       export * from './src/api/client/_core';
       export { connectThreadEvents, disconnectThreadEvents } from './src/store/actions/thread-sync';
       export { backupProgress } from './src/store/store';
+      export { startIdlePrefetch } from './src/utils/idlePrefetch';
       export * from './src/components/chat/prompt-input-helpers';
       export * from './src/store/pendingUploads';
       export * from './src/store/actions/app-bridge';
@@ -81,6 +83,8 @@ test('lower-sequence hello journals before subsequent production stream frames',
     Object.defineProperty(window, 'EventSource', { value: Socket, configurable: true });
     restore.installRestoreRuntime();
     restore.connectThreadEvents();
+    // The live-update chunk loads once the boot splash lifts, which this page lacks.
+    restore.startIdlePrefetch();
   });
   await page.evaluate(() => {
     const socket = (window as unknown as { socket: EventSource }).socket;

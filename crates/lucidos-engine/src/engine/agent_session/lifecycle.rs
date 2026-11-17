@@ -84,7 +84,9 @@ pub(crate) fn mark_turn_boundary(s: &mut crate::engine::AgentSession) {
     s.cancel_actor = None;
     s.in_ceiling_reentry = false;
     if futures::FutureExt::now_or_never(s.interrupt.notified()).is_some() {
-        crate::log!("[AgentSession] Retired an interrupt that arrived after its turn's Result");
+        crate::log_legacy!(
+            "[AgentSession] Retired an interrupt that arrived after its turn's Result"
+        );
     }
 }
 
@@ -135,16 +137,19 @@ pub(super) enum TerminateDecision {
 /// completion re-opens the thread through an *event wait*, which resumes a
 /// terminated session like any other follow-up.
 ///
-/// A session that `handed_off` waits only for `unread`. Queued and promised
-/// follow-ups belong to the successor session: the idle exit drains them, and
-/// the turn they start reads the handoff's opening first.
+/// A session that `leaves_queue_to_next_session` waits only for `unread`. That
+/// is a session that handed off, or whose turn the provider blocked. Queued
+/// and promised follow-ups belong to the next session: the idle exit drains
+/// them, and the turn they start reads the handoff's opening or the block's
+/// brief first.
 pub(super) fn terminate_decision(
     queued: usize,
     unread: u32,
     redirect_pending: bool,
-    handed_off: bool,
+    leaves_queue_to_next_session: bool,
 ) -> TerminateDecision {
-    let follow_up_coming = unread > 0 || (!handed_off && (queued > 0 || redirect_pending));
+    let follow_up_coming =
+        unread > 0 || (!leaves_queue_to_next_session && (queued > 0 || redirect_pending));
     if follow_up_coming {
         TerminateDecision::KeepAliveForFollowup {
             queued,
@@ -425,16 +430,40 @@ pub(super) fn result_auto_commits(terminal: &TerminalKind) -> bool {
 /// turn. An engine turn is a cache keep-alive or a *ceiling re-entry*. A
 /// shutdown aborts the turn, so it never reads as `Generated`.
 ///
-/// Only such a turn decides anything at its end: the turn-end gate's forced
-/// decisions (ADR 0417), the wait over running background tasks, and the
-/// context ceiling (ADR 0629). A user Stop, a redirect, a failure or an abort
-/// leaves all three alone.
+/// Only such a turn runs forced decisions and waits for background tasks.
+/// The context ceiling settles every terminal separately.
 pub(super) fn turn_ended_cleanly(
     terminal: &Option<TerminalKind>,
     is_resolution_session: bool,
     engine_turn: bool,
 ) -> bool {
     matches!(terminal, Some(TerminalKind::Generated)) && !is_resolution_session && !engine_turn
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CeilingTurnEnd {
+    Wait,
+    Reenter,
+    Brief,
+}
+
+pub(super) fn ceiling_turn_end(
+    terminal: Option<&TerminalKind>,
+    is_shutdown: bool,
+) -> CeilingTurnEnd {
+    use crate::engine::thread_events::CancelCause;
+    if is_shutdown {
+        return CeilingTurnEnd::Wait;
+    }
+    match terminal {
+        Some(
+            TerminalKind::Generated | TerminalKind::Canceled(CancelCause::SupersededByFollowup),
+        ) => CeilingTurnEnd::Reenter,
+        Some(TerminalKind::Canceled(CancelCause::UserStop) | TerminalKind::Failed { .. }) => {
+            CeilingTurnEnd::Brief
+        }
+        _ => CeilingTurnEnd::Wait,
+    }
 }
 
 /// Whether the session-end path may delete this thread's worktree directory.

@@ -83,6 +83,13 @@ impl CallAuth<'_> {
 }
 
 impl Endpoint {
+    pub(super) fn provider_kind(&self) -> crate::llm::ProviderKind {
+        match self {
+            Self::Direct(_) => crate::llm::ProviderKind::Anthropic,
+            Self::ClaudeGateway { .. } => crate::llm::ProviderKind::ClaudeGateway,
+        }
+    }
+
     fn messages_url(&self) -> String {
         match self {
             Self::Direct(_) => format!("{}/messages", crate::llm::ANTHROPIC_API_BASE_URL),
@@ -158,6 +165,7 @@ impl AnthropicProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(self.endpoint.provider_kind()).await?;
         let requested = selection.model.unwrap_or(&self.model);
         let (mut auth, model) = self.endpoint.begin_call(requested).await?;
         let model = model.as_str();
@@ -223,7 +231,18 @@ impl AnthropicProvider {
 
             let status = resp.status();
             if !status.is_success() {
+                let error_headers = resp.headers().clone();
                 let error_body = resp.text().await.unwrap_or_default();
+                if let Some(cap) = crate::llm::metered::http_spend_cap(
+                    self.endpoint.provider_kind(),
+                    status.as_u16(),
+                    &error_headers,
+                    &error_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
 
                 // 401 means a bad or expired credential for this host. A
                 // gateway bearer renews once before the turn fails.
@@ -247,12 +266,10 @@ impl AnthropicProvider {
                 }
 
                 return Err(crate::llm::not_served::failure(
+                    label,
                     status.as_u16(),
                     &error_body,
-                    crate::llm::with_retry_context(
-                        format!("{label} API error ({}): {}", status, error_body),
-                        attempt,
-                    ),
+                    attempt,
                 ));
             }
 
@@ -265,11 +282,10 @@ impl AnthropicProvider {
                     })
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
+                    if crate::llm::retry_after_stream_error(model, &*e, attempt).await {
                         continue;
                     }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
+                    return Err(crate::llm::retry_failure(e, attempt));
                 }
             }
         }
@@ -650,15 +666,18 @@ mod tests {
         }
 
         /// A gateway refuses a model outside the account's access group with a
-        /// `400`. Its body reaches the user as the gateway wrote it.
+        /// `400`. The gateway's own words reach the user, with the code.
         #[tokio::test]
-        async fn a_400_reaches_the_user_verbatim() {
+        async fn a_400_reaches_the_user_with_the_gateways_words() {
             const REFUSAL: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model not allowed for your group"}}"#;
             let (origin, _) = serve(StatusCode::BAD_REQUEST, REFUSAL).await;
             let err = one_turn(origin, FixedTokens::fixed(Ok("gw-token".into())))
                 .await
                 .expect_err("a 400 fails the turn");
-            assert!(err.contains(REFUSAL), "{err}");
+            assert!(
+                err.contains("[invalid_request_error]: model not allowed for your group"),
+                "{err}"
+            );
         }
 
         /// A `401` that renewing does not cure tells the user to sign in to
@@ -769,6 +788,20 @@ mod tests {
             assert_eq!(trace.attempts, 2);
             assert_eq!(trace.status, Some(200));
             assert!(trace.first_delta.is_some());
+        }
+
+        #[tokio::test]
+        async fn a_spend_cap_is_returned_without_retry() {
+            let body = r#"{"error":{"type":"billing_error","message":"spent"}}"#;
+            let (origin, seen) = serve(StatusCode::TOO_MANY_REQUESTS, body).await;
+            let error = turn_on(origin, FixedTokens::fixed(Ok("gw-token".into())), LISTED)
+                .await
+                .unwrap_err();
+            let cap = error
+                .downcast_ref::<crate::llm::spend_cap::SpendCapReached>()
+                .unwrap();
+            assert_eq!(cap.provider, crate::llm::ProviderKind::ClaudeGateway);
+            assert_eq!(messages(&seen).len(), 1);
         }
 
         /// A failed call's trace names the last status, which classifies it.

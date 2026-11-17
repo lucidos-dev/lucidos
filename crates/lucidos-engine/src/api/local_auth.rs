@@ -49,18 +49,21 @@
 //! # The same token also answers a second question, on every bind
 //!
 //! [`is_local_process`] asks whether a caller is a process on this machine, for
-//! ATTRIBUTION rather than for the door. `api::actor` reads it to stamp the
-//! engine's own build-watch and release scripts, which hold no thread-bound
-//! origin token and are not a person (ADR 0169).
+//! ATTRIBUTION rather than for the door. `api::actor` reads it to name a caller
+//! with no other credential, such as the build-watch and the release scripts
+//! (ADR 0169). [`local_process_origin`] builds that name.
 //!
 //! It answers on a loopback bind too, where [`EngineAuth::is_required`] is
 //! false and nothing is refused. The door and the name are separate questions,
 //! which is the split this module's header opens with.
 //!
 //! **The answer names a machine, never a person.** So it can never be the
-//! evidence ADR 0168's clause 4 asks for. Two scripts presenting the token are
-//! one identity in the log, and that is accepted.
+//! evidence ADR 0168's clause 4 asks for. Every subprocess runs as the owner
+//! and can read the token, so it does not prove the owner either. The caller
+//! is an `UnattestedCaller` until the OS sandbox lands
+//! ([`LOCAL_TOKEN_PROVES_OWNER`]).
 
+use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::net_config::BindChoice;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -118,16 +121,19 @@ impl EngineAuth {
         // reading again keeps the door and the attribution answer from ever
         // disagreeing about what the token is.
         publish_local_token(auth.local.clone());
+        crate::diagnostic_log::register_secret_values(
+            auth.local.iter().chain(&auth.hook_socket).cloned(),
+        );
         if required {
             let scope = crate::net_config::bind_scope_label(choice);
             if auth.local.is_none() && auth.hook_socket.is_none() {
-                crate::log!(
+                crate::log_legacy!(
                     "[API] bound to {scope} with no credential on disk, so every call is \
                      refused. The mint above says why it could not write one; bind \
                      loopback until it can."
                 );
             } else {
-                crate::log!("[API] bound to {scope}, so callers must present a credential");
+                crate::log_legacy!("[API] bound to {scope}, so callers must present a credential");
             }
         }
         auth
@@ -179,7 +185,9 @@ fn token_for_this_engine(name: &str, consequence: &str) -> Option<String> {
     match local_token::ensure_named(name) {
         Ok(token) => Some(token),
         Err(e) => {
-            crate::log!("[API] could not read or mint ~/.lucidos/{name} ({e}), so {consequence}");
+            crate::log_legacy!(
+                "[API] could not read or mint the private entry {name} ({e}), so {consequence}"
+            );
             None
         }
     }
@@ -265,6 +273,46 @@ pub(super) fn machine_local_token() -> Option<&'static str> {
 /// than a person.
 pub fn is_local_process(headers: &HeaderMap) -> bool {
     carries_local_token(headers, LOCAL_TOKEN.get().and_then(Option::as_deref))
+}
+
+/// Does the machine-local token prove the workspace owner sent a request?
+///
+/// No, while every subprocess Lucidos starts runs as the owner with no OS
+/// sandbox: any of them can read the token. The sandbox flips this back.
+/// Temporary measure: `docs/temporary-measures.md` § Local token proves nothing.
+///
+/// The one site that gives the token an owner meaning. Read it only through
+/// [`local_process_origin`].
+const LOCAL_TOKEN_PROVES_OWNER: bool = false;
+
+/// The actor for a caller whose only credential is the machine-local token.
+pub(crate) fn local_process_origin(user_agent: Option<String>) -> MessageOrigin {
+    local_process_origin_under(LOCAL_TOKEN_PROVES_OWNER, user_agent)
+}
+
+/// [`local_process_origin`] with the switch as an argument, so a test covers
+/// both positions.
+///
+/// Both keep `Engine` mode, so flipping the switch moves the spawn-gate root
+/// and the owner-only doors and nothing else.
+fn local_process_origin_under(proves_owner: bool, user_agent: Option<String>) -> MessageOrigin {
+    if proves_owner {
+        MessageOrigin::Api {
+            user_agent,
+            mode: ActorMode::Engine,
+            source_thread_id: None,
+            emitting_trigger_id: None,
+        }
+    } else {
+        MessageOrigin::UnattestedCaller {
+            mode: ActorMode::Engine,
+            user_agent,
+            claimed_device_id: None,
+            claimed_local_token: true,
+            claimed_workspace: None,
+            claimed_thread_id: None,
+        }
+    }
 }
 
 /// The pure half of [`is_local_process`], so the comparison is testable without
@@ -391,7 +439,7 @@ pub async fn enforce(
 ) -> Response {
     if !auth.is_required() {
         if let Some(authority) = foreign_authority(&req) {
-            crate::log!(
+            crate::log_legacy!(
                 "[API] refused {}: a loopback engine does not answer for host {authority:?}",
                 req.uri().path()
             );
@@ -413,7 +461,7 @@ pub async fn enforce(
         Some(scope) => {
             // Naming the scope is safe and is the point: the caller knows which
             // credential it sent, and a silent 403 here is undebuggable.
-            crate::log!("[API] refused {path}: a {scope:?} credential does not reach it");
+            crate::log_legacy!("[API] refused {path}: a {scope:?} credential does not reach it");
             (
                 StatusCode::FORBIDDEN,
                 "that credential does not reach this route",
@@ -421,7 +469,9 @@ pub async fn enforce(
                 .into_response()
         }
         None => {
-            crate::log!("[API] refused {path}: this engine faces a network and proved no caller");
+            crate::log_legacy!(
+                "[API] refused {path}: this engine faces a network and proved no caller"
+            );
             (
                 StatusCode::UNAUTHORIZED,
                 "this engine is not on loopback, so a caller must present a local credential",
@@ -449,6 +499,46 @@ mod tests {
             );
         }
         h
+    }
+
+    /// Invariant 10 of the unattested-callers plan. Off, the local token is an
+    /// unattested caller. On, it is the engine's own machinery, which the spawn
+    /// gate roots at the owner. The mode and the user agent never move.
+    #[test]
+    fn the_local_token_switch_changes_only_the_origin() {
+        let off = local_process_origin_under(false, Some("lucidos-cli".into()));
+        let on = local_process_origin_under(true, Some("lucidos-cli".into()));
+        assert_eq!(
+            off,
+            MessageOrigin::UnattestedCaller {
+                mode: ActorMode::Engine,
+                user_agent: Some("lucidos-cli".into()),
+                claimed_device_id: None,
+                claimed_local_token: true,
+                claimed_workspace: None,
+                claimed_thread_id: None,
+            }
+        );
+        assert_eq!(
+            on,
+            MessageOrigin::Api {
+                user_agent: Some("lucidos-cli".into()),
+                mode: ActorMode::Engine,
+                source_thread_id: None,
+                emitting_trigger_id: None,
+            }
+        );
+        assert_eq!(off.mode(), on.mode());
+    }
+
+    /// The switch stays off until the OS sandbox stops subprocesses reading
+    /// the token. Flipping it is that plan's change, never a drive-by.
+    #[test]
+    fn the_local_token_does_not_prove_the_owner_today() {
+        assert!(matches!(
+            local_process_origin(None),
+            MessageOrigin::UnattestedCaller { .. }
+        ));
     }
 
     #[test]

@@ -137,3 +137,16 @@ describe('createSwLivenessProbe', () => {
     expect(onRecovered).not.toHaveBeenCalled();
   });
 });
+
+it('records worker restarts without adding a ping', async () => {
+  const states: number[] = [];
+  const ping = vi.fn(() => true);
+  const p = createSwLivenessProbe({ ping, recover, onRecovered, onState: state => states.push(state) });
+  const done = p.check();
+  p.notePong(10);
+  await done;
+  p.notePong(10);
+  p.notePong(11);
+  expect(states).toEqual([0, 1, 1, 2]);
+  expect(ping).toHaveBeenCalledTimes(1);
+});

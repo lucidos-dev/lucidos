@@ -1,3 +1,4 @@
+import { retryTransportRead } from './_transport';
 import { apiUrl } from './_fetch';
 import {
   callHost,
@@ -58,7 +59,7 @@ export function proxy(name: string): ProxyClient {
     async fetch(path: string, init?: RequestInit): Promise<Response> {
       const normalizedPath = path.startsWith('/') ? path : `/${path}`;
       const suffix = `/proxy/${safeName}${normalizedPath}`;
-      if (!isBridged()) return fetch(apiUrl(suffix), init);
+      if (!isBridged()) return retryTransportRead(() => fetch(apiUrl(suffix), init), init);
       // An isolated frame's own `fetch` is CORS-blocked, so the host makes the
       // call. The raw `Response` is rebuilt on this side, so a caller still
       // picks its own way to read the body.

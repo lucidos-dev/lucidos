@@ -59,3 +59,10 @@ ls $DATA/triggers/*/*.md      2>/dev/null
 ```
 
 The live system prompt's "## Available Intents" section is the ground truth. If it disagrees with the shell list, the engine wins: the loader rejected a file (for example, for invalid frontmatter).
+
+## Diagnostic evidence
+
+Registry diagnostic lines remain private in maintainer bundles.
+Diagnostics do not replace filesystem enumeration when checking which intents exist.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

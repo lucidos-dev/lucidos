@@ -1,6 +1,6 @@
 # 0596: The follow toggle floats over the composer in the down chevron's old slot, always shown; the chevron stands one slot above it
 
-- **Status**: Accepted
+- **Status**: Superseded by ADR 0713 (placement only: the two now share a row; the rest stands)
 - **Date**: 2026-10-28
 
 ## Context

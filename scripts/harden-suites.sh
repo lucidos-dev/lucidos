@@ -10,6 +10,7 @@
 #                   [--budget <seconds>]       #   how long to wait (default 230)
 #   ./scripts/harden-suites.sh verdict         # the verdict alone
 #   ./scripts/harden-suites.sh start           # a normal run, when the verdict says RERUN
+#                   [--include-suite <name>]  # repeat to add canonical suites
 #   ./scripts/harden-suites.sh timings         # each suite's start, end and exit, as JSON
 #
 # `start` selects suites from `git diff main...HEAD`, runs them, and records
@@ -31,11 +32,20 @@
 # the tier only when no engine answers. HS_LUCIDOS_CMD replaces the CLI in
 # the tests, which must never ask a real engine.
 #
+# Includes add to automatic selection in both tiers, even when the main check
+# covers a requested suite. Names are validated before evidence is replaced.
+# Requests persist in .lucidos/harden-included-suites for this worktree and are
+# copied to each run's included-suites. Ordinary starts and retries retain them.
+# Existing retries keep their subset; a new request forces a full round.
+# Commands remain defined by hs_suite_command, with Cargo in its serial lane.
+#
 # A FAIL verdict records what failed in .lucidos/harden-retry: engine tests and
-# browser specs by name, any other failed suite whole. The next `start` is then
-# a retry round, which runs only those. A retry round never passes the harden:
-# once its tests pass it clears the record and says RERUN, so the full set runs
-# once more (ADR 0536).
+# browser specs by name, other failures and unfinished suites whole. The next
+# `start` retries the obligations still selected by the current change.
+# Browser retries select specs before launching any suites. Passing retries
+# complete the harden when only standalone tests changed since the last full
+# round started. Otherwise they say RERUN for the full set (ADR 0536 and its
+# amendment).
 #
 # A passing touched-spec suite records each spec it ran in .lucidos/harden-carried,
 # with the commit it ran at. The next round leaves out a spec whose record is
@@ -44,8 +54,8 @@
 # nothing.
 #
 # The touched specs mobile-webkit runs get their own suite, e2e-touched-webkit.
-# A macOS host runs it after e2e-touched, on the e2e cargo profile. Any other
-# host sends it to GitHub as the run starts. The rest run on this host.
+# Every host sends it to GitHub as the run starts, beside e2e-touched.
+# The rest run on this host.
 #
 # The verdict prints one line per suite: PASS, SKIP <reason>, FAIL, VOID
 # <reason>, RUNNING or MISSING. A touched-spec suite refused by a busy e2e lock
@@ -58,8 +68,8 @@
 # A cargo suite waits on the build memory gate before it starts, and exits 72
 # when the host never recovers (ADR 0351).
 #
-# When a selected suite reads codegen's output (ts, vitest, knowhow-generated),
-# the cargo lane first runs codegen-step, behind the same gate. Those suites
+# When a selected suite reads codegen's output (`hs_waits_for_codegen`), the
+# cargo lane first runs codegen-step, behind the same gate. Those suites
 # wait for it, then run outside the lane and never compile. A failed step fails
 # each of them, and a refused gate voids them.
 #
@@ -73,6 +83,9 @@
 #
 # State and logs: .lucidos/harden-suites/ in the worktree (gitignored).
 #
+# `wait` reports a FAIL as soon as one suite fails, while the rest may still
+# run. An unfinished suite is never a pass: the next round owes that suite whole.
+#
 # Exit status: 0 every suite PASS or SKIP, 1 a FAIL or bad usage, 2 RERUN needed
 # (a VOID or MISSING line, and no FAIL), 3 still running.
 
@@ -83,6 +96,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib/harden_suites.sh"
 # shellcheck source=scripts/lib/proc_tree.sh
 source "$SCRIPT_DIR/lib/proc_tree.sh"
+# shellcheck source=scripts/lib/ps_tools.sh
+source "$SCRIPT_DIR/lib/ps_tools.sh"
+ps_tools_env
 
 if ! ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
     echo "harden-suites: not inside a git checkout." >&2
@@ -91,7 +107,9 @@ fi
 STATE="$ROOT/.lucidos/harden-suites"
 # Outside STATE, which every start clears: the record outlives the run.
 RETRY_FILE="$ROOT/.lucidos/harden-retry"
+RETRY_BASE="$ROOT/.lucidos/harden-retry-base"
 CARRY_FILE="$ROOT/.lucidos/harden-carried"
+INCLUDE_FILE="$ROOT/.lucidos/harden-included-suites"
 REVIEW_OUT="$ROOT/.lucidos/other-model-review.out"
 REVIEW_DONE="$ROOT/.lucidos/other-model-review.done"
 
@@ -136,6 +154,22 @@ recorded_tier() {
     hs_normalize_tier "$(cat "$STATE/tier" 2>/dev/null)"
 }
 
+# Whether a main check covers this workspace, as the engine says. No engine,
+# an older one, or any other answer is `off`: the round then keeps every suite.
+resolve_main_check_setting() {
+    "${HS_LUCIDOS_CMD:-lucidos}" main-check setting 2>/dev/null | head -1
+}
+
+# Exports HS_MAIN_CHECK_COVERED from the setting `start` recorded, so the
+# verdict's re-selection agrees with the start's.
+use_recorded_main_check_setting() {
+    HS_MAIN_CHECK_COVERED=""
+    if hs_main_check_covers "$(cat "$STATE/main-check-setting" 2>/dev/null)"; then
+        HS_MAIN_CHECK_COVERED=1
+    fi
+    export HS_MAIN_CHECK_COVERED
+}
+
 # The browser specs a branch can break (touched_specs.sh), against main. What
 # the selector says about the coverage map goes to the e2e-touched suite's log.
 # HS_TOUCHED_SPECS_CMD replaces the selector in the tests.
@@ -149,8 +183,22 @@ retry_round() { [ -f "$STATE/retry" ]; }
 selected_suites() {
     cat "$STATE/suites" 2>/dev/null
     if [ "$(cat "$STATE/mode" 2>/dev/null)" = early ] && ! retry_round && grep -q -x engine "$STATE/suites" 2>/dev/null; then
-        echo driver
+        grep -q -x driver "$STATE/suites" || echo driver
     fi
+}
+
+# Keep automatic order and add each required suite once. Browser suites need
+# the slow spec selection; Cargo includes always join the first lane.
+select_with_includes() {
+    local s
+    {
+        hs_select_suites "$@"
+        [ -f "$STATE/included-suites" ] || return 0
+        while IFS= read -r s; do
+            if [ "${6:-}" = /dev/null ] && hs_is_e2e_suite "$s"; then continue; fi
+            echo "$s"
+        done < "$STATE/included-suites"
+    } | awk 'NF && !seen[$0]++'
 }
 
 # A git failure prints a path that is never safe, so it voids the result.
@@ -196,16 +244,6 @@ run_codegen_step() {
     run_step codegen-step "$cmd" "the /harden codegen step"
 }
 
-# A local WebKit run takes both e2e slots, so it starts after e2e-touched
-# ends. A run gone with no exit file leaves the suite MISSING, so the verdict reruns.
-await_local_touched_specs() {
-    [ -f "$STATE/e2e-touched.queued" ] || return 0
-    while [ ! -f "$STATE/e2e-touched.exit" ]; do
-        runner_alive || return 1
-        sleep 1
-    done
-}
-
 # A suite that waits for the codegen step takes a failed step's exit code as
 # its own, so a refused gate (72) voids it and any other failure fails it.
 run_suite() { # <suite>
@@ -229,9 +267,6 @@ run_suite() { # <suite>
         fi
     fi
     hs_is_cargo_suite "$suite" && gate="the /harden $suite suite"
-    if [ "$suite" = e2e-touched-webkit ] && hs_runs_webkit_here; then
-        await_local_touched_specs || return
-    fi
     run_step "$suite" "$cmd" "$gate"
 }
 
@@ -263,12 +298,23 @@ launch_suites() { # <newline-separated suites>
 }
 
 cmd_start() {
-    local mode=normal suites early added="" s disabled tier label
-    case "${1:-}" in
-        --early) mode=early ;;
-        "") ;;
-        *) usage >&2; return 1 ;;
-    esac
+    local mode=normal suites early added="" s disabled tier label includes="" new_includes=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --early) mode=early ;;
+            --include-suite)
+                shift
+                if [ $# -eq 0 ]; then usage >&2; return 1; fi
+                hs_is_suite "$1" || return 1
+                includes="$includes$1"$'\n'
+                ;;
+            *) usage >&2; return 1 ;;
+        esac
+        shift
+    done
+    includes="$( { cat "$INCLUDE_FILE" 2>/dev/null; printf '%s' "$includes"; } | sed '/^$/d' | sort -u)"
+    for s in $includes; do hs_is_suite "$s" || return 1; done
+    [ "$includes" = "$(cat "$INCLUDE_FILE" 2>/dev/null)" ] || new_includes=1
     if runner_alive; then
         echo "A suite run is still going. Stop it first: ./scripts/harden-suites.sh stop" >&2
         return 1
@@ -278,13 +324,21 @@ cmd_start() {
         return 1
     fi
 
+    # Supersede the old retry before persisting new requirements, so failed
+    # startup cannot leave them attached to an older retry subset.
+    if [ -n "$new_includes" ]; then rm -f "$RETRY_FILE" "$RETRY_BASE"; fi
     rm -rf "$STATE"
     mkdir -p "$STATE"
+    printf '%s\n' "$includes" | sed '/^$/d' > "$INCLUDE_FILE.tmp"
+    mv "$INCLUDE_FILE.tmp" "$INCLUDE_FILE"
+    cp "$INCLUDE_FILE" "$STATE/included-suites"
     echo $$ > "$STATE/pid"
     started_at $$ > "$STATE/pid-started"
     echo "$mode" > "$STATE/mode"
     tier="$(resolve_tier)"
     echo "$tier" > "$STATE/tier"
+    resolve_main_check_setting > "$STATE/main-check-setting"
+    use_recorded_main_check_setting
     git -C "$ROOT" rev-parse HEAD > "$STATE/start-sha"
     hs_untracked_fingerprint "$ROOT" > "$STATE/untracked-at-start"
     branch_paths | sort -u > "$STATE/paths"
@@ -307,10 +361,25 @@ cmd_start() {
     label="$mode"
     if [ "$tier" = fast ]; then label="$mode, fast tier"; fi
 
-    if [ -s "$RETRY_FILE" ]; then
-        suites="$(hs_retry_plan "$ROOT" "$STATE" < "$RETRY_FILE")"
+    # New requirements owe a full round: a passing retry subset cannot prove
+    # that a suite added after the failed round ever ran.
+    if [ -s "$RETRY_FILE" ] && [ -z "$new_includes" ]; then
+        while read -r s _; do
+            hs_is_e2e_suite "$s" || continue
+            if ! select_touched_specs "$STATE/paths" "$STATE/touched-specs.tmp" "$STATE/e2e-touched.note"; then
+                echo "Could not select the touched browser specs for the retry; the failure record is unchanged." >&2
+                return 1
+            fi
+            mv "$STATE/touched-specs.tmp" "$STATE/touched-specs"
+            break
+        done < "$RETRY_FILE"
+        if ! suites="$(hs_retry_plan "$ROOT" "$STATE" "$STATE/touched-specs" < "$RETRY_FILE")"; then
+            echo "Could not plan the retry; the failure record is unchanged." >&2
+            return 1
+        fi
         if [ -n "$suites" ]; then
             cp "$RETRY_FILE" "$STATE/retry"
+            cp "$RETRY_BASE" "$STATE/full-start-sha" 2>/dev/null || :
             printf '%s\n' "$suites" > "$STATE/suites"
             echo "Suites ($label, a retry of what failed): $(tr '\n' ' ' < "$STATE/suites")"
             # A failed driver run reruns alone, once `wait` has joined the other-model review.
@@ -322,18 +391,22 @@ cmd_start() {
         echo "Nothing the last round failed is left to rerun, so this is a full run."
     fi
 
+    cp "$STATE/start-sha" "$STATE/full-start-sha"
+
     # Only e2e-touched reads the specs, and it is no cargo suite, so the cargo
     # lane starts once, before the slow selection.
-    early="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths" | sed '/^$/d')"
-    launch_suites "$early"
-    if ! select_touched_specs "$STATE/paths" "$STATE/touched-specs.tmp" "$STATE/e2e-touched.note"; then
-        stop_tree "$(descendants $$ | grep -v -x $$)"
-        echo "Could not select the touched browser specs." >&2
-        return 1
+    early="$(select_with_includes "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" /dev/null "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths")"
+    launch_suites "$(printf '%s\n' "$early" | grep -v -x driver)"
+    if [ ! -f "$STATE/touched-specs" ]; then
+        if ! select_touched_specs "$STATE/paths" "$STATE/touched-specs.tmp" "$STATE/e2e-touched.note"; then
+            stop_tree "$(descendants $$ | grep -v -x $$)"
+            echo "Could not select the touched browser specs." >&2
+            return 1
+        fi
+        mv "$STATE/touched-specs.tmp" "$STATE/touched-specs"
     fi
-    mv "$STATE/touched-specs.tmp" "$STATE/touched-specs"
 
-    suites="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" "$STATE/touched-specs" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths" | sed '/^$/d')"
+    suites="$(select_with_includes "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift" "$tier" "$STATE/touched-specs" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths")"
     for s in $suites; do
         case $'\n'"$early"$'\n' in
             *$'\n'"$s"$'\n'*) ;;
@@ -407,13 +480,29 @@ all_done() {
     return 0
 }
 
-# Sleep until every suite is done or the deadline passes. The deadline is on
-# bash's own clock, so a slow host's checks cannot stretch the budget.
+# True once a suite has exited with a failing code. A cheap read of the exit
+# files alone: suite_state still decides the verdict.
+any_failed() {
+    local s code
+    for s in $(running_suites); do
+        [ -f "$STATE/$s.exit" ] || continue
+        code="$(cat "$STATE/$s.exit")"
+        case "$code" in
+            0 | 72) ;;
+            "$E2E_LOCK_BUSY_EXIT") hs_is_e2e_suite "$s" || return 0 ;;
+            *) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Sleep until every suite is done, one has failed, or the deadline passes. The
+# deadline is on bash's own clock, so a slow host's checks cannot stretch it.
 join_until() { # <deadline in $SECONDS>
-    while ! all_done && [ "$SECONDS" -lt "$1" ]; do
+    while ! all_done && ! any_failed && [ "$SECONDS" -lt "$1" ]; do
         sleep 1
     done
-    all_done
+    all_done || any_failed
 }
 
 # Start the driver run as its own process, so it outlives the `wait` that
@@ -453,7 +542,7 @@ cmd_wait() {
         echo "Still running after ${budget}s. Re-issue: ./scripts/harden-suites.sh wait"
         return 3
     fi
-    if driver_due; then
+    if ! any_failed && driver_due; then
         if [ -f "$REVIEW_OUT" ] && [ ! -f "$REVIEW_DONE" ] && [ -z "$review_abandoned" ]; then
             echo "The other-model review is still running. Join it (harden.md Phase 3), then re-issue wait."
             echo "If Phase 3 abandoned it, re-issue: ./scripts/harden-suites.sh wait --review-abandoned"
@@ -480,9 +569,14 @@ allowlist_off_note() { # <path>
         "$(cut -d' ' -f1 "$STATE/allowlist-disabled" | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 }
 
-engine_dead_filters() {
+# The filters that matched no test in <suite>'s log: the engine-filtered
+# table's, and for engine-touched the guard tests too. A module filter may
+# match nothing, since not every module has tests.
+engine_dead_filters() { # <suite>
+    local guard=""
+    [ "$1" = engine-touched ] && guard=guard_tests
     # shellcheck disable=SC2046 # one argument per filter
-    hs_dead_filters "$STATE/engine-filtered.log" $(hs_engine_filters "$STATE/test-inputs" < "$STATE/paths")
+    hs_dead_filters "$STATE/$1.log" $guard $(hs_engine_filters "$STATE/test-inputs" < "$STATE/paths")
 }
 
 # Print the state of one suite: PASS, SKIP <reason>, FAIL, VOID <reason>,
@@ -517,8 +611,9 @@ suite_state() { # <suite>
     elif { hs_is_filtered_suite "$suite" || { hs_names_engine_tests "$suite" && [ -s "$STATE/$suite.retry" ]; }; } \
         && ! grep -q -E '^running [1-9]' "$STATE/$suite.log"; then
         echo "FAIL ran no tests"
-    elif [ "$suite" = engine-filtered ] && [ ! -s "$STATE/$suite.retry" ] && [ -n "$(engine_dead_filters)" ]; then
-        echo "FAIL no test matched the filter: $(engine_dead_filters)"
+    elif { [ "$suite" = engine-filtered ] || [ "$suite" = engine-touched ]; } && [ ! -s "$STATE/$suite.retry" ] \
+        && [ -n "$(engine_dead_filters "$suite")" ]; then
+        echo "FAIL no test matched the filter: $(engine_dead_filters "$suite")"
     elif [ -f "$STATE/$suite.all-carried" ]; then
         echo "PASS carried from $(awk -v s="$suite" '$1 == s { print substr($3, 1, 10) }' "$STATE/carried" | sort -u | tr '\n' ' ' | sed 's/ $//')"
     else
@@ -532,7 +627,7 @@ record_carry() { # <suite>
 }
 
 cmd_verdict() {
-    local s state now fail=0 rerun=0
+    local s state now fail=0 rerun=0 selection_valid=1 running=""
     if [ ! -f "$STATE/suites" ]; then
         if runner_alive; then
             echo "RUNNING: the run is still setting up"
@@ -544,14 +639,16 @@ cmd_verdict() {
     # A fix can widen the selection, and no recorded suite would notice. A
     # retry round runs a subset by design, and the full run after it selects.
     if ! retry_round; then
+        use_recorded_main_check_setting
         hs_generated_drift "$ROOT" > "$STATE/generated-drift-now"
         branch_paths | sort -u > "$STATE/paths-now"
         select_touched_specs "$STATE/paths-now" "$STATE/touched-specs-now" \
             || echo "(the touched specs could not be selected)" > "$STATE/touched-specs-now"
-        now="$(hs_select_suites "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)" "$STATE/touched-specs-now" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths-now")"
+        now="$(select_with_includes "$STATE/compile-inputs" "$STATE/cli-inputs" "$STATE/vitest-inputs" "$STATE/generated-drift-now" "$(recorded_tier)" "$STATE/touched-specs-now" "$STATE/test-inputs" "$STATE/crate-graph" "$STATE/compile-owners" < "$STATE/paths-now")"
         if [ "$now" != "$(cat "$STATE/suites")" ]; then
             echo "selection VOID the diff now selects: $(printf '%s' "$now" | tr '\n' ' ')"
             rerun=1
+            selection_valid=0
         fi
     fi
     : > "$STATE/failed"
@@ -562,21 +659,40 @@ cmd_verdict() {
             PASS) ! hs_is_e2e_suite "$s" || record_carry "$s" ;;
             PASS* | SKIP*) ;;
             FAIL*) fail=1; failure_record "$s" >> "$STATE/failed" ;;
-            RUNNING) return 3 ;;
-            *) rerun=1 ;;
+            RUNNING) running="$running $s"; echo "$s" >> "$STATE/failed" ;;
+            *) rerun=1; echo "$s" >> "$STATE/failed" ;;
         esac
     done
-    if [ "$fail" = 1 ]; then
+    # Every nonterminal or invalid suite stays owed whole. Only selection
+    # drift can leave requirements outside this record and invalidate the base.
+    if [ "$fail" = 1 ] || [ "$rerun" = 1 ]; then
         mv "$STATE/failed" "$RETRY_FILE"
+        rm -f "$RETRY_BASE"
+        if [ "$selection_valid" = 1 ]; then
+            cp "$STATE/full-start-sha" "$RETRY_BASE" 2>/dev/null || :
+        fi
+    fi
+    if [ "$fail" = 1 ]; then
         echo "verdict: FAIL. Fix, commit, and return to Phase 1. The next start reruns what failed first."
+        if [ -n "$running" ]; then
+            echo "Still running:$running. Stop them before the next start: ./scripts/harden-suites.sh stop"
+        fi
         return 1
+    elif [ -n "$running" ]; then
+        return 3
     elif [ "$rerun" = 1 ]; then
         echo "verdict: RERUN. Start a normal run: ./scripts/harden-suites.sh start"
         return 2
     fi
-    rm -f "$RETRY_FILE"
+    rm -f "$RETRY_FILE" "$RETRY_BASE"
     if retry_round; then
-        echo "verdict: RERUN. What failed now passes. Start a normal run for the full set: ./scripts/harden-suites.sh start"
+        if hs_retry_test_only "$ROOT" "$(cat "$STATE/full-start-sha" 2>/dev/null)" > "$STATE/retry-evidence"; then
+            cat "$STATE/retry-evidence"
+            echo "verdict: PASS. What failed now passes; only tests changed since the last full round."
+            return 0
+        fi
+        cat "$STATE/retry-evidence"
+        echo "verdict: RERUN. What failed now passes; non-test or unverifiable changes require the full set: ./scripts/harden-suites.sh start"
         return 2
     fi
     echo "verdict: PASS"

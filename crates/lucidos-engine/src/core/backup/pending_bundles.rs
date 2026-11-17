@@ -65,7 +65,7 @@ pub(crate) async fn write_bundles(
         }
         // A checkout's `.git` is a directory, or a file in a linked worktree.
         if !repo.join(".git").exists() {
-            crate::log!(
+            crate::log_legacy!(
                 "[Backup] Skipping pending branches of {}: no git checkout is there",
                 repo.display()
             );

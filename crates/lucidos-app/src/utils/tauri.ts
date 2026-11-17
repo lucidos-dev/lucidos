@@ -203,16 +203,17 @@ export function setWindowTitle(title: string): Promise<void> {
  * `deepLink` is the SW-message shape. On tap the command emits
  * `native-notification-tapped` with it, which the page routes through the same
  * dispatchDeepLink the web-push tap uses. Only call when isTauri() is true.
+ * Returns true after OS acceptance; older binaries return null without proof.
  */
 export async function showNativeNotification(opts: {
   title: string;
   body: string;
   deepLink: Record<string, unknown>;
-}): Promise<void> {
+}): Promise<boolean | null> {
   // `link` (single word) matches the Rust command param name verbatim. The
   // caller stamps `workspace` into `deepLink`, which is what composes the UN
   // request identifier and lets the tap route back to the right workspace.
-  await invoke('show_native_notification', {
+  return invoke<boolean | null>('show_native_notification', {
     title: opts.title,
     body: opts.body,
     link: opts.deepLink,
@@ -281,8 +282,13 @@ export function nudgeDockBadge(): void {
   invoke('nudge_dock_badge').catch(() => {});
 }
 
+/** The calling window's native hide/show intent, independent of focus. */
+export function getNativeWindowShown(): Promise<boolean> {
+  return invoke<boolean>('get_native_window_shown');
+}
+
 /**
- * Report whether the native main window is currently ACTIVE: focused and
+ * Report whether the calling native window is currently ACTIVE: focused and
  * on-screen, read live from AppKit by the Rust `get_native_window_active`.
  *
  * The page pulls this at startup to SEED its `native-window-active` cache
@@ -631,8 +637,8 @@ export function currentWindowLabel(): string | null {
  * dispatch does `*listener_target == EventTarget::Any || filter(target)`
  * (`match_any_or_filter` in tauri's `event/listener.rs`), so a listener
  * registered as `Any` matches unconditionally and receives every
- * `emit_to(other_label, ...)` in the process. That defeats all three of the
- * app's targeted emits: `native-window-active`, `native-notification-tapped`,
+ * `emit_to(other_label, ...)` in the process. That defeats the
+ * app's targeted emits: `native-window-active`, `native-window-shown`, `native-notification-tapped`,
  * and the `panel-*` panel-preview events.
  *
  * Registering as `AnyLabel` instead costs nothing on the broadcast path. A

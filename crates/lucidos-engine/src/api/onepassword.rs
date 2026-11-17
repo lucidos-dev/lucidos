@@ -42,10 +42,17 @@ const SETTINGS_ONLY: &str = "The 1Password service account is managed from Setti
 /// referenced value.
 async fn require_owner(state: &AppState, headers: &HeaderMap) -> Result<MessageOrigin, ApiError> {
     if !reveal_request_allowed(headers, RefererRule::Required) {
-        log!("[1Password] refused a service account request from an app document");
+        log_legacy!("[1Password] refused a service account request from an app document");
         return Err(ApiError::new(StatusCode::FORBIDDEN, SETTINGS_ONLY));
     }
-    crate::api::actor::require_owner_device_for(headers, &state.pool, None, SETTINGS_ONLY).await
+    crate::api::actor::require_owner_device_for(
+        headers,
+        &state.pool,
+        None,
+        SETTINGS_ONLY,
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .await
 }
 
 async fn stored_account(pool: &PgPool) -> Result<Option<ServiceAccount>, ApiError> {

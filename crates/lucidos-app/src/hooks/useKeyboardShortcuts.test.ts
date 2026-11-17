@@ -43,7 +43,7 @@ import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt, isMacTextEditingKey } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript, isInteractiveTarget } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
-import { focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
+import { activeMenuItem, appSearchOpen, focusedPane, focusedThreadId, panelOverlay, splitRatio, searchEverywhereAnchor, searchEverywhereOpen, threadMap } from '../store/store';
 import { makeThreadState } from '../store/__tests__/thread-events-helpers';
 import { findSurface } from '../store/actions/find-bar';
 import { openHighlightedThreadActions } from '../components/drawer/ThreadDrawer';
@@ -584,5 +584,25 @@ describe('the host-only shortcuts', () => {
     pushOverlay({ id: 'confirm', dismiss: vi.fn(), hasPanel: true });
     dispatchPreviewIframeShortcut(hostKeydown());
     expect(applyFocusedThreadChange).not.toHaveBeenCalled();
+  });
+});
+
+describe('app-list search shortcut scope', () => {
+  const chord = { key: 'Enter', metaKey: true, ctrlKey: false, altKey: true, shiftKey: false };
+  it('claims only Apps and Plugins lists and yields under overlays', () => {
+    panelOverlay.value = null;
+    for (const menu of ['apps', 'plugins'] as const) {
+      activeMenuItem.value = menu;
+      expect(classifyChord(chord)).toBe('searchApps');
+    }
+    activeMenuItem.value = 'settings';
+    expect(classifyChord(chord)).toBeNull();
+    activeMenuItem.value = 'apps';
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/example.md' };
+    expect(classifyChord(chord)).toBeNull();
+    panelOverlay.value = null;
+    pushOverlay({ id: 'dialog', dismiss: () => {}, hasPanel: true });
+    expect(classifyChord(chord)).toBeNull();
+    appSearchOpen.value = false;
   });
 });

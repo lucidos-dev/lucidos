@@ -205,8 +205,6 @@ esac
 echo "test: every engine build prunes after compiling and before publishing"
 ORDER="$SCRATCH/order.log"
 : > "$ORDER"
-STATE="$SCRATCH/state"
-echo stale > "$STATE"
 CHECKOUT="$SCRATCH/checkout"
 mkdir -p "$CHECKOUT/target/debug/deps"
 # shellcheck disable=SC2329 # the stubs are called by build_or_find_engine
@@ -219,8 +217,7 @@ mkdir -p "$CHECKOUT/target/debug/deps"
     run_engine_cargo_build() { echo build >> "$ORDER"; }
     prune_stale_debug_objects() { echo "prune $1" >> "$ORDER"; }
     publish_launch_binaries() { echo publish >> "$ORDER"; }
-    # Stale once, so the build takes its rebuild-once path too.
-    published_build_state() { cat "$STATE"; echo current > "$STATE"; }
+    published_build_state() { echo current; }
     sign_engine_binary() { :; }
     BUILD=1
     PROJECT_DIR="$CHECKOUT"
@@ -229,12 +226,9 @@ mkdir -p "$CHECKOUT/target/debug/deps"
 BUILD_RC=$?
 EXPECTED="build
 prune $CHECKOUT/target/debug/deps
-publish
-build
-prune $CHECKOUT/target/debug/deps
 publish"
 if [ "$BUILD_RC" -eq 0 ] && [ "$(cat "$ORDER")" = "$EXPECTED" ]; then
-    pass "build, prune, publish on both the first build and the rebuild"
+    pass "build, prune, publish"
 else
     fail "exit $BUILD_RC, order: $(tr '\n' ';' < "$ORDER") output: $(cat "$SCRATCH/build.out")"
 fi

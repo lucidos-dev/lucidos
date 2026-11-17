@@ -301,7 +301,7 @@ pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &s
     // only when the fetched manifest parses, inside the blocking task. So it
     // cannot look up its own install record from in there.
     let installed = project_installed_plugins(&engine.pool).await.map_err(|e| {
-        log!(@Plugins, "read installed plugins failed: {}", e);
+        log_legacy!(@Plugins, "read installed plugins failed: {}", e);
         e.to_string()
     });
     // The staging body is synchronous, so its credentials are resolved here.
@@ -924,7 +924,7 @@ pub(crate) async fn uninstall_with_bus(
         false => Ok(()),
     };
     let media_note = removal.err().map(|e| {
-        log!("[Plugins] could not delete {}: {}", media.display(), e);
+        log_legacy!("[Plugins] could not delete {}: {}", media.display(), e);
         format!(" Its pictures could not be deleted: {e}.")
     });
 
@@ -1137,19 +1137,19 @@ async fn resync_plugin_triggers(
         let text = match std::fs::read_to_string(&abs) {
             Ok(t) => t,
             Err(e) => {
-                log!("[Plugins] read trigger {} failed: {}", rel, e);
+                log_legacy!("[Plugins] read trigger {} failed: {}", rel, e);
                 continue;
             }
         };
         let mut def = match crate::triggers::definition::TriggerDefinition::from_toml(&text) {
             Ok(d) => d,
             Err(e) => {
-                log!("[Plugins] skip unparseable trigger {}: {}", rel, e);
+                log_legacy!("[Plugins] skip unparseable trigger {}: {}", rel, e);
                 continue;
             }
         };
         if !def.slug.is_empty() && def.slug != slug {
-            log!(
+            log_legacy!(
                 "[Plugins] trigger {} body slug '{}' differs from its directory '{}' — using the directory",
                 rel,
                 def.slug,
@@ -1161,7 +1161,7 @@ async fn resync_plugin_triggers(
         // plugin (author error) — keeping it would mint two triggers writing one
         // shared data/triggers/<slug>/ projection.
         if resolved.iter().any(|(s, _)| s == &slug) {
-            log!(
+            log_legacy!(
                 "[Plugins] skip duplicate plugin trigger slug '{}' ({})",
                 slug,
                 rel
@@ -1206,7 +1206,7 @@ async fn resync_plugin_triggers(
         } else if foreign_slugs.contains(slug) {
             // Slug already belongs to a user trigger or another plugin — refuse
             // to hijack it. The plugin's other triggers still register.
-            log!(
+            log_legacy!(
                 "[Plugins] skip plugin '{}' trigger '{}' — slug already in use by another trigger",
                 plugin_id,
                 slug
@@ -1307,7 +1307,7 @@ pub async fn confirm_pending_install(
     let prior = match latest_install(&engine.pool, &pending.plugin_id).await {
         Ok(rec) => rec.map(|rec| rec.prior_setup()),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Plugins] prior-install lookup failed for '{}' (treating setup as new): {}",
                 pending.plugin_id,
                 e
@@ -1483,6 +1483,7 @@ async fn announce_local_changes(
                     source: Some("plugin_update".to_string()),
                     // A plugin update the user confirmed, not a thread's turn.
                     writer_thread_id: None,
+                    writer: Some(crate::engine::event_bus::ArtifactWriter::Person),
                 }),
                 "[Plugins] ArtifactCreated",
             )
@@ -1572,6 +1573,7 @@ pub async fn propose_local_patch_upstream(
                     Some("plugin_upstream_patch".to_string()),
                     // Written before the thread that proposes it exists.
                     None,
+                    crate::engine::event_bus::ArtifactWriter::Engine,
                 )),
                 "[Plugins] ArtifactCreated",
             )
@@ -1809,7 +1811,7 @@ async fn reload_auth_modules_if_needed(
         if let Err(e) =
             crate::api::proxy::reload_proxy_modules_into(engine, &engine.workspace_path).await
         {
-            log!(
+            log_legacy!(
                 "[Plugins] auto-reload after {operation} failed ({operation} still succeeded): {}",
                 e
             );
@@ -2196,7 +2198,7 @@ fn keep_installed_media(
     let resolved = plugin_media::resolve(plugin_root, &manifest.media);
     let copy = plugin_media::installed_dir(workspace_path, &manifest.id);
     let error = plugin_media::write_copy(&resolved, &copy).err()?;
-    log!(
+    log_legacy!(
         "[Plugins] could not keep the media of '{}': {}",
         manifest.id,
         error

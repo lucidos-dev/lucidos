@@ -311,7 +311,7 @@ const CHANGE_STATE_MIGRATION: &str =
 
 /// The migration that last redefined the unproposed-reason CHECK.
 const UNPROPOSED_REASON_MIGRATION: &str =
-    include_str!("../../../migrations/20261014101727_successor_threads.sql");
+    include_str!("../../../migrations/20261114112658_allow_plan_only_code_unproposed_reason.sql");
 
 /// I2: the database admits exactly the Rust state kinds and reasons. A variant
 /// added on one side only fails here, before a row can carry it.
@@ -361,6 +361,7 @@ fn every_proposal_hold_maps_to_its_own_reason() {
     let from_holds: Vec<UnproposedReason> = [
         ProposalHold::Plan(PlanHold::Missing),
         ProposalHold::Plan(PlanHold::AwaitingApproval),
+        ProposalHold::Plan(PlanHold::PlanOnlyCode),
         ProposalHold::Plan(PlanHold::OutsideBound),
         ProposalHold::HardeningMissing,
         ProposalHold::IntegratedIntoParent,

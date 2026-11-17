@@ -1147,11 +1147,11 @@ async fn the_newest_success_wins() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// Configured needs BOTH halves, the same pair the scheduler requires before it
-/// registers a job. A destination with the cron off runs no backup, and a cron
-/// with no destination has nowhere to upload.
+/// Configured means a destination is stored, whatever the schedule. A
+/// manual-only workspace (schedule `off`) is set up, and a cron with no
+/// destination has nowhere to upload.
 #[tokio::test]
-async fn backups_are_configured_needs_a_destination_and_an_active_schedule() {
+async fn backups_are_configured_means_a_destination_is_set() {
     use crate::core::PreferenceStore;
     use crate::engine::event_bus::EventBus;
     let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -1168,17 +1168,20 @@ async fn backups_are_configured_needs_a_destination_and_an_active_schedule() {
 
     assert!(!backups_are_configured(&pool).await.unwrap(), "nothing set");
 
-    write(prefs::BACKUP_PROVIDER.key(), "google_drive").await;
+    write(prefs::BACKUP_SCHEDULE.key(), "0 0 3 * * *").await;
     assert!(
         !backups_are_configured(&pool).await.unwrap(),
-        "a destination alone backs nothing up",
+        "a cron with no destination has nowhere to upload",
     );
 
-    write(prefs::BACKUP_SCHEDULE.key(), "off").await;
-    assert!(!backups_are_configured(&pool).await.unwrap(), "cron off");
-
-    write(prefs::BACKUP_SCHEDULE.key(), "0 0 3 * * *").await;
+    write(prefs::BACKUP_PROVIDER.key(), "google_drive").await;
     assert!(backups_are_configured(&pool).await.unwrap(), "both set");
+
+    write(prefs::BACKUP_SCHEDULE.key(), "off").await;
+    assert!(
+        backups_are_configured(&pool).await.unwrap(),
+        "manual only is still set up",
+    );
 
     write(prefs::BACKUP_PROVIDER.key(), "").await;
     assert!(

@@ -81,7 +81,7 @@ pub(crate) fn join_or_start<H: BuildHost>(host: &Arc<H>) {
     let mut slot = host.background_build().slot.lock().unwrap();
     if slot.running() {
         slot.joined = true;
-        crate::log!(
+        crate::log_legacy!(
             "[Rebuild] joined the engine build in flight; it builds once more if HEAD has moved past it"
         );
         return;
@@ -95,7 +95,7 @@ pub(crate) fn restart<H: BuildHost>(host: &Arc<H>) {
     let superseded = slot.task.take().filter(|t| !t.is_finished());
     if let Some(old) = &superseded {
         old.abort();
-        crate::log!("[Rebuild] restarting the engine build in flight on request");
+        crate::log_legacy!("[Rebuild] restarting the engine build in flight on request");
     }
     start(host, &mut slot, superseded);
 }
@@ -149,7 +149,7 @@ async fn drive<H: BuildHost>(
             Settled::Done => break finished.state,
             Settled::Restarted => return,
             Settled::BuildAgain => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Rebuild] HEAD moved past the engine build an Apply joined; building once more"
                 );
                 previous_failure = finished.state.failure().map(|f| f.summary.clone());

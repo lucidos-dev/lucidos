@@ -31,6 +31,7 @@ fn idle(reason: Option<&str>) -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -141,6 +142,8 @@ async fn a_card_ends_the_keep_alive_turn() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
     )
     .await;

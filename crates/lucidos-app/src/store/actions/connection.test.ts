@@ -17,7 +17,7 @@ vi.mock('../../api/client', async (importActual) => ({
   }),
   API_BASE: 'http://localhost:3000',
 }));
-vi.mock('./thread-sync', () => ({
+vi.mock('./thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),
 }));
@@ -53,7 +53,7 @@ vi.mock('./whatsNew', () => ({
 
 // Import after mocks are set up
 const { handleResume } = await import('./connection');
-const { reviveThreadEvents } = await import('./thread-sync');
+const { reviveThreadEvents } = await import('./thread-stream');
 const { loadPreferences } = await import('./preferences');
 const { loadReleaseNotices } = await import('./releaseNotices');
 const { reloadChangelogIfRead } = await import('./whatsNew');

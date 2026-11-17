@@ -2175,7 +2175,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users 0.5.2",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2486,7 +2486,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2675,6 +2675,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -4391,9 +4392,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.182"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libdbus-sys"
@@ -4553,23 +4554,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lucidos-agent-sandbox"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
+
+[[package]]
 name = "lucidos-app"
 version = "0.1.0"
 dependencies = [
  "block2",
  "libc",
+ "lucidos-diagnostic-log",
  "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-owner-lock",
  "lucidos-tailscale",
- "lucidos-update-address",
+ "lucidos-update-channel",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-user-notifications",
  "objc2-web-kit",
  "reqwest 0.12.28",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "tauri",
@@ -4611,13 +4622,13 @@ dependencies = [
  "lucidos-build-slot",
  "lucidos-capabilities",
  "lucidos-claude-code-managed",
- "lucidos-engine-socket",
  "lucidos-gateway-constants",
+ "lucidos-gateway-stamp",
  "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
  "lucidos-tailscale",
- "lucidos-update-address",
+ "lucidos-update-channel",
  "qrcode",
  "reqwest 0.12.28",
  "serde",
@@ -4626,6 +4637,32 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "lucidos-diagnostic-log"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "http 1.4.0",
+ "libc",
+ "lucidos-diagnostic-log-macros",
+ "lucidos-gateway-constants",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "trybuild",
+ "uuid",
+]
+
+[[package]]
+name = "lucidos-diagnostic-log-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -4640,6 +4677,7 @@ dependencies = [
  "hmac",
  "image",
  "lucidos-engine",
+ "lucidos-gateway-stamp",
  "lucidos-local-token",
  "reqwest 0.12.28",
  "serde_json",
@@ -4683,13 +4721,16 @@ dependencies = [
  "kamadak-exif",
  "lettre",
  "libc",
+ "lucidos-agent-sandbox",
  "lucidos-build-slot",
  "lucidos-capabilities",
  "lucidos-claude-code-managed",
+ "lucidos-diagnostic-log",
  "lucidos-engine-socket",
  "lucidos-file-backup-exclusion",
  "lucidos-frame-capability",
  "lucidos-gateway-constants",
+ "lucidos-gateway-stamp",
  "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
@@ -4697,6 +4738,7 @@ dependencies = [
  "lucidos-pg-url",
  "lucidos-secret-store",
  "lucidos-tailscale",
+ "lucidos-update-channel",
  "mail-parser",
  "native-tls",
  "openssl",
@@ -4733,7 +4775,7 @@ dependencies = [
  "wasmtime",
  "wat",
  "web-push",
- "zip 2.4.2",
+ "zip 9.0.5",
  "zstd",
 ]
 
@@ -4802,10 +4844,12 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "lucidos-diagnostic-log",
  "lucidos-engine-socket",
  "lucidos-file-backup-exclusion",
  "lucidos-frame-capability",
  "lucidos-gateway-constants",
+ "lucidos-gateway-stamp",
  "lucidos-home",
  "lucidos-installs",
  "lucidos-local-token",
@@ -4813,7 +4857,7 @@ dependencies = [
  "lucidos-pg-url",
  "lucidos-secret-store",
  "lucidos-tailscale",
- "lucidos-update-address",
+ "lucidos-update-channel",
  "mach2",
  "qrcode",
  "rcgen",
@@ -4830,11 +4874,23 @@ dependencies = [
  "tower-http",
  "urlencoding",
  "webpki-roots 1.0.6",
+ "zstd",
 ]
 
 [[package]]
 name = "lucidos-gateway-constants"
 version = "0.1.0"
+
+[[package]]
+name = "lucidos-gateway-stamp"
+version = "0.1.0"
+dependencies = [
+ "hmac",
+ "lucidos-local-token",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "lucidos-home"
@@ -4873,6 +4929,7 @@ dependencies = [
 name = "lucidos-pg-url"
 version = "0.1.0"
 dependencies = [
+ "tempfile",
  "urlencoding",
 ]
 
@@ -4899,9 +4956,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "lucidos-update-address"
+name = "lucidos-update-channel"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "url",
 ]
 
@@ -5235,6 +5293,18 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.11.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
+]
 
 [[package]]
 name = "nom"
@@ -6483,7 +6553,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7017,7 +7087,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7085,7 +7155,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8244,6 +8314,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 
 [[package]]
+name = "target-tuple"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "876fef147edbcbddc8ac5cbbba92c7b86519e314e86638596c09673b2ed01e7f"
+
+[[package]]
 name = "tauri"
 version = "2.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8574,7 +8650,7 @@ dependencies = [
  "getrandom 0.4.1",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9121,6 +9197,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "trybuild"
+version = "1.0.125"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9838b494ee14d28f1eeea490e8f4f10248fa6dd371d4bc874b635de499408245"
+dependencies = [
+ "glob",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "target-tuple",
+ "termcolor",
+ "toml 1.0.6+spec-1.1.0",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9166,6 +9257,12 @@ checksum = "cb30dbbd9036155e74adad6812e9898d03ec374946234fbcebd5dfc7b9187b90"
 dependencies = [
  "rustc-hash",
 ]
+
+[[package]]
+name = "typed-path"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54ec2755506471f54baf5e4bb5499d8e510cc1caf271270e778a736bd2d7336c"
 
 [[package]]
 name = "typeid"
@@ -10173,7 +10270,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11036,23 +11133,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "2.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
-dependencies = [
- "arbitrary",
- "crc32fast",
- "crossbeam-utils",
- "displaydoc",
- "flate2",
- "indexmap 2.13.0",
- "memchr",
- "thiserror 2.0.18",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa8cd6af31c3b31c6631b8f483848b91589021b28fffe50adada48d4f4d2ed1"
@@ -11062,6 +11142,27 @@ dependencies = [
  "indexmap 2.13.0",
  "memchr",
 ]
+
+[[package]]
+name = "zip"
+version = "9.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "indexmap 2.13.0",
+ "memchr",
+ "nix",
+ "typed-path",
+ "zopfli",
+]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zmij"

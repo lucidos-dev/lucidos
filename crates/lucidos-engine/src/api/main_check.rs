@@ -1,6 +1,7 @@
 //! The main check's routes (ADR 0464): read where it stands, and close a red.
 
 use super::actor::require_owner_device;
+use super::owner_door::{OnUnattested, OwnerAct};
 use super::*;
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::MainCheckCloseRefusal;
@@ -14,9 +15,8 @@ pub(super) async fn get_main_check(State(state): State<AppState>) -> Json<serde_
 }
 
 /// POST /api/v1/main-check/close: the maintainer closes a red main check. Its
-/// fix thread stays an ordinary thread. What landed while red was open starts
-/// the next check. An agent, a script or an app may not close it: the fix
-/// thread owns a red until its change lands.
+/// repair thread continues. Checks keep running, with their owed landings.
+/// An agent, script or app cannot close red.
 pub(super) async fn close_main_check(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -30,25 +30,62 @@ pub(super) async fn close_main_check(
     close_answer(answer)
 }
 
+/// POST /api/v1/main-check/fix-now: start the owner's main repair now.
+pub(super) async fn fix_main_now(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let actor = require_owner_device(
+        &headers,
+        &state.pool,
+        OnUnattested::Ask(OwnerAct::new("start the main repair now")),
+    )
+    .await?;
+    match state
+        .engine
+        .fix_main_now(Some(actor))
+        .await
+        .map_err(ApiError::internal)?
+    {
+        Ok(()) => Ok(Json(
+            serde_json::json!({ "message": "Main repair started." }),
+        )),
+        Err(MainCheckCloseRefusal::NoRed) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "No main findings need repair.",
+        )
+        .with_reason("main_check_no_repair")),
+        Err(MainCheckCloseRefusal::StateUnread) => Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Could not record the repair start. Try again shortly.",
+        )
+        .with_reason("main_check_state_unread")),
+    }
+}
+
 /// The owner at a registered device, and nobody else. The machine-local token
 /// and a verified agent subprocess are real credentials but not the
 /// maintainer, so each gets the main check's own `403`.
 async fn require_maintainer(headers: &HeaderMap, pool: &PgPool) -> Result<MessageOrigin, ApiError> {
-    require_owner_device(headers, pool)
-        .await
-        .map_err(|refusal| {
-            if refusal.status == StatusCode::FORBIDDEN {
-                maintainer_only()
-            } else {
-                refusal
-            }
-        })
+    require_owner_device(
+        headers,
+        pool,
+        OnUnattested::Ask(OwnerAct::new("close the red main check")),
+    )
+    .await
+    .map_err(|refusal| {
+        if refusal.status == StatusCode::FORBIDDEN {
+            maintainer_only()
+        } else {
+            refusal
+        }
+    })
 }
 
 fn maintainer_only() -> ApiError {
     ApiError::new(
         StatusCode::FORBIDDEN,
-        "Only the maintainer closes a red main check, from the Lucidos UI. Its fix thread owns it until a fix lands.",
+        "Only the maintainer closes a red main check, from the Lucidos UI.",
     )
     .with_reason("maintainer_only")
 }
@@ -79,6 +116,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/main-check", get(get_main_check))
         .route("/main-check/close", post(close_main_check))
+        .route("/main-check/fix-now", post(fix_main_now))
 }
 
 #[cfg(test)]
@@ -154,7 +192,7 @@ mod tests {
         assert_eq!(refusal.status, StatusCode::FORBIDDEN);
         assert_eq!(refusal.reason, Some("maintainer_only"));
 
-        let owner = headers_with(&[(HEADER_DEVICE_ID, "owner-phone")]);
+        let owner = crate::api::gateway_stamp::test_support::stamped_device_headers("owner-phone");
         let actor = require_maintainer(&owner, &pool)
             .await
             .expect("the owner's device");

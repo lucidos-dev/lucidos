@@ -149,6 +149,30 @@ impl LucidosEngine {
         widget_fit::check_widget_fit(&cx, app_id, thread_id, preferred, WIDGET_FIT_BOX_BUDGET).await
     }
 
+    /// An explicitly selected fit-only renderer, attributed to its source thread.
+    pub(crate) async fn check_widget_fit_with_renderer(
+        &self,
+        app_id: &str,
+        thread_id: Uuid,
+        handle: &str,
+        device: &str,
+        actor: crate::engine::thread_events::MessageOrigin,
+    ) -> String {
+        widget_fit::check_widget_fit_with_responder(
+            &self.widget_fit_context(),
+            app_id,
+            thread_id,
+            widget_fit::FitResponder::AgentRenderer {
+                sessions: &self.widget_fit_sessions,
+                handle,
+                device,
+                actor,
+            },
+            WIDGET_FIT_BOX_BUDGET,
+        )
+        .await
+    }
+
     /// What a write tool appends to its result for the widget files it wrote.
     /// It never fails, so a write's result always stands.
     pub(crate) async fn widget_fit_notes<'p>(

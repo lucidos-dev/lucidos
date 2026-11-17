@@ -140,9 +140,10 @@ pub const COUNT_EVENTS: &str = "count_events";
 pub const LIST_EVENT_TYPES: &str = "list_event_types";
 
 // The grouped `threads` tool from the capability parity manifest: thread
-// reads, moving a child to top level, archiving, and thread triage. Its
-// actions are list, count, drafts, held_messages, search, detach_child,
-// archive, cache_keep_alive, context_ceiling, triage and apply_triage. The
+// reads, moving a child to top level, archiving, thread triage and sending a
+// saved draft. Its actions are list, count, drafts, submit_draft,
+// held_messages, search, detach_child, archive, cache_keep_alive,
+// context_ceiling, triage and apply_triage. The
 // flat names below are their dispatch aliases. Spawning stays with the
 // standalone run_thread and run_coding_agent.
 pub const THREADS: &str = "threads";
@@ -150,6 +151,7 @@ pub const LIST_THREADS: &str = "list_threads";
 pub const COUNT_THREADS: &str = "count_threads";
 pub const SEARCH_THREADS: &str = "search_threads";
 pub const LIST_DRAFTS: &str = "list_drafts";
+pub const SUBMIT_SAVED_DRAFT: &str = "submit_saved_draft";
 pub const LIST_HELD_MESSAGES: &str = "list_held_messages";
 pub const DETACH_CHILD_THREAD: &str = "detach_child_thread";
 pub const ARCHIVE_THREAD: &str = "archive_thread";

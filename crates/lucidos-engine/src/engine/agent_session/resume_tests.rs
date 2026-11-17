@@ -48,6 +48,7 @@ async fn seed_session_started(bus: &EventBus, thread_id: Uuid, session_id: &str,
         bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: session_id.into(),
             branch: branch.into(),
@@ -70,6 +71,7 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
         bus,
         thread_id,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("work".into()),
             files: vec!["src/x.rs".to_string()],
@@ -152,6 +154,7 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "wrong-session".into(),
             branch: wrong_branch.into(),
@@ -179,6 +182,7 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -221,6 +225,7 @@ async fn a_pending_handoff_resumes_no_session_but_keeps_the_branch() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -236,6 +241,127 @@ async fn a_pending_handoff_resumes_no_session_but_keeps_the_branch() {
     };
     assert_eq!(resolve(false).await.0, Some("sess-1".to_string()));
     assert_eq!(resolve(true).await, (None, Some(branch.to_string())));
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+async fn emit_failed(bus: &EventBus, thread_id: Uuid, code: Option<&str>) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::ResponseFailed {
+            error: "This request was blocked by our safety systems.".into(),
+            spend_cap: None,
+            agent_exit: None,
+            provider_error: code.map(|code| crate::engine::thread_events::ProviderError {
+                code: code.into(),
+                detail: None,
+            }),
+        },
+    )
+    .await;
+}
+
+async fn emit_resumable_idle(bus: &EventBus, thread_id: Uuid, session_id: &str) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::CodingAgentIdled {
+            has_changes: false,
+            is_external_repo: false,
+            requires_restart: false,
+            cc_session_id: Some(session_id.into()),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            reason: None,
+            worktree_path: None,
+            worktree_head_sha: None,
+            bg_bash_pending: false,
+            turn_end: None,
+        },
+    )
+    .await;
+}
+
+/// A policy block ends the session's life: whoever sends the next turn, the
+/// resolver starts fresh on the same branch, so the blocked history is not replayed.
+#[tokio::test]
+async fn a_blocked_session_is_never_resumed() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let branch = "claude-code/blocked";
+    seed_session_started(&bus, thread_id, "sess-1", branch).await;
+    emit_failed(&bus, thread_id, Some("misalignment_policy_violation")).await;
+    emit_resumable_idle(&bus, thread_id, "sess-1").await;
+
+    let policy = blocking_policy(&pool, thread_id).await;
+    assert_eq!(policy, Some("potentially unintended activity"));
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        Some("sess-1".to_string()),
+        None,
+        policy.is_some(),
+    )
+    .await;
+    assert_eq!(
+        (sid, resume_branch),
+        (None, Some(branch.to_string())),
+        "not even a caller-supplied session id resumes a blocked session"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn only_a_policy_block_since_the_last_session_start_blocks_the_resume() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    seed_session_started(&bus, thread_id, "sess-1", "claude-code/b").await;
+    assert_eq!(blocking_policy(&pool, thread_id).await, None, "no failure");
+
+    emit_failed(&bus, thread_id, Some("rate_limit_exceeded")).await;
+    emit_failed(&bus, thread_id, Some("brand_new_failure")).await;
+    emit_failed(&bus, thread_id, None).await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        None,
+        "another code, an unknown code and no code all resume as before"
+    );
+
+    emit_failed(&bus, thread_id, Some("cyber_policy")).await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        Some("cybersecurity policy")
+    );
+    emit_failed(&bus, thread_id, Some("rate_limit_exceeded")).await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        None,
+        "the newest failure decides"
+    );
+
+    emit_failed(&bus, thread_id, Some("bio_policy")).await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        Some("biosecurity policy")
+    );
+    emit_failed(&bus, thread_id, None).await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        Some("biosecurity policy"),
+        "a failure the provider did not name, such as a spawn error, keeps the block"
+    );
+    seed_session_started(&bus, thread_id, "sess-2", "claude-code/b").await;
+    assert_eq!(
+        blocking_policy(&pool, thread_id).await,
+        None,
+        "a later session carries its own id, which resumes"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -265,6 +391,7 @@ async fn pending_change_with_idled_session_recovers_cc_session_id() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -318,6 +445,7 @@ async fn applied_change_falls_through_to_fresh_start() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,
@@ -439,6 +567,7 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -980,6 +1109,7 @@ async fn emit_idled(
             worktree_path: worktree_path.map(|p| p.to_string_lossy().into_owned()),
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -1200,6 +1330,7 @@ async fn emit_idled_with_sha(
             worktree_path: worktree_path.map(|p| p.to_string_lossy().into_owned()),
             worktree_head_sha: head_sha.map(String::from),
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -1515,4 +1646,145 @@ async fn api_error_budget_resets_on_a_new_user_message() {
 
     pool.close().await;
     teardown_test_db(&db_name).await;
+}
+
+mod run_resume {
+    use super::*;
+    use crate::engine::agent_session::continuity::resolve_session_continuity;
+    use crate::engine::agent_session::spawn::ResumeAttempt;
+    use crate::engine::successor::{pending_handoff, pending_handoff_threads_sql};
+    use crate::runtime::CodingAgent;
+
+    fn handed_off(coding_agent: CodingAgent) -> ThreadEvent {
+        ThreadEvent::SessionHandedOff {
+            plan_path: None,
+            cause: None,
+            starts: crate::engine::thread_events::SessionStart::AfterThisTurn,
+            crossing: None,
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "A fresh session starts here.".into(),
+            checkpoint: Some("pre-harden".into()),
+            progress: None,
+            coding_agent,
+            coding_agent_model: None,
+            reasoning_effort: None,
+            request: None,
+        }
+    }
+
+    fn session_started(
+        coding_agent: CodingAgent,
+        continuity: Option<crate::engine::thread_events::SessionContinuity>,
+    ) -> ThreadEvent {
+        ThreadEvent::SessionStarted {
+            sandbox: None,
+            coding_agent,
+            session_id: String::new(),
+            branch: "lane/batch".into(),
+            repo_id: None,
+            coding_agent_kind: Default::default(),
+            coding_agent_folder: String::new(),
+            app_id: None,
+            integrated: false,
+            auto_compact_window: None,
+            auto_compact_arm: None,
+            continuity,
+        }
+    }
+
+    async fn resolve(bus: &EventBus, thread_id: Uuid, kind: RunKind) -> RunResume {
+        resolve_run_resume(
+            bus.pool(),
+            bus.changes_projection(),
+            thread_id,
+            kind,
+            Some("old-session".into()),
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn in_boot_sweep(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+        let pending: Vec<Uuid> = sqlx::query_scalar(&pending_handoff_threads_sql())
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        pending.contains(&thread_id)
+    }
+
+    /// A lane run that starts while a handoff is pending is the thread's
+    /// successor session: no resume id, continuity `handoff`. Its
+    /// `SessionStarted` ends the handoff, so no later boot replays it.
+    #[tokio::test]
+    async fn a_lane_run_starts_the_pending_handoff_fresh_on_either_backend() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        for coding_agent in [CodingAgent::ClaudeCode, CodingAgent::Codex] {
+            let thread_id = Uuid::new_v4();
+            seed_session_started(&bus, thread_id, "old-session", "lane/batch").await;
+            emit(&bus, thread_id, handed_off(coding_agent)).await;
+
+            let resume = resolve(&bus, thread_id, RunKind::Lane).await;
+            let handoff = resume
+                .pending_handoff
+                .clone()
+                .expect("a lane run reads the pending handoff");
+            assert_eq!(handoff.coding_agent, coding_agent);
+            assert_eq!(resume.session_id, None, "a successor session never resumes");
+            assert!(resume.records_continuity(RunKind::Lane));
+            let continuity = resolve_session_continuity(
+                &pool,
+                thread_id,
+                ResumeAttempt::NotAttempted,
+                false,
+                resume.blocking_policy.is_some(),
+                resume.pending_handoff.as_ref(),
+            )
+            .await;
+            assert_eq!(continuity, Some(handoff.continuity()));
+
+            emit(&bus, thread_id, session_started(coding_agent, continuity)).await;
+            assert_eq!(pending_handoff(&pool, thread_id).await.unwrap(), None);
+            assert!(!in_boot_sweep(&pool, thread_id).await);
+        }
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Re-hardening on an open batch keeps its context.
+    #[tokio::test]
+    async fn a_lane_run_without_a_handoff_keeps_the_callers_session() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_session_started(&bus, thread_id, "old-session", "lane/batch").await;
+
+        let resume = resolve(&bus, thread_id, RunKind::Lane).await;
+        assert_eq!(resume.pending_handoff, None);
+        assert_eq!(resume.session_id.as_deref(), Some("old-session"));
+        assert_eq!(resume.branch, None, "the lane owns its worktree");
+        assert!(!resume.records_continuity(RunKind::Lane));
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A conflict-resolution or recovery session is not the thread's next
+    /// session: it leaves the handoff pending and keeps its resume id.
+    #[tokio::test]
+    async fn a_resolution_run_never_consumes_the_handoff() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_session_started(&bus, thread_id, "old-session", "claude-code/x").await;
+        emit(&bus, thread_id, handed_off(CodingAgent::ClaudeCode)).await;
+
+        let resume = resolve(&bus, thread_id, RunKind::Resolution).await;
+        assert_eq!(resume.pending_handoff, None);
+        assert_eq!(resume.session_id.as_deref(), Some("old-session"));
+        assert!(!resume.records_continuity(RunKind::Resolution));
+        assert!(pending_handoff(&pool, thread_id).await.unwrap().is_some());
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
 }

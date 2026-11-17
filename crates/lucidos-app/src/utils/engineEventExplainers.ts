@@ -2,8 +2,12 @@ import {
   CONTINUATION_AUTO_RECOVERY_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_BUILD_REQUESTED_REASON,
   CONTINUATION_EFFORT_RESTART_REASON,
+  CONTINUATION_HANDOFF_REQUESTED_REASON,
   CONTINUATION_HARDEN_REQUESTED_REASON,
+  CONTINUATION_PLAN_REQUESTED_REASON,
+  CONTINUATION_REPORTS_REQUESTED_REASON,
   CONTINUATION_USER_CLICKED_REASON,
   plainEventName,
   type AbortCause,
@@ -28,6 +32,8 @@ export function describeCancelCause(cause: CancelCause | undefined): string {
       return 'You sent a follow-up while the agent was working. Lucidos stopped that reply and answered your follow-up next. Work already done is kept.';
     case 'effort_restart':
       return 'You picked a new reasoning effort. This agent takes effort only when it starts, so Lucidos stopped this reply and restarted the agent at the new effort. Work already done is kept.';
+    case 'refused':
+      return "You chose Don't allow on the card, so the coding agent never started.";
     case 'unknown':
     case undefined:
       return 'You stopped the reply. Lucidos did not record how.';
@@ -87,6 +93,14 @@ export function describeContinuationReason(reason: string | undefined): string |
       return 'You chose Switch on the new version, which stopped this reply. Lucidos picked it back up once the new version was running.';
     case CONTINUATION_HARDEN_REQUESTED_REASON:
       return 'You pressed Harden. Lucidos picked the thread back up to review the work and run its tests, and proposes the change when that finishes.';
+    case CONTINUATION_PLAN_REQUESTED_REASON:
+      return 'Automatic steps on this thread were paused, and you let one run: Lucidos sent the agent back to settle its plan marker.';
+    case CONTINUATION_BUILD_REQUESTED_REASON:
+      return 'Automatic steps on this thread were paused, and you let one run: Lucidos told the agent to start building the plan you approved.';
+    case CONTINUATION_HANDOFF_REQUESTED_REASON:
+      return 'Automatic steps on this thread were paused, and you let one run: Lucidos asked the agent to write its handoff, since its session passed its context ceiling.';
+    case CONTINUATION_REPORTS_REQUESTED_REASON:
+      return 'Automatic steps on this thread were paused, and you let one run: Lucidos woke the agent to read the reports that arrived meanwhile.';
     case CONTINUATION_EFFORT_RESTART_REASON:
       return 'You picked a new reasoning effort. This agent takes effort only when it starts, so Lucidos restarted it at the new effort and it carried on where it stopped.';
     case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
@@ -134,6 +148,8 @@ export function describeEngineReason(reason: EngineReason): string {
       return `${REVIEW_RULE} It had not run yet, so Lucidos asked the agent to run it.`;
     case 'missing_plan':
       return 'Changes to Lucidos itself need an approved implementation plan, or a note that the fix is local, before they are offered. This work had neither, so Lucidos held it back and asked the agent for one.';
+    case 'approved_plan_unstarted':
+      return 'You approved building the plan here, but the turn ended before any code changed. Lucidos told the agent to start the first phase.';
     case 'context_ceiling':
       return 'The agent’s context grew past this thread’s context ceiling. Lucidos asked it to write down where the work stands, so a fresh start can carry on from there with a clean context.';
     case 'plugin_auto_update':

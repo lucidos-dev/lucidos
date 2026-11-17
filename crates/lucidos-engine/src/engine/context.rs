@@ -205,7 +205,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
         // debug/test build) and a wrapped ~18-quintillion-KB figure in the log
         // otherwise. The raw before/after byte counts below stay exact either way.
         let stripped_kb = original_len.saturating_sub(sanitized.len()) / 1024;
-        log!(
+        log_legacy!(
             "[Context] read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
             path,
             stripped_kb,
@@ -236,7 +236,7 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
     let next_offset = start + chunk_end_rel;
     let chunk = &remaining[..chunk_end_rel];
 
-    log!(
+    log_legacy!(
         "[Context] read_file '{}': returning bytes {}–{} of {}",
         path,
         start,
@@ -788,7 +788,7 @@ pub(super) fn trim_context_if_needed(
         }
     }
     if image_bytes_stripped > 0 {
-        log!(
+        log_legacy!(
             "[Context] Context trimming: stripped {}KB of image data from older messages",
             image_bytes_stripped / 1024
         );
@@ -822,7 +822,7 @@ pub(super) fn trim_context_if_needed(
     blocks_truncated += pass_1;
     passes |= u8::from(pass_1 > 0) << 1;
     if running <= budget {
-        log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
+        log_legacy!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
             budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(running) / 1000,
             total, running, messages.len(), budget_tokens_from_chars(budget) / 1000
         );
@@ -844,7 +844,7 @@ pub(super) fn trim_context_if_needed(
     blocks_truncated += pass_2;
     passes |= u8::from(pass_2 > 0) << 2;
     if running <= budget {
-        log!(
+        log_legacy!(
             "[Context] Context trimming: pass 2 (old prose) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
             budget_tokens_from_chars(running) / 1000,
             running,
@@ -876,7 +876,7 @@ pub(super) fn trim_context_if_needed(
         blocks_truncated += pass_3;
         passes |= u8::from(pass_3 > 0) << 3;
         if running <= budget {
-            log!("[Context] Context trimming: pass 3 (tail trim) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
+            log_legacy!("[Context] Context trimming: pass 3 (tail trim) reduced to ~{}k tokens ({} chars, budget ~{}k tokens)",
                 budget_tokens_from_chars(running) / 1000, running, budget_tokens_from_chars(budget) / 1000
             );
             return TrimOutcome {
@@ -905,7 +905,7 @@ pub(super) fn trim_context_if_needed(
             blocks_truncated += cut;
             passes |= u8::from(cut > 0) << 4;
             if cut > 0 {
-                log!(
+                log_legacy!(
                     "[Context] Context trimming: last resort cut {} result(s) from the newest message, which exceeded the whole budget alone ({} chars now, {} budget)",
                     cut,
                     running,
@@ -984,12 +984,12 @@ pub(super) fn trim_context_if_needed(
         }
     }
 
-    log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
+    log_legacy!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
         budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(current_total) / 1000,
         total, current_total, removed, messages.len(), budget_tokens_from_chars(budget) / 1000
     );
     if current_total > budget {
-        log!(
+        log_legacy!(
             "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
             budget_tokens_from_chars(current_total) / 1000,
             current_total,
@@ -1237,7 +1237,7 @@ impl LucidosEngine {
 
         // Skip memory retrieval entirely if classification says it's not needed
         if !classification.needs_memory {
-            log!(@Memory, "Query classified as not needing memory — skipping retrieval");
+            log_legacy!(@Memory, "Query classified as not needing memory — skipping retrieval");
             return (String::new(), Vec::new());
         }
 
@@ -1263,7 +1263,7 @@ impl LucidosEngine {
         let embeddings = match self.embedder.embed_batch(&sub_query_strs).await {
             Ok(e) => e,
             Err(e) => {
-                log!(@Memory, "Batch embedding failed: {}", e);
+                log_legacy!(@Memory, "Batch embedding failed: {}", e);
                 return (String::new(), Vec::new());
             }
         };
@@ -1298,7 +1298,7 @@ impl LucidosEngine {
                             .or_insert((entry, score));
                     }
                 }
-                Err(e) => log!(@Memory, "Semantic search failed: {}", e),
+                Err(e) => log_legacy!(@Memory, "Semantic search failed: {}", e),
             }
         }
 
@@ -1340,7 +1340,7 @@ impl LucidosEngine {
                             });
                     }
                 }
-                Err(e) => log!(@Memory, "Keyword search failed: {}", e),
+                Err(e) => log_legacy!(@Memory, "Keyword search failed: {}", e),
             }
         }
 

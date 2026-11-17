@@ -24,6 +24,7 @@ async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -837,6 +838,8 @@ async fn orphan_pass_leaves_a_question_parked_thread_alone() {
             options: vec![],
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
             tool_use_id: "tu-park".into(),
             cc_session_id: "sid-test".into(),
             worktree_path: None,

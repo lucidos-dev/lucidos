@@ -147,8 +147,35 @@ export function PairingGate({ children }: { children: ComponentChildren }) {
  * A failure is never a dead end. It falls through to the same form, which still
  * takes a typed code.
  */
+/**
+ * What a redeemer shows while a paired device has not tapped Allow yet.
+ *
+ * A code minted through the local token waits for a paired device once one
+ * exists. That device also gets a notification pointing at Settings → Access.
+ * The redeem keeps presenting the code, so this screen moves on by itself.
+ */
+function AwaitingOwnerScreen() {
+  useUncoverOnPaint(true);
+  return (
+    <div class="pairing-gate">
+      <div class="pairing-column" role="status">
+        <h1 class="pairing-title">Waiting for your Allow</h1>
+        <p class="pairing-lede">
+          A device is already paired with this Lucidos. On it, open{' '}
+          <strong>Settings → Access</strong> and tap <strong>Allow</strong>. This screen
+          moves on by itself.
+        </p>
+        <p class="pairing-lede">
+          No paired device works any more? Run <code>lucidos devices revoke --all</code> on
+          the machine running Lucidos, then pair again.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function DesktopPairing({ onPaired }: { onPaired: () => void }) {
-  const [auto, setAuto] = useState<'running' | 'failed'>(isTauri() ? 'running' : 'failed');
+  const [auto, setAuto] = useState<'running' | 'waiting' | 'failed'>(isTauri() ? 'running' : 'failed');
   // Why the automatic attempt gave up, carried into the form rather than
   // swallowed. The form is the recovery. A user who never learns the mint
   // failed has no idea why the Mac is suddenly asking for a code.
@@ -165,7 +192,7 @@ function DesktopPairing({ onPaired }: { onPaired: () => void }) {
   useEffect(() => {
     if (auto !== 'running') return;
     let live = true;
-    pairDesktopWindow()
+    pairDesktopWindow(() => live && setAuto('waiting'))
       .then(() => {
         if (!live) return;
         onPaired();
@@ -179,9 +206,10 @@ function DesktopPairing({ onPaired }: { onPaired: () => void }) {
     return () => {
       live = false;
     };
-    // Runs once: `auto` only ever moves to `failed`, which leaves this branch.
+    // Runs once: `auto` only moves on to `waiting` or `failed`.
   }, []);
 
+  if (auto === 'waiting') return <AwaitingOwnerScreen />;
   if (auto === 'running') {
     if (!showBusy) return null;
     return (
@@ -482,6 +510,8 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
   // this form is on screen. A submit overwrites it with its own result.
   const [error, setError] = useState<string | null>(notice ?? null);
   const [busy, setBusy] = useState(false);
+  // The code waits for a paired device's Allow. Cleared when the redeem ends.
+  const [awaitingOwner, setAwaitingOwner] = useState(false);
   // Read once: an ability cannot appear mid-screen, and re-reading it would
   // only make the control flicker.
   const [canPaste] = useState(() => clipboardAbilities().paste);
@@ -525,7 +555,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     setBusy(true);
     setError(null);
     try {
-      await redeemPairingCode(value, label.trim() || undefined);
+      await redeemPairingCode(value, label.trim() || undefined, () => setAwaitingOwner(true));
       // The credential arrived as an HttpOnly cookie, so there is nothing to
       // store here. Reload so every already-issued request retries with it.
       onPaired();
@@ -536,6 +566,7 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
       return false;
     } finally {
       setBusy(false);
+      setAwaitingOwner(false);
     }
   };
 
@@ -576,6 +607,8 @@ function PairingForm({ onPaired, notice }: { onPaired: () => void; notice?: stri
     // Once, on mount. `scanned` is memoized for the page load, so a re-run
     // could only re-redeem a code this already spent.
   }, []);
+
+  if (awaitingOwner) return <AwaitingOwnerScreen />;
 
   // Nothing to ask for yet, and nothing worth drawing under the delay. The
   // screen appears only when the redeem is slow enough that a held splash would

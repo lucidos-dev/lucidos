@@ -1,3 +1,4 @@
+import { retryTransportRead } from '../../api/client/_core';
 import type { ComponentChildren } from 'preact';
 import { signal } from '@preact/signals';
 import { useEffect, useState } from 'preact/hooks';
@@ -56,7 +57,7 @@ const summary = signal<Loadable<DiskSummary>>({ status: 'not-loaded' });
 async function loadSummary(): Promise<void> {
   setLoadingIfFresh(summary);
   try {
-    const res = await fetch(`${API}/disk-usage/summary`);
+    const res = await retryTransportRead(() => fetch(`${API}/disk-usage/summary`));
     await throwIfNotOk(res);
     const data = (await res.json()) as DiskSummary;
     summary.value = { status: 'loaded', data };
@@ -71,7 +72,7 @@ async function loadSummary(): Promise<void> {
 async function loadInventory(): Promise<void> {
   setLoadingIfFresh(inventory);
   try {
-    const res = await fetch(`${API}/disk-usage/worktrees`);
+    const res = await retryTransportRead(() => fetch(`${API}/disk-usage/worktrees`));
     await throwIfNotOk(res);
     const body = (await res.json()) as InventoryResponse;
     inventory.value = { status: 'loaded', data: body.worktrees };

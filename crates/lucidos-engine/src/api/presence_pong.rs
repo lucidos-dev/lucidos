@@ -123,7 +123,7 @@ impl PresenceTracker {
         if existed {
             // UUIDs are collision-free in practice; if this fires the
             // fan-out is being invoked twice for the same id (upstream bug).
-            crate::log!(
+            crate::log_legacy!(
                 "[PresenceTracker] expect() overwrote an existing slot for {} \
                  — dropped any pongs collected so far",
                 notification_id
@@ -147,7 +147,7 @@ impl PresenceTracker {
             };
             if let Some(push_allowed) = slot.decided {
                 if push_allowed && req.outcome.suppresses_push() {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[PresenceTracker] {:?} pong for {} from {} arrived after the push \
                          decision: the page handled it in the app AND the push went out",
                         req.outcome,

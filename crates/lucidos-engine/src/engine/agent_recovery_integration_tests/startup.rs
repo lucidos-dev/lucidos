@@ -736,3 +736,53 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+#[tokio::test]
+async fn startup_never_reproposes_historical_closed_lane_work() {
+    use crate::engine::event_bus::SystemEvent;
+    let (pool, db) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let (_tmp, repo, thread) =
+        stuck_thread_with_held_back_work(&pool, &bus, "historical-lane-work").await;
+    let batch = Uuid::new_v4();
+    for event in [
+        SystemEvent::LaneBatchStarted {
+            batch_id: batch,
+            members: vec![],
+            base_sha: "base".into(),
+            lane_thread_id: thread,
+        },
+        SystemEvent::LaneBatchFailed {
+            batch_id: batch,
+            reason: "test failure".into(),
+            actor: None,
+        },
+    ] {
+        bus.emit(BusEvent::System(event)).await.unwrap();
+    }
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+        .bind(thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        super::propose_held_back_changes_on_startup_with_roots(
+            &pool,
+            &bus,
+            &repo,
+            &repo,
+            &[thread],
+        )
+        .await;
+    }
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+        .bind(thread)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "startup neither proposes nor repeats a hold for a closed lane"
+    );
+    teardown_test_db(&db).await;
+}

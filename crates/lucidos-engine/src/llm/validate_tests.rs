@@ -275,59 +275,6 @@ fn missing_tool_result_when_next_user_text_preserves_other_blocks() {
     assert_eq!(texts, vec!["[CHILD THREAD COMPLETED] some text"]);
 }
 
-/// Layer-inversion guard: `llm/*.rs` must NOT import or reference
-/// `crate::engine::` (or `super::engine::` etc.). Pre-Wave-4, `llm::vertex`
-/// reached into `engine::context::validate_tool_use_pairing` — moving the
-/// function into `llm::validate` (this module) made the import unnecessary,
-/// and this test ensures nobody adds it back.
-///
-/// Scope: all `.rs` files directly under `crates/lucidos-engine/src/llm/`
-/// (the LLM provider layer). Test files (`*_tests.rs`) are excluded because
-/// they're allowed to wire integration tests with engine helpers — only
-/// production code is gated.
-#[test]
-fn llm_does_not_depend_on_engine() {
-    let llm_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("llm");
-    let mut violations: Vec<(String, usize, String)> = Vec::new();
-    for entry in std::fs::read_dir(&llm_dir).expect("read llm dir") {
-        let entry = entry.expect("dir entry");
-        let path = entry.path();
-        if path.extension().and_then(|s| s.to_str()) != Some("rs") {
-            continue;
-        }
-        let name = path.file_name().unwrap().to_string_lossy().to_string();
-        // Skip the test file enforcing this rule (its module path includes
-        // "engine" in the string literal) and any *_tests.rs files.
-        if name.ends_with("_tests.rs") || name == "tests.rs" {
-            continue;
-        }
-        let content = std::fs::read_to_string(&path).expect("read source");
-        for (i, line) in content.lines().enumerate() {
-            // Skip comment lines so doc-strings explaining the rule itself
-            // don't trip the check.
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
-                continue;
-            }
-            if line.contains("crate::engine::") || line.contains("crate :: engine ::") {
-                violations.push((name.clone(), i + 1, line.to_string()));
-            }
-        }
-    }
-    assert!(
-        violations.is_empty(),
-        "llm/*.rs files must not depend on crate::engine — layer inversion. \
-         Move the shared helper into llm/ (or core/) instead. Violations:\n{}",
-        violations
-            .iter()
-            .map(|(f, line, src)| format!("  {}:{}: {}", f, line, src.trim()))
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Wire-safe tool names
 // ---------------------------------------------------------------------------
@@ -435,4 +382,59 @@ fn a_fully_safe_tool_list_is_untouched() {
         tools.iter().map(|t| &t.name).collect::<Vec<_>>(),
         before.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
+}
+
+mod guard_tests {
+    /// Layer-inversion guard: `llm/*.rs` must NOT import or reference
+    /// `crate::engine::` (or `super::engine::` etc.). Pre-Wave-4, `llm::vertex`
+    /// reached into `engine::context::validate_tool_use_pairing` — moving the
+    /// function into `llm::validate` (this module) made the import unnecessary,
+    /// and this test ensures nobody adds it back.
+    ///
+    /// Scope: all `.rs` files directly under `crates/lucidos-engine/src/llm/`
+    /// (the LLM provider layer). Test files (`*_tests.rs`) are excluded because
+    /// they're allowed to wire integration tests with engine helpers — only
+    /// production code is gated.
+    #[test]
+    fn llm_does_not_depend_on_engine() {
+        let llm_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("llm");
+        let mut violations: Vec<(String, usize, String)> = Vec::new();
+        for entry in std::fs::read_dir(&llm_dir).expect("read llm dir") {
+            let entry = entry.expect("dir entry");
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            // Skip the test file enforcing this rule (its module path includes
+            // "engine" in the string literal) and any *_tests.rs files.
+            if name.ends_with("_tests.rs") || name == "tests.rs" {
+                continue;
+            }
+            let content = std::fs::read_to_string(&path).expect("read source");
+            for (i, line) in content.lines().enumerate() {
+                // Skip comment lines so doc-strings explaining the rule itself
+                // don't trip the check.
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains("crate::engine::") || line.contains("crate :: engine ::") {
+                    violations.push((name.clone(), i + 1, line.to_string()));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "llm/*.rs files must not depend on crate::engine — layer inversion. \
+         Move the shared helper into llm/ (or core/) instead. Violations:\n{}",
+            violations
+                .iter()
+                .map(|(f, line, src)| format!("  {}:{}: {}", f, line, src.trim()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
 }

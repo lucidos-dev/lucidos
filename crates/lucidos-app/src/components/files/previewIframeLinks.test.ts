@@ -539,14 +539,14 @@ describe('markdown preview links (rendered in the host document)', () => {
     expect(mocks.openThreadAcrossWorkspaces).toHaveBeenCalledWith('other-ws', TID);
   });
 
-  it('routes a repo citation through the navigate router, lines and all', () => {
+  it('routes a repo citation through the navigate router, lines and all', async () => {
     repositories.value = { status: 'loaded', data: [{ id: 'repo-1', name: 'example-repo', path: '/src/example' }] };
     const e = clickInMarkdown('repo:repo-1:file:src/main.rs#L510-L520');
     expect(e.defaultPrevented).toBe(true);
-    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+    await vi.waitFor(() => expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
       { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
       { source: 'a file preview' },
-    );
+    ));
   });
 
   it('resolves a repo citation that names its repository', () => {

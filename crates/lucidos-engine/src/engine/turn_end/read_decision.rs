@@ -158,7 +158,7 @@ impl OpeningSource {
     fn from_columns(event_type: Option<&str>, mode: Option<String>) -> Self {
         let mode = mode.and_then(|m| {
             serde_json::from_value(serde_json::Value::String(m.clone()))
-                .inspect_err(|e| crate::log!("[TurnEnd] Opener mode {:?} unknown: {}", m, e))
+                .inspect_err(|e| crate::log_legacy!("[TurnEnd] Opener mode {:?} unknown: {}", m, e))
                 .ok()
         });
         Self::from_event(event_type.unwrap_or_default(), mode)
@@ -254,7 +254,7 @@ impl AnsweredQuestion {
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[TurnEnd] Answers on {} unreadable: {}", thread_id, e);
+            crate::log_legacy!("[TurnEnd] Answers on {} unreadable: {}", thread_id, e);
             Vec::new()
         });
         rows.into_iter().find_map(|(question, options, answer)| {
@@ -296,7 +296,7 @@ impl PushedNotification {
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[TurnEnd] Pushes on {} unreadable: {}", thread_id, e);
+            crate::log_legacy!("[TurnEnd] Pushes on {} unreadable: {}", thread_id, e);
             Vec::new()
         })
         .into_iter()
@@ -333,15 +333,15 @@ impl PushedNotification {
 /// drawer's Waiting dot. A turn that ends in flight is a step, not the end.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InFlight {
-    /// Sub-threads still mid-turn or idling on their own event wait.
+    /// Awaited sub-threads: direct children whose finish will wake this
+    /// thread and that are unfinished, at any depth (ADR 0672).
     pub sub_threads: i64,
     /// The thread's own live event waits.
     pub event_waits: i64,
 }
 
 /// The `InFlight` columns of a thread summary aliased `t`.
-const IN_FLIGHT_COLUMNS_SQL: &str =
-    "(t.active_children_count + t.waiting_children_count)::bigint, \
+const IN_FLIGHT_COLUMNS_SQL: &str = "t.awaited_children_count::bigint, \
      t.live_event_wait_count::bigint";
 
 impl InFlight {
@@ -377,7 +377,7 @@ impl InFlight {
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[TurnEnd] In-flight state of {} unreadable: {}",
                 thread_id,
                 e
@@ -636,7 +636,7 @@ impl crate::engine::LucidosEngine {
     ) -> ReadDecision {
         let call = self.aux_call(ContextPurpose::ReadDecision).await;
         let system_one = self
-            .turn_end_system_one(JudgmentSite::ReadDecision, call.attempt_timeout())
+            .judgment_system_one(JudgmentSite::ReadDecision, call.attempt_timeout())
             .await;
         let chat = read_decision_chat_judge(call.provider(), call.reasoning().map(str::to_string));
         let provider = for_site(system_one, chat);
@@ -658,7 +658,7 @@ pub(crate) async fn record_forced_decision(
     outcome: Result<ReadDecision, BoxError>,
 ) -> ReadDecision {
     let decision = outcome.unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[TurnEnd] Read decision for thread {} failed, so it asks to be read: {}",
             thread_id,
             e
@@ -666,7 +666,7 @@ pub(crate) async fn record_forced_decision(
         ReadDecision::Requested
     });
     if let Err(e) = record_read_decision(bus, thread_id, decision, None).await {
-        crate::log!(
+        crate::log_legacy!(
             "[TurnEnd] Recording the read decision for thread {} failed: {}",
             thread_id,
             e
@@ -694,7 +694,7 @@ impl Opening {
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[TurnEnd] Opening event {} unreadable: {}", origin_id, e);
+            crate::log_legacy!("[TurnEnd] Opening event {} unreadable: {}", origin_id, e);
             None
         })
         .map(|(text, event_type, mode, sequence)| Self {

@@ -227,7 +227,7 @@ describe('the installed router', () => {
   afterEach(() => {
     stop();
     observeSourceGeneration(null);
-    installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     frame.remove();
     vi.unstubAllGlobals();
   });
@@ -480,7 +480,7 @@ describe('the installed router', () => {
       let ready = false;
       let release!: () => void;
       const wait = new Promise<void>((resolve) => { release = resolve; });
-      installRestoreAdmission({ ready: () => ready, wait: () => wait });
+      installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => wait });
       deliver(frame.contentWindow, callWith('/threads/list'));
       await settleTick();
       expect(fetchMock).not.toHaveBeenCalled();
@@ -501,7 +501,7 @@ describe('the installed router', () => {
       let ready = true;
       let release!: () => void;
       const admission = new Promise<void>((resolve) => { release = resolve; });
-      installRestoreAdmission({ ready: () => ready, wait: () => admission });
+      installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => admission });
       deliver(frame.contentWindow, callWith('/threads/list'));
       await vi.waitFor(() => expect(readBody).toHaveBeenCalledOnce());
       ready = false;
@@ -619,6 +619,7 @@ describe('the installed router', () => {
       await vi.waitFor(() => expect(logged()).toHaveLength(1));
       expect(logged()[0]).toEqual({
         category: 'app-link',
+        code: 'route',
         message: 'route',
         data: { app: 'habit-tracker', href: 'https://example.com/a' },
       });
@@ -658,6 +659,7 @@ describe('the installed router', () => {
       await vi.waitFor(() => expect(logged()).toHaveLength(1));
       expect(logged()[0]).toEqual({
         category: 'app-fullscreen',
+        code: 'never-opened',
         message: 'never-opened',
         data: { app: 'habit-tracker', readyState: 4 },
       });

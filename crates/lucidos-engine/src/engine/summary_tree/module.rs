@@ -50,7 +50,7 @@ impl MemoryModule {
         match Self::stored(pool).await {
             Ok(stored) => stored.unwrap_or(Self::Classic),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[SummaryTree] Failed to read the memory module: {}. Staying on Classic",
                     e
                 );
@@ -75,7 +75,7 @@ pub async fn tree_ready(pool: &PgPool) -> bool {
     match super::store::is_ready(pool).await {
         Ok(ready) => ready,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Failed to read the ready flag: {}. Staying on Classic",
                 e
             );
@@ -111,6 +111,10 @@ pub struct BackfillProgress {
     /// another.
     #[serde(default)]
     pub failing_model: Option<String>,
+    #[serde(default)]
+    pub spend_cap_held_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub spend_cap_resets_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The ready flag is set, so turns read the trees while the older
     /// threads still fill in.
     pub ready: bool,

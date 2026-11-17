@@ -1181,6 +1181,38 @@ test_launch_bin_dir_is_per_profile_and_variant() {
     fi
 }
 
+test_cargo_and_launch_profiles_map_one_to_one() {
+    echo "test: cargo profiles and launch profiles map one to one"
+
+    # A launch dir holds builds of ONE cargo profile (ADR 0022). The mapping
+    # must round-trip in both directions, or two profiles share a launch dir.
+    local cargo launch back
+    for cargo in debug local-release e2e; do
+        launch="$(launch_profile_for_cargo_profile "$cargo")"
+        back="$(cargo_profile_for_launch_profile "$launch")"
+        if [ "$back" = "$cargo" ]; then
+            pass "cargo $cargo publishes to launch $launch and back"
+        else
+            fail "cargo $cargo -> launch $launch -> cargo $back"
+        fi
+    done
+    if [ "$(launch_profile_for_cargo_profile local-release)" = release ]; then
+        pass "local-release builds publish to .launch/release"
+    else
+        fail "local-release does not publish to .launch/release"
+    fi
+    if launch_profile_for_cargo_profile release >/dev/null 2>&1; then
+        fail "the shipped release profile resolved to a launch dir"
+    else
+        pass "the shipped release profile has no launch dir"
+    fi
+    if [ "$(RELEASE=1 ENGINE_CARGO_PROFILE="" engine_build_profile)" = local-release ]; then
+        pass "a release request builds local-release"
+    else
+        fail "a release request does not build local-release"
+    fi
+}
+
 test_launch_dir_is_outside_cargo_target() {
     echo "test: no launch dir is under target/, so cargo clean cannot remove it"
 
@@ -1193,7 +1225,7 @@ test_launch_dir_is_outside_cargo_target() {
     # with "No such file or directory: 'lucidos'" and `run_coding_agent` cannot
     # even spawn the child that would rebuild it. That is the 2026-08-13 outage.
     local profile variant dir
-    for profile in debug release; do
+    for profile in debug local-release e2e; do
         for variant in plain e2e-test-hooks; do
             dir="$(launch_bin_dir "$profile" "$variant")"
             case "$dir" in
@@ -1535,6 +1567,23 @@ test_published_build_state_classifies_against_head() {
     fi
 }
 
+test_locate_refuses_a_profile_with_no_launch_dir() {
+    echo "test: an unknown cargo profile fails instead of searching an empty path"
+
+    local PROJECT_DIR="$SANDBOX/proj-locate-unknown"
+    local ENGINE_BIN="" GATEWAY_BIN="" rc=0
+    mkdir -p "$PROJECT_DIR/target/debug"
+    : > "$PROJECT_DIR/target/debug/lucidos-engine"
+    : > "$PROJECT_DIR/target/debug/lucidos-gateway"
+
+    ENGINE_CARGO_PROFILE=release locate_launch_binaries >/dev/null 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ] && [ -z "$ENGINE_BIN" ]; then
+        pass "the shipped release profile is refused, with nothing selected"
+    else
+        fail "unknown profile was not refused (rc=$rc, ENGINE_BIN=$ENGINE_BIN)"
+    fi
+}
+
 test_locate_prefers_published_and_falls_back() {
     echo "test: the no-build path prefers the published binary, then warns"
 
@@ -1602,6 +1651,29 @@ test_locate_prefers_published_and_falls_back() {
         fail "release→debug fallback regressed: $ENGINE_BIN"
     fi
 
+    # A release request publishes to .launch/release but uplifts to
+    # target/local-release, the cargo profile it builds.
+    mkdir -p "$PROJECT_DIR/target/local-release" "$PROJECT_DIR/target/release"
+    : > "$PROJECT_DIR/target/release/lucidos-engine"
+    : > "$PROJECT_DIR/target/release/lucidos-gateway"
+    : > "$PROJECT_DIR/target/local-release/lucidos-engine"
+    : > "$PROJECT_DIR/target/local-release/lucidos-gateway"
+    if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/target/local-release/lucidos-engine" ]; then
+        pass "a release request falls back to target/local-release"
+    else
+        fail "release request uplift path: $ENGINE_BIN"
+    fi
+    mkdir -p "$PROJECT_DIR/.launch/release/plain"
+    : > "$PROJECT_DIR/.launch/release/plain/lucidos-engine"
+    : > "$PROJECT_DIR/.launch/release/plain/lucidos-gateway"
+    if RELEASE=1 locate_launch_binaries >/dev/null 2>&1 &&
+       [ "$ENGINE_BIN" = "$PROJECT_DIR/.launch/release/plain/lucidos-engine" ]; then
+        pass "a release request prefers .launch/release/plain"
+    else
+        fail "release request launch dir: $ENGINE_BIN"
+    fi
+
     # A featured build looks in its OWN launch dir, not the plain one.
     mkdir -p "$PROJECT_DIR/.launch/debug/e2e-test-hooks"
     : > "$PROJECT_DIR/.launch/debug/e2e-test-hooks/lucidos-engine"
@@ -1651,10 +1723,11 @@ test_delivery_contract() (
     local before="$FAIL" rc out
     SCRIPT_NAME="test"
     parse_dev_args -w test --engine-build --publish-to "$PROJECT_DIR/.launch/release/plain" --fresh
-    if [ "$(engine_build_profile)" = release ]; then pass "target selects release"; else fail "wrong profile"; fi
+    if [ "$(engine_build_profile)" = local-release ]; then pass "target selects local-release"; else fail "wrong profile"; fi
+    if [ "$(launch_bin_dir)" = "$PROJECT_DIR/.launch/release/plain" ]; then pass "build publishes back to its target"; else fail "build publishes elsewhere: $(launch_bin_dir)"; fi
     if [ -n "$ENGINE_BUILD_FRESH" ]; then pass "fresh requested"; else fail "fresh lost"; fi
     parse_dev_args -w test --engine-only --publish-to "$PROJECT_DIR/.launch/release/plain" || fail "standalone switch target rejected"
-    if [ "$(engine_build_profile)" = release ]; then pass "standalone switch preserves release"; else fail "standalone switch lost profile"; fi
+    if [ "$(engine_build_profile)" = local-release ]; then pass "standalone switch preserves local-release"; else fail "standalone switch lost profile"; fi
     if parse_dev_args -w test --engine-only --fresh >/dev/null 2>&1; then
         fail "standalone switch accepted fresh clean"
     else
@@ -1686,28 +1759,32 @@ test_delivery_contract() (
 )
 test_delivery_contract || FAIL=$((FAIL+1))
 
-test_stale_publish_fails_after_one_retry() (
-    local before="$FAIL" count=0 rc=0 out
+# shellcheck disable=SC2329 # build_or_find_engine calls the stubs through run_launch_build
+test_stale_publish_compiles_once() (
+    local before="$FAIL" count=0 rc=0 out published=0
     BUILD=1
+    # PROJECT_DIR is this checkout, which must never get a launch tree here.
+    launch_tree_wanted() { return 1; }
     run_launch_cargo_builds() { count=$((count+1)); }
     prune_stale_debug_objects() { :; }
-    publish_after_preflight() { :; }
+    publish_after_preflight() { published=$((published+1)); }
     published_build_state() { echo stale; }
     build_or_find_engine > "$SANDBOX/stale-output" 2>&1 || rc=$?
     out="$(cat "$SANDBOX/stale-output")"
-    if [ "$rc" -eq 75 ]; then pass "head-moved exit is distinct"; else fail "stale result returned $rc"; fi
-    if [ "$count" -eq 2 ]; then pass "stale retry is bounded"; else fail "stale build count $count"; fi
+    if [ "$rc" -eq 0 ]; then pass "a stale publish still exits 0"; else fail "stale result returned $rc"; fi
+    if [ "$count" -eq 1 ]; then pass "a stale publish compiles once"; else fail "stale build count $count"; fi
+    if [ "$published" -eq 1 ]; then pass "a stale snapshot publishes once"; else fail "stale publish count $published"; fi
     case "$out" in
-        *"ERROR: head-moved:"*) pass "stale publish names reason" ;;
-        *) fail "stale publish omitted reason" ;;
+        *"WARNING: HEAD moved to"*) pass "stale publish prints the head-moved note" ;;
+        *) fail "stale publish omitted the note: $out" ;;
     esac
     [ "$FAIL" -eq "$before" ]
 )
-test_stale_publish_fails_after_one_retry || FAIL=$((FAIL+1))
+test_stale_publish_compiles_once || FAIL=$((FAIL+1))
 
 test_fresh_clean_uses_profile_and_slot() (
     local before="$FAIL" PROJECT_DIR="$SANDBOX/fresh-checkout" ENGINE_BUILD_FRESH=1
-    ENGINE_CARGO_PROFILE=release
+    ENGINE_CARGO_PROFILE=local-release
     mkdir -p "$PROJECT_DIR/scripts"
     cat > "$PROJECT_DIR/scripts/with-build-slot.sh" <<'SLOT'
 #!/bin/bash
@@ -1722,7 +1799,7 @@ SLOT
         *"cargo
 clean
 --profile
-release
+local-release
 -p
 lucidos-engine
 -p
@@ -1741,6 +1818,7 @@ test_fresh_clean_uses_profile_and_slot || FAIL=$((FAIL+1))
 test_background_publish_failure_is_fatal || FAIL=$((FAIL+1))
 
 test_launch_bin_dir_is_per_profile_and_variant
+test_cargo_and_launch_profiles_map_one_to_one
 test_launch_dir_is_outside_cargo_target
 test_worktree_refusal_still_sees_a_worktree_launch_dir
 test_publish_launch_binary_is_atomic_and_executable
@@ -1748,6 +1826,7 @@ test_publish_failure_preserves_the_previous_binary
 test_publish_prunes_only_dead_publish_temps
 test_publish_signs_the_temp_before_the_rename
 test_published_build_state_classifies_against_head
+test_locate_refuses_a_profile_with_no_launch_dir
 test_locate_prefers_published_and_falls_back
 test_worktree_predicate_classifies_paths
 test_refuses_worktree_pinned_stack
@@ -2652,6 +2731,53 @@ test_setup_postgres_on_an_external_port_never_calls_docker() {
 
 test_shared_pg_psql_follows_the_external_port
 test_setup_postgres_on_an_external_port_never_calls_docker
+
+# ── generate_build_outputs: never a binary from another source ─────────
+# Runs generate_build_outputs on a stub codegen.sh that logs each call's
+# arguments, one line per call. A `--cached-only` call exits CACHED_RC.
+# shellcheck disable=SC2329 # ensure_npm_deps is called by generate_build_outputs
+codegen_calls() { # <launch tree> <build> <reused bin>
+    local project="$SANDBOX/codegen-project"
+    rm -rf "$project"
+    mkdir -p "$project/scripts" "$project/target/debug"
+    # shellcheck disable=SC2016 # the stub expands these, not this shell
+    printf '#!/bin/bash\necho "[$*]" >> "%s/calls"\n[ "$*" != --cached-only ] || exit "${CACHED_RC:-0}"\n' \
+        "$project" > "$project/scripts/codegen.sh"
+    chmod +x "$project/scripts/codegen.sh"
+    touch "$project/target/debug/lucidos-codegen"
+    chmod +x "$project/target/debug/lucidos-codegen"
+    (
+        ensure_npm_deps() { :; }
+        PROJECT_DIR="$project" LAUNCH_TREE="$1" BUILD="$2" REUSED_CODEGEN_BIN="$3"
+        generate_build_outputs >/dev/null 2>&1
+    )
+    cat "$project/calls"
+}
+
+test_generate_build_outputs_picks_a_matching_source() {
+    echo "test: generate_build_outputs never renders with a binary from another source"
+    local project="$SANDBOX/codegen-project" got
+    got="$(codegen_calls "$SANDBOX/tree" 1 "")"
+    if [ "$got" = "[--cached-only]" ]; then pass "a launch tree build syncs from the cache"; else fail "launch tree: '$got'"; fi
+    got="$(CACHED_RC=1 codegen_calls "$SANDBOX/tree" 1 "")"
+    if [ "$got" = $'[--cached-only]\n[]' ]; then
+        pass "a checkout with no generated files renders in full"
+    else
+        fail "launch tree, nothing generated: '$got'"
+    fi
+    got="$(codegen_calls "" 1 "")"
+    if [ "$got" = "[--bin $project/target/debug/lucidos-codegen]" ]; then
+        pass "a live build renders with its own binary"
+    else
+        fail "live build: '$got'"
+    fi
+    got="$(codegen_calls "$SANDBOX/tree" "" "$SANDBOX/reused")"
+    if [ "$got" = "[--reused-bin $SANDBOX/reused]" ]; then pass "a reused e2e binary still renders"; else fail "reused: '$got'"; fi
+    got="$(codegen_calls "" "" "")"
+    if [ "$got" = "[]" ]; then pass "no build renders with no binary"; else fail "no build: '$got'"; fi
+}
+
+test_generate_build_outputs_picks_a_matching_source
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

@@ -65,7 +65,7 @@ Four common mistakes, most frequent first:
 3. **Keep the body and control lines.** A `<code>`, a `<button>` and an `<input>` each carry their own UA font and inherit nothing. Without those lines the document mixes its font with the browser's.
 4. **Every `font-size` reads a step.** No `0.9375rem`, no `1.05rem`, no `0.8rem`. If none of the ten fits, pick a different step, not a new number.
 
-Use `--font-mono` for code. The UI font is whatever the user picked, so a mockup meant to look like Lucidos says `font-family: 'Fira Code', ui-monospace, SFMono-Regular, Menlo, monospace`.
+Use `--font-mono` for code and `--font-ui` for the user's UI font when the theme provides them. Standalone mockups without theme variables use the native system stack: `font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace`. Do not name user-installed coding fonts in that fallback or bundle a font for it.
 
 ### What a standalone HTML document can do
 
@@ -165,16 +165,15 @@ Every subprocess output is masked: an injected value, a token in the engine's ow
 
 ## Listing this machine's workspaces
 
-Read `system-knowhow/scripts/list-workspaces.sh` for the shipped helper.
-It queries the gateway's registered inventory and health, including stopped
-workspaces. A ports file records an assignment and proves no running process.
+Run `lucidos workspaces list`. It prints one workspace per line: slug, name,
+port, health, autostart and origin, tab-separated; `--json` adds the folder.
+Health is `healthy`, `booting`, `restoring` or `unhealthy`; a stopped workspace
+reads `unhealthy`. To stop, start or create one, see `lucidos-cli.md` § "The
+broker verbs".
 
-Pass two positional arguments: the loopback gateway origin and the local token
-file path, normally `~/.lucidos/local-token`. The origin includes its scheme
-and gateway port; see `system-knowhow/remote-access.md` for identifying it.
-For a private HTTPS certificate, pass `--ca-file <trusted-ca.pem>` too.
-The helper reads the token from disk and never places its value in argv.
-Its output is a JSON-quoted name and health value, separated by a tab.
+It asks this workspace's engine, which asks the gateway, so it works inside the
+agent sandbox. A ports file records an assignment and proves no running
+process, so never infer health from one.
 
 ## The workspace database: `LUCIDOS_DATABASE_URL`
 
@@ -190,6 +189,14 @@ conn = psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])
 ```
 
 - **It is read-only by default.** Every transaction opens read-only, so an accidental `DROP`, `DELETE` or `CREATE` fails with `cannot execute … in a read-only transaction`. A deliberate write opts in per transaction: `BEGIN READ WRITE; …; COMMIT;`.
+- **Writes use a table allow-list.** Even inside `BEGIN READ WRITE`, only
+  `preferences`, `memory_entries`, `summary_tree_nodes`, `summary_tree_scopes`,
+  `notification_reads`, `pinned_apps` and `browser_logins` are writable.
+  Human-only preference keys remain protected. Use the CLI or API for other
+  tables. Machine-made workspaces retain broader writes, except secret-bearing
+  tables, `_sqlx_migrations`, `backup_recipient`, `email_accounts` and
+  `snapshot_restore_boundary`. The gateway's registered origin decides this
+  at boot; absent or unknown origins use the allow-list.
 - **It cannot read stored secrets.** It signs in as an agent role with no access to secret columns, such as `credentials.auth_value` or OAuth tokens. A query naming one fails with `permission denied`. Reach a secret through its `CRED_*` variable or the proxy instead. Every other column reads as usual. How secrets are stored: `system-knowhow/stored-secrets`.
 - **Never put the URL or a password on the command line.** The command is recorded in the tool call. Naming the variable keeps the password out, and tool output masks the URL's value.
 - **Bare `psql` reaches nothing.** The engine sets no `PGHOST` / `PGUSER` / `PGDATABASE` defaults and passes on no `DATABASE_URL` of its own. So an unset variable, as in `psql "$STAGING_URL"`, fails instead of landing on the workspace database.

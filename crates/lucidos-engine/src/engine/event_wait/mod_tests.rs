@@ -656,6 +656,7 @@ fn an_idle() -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -673,6 +674,7 @@ async fn seed_coding_agent_idle(
         bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("session-{}", thread_id.simple()),
             branch: format!("claude-code/{}", thread_id.simple()),
@@ -2663,6 +2665,7 @@ async fn recent_subscriptions_resets_on_a_human_answer_only() {
     let answer = |tool_use_id: &str, actor: MessageOrigin| BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer: crate::engine::thread_events::AnswerKind::Canceled,

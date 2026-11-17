@@ -70,7 +70,7 @@ pub(crate) async fn ask_and_render<J: JudgmentProvider + ?Sized>(
     };
     let model = judgment.model.as_deref().unwrap_or(JEV_DEFAULT_MODEL);
 
-    log!(
+    log_legacy!(
         "[Judgment] judge answered {}/{} questions on {} ({} in, {} out)",
         judgment.answers.len(),
         asked,

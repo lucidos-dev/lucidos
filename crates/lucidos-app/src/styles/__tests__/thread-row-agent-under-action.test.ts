@@ -35,6 +35,11 @@ describe('the drawer row agent mark', () => {
     }
   });
 
+  it('keeps every glyph at the same size when the action column is narrow', () => {
+    const svg = RULES.find(r => r.selector === '.thread-row-agent svg')!;
+    expect(svg.props.get('flex-shrink')).toBe('0');
+  });
+
   it('takes its width from the row in every layout', () => {
     for (const layout of LAYOUTS) {
       const set = RULES.filter(r => r.selector === '.thread-row' && r.atRules === layout && r.props.has(VAR));

@@ -66,6 +66,29 @@ const chunk = (text: string) =>
   Array.from(host.querySelectorAll('.response-chunk')).find(c => c.textContent?.includes(text));
 
 describe('the turn toggles', () => {
+  it('combines full response and steps independently through their controls', () => {
+    const click = (role: string) => act(() => {
+      host.querySelector<HTMLButtonElement>(`[data-role="${role}"]`)!.click();
+    });
+    const check = (details: boolean, steps: boolean) => {
+      expect(detailsExpanded.value).toBe(details);
+      expect(stepsExpanded.value).toBe(steps);
+      expect(!!chunk('First part.')).toBe(details);
+      expect(chunk('Final answer.')).toBeDefined();
+      // Latest-answer mode retains only events after the final text block.
+      expect(!!host.querySelector('.inline-step')).toBe(details && steps);
+    };
+    check(true, true);
+    click('toggle-steps');
+    check(true, false);
+    click('toggle-details');
+    check(false, false);
+    click('toggle-steps');
+    check(false, true);
+    click('toggle-details');
+    check(true, true);
+  });
+
   it('draws each chunk and the step run inside a Disclosure', () => {
     expect(chunk('First part.')?.closest('.response-content > .disclosure')).not.toBeNull();
     expect(host.querySelector('.response-content > .disclosure .inline-step')).not.toBeNull();

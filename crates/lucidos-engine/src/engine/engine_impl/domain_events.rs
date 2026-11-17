@@ -82,7 +82,7 @@ impl LucidosEngine {
             .record_trigger_executed_at(trigger_id, status, chrono::Utc::now())
             .await
         {
-            log!(
+            log_legacy!(
                 "[Triggers] Failed to persist TriggerExecuted event: {}",
                 error
             );
@@ -174,7 +174,7 @@ fn domain_event(
     // `to_payload` drops the caller's `actor`. Logged here rather than
     // there, because every reader of the event calls `to_payload` again.
     if let Some(claimed) = payload.get(SystemEvent::ACTOR_KEY) {
-        log!(
+        log_legacy!(
             "[Events] {} carried its own `actor` ({}); recorded the engine's instead ({})",
             event_type,
             claimed,

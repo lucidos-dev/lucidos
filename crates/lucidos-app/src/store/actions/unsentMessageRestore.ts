@@ -1,5 +1,5 @@
-/** Bring back the unsent messages a previous page load left: sends whose
- *  outcome it never learned. A reload, often iOS unloading a backgrounded PWA,
+/** Bring back sends with unknown outcomes or explicit ordering refusals.
+ *  A reload, often iOS unloading a backgrounded PWA,
  *  would otherwise lose them with no word. Each comes back as a Not sent card
  *  with Retry, where it was sent. An answer typed to a question card comes
  *  back on that card while it still waits. One the engine has settles as
@@ -11,7 +11,7 @@ import { isHistoricalRestoreSource } from '../../utils/restoreSourceGeneration';
 import { effect } from '@preact/signals';
 import { waitForRestoreAdmission, restoreSourcePreserved } from '../../utils/restoreAdmission';
 
-import { makeOptimisticThreadState } from '../thread-events';
+import { awaitedQuestionCard, computeExchanges, makeOptimisticThreadState } from '../thread-events';
 import { holdPageOwnerLock, liveOwnerIds, ownedByAnotherLiveTab, pageOwnerId } from '../pageOwner';
 import { isConnected, showToast, threadListFetched, threadMap } from '../store';
 import {
@@ -20,12 +20,15 @@ import {
   readUnsentMessageStore,
   type UnsentMessageRecord,
 } from '../unsentMessageRecords';
+import { unsentPicks } from '../pendingDecisions';
 import { unsentMessages } from '../unsentMessages';
 import { errorDetail } from '../../utils/errorDetail';
+import { rerunWhenPageShows } from '../deviceDatabase';
 import { engineRecordedMessage, showRestoredUnsentMessage } from './chat';
 import { composeInFreshDraft, resumeUnsentFirstSend } from './compose';
 import { settleAcceptedSend } from './sendSettlement';
 import { ensureThreadByIdInMap } from './thread-loading';
+import { recoverQuestionPick } from './questionPickRecovery';
 
 /** What a restore pass found, for the one toast that reports it. */
 export interface UnsentRestoreOutcome {
@@ -113,8 +116,8 @@ async function restorePass(): Promise<UnsentRestoreOutcome> {
     }
     const { threadId, eventId, body, settlement } = record;
     if (verdict === 'gone') {
-      forgetUnsentMessageRecord(eventId);
       composeInFreshDraft(body.message, body.image_hashes ?? []);
+      forgetUnsentMessageRecord(eventId);
       outcome.movedToDraft += 1;
       continue;
     }
@@ -128,7 +131,19 @@ async function restorePass(): Promise<UnsentRestoreOutcome> {
     adoptUnsentMessageRecord(record);
     if (verdict === 'never-made') addNeverMadeThread(record);
     if (settlement.kind === 'first-send') resumeUnsentFirstSend(threadId, settlement.engineDraftAtSend);
-    showRestoredUnsentMessage(record);
+    if (record.questionPick) {
+      const { toolUseId, answer, placement } = record.questionPick;
+      const pick = { threadId, answer, placement, refusal: record.refusal };
+      unsentPicks.set(toolUseId, pick);
+      const thread = threadMap.peek().get(threadId);
+      if (!thread || thread.meta.status !== 'waiting_for_user_answer' || awaitedQuestionCard(computeExchanges(thread)) !== toolUseId) {
+        recoverQuestionPick(toolUseId, pick, body.message);
+        outcome.shown += 1;
+        continue;
+      }
+    } else {
+      showRestoredUnsentMessage(record);
+    }
     outcome.shown += 1;
   }
 
@@ -157,6 +172,7 @@ function runRestore(): void {
   restoreUnsentMessages().then((outcome) => {
     pendingUnresolved = outcome.unresolved > 0;
   }).catch((err) => {
+    if (rerunWhenPageShows(err, runRestore)) return;
     showToast(`Could not bring back unsent messages from before the reload: ${errorDetail(err)}`, 'error');
   });
 }

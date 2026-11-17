@@ -297,7 +297,7 @@ impl LucidosEngine {
         let abandoned = match abandoned_background_tasks(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[BashBg] Could not look for background tasks the last engine abandoned: {e}. \
                      Any thread watching one will sit until its subscription expires."
                 );
@@ -324,7 +324,9 @@ impl LucidosEngine {
             }
         }
         if settled > 0 {
-            log!("[BashBg] Settled {settled} background task(s) the last engine did not outlive");
+            log_legacy!(
+                "[BashBg] Settled {settled} background task(s) the last engine did not outlive"
+            );
         }
         settled
     }
@@ -371,7 +373,7 @@ impl LucidosEngine {
                 .wait_until_finished(&task.task_id, left)
                 .await
             {
-                log!(
+                log_legacy!(
                     "[BashBg] Task {} did not reap in time; the next boot will record it",
                     task.task_id
                 );
@@ -393,7 +395,7 @@ impl LucidosEngine {
             }
         }
         if settled > 0 {
-            log!("[BashBg] Recorded {settled} unfinished background task(s) at shutdown");
+            log_legacy!("[BashBg] Recorded {settled} unfinished background task(s) at shutdown");
         }
         settled
     }
@@ -418,7 +420,7 @@ impl LucidosEngine {
         {
             Ok(_) => true,
             Err(e) => {
-                log!("[BashBg] Could not settle task {task_id} on thread {thread_id}: {e}");
+                log_legacy!("[BashBg] Could not settle task {task_id} on thread {thread_id}: {e}");
                 false
             }
         }

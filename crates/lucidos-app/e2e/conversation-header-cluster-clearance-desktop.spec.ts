@@ -1,6 +1,6 @@
 import { test, expect, type Page } from './fixtures';
 import {
-  assertHealthy, gotoWithRetry, navigateToApp, openThreadDrawer, stampOverlayBuild, watchPreferenceReads,
+  assertHealthy, gotoWithRetry, hideDashboardRail, navigateToApp, openThreadDrawer, stampOverlayBuild, watchPreferenceReads,
 } from './helpers';
 
 /**
@@ -150,6 +150,7 @@ test.describe('the Conversation header cluster clears both flanking controls', (
 
   test.beforeEach(async ({ page, context }) => {
     await assertHealthy(page);
+    await hideDashboardRail(page);
     await context.addInitScript((width) => {
       localStorage.setItem('lucidos-split-ratio', '0.4');
       localStorage.setItem('lucidos-thread-drawer-open', 'false');

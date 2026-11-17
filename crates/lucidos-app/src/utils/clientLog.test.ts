@@ -26,3 +26,13 @@ it('explicitly stamps the legacy generation', () => {
   expect(new Headers(fetchMock.mock.calls[0][1].headers)
     .get('x-lucidos-restore-generation')).toBe('none');
 });
+
+it('sends a separate diagnostic code alongside private message and data', () => {
+  const fetchMock = vi.fn().mockResolvedValue({});
+  vi.stubGlobal('fetch', fetchMock);
+  postClientLog('error', 'uncaught', { message: 'PRIVATE_CLIENT_MARKER' });
+  expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+    category: 'error', code: 'uncaught', message: 'uncaught',
+    data: { message: 'PRIVATE_CLIENT_MARKER' },
+  });
+});

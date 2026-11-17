@@ -20,6 +20,7 @@ real-embedder-tests = []
 e2e-test-hooks = []
 
 [dependencies]
+lucidos-diagnostic-log = { path = "../lucidos-diagnostic-log" }
 lucidos-secret-store = { path = "../lucidos-secret-store" }
 async-trait = "0.1"
 bytes = "1"
@@ -37,13 +38,16 @@ lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-build-slot = { path = "../lucidos-build-slot" }
 lucidos-home = { path = "../lucidos-home" }
 lucidos-installs = { path = "../lucidos-installs" }
+lucidos-update-channel = { path = "../lucidos-update-channel" }
 lucidos-local-token = { path = "../lucidos-local-token" }
 lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 # The engine socket the gateway reaches this engine on (ADR 0445).
 lucidos-engine-socket = { path = "../lucidos-engine-socket" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
+lucidos-gateway-stamp = { path = "../lucidos-gateway-stamp" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 lucidos-pg-url = { path = "../lucidos-pg-url" }
+lucidos-agent-sandbox = { path = "../lucidos-agent-sandbox" }
 lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 lucidos-capabilities = { path = "../lucidos-capabilities" }
 lucidos-claude-code-managed = { path = "../lucidos-claude-code-managed" }
@@ -129,7 +133,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 toml = "0.8"
 semver = "1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 wasmtime = { version = "36", default-features = false, features = ["cranelift", "async", "cache"] }
 unicode-normalization = "0.1"
 pulldown-cmark = { version = "0.13", default-features = false }

@@ -98,7 +98,7 @@ function lastFetchBody(): DevicePresenceBody | null {
 describe('device presence tracking', () => {
   beforeEach(() => {
     observeSourceGeneration(null);
-    installRestoreAdmission({ ready: () => true, wait: async () => {} });
+    installRestoreAdmission({ ready: () => true, phase: () => 'admitted', wait: async () => {} });
     fetchMock.mockClear();
     documentListeners.clear();
     windowListeners.clear();
@@ -140,7 +140,7 @@ describe('device presence tracking', () => {
     let release!: () => void;
     let ready = false;
     const waiting = new Promise<void>((resolve) => { release = resolve; });
-    installRestoreAdmission({ ready: () => ready, wait: () => waiting });
+    installRestoreAdmission({ ready: () => ready, phase: () => ready ? 'admitted' : 'awaiting-hello', wait: () => waiting });
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       startDevicePresenceTracking();

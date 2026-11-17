@@ -175,9 +175,15 @@ pub(crate) fn extract_zip(archive: &Path, dest: &Path) -> Result<(), String> {
     let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("read archive: {}", e))?;
     for i in 0..zip.len() {
         let mut entry = zip
-            .by_index(i)
+            .by_index_with_options(
+                i,
+                zip::read::ZipReadOptions::new().enforce_header_consistency(true),
+            )
             .map_err(|e| format!("zip entry {}: {}", i, e))?;
-        let raw_name = entry.name().to_string();
+        let raw_name = entry
+            .name()
+            .map_err(|e| format!("zip entry {} name: {}", i, e))?
+            .into_owned();
         validate_archive_entry_path(&raw_name)
             .map_err(|e: ValidationError| format!("rejected archive entry: {}", e))?;
 

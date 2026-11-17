@@ -148,6 +148,7 @@ pub(crate) fn claim_thread_for(
     sessions.insert(
         thread_id,
         AgentSession {
+            execution_sandbox: None,
             msg_tx: entry.msg_tx.clone(),
             is_waiting: false,
             pending_stop: None,
@@ -188,6 +189,7 @@ pub(crate) fn claim_thread_for(
             tools_in_flight: entry.tools_in_flight.clone(),
             question_flushes: entry.question_flushes.clone(),
             coding_agent,
+            can_steer: coding_agent == CodingAgent::ClaudeCode,
             agent_cancel: entry.agent_cancel.clone(),
             keep_alive: purpose == ClaimFor::KeepAlive,
         },
@@ -438,7 +440,7 @@ impl crate::engine::LucidosEngine {
         meta: &crate::engine::thread_events::EventMeta,
     ) -> crate::engine::types::ProcessResult {
         let thread_id = claim.thread_id;
-        log!(
+        log_legacy!(
             "[AgentSession] A Stop cancelled the spawn for thread {} before its agent took a turn",
             thread_id
         );
@@ -494,7 +496,7 @@ impl Drop for SpawnClaim {
         }
         match self.engine.upgrade() {
             Some(engine) => engine.resubmit_orphans_of_failed_turn(self.thread_id, leftovers),
-            None => log!(
+            None => log_legacy!(
                 "[AgentSession] Dropped {} follow-up(s) on thread {}: no engine to re-submit them",
                 leftovers.len(),
                 self.thread_id
@@ -525,7 +527,7 @@ pub(crate) async fn resolve_thread_coding_agent(
         Some(s) => {
             let stored_agent = CodingAgent::parse(&s);
             if requested.is_some_and(|req| req != stored_agent) {
-                log!(
+                log_legacy!(
                     "[AgentSession] thread {} is locked to {:?} — ignoring requested backend {:?}",
                     thread_id,
                     stored_agent,

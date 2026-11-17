@@ -1,7 +1,9 @@
 //! The three permission-grant files: what they are called, and where they live.
 //!
 //! A grant is a decision the user made while looking at one workspace, so it is
-//! stored per workspace rather than per machine (ADR 0095). The files sit in
+//! kept per workspace rather than per machine (ADR 0095). Once a lane is
+//! imported, its *tool grants* are `permissions` rows, and its file is a mirror
+//! the engine rewrites ([`crate::engine::permission::tool_grants`]). The files sit in
 //! `<workspace>/.lucidos/`, which the engine reads and the agent's own file
 //! tools refuse: `write_file` and `edit_file` resolve nothing under `.lucidos/`
 //! except the `tmp/` subtree. `data/config/` was the obvious alternative and is
@@ -12,8 +14,8 @@
 //! machine-global.
 //!
 //! The three lanes differ only in the file name, the instructional header and
-//! how a pattern is derived. Derivation stays with each lane. The file itself
-//! is owned here, so the migration and the three readers cannot drift.
+//! how a pattern is derived. Derivation stays with each lane. The file format
+//! is owned here, so the migration, the import and the mirror cannot drift.
 
 pub mod migration;
 
@@ -22,12 +24,9 @@ use std::sync::Mutex;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Serializes the read-modify-write in [`append`] and every [`write_raw`].
-///
-/// Several gates grant in parallel: chat's command guard, the Claude Code and
-/// MCP lanes, and the Settings editor. Without this, two appends both read the
-/// pre-state and the second rename publishes a file missing the first grant.
-/// `core::handshake_approvals` guards its own record the same way.
+/// Serializes every [`write_raw`] in this process, so two writers never share
+/// a scratch file. `core::handshake_approvals` guards its own record the same
+/// way.
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Take [`WRITE_LOCK`], recovering a poisoned one. A panic under the lock
@@ -40,6 +39,12 @@ fn write_guard() -> std::sync::MutexGuard<'static, ()> {
 /// files alongside the pidfile, the ports file and the worktrees. Gitignored,
 /// excluded from backup, and unreachable by the file tools.
 const GRANTS_DIR: &str = ".lucidos";
+
+/// Every mirror file says what it is. The `permissions` table holds the grants
+/// once a lane is imported, so a hand edit is reviewed rather than obeyed.
+const MIRROR_NOTE: &str = "# Lucidos keeps these grants itself and rewrites this file to match. \
+     Delete a line to revoke it.\n\
+     # A line added here by hand grants nothing until you import it in Lucidos.\n";
 
 /// Where `workspace_path` keeps its permission grants.
 pub fn grants_dir(workspace_path: &Path) -> PathBuf {
@@ -102,6 +107,17 @@ impl GrantFile {
         }
     }
 
+    /// The whole file the engine writes for `patterns`: the header, the note
+    /// that the file is a mirror, then one pattern per line.
+    pub fn mirror_body(self, patterns: &[String]) -> String {
+        let mut body = format!("{}{MIRROR_NOTE}", self.header());
+        for pattern in patterns {
+            body.push_str(pattern);
+            body.push('\n');
+        }
+        body
+    }
+
     /// Patterns granted before the user has decided anything. Empty for every
     /// lane, so each feature ships dark and the list is built by the per-prompt
     /// "Always allow" buttons.
@@ -111,6 +127,86 @@ impl GrantFile {
 
     fn path_in(self, dir: &Path) -> PathBuf {
         dir.join(self.file_name())
+    }
+
+    /// Whether `pattern` has a shape this lane's matcher reads. A line it does
+    /// not recognize still grants exactly what it granted in the file, which
+    /// is an exact match at most. It is shown as *legacy unmapped*.
+    pub fn recognizes(self, pattern: &str) -> bool {
+        match self {
+            Self::AgentCommands => {
+                pattern == "Bash"
+                    || pattern == "Python"
+                    || call_argument(pattern, "Bash")
+                        .and_then(|arg| arg.strip_suffix(":*"))
+                        // This lane trusts no repo script, so a path head
+                        // covers nothing.
+                        .is_some_and(|head| is_bare_word(head) && !head.contains('/'))
+            }
+            Self::McpTools => call_argument(pattern, "Mcp")
+                .and_then(|arg| arg.split_once(':'))
+                .is_some_and(|(server, tool)| is_bare_word(server) && is_bare_word(tool)),
+            Self::CodingAgentTools => {
+                let name = pattern.split_once('(').map_or(pattern, |(name, _)| name);
+                let well_formed = !pattern.contains('(') || pattern.ends_with(')');
+                well_formed
+                    && name.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            }
+        }
+    }
+}
+
+/// The argument of `<name>(<argument>)`, when `pattern` has that shape.
+fn call_argument<'p>(pattern: &'p str, name: &str) -> Option<&'p str> {
+    pattern
+        .strip_prefix(name)?
+        .strip_prefix('(')?
+        .strip_suffix(')')
+}
+
+/// A non-empty word with no space, bracket or colon in it.
+fn is_bare_word(word: &str) -> bool {
+    !word.is_empty()
+        && !word
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '(' | ')' | ':'))
+}
+
+/// What changed a lane's standing grants. Each new row records it as its
+/// `source`, and the `PermissionGrantsChanged` audit row names it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GrantSource {
+    /// The owner's Always allow tap on a tool card.
+    Card,
+    /// The owner's edit in a Settings allowlist editor. Every event written
+    /// before the source existed came from there.
+    #[default]
+    Settings,
+    /// The one-time import of the grant file the lane read before.
+    LegacyImport,
+    /// The owner's Import on the card listing lines added to the file by hand.
+    FileReview,
+    /// Lines deleted from the file by hand. Deleting only takes power away.
+    FileEdit,
+    /// A revoke through `DELETE /api/v1/permissions/:permission_id` or a review card.
+    Revoke,
+}
+
+impl GrantSource {
+    /// The stored spelling, as the `permissions.source` column holds it.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Card => "card",
+            Self::Settings => "settings",
+            Self::LegacyImport => "legacy-import",
+            Self::FileReview => "file-review",
+            Self::FileEdit => "file-edit",
+            Self::Revoke => "revoke",
+        }
     }
 }
 
@@ -130,7 +226,7 @@ pub fn patterns(dir: &Path, file: GrantFile) -> Vec<String> {
             .map(|s| s.to_string())
             .collect(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Grants] Failed to read {}: {}. Treating as no patterns.",
                 path.display(),
                 e
@@ -138,12 +234,6 @@ pub fn patterns(dir: &Path, file: GrantFile) -> Vec<String> {
             Vec::new()
         }
     }
-}
-
-/// Whether the file is on disk. Only the Claude Code lane asks, because it is
-/// the one that seeds a header for the user to discover.
-pub fn exists(dir: &Path, file: GrantFile) -> bool {
-    file.path_in(dir).exists()
 }
 
 /// The granted lines of an allowlist body.
@@ -159,63 +249,9 @@ pub fn parse_patterns(contents: &str) -> Vec<String> {
         .collect()
 }
 
-/// Append `pattern` unless it is already granted. Creates the file with its
-/// header when absent.
-///
-/// Refuses a pattern holding a control character. The file is one grant per
-/// line, and a pattern derives from agent or MCP server input. An embedded
-/// newline would therefore write extra grants the user never saw.
-pub fn append(dir: &Path, file: GrantFile, pattern: &str) -> Result<(), BoxError> {
-    if pattern.chars().any(char::is_control) {
-        return Err(
-            format!("refusing a grant pattern with a control character: {pattern:?}").into(),
-        );
-    }
-    // Held across the read AND the write: two concurrent grants would
-    // otherwise both read the pre-state and the loser's pattern would vanish.
-    let _guard = write_guard();
-    let path = file.path_in(dir);
-    let existing = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => file.header().to_string(),
-        Err(e) => return Err(e.into()),
-    };
-    if parse_patterns(&existing).iter().any(|l| l == pattern) {
-        return Ok(());
-    }
-    let mut next = existing;
-    if !next.is_empty() && !next.ends_with('\n') {
-        next.push('\n');
-    }
-    next.push_str(pattern);
-    next.push('\n');
-    write_locked(dir, file, &next)
-}
-
-/// The whole file, for the settings editor. A missing file reads as its header,
-/// so the editor always opens on the instructional comment.
-pub fn read_raw(dir: &Path, file: GrantFile) -> Result<String, BoxError> {
-    match std::fs::read_to_string(file.path_in(dir)) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(file.header().to_string()),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// Overwrite the file atomically, through a sibling temp file and a rename.
-///
-/// Every gate re-reads its file per prompt, so an edit takes effect on the next
-/// gated call with no restart. Claude Code is the one exception: a running
-/// subprocess keeps the `--allowedTools` flag it was spawned with.
 pub fn write_raw(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxError> {
     let _guard = write_guard();
-    write_locked(dir, file, contents)
-}
-
-/// The write itself. Callers already holding [`WRITE_LOCK`] use this, because
-/// [`std::sync::Mutex`] is not reentrant and [`append`] holds the lock across
-/// its read.
-fn write_locked(dir: &Path, file: GrantFile, contents: &str) -> Result<(), BoxError> {
     std::fs::create_dir_all(dir)?;
     let path = file.path_in(dir);
     let tmp = scratch_path(&path);

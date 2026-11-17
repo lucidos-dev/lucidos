@@ -2,7 +2,7 @@ import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { formatTokens } from '../../utils/formatTokens';
 import { AWAIT_EVENT_TOOL } from './event-waits';
-import { exchangeHasCCContent, exchangeQuietReply, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, apiCallIdOf, parentToolUseIdOf } from './exchange';
+import { displayModelName, exchangeHasCCContent, exchangeQuietReply, isAgentReplyText, isChangeLifecycleEvent, exchangeResponseText, apiCallIdOf, parentToolUseIdOf } from './exchange';
 import { describeCCTool, describeEngineTool, fullCommandForCCTool, fullCommandForEngineTool } from './tool-descriptions';
 import { TERMINAL_EVENT_TYPES, VOICE_ONLY_STEP_TYPES, exchangeHoldsNoTurn, isCallBoundary, isLiveCallRow, isLiveReplyRow, isLiveUtteranceRow, isSettledLiveUtterance, isUningestedMessage, opensAwaitingAnswer, toolUseIdOf } from './exchange-grouping';
 import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isEngineDownAbort, isRedirectCancel, isSwitchTeardownAbort, isTurnlessBoundary, isUserStoppedWait } from './thread-event-types';
@@ -196,6 +196,12 @@ export function compactedLabel(event: Extract<ThreadEvent, { type: 'CodingAgentC
   if (before == null) return 'Compacted its context';
   if (after == null) return `Compacted its context from ${formatTokens(before)} tokens`;
   return `Compacted its context from ${formatTokens(before)} to ${formatTokens(after)} tokens`;
+}
+/** Step label for a `CodingAgentModelSubstituted`: the account may not run
+ *  the pick, so the agent ran another model and the thread moves to it. */
+export function modelSubstitutedLabel(event: Extract<ThreadEvent, { type: 'CodingAgentModelSubstituted' }>): string {
+  const requested = displayModelName(event.requested);
+  return `Ran ${displayModelName(event.served)}, not ${requested}: this account cannot use ${requested}`;
 }
 /** The park's own step, i.e. the one the event-wait row replaces. See the
  *  `EventWaitStarted` arm of `exchangeResponseEvents`. */
@@ -462,6 +468,9 @@ export function exchangeSteps(exchange: Exchange, isLast = true, threadIdle = fa
       }
       case 'CodingAgentCompacted':
         steps.push({ description: compactedLabel(event), outcome: 'success' });
+        break;
+      case 'CodingAgentModelSubstituted':
+        steps.push({ description: modelSubstitutedLabel(event), outcome: 'success' });
         break;
       case 'ThoughtStreamed': {
         // ThoughtStreamed marks "about to invoke the LLM with this context".
@@ -832,6 +841,9 @@ export function exchangeResponseEvents(exchange: Exchange, isLast = true, thread
       }
       case 'CodingAgentCompacted':
         pushStep({ type: 'step', description: compactedLabel(event), outcome: 'success', created });
+        break;
+      case 'CodingAgentModelSubstituted':
+        pushStep({ type: 'step', description: modelSubstitutedLabel(event), outcome: 'success', created });
         break;
       case 'ThoughtStreamed': {
         // Stay pending until the next visible output supersedes us. See the

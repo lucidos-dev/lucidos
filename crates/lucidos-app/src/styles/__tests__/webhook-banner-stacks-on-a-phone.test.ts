@@ -1,5 +1,6 @@
 /**
- * The two webhook bars give their sentence the whole bar width on a phone.
+ * The webhook and agent sandbox bars keep the icon beside their sentence
+ * and the actions below on a phone.
  *
  * Photographed on a real iPhone in portrait: the refusal notice wrapped inside
  * roughly 60% of the bar. It ran to ten lines, beside a tall empty gap. The
@@ -9,9 +10,9 @@
  * Four properties, each a property of the RULE rather than of a rendered frame.
  * That is cheaper to assert here than in a browser.
  *
- * 1. ONE grouped rule covers both bars. The pair shares every other declaration
- *    on purpose, and a second copy is how the two drift apart.
- * 2. The sentence takes a whole line of its own, so the buttons wrap below it.
+ * 1. ONE grouped rule covers all three bars. They share every other
+ *    declaration on purpose, and a second copy is how they drift apart.
+ * 2. The sentence shares its row with the icon, and the buttons wrap below it.
  * 3. The breakpoint is the one the sheet already switches its mobile layout at.
  * 4. Desktop keeps its single row, which is the half a mobile fix can break
  *    without anyone on a phone noticing.
@@ -32,6 +33,9 @@ const shellCss = readFileSync(resolve(here, '../panels/shell.css'), 'utf-8');
 /** The sheet's mobile breakpoint, as `cssRules` reports the at-rule. */
 const MOBILE = '@media (--phone-layout)';
 
+/** Every bar the grouped rules cover, in sheet order. */
+const BARS = ['ingress-banner', 'refusal-banner', 'sandbox-banner'];
+
 /** The one rule that styles `className` below the mobile breakpoint. Asserting
  *  there is exactly one is half the point: a second copy would be the drift. */
 function stackRule(className: string): CssRule {
@@ -45,23 +49,23 @@ function desktopRules(className: string): CssRule[] {
   return rulesTargeting(shellCss, className).filter(r => !r.atRules.includes('(--phone-layout)'));
 }
 
-describe('the webhook bars stack on a phone', () => {
-  it('wraps both bars from one rule, so the pair cannot drift apart', () => {
+describe('the webhook and sandbox bars stack on a phone', () => {
+  it('wraps every bar from one rule, so they cannot drift apart', () => {
     const bar = stackRule('refusal-banner');
-    expect(selectorList(bar.selector)).toEqual(['.ingress-banner', '.refusal-banner']);
-    expect(stackRule('ingress-banner').selector).toBe(bar.selector);
+    expect(selectorList(bar.selector)).toEqual(BARS.map(b => `.${b}`));
+    for (const other of BARS) expect(stackRule(other).selector).toBe(bar.selector);
     expect(bar.props.get('flex-wrap')).toBe('wrap');
     // The buttons keep the trailing edge they hold on the desktop row.
     expect(bar.props.get('justify-content')).toBe('flex-end');
   });
 
-  it('gives the sentence a line of its own, on both bars', () => {
+  it('reserves room for the leading icon on every bar', () => {
     const text = stackRule('refusal-banner-text');
-    expect(selectorList(text.selector)).toEqual(['.ingress-banner-text', '.refusal-banner-text']);
-    expect(stackRule('ingress-banner-text').selector).toBe(text.selector);
-    // The base rule's `flex: 1` leaves the basis at 0, so the text shares the
-    // line. A full basis is what pushes everything after it onto the next one.
-    expect(text.props.get('flex-basis')).toBe('100%');
+    expect(selectorList(text.selector)).toEqual(BARS.map(b => `.${b}-text`));
+    for (const other of BARS) expect(stackRule(`${other}-text`).selector).toBe(text.selector);
+    // A full-width sentence strands the icon on its own right-aligned row.
+    // Reserve its fixed width and the shared column gap before wrapping actions.
+    expect(text.props.get('flex-basis')).toBe('calc(100% - var(--icon-size-md) - var(--space-md))');
   });
 
   it('spends a spacing token on the gap it opens', () => {
@@ -71,12 +75,12 @@ describe('the webhook bars stack on a phone', () => {
   });
 
   it('leaves the desktop row as one line', () => {
-    for (const bar of ['ingress-banner', 'refusal-banner']) {
+    for (const bar of BARS) {
       for (const rule of desktopRules(bar)) {
         expect(rule.props.has('flex-wrap'), `${rule.selector} wraps at every width`).toBe(false);
       }
     }
-    for (const text of ['ingress-banner-text', 'refusal-banner-text']) {
+    for (const text of BARS.map(b => `${b}-text`)) {
       for (const rule of desktopRules(text)) {
         // Read the shorthand too: `flex: 1 1 100%` stacks the bar just as well.
         const basis = rule.props.get('flex-basis') ?? rule.props.get('flex') ?? '';

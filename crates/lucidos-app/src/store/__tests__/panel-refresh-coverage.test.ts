@@ -53,6 +53,7 @@ const SETTINGS: Record<SettingsSubview, Coverage> = {
   appearance: { sectionTable: true },
   memory: { registers: ['settings/MemoryInspector.tsx', 'settings/SummaryTreeBrowser.tsx'] },
   devices: { sectionTable: true },
+  users: { sectionTable: true },
   accounts: { sectionTable: true },
   backup: { registers: ['settings/SnapshotSection.tsx', 'settings/BackupSection.tsx', 'settings/RetainedRestoreSources.tsx'] },
   'coding-agents': { sectionTable: true },

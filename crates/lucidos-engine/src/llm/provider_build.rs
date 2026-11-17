@@ -223,7 +223,7 @@ async fn read_credential_pair(
         Ok(None) => return Ok(None),
         Err(e) => e.to_string(),
     };
-    crate::log!(
+    crate::log_legacy!(
         "[Startup] WARNING: could not read the {} credential ({}). \
          Falling back to the environment, which may name a different \
          account than the stored one.",
@@ -301,7 +301,7 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
     match prefs::LOCAL_BASE_URL.try_stored(pool).await {
         Ok(opt) => stored.local_base = opt,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Failed to read local_base_url preference, omitting local: {}",
                 e
             );
@@ -320,7 +320,7 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
         }
         Ok(None) => stored.local_key = None,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Failed to read local provider credential, omitting local: {}",
                 e
             );
@@ -332,14 +332,14 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
     // tokens. Either read failing leaves the gateway out, with nothing sent.
     match prefs::CLAUDE_GATEWAY_URL.try_stored(pool).await {
         Ok(url) => stored.claude_gateway_url = url,
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[Startup] Failed to read claude_gateway_url preference, omitting the Claude gateway: {}",
             e
         ),
     }
     match ClaudeGatewayAccountStore::get(pool).await {
         Ok(account) => stored.claude_gateway_issuer = account.map(|a| a.issuer),
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[Startup] Failed to read the Claude gateway sign-in, omitting the Claude gateway: {}",
             e
         ),
@@ -348,7 +348,7 @@ async fn read_stored_inputs(pool: &PgPool, mut switches: ProviderSwitches) -> St
     // The ChatGPT plan: whether a sign-in is stored, never its tokens.
     match ChatGptPlanAccountStore::is_signed_in(pool).await {
         Ok(signed_in) => stored.chatgpt_plan_signed_in = signed_in,
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[Startup] Failed to read the ChatGPT plan sign-in, omitting the ChatGPT plan: {}",
             e
         ),
@@ -578,7 +578,7 @@ fn anthropic_search_backend(
     match AnthropicServerToolSearch::new(auth, model) {
         Ok(b) => Some(Arc::new(b) as Arc<dyn WebSearchProvider>),
         Err(e) => {
-            crate::log!("[Startup] Failed to build Anthropic search backend: {}", e);
+            crate::log_legacy!("[Startup] Failed to build Anthropic search backend: {}", e);
             None
         }
     }
@@ -622,7 +622,7 @@ fn openai_search_backend(
     match OpenAiResponsesSearch::new(key, model, OPENAI_DEFAULT_BASE_URL) {
         Ok(b) => Some(Arc::new(b) as Arc<dyn WebSearchProvider>),
         Err(e) => {
-            crate::log!("[Startup] Failed to build OpenAI search backend: {}", e);
+            crate::log_legacy!("[Startup] Failed to build OpenAI search backend: {}", e);
             None
         }
     }
@@ -749,20 +749,20 @@ pub async fn build_active_provider(
             cache,
         ) {
             Ok(b) => backends.push(Arc::new(b)),
-            Err(e) => crate::log!("[Startup] Failed to build Vertex search backend: {}", e),
+            Err(e) => crate::log_legacy!("[Startup] Failed to build Vertex search backend: {}", e),
         }
     }
     backends.extend(search_backends);
     let web_search = Arc::new(WebSearchChain::new(backends));
     if web_search.backend_ids().is_empty() {
-        crate::log!(
+        crate::log_legacy!(
             "[Startup] No web search backend configured — web_search will report how to enable it"
         );
     } else {
         // Log the model per backend: the cross-provider case silently picks a
         // different model than the chat one, and that substitution should be
         // visible when a search misbehaves.
-        crate::log!(
+        crate::log_legacy!(
             "[Startup] Web search backends: {}",
             web_search
                 .backend_models()
@@ -830,14 +830,14 @@ fn build_anthropic_provider(
     let (auth, source) = resolved_auth?;
     match AnthropicProvider::new(auth, default_model.to_string()) {
         Ok(p) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Direct Anthropic provider configured (auth from {})",
                 source
             );
             Some(p)
         }
         Err(e) => {
-            crate::log!("[Startup] Failed to build Anthropic provider: {}", e);
+            crate::log_legacy!("[Startup] Failed to build Anthropic provider: {}", e);
             None
         }
     }
@@ -853,14 +853,14 @@ fn signed_in_gateway(url: Option<String>, issuer: Option<String>) -> Option<Gate
     let origin = match GatewayOrigin::parse(&url) {
         Ok(origin) => origin,
         Err(reason) => {
-            crate::log!("[Startup] Omitting the Claude gateway: {}", reason);
+            crate::log_legacy!("[Startup] Omitting the Claude gateway: {}", reason);
             return None;
         }
     };
     match issuer {
         Some(issuer) if issuer == origin.as_str() => Some(origin),
         Some(issuer) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Omitting the Claude gateway: signed in to {}, not the configured {}",
                 issuer,
                 origin
@@ -868,7 +868,7 @@ fn signed_in_gateway(url: Option<String>, issuer: Option<String>) -> Option<Gate
             None
         }
         None => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Claude gateway {} is configured but not signed in to",
                 origin
             );
@@ -885,7 +885,7 @@ fn build_claude_gateway_provider(
     default_model: &str,
 ) -> Option<AnthropicProvider> {
     let Some(access) = access else {
-        crate::log!(
+        crate::log_legacy!(
             "[Startup] Claude gateway {} joins once the engine's event bus exists",
             origin
         );
@@ -897,11 +897,11 @@ fn build_claude_gateway_provider(
         default_model.to_string(),
     ) {
         Ok(p) => {
-            crate::log!("[Startup] Claude gateway provider configured ({})", origin);
+            crate::log_legacy!("[Startup] Claude gateway provider configured ({})", origin);
             Some(p)
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Failed to build the Claude gateway provider: {}",
                 e
             );
@@ -917,7 +917,7 @@ fn build_chatgpt_plan_provider(
     default_model: &str,
 ) -> Option<OpenAiProvider> {
     let Some(access) = access else {
-        crate::log!("[Startup] The ChatGPT plan joins once the engine's event bus exists");
+        crate::log_legacy!("[Startup] The ChatGPT plan joins once the engine's event bus exists");
         return None;
     };
     match OpenAiProvider::new_chatgpt_plan(
@@ -926,11 +926,11 @@ fn build_chatgpt_plan_provider(
         OPENAI_DEFAULT_BASE_URL,
     ) {
         Ok(p) => {
-            crate::log!("[Startup] ChatGPT plan provider configured");
+            crate::log_legacy!("[Startup] ChatGPT plan provider configured");
             Some(p)
         }
         Err(e) => {
-            crate::log!("[Startup] Failed to build the ChatGPT plan provider: {}", e);
+            crate::log_legacy!("[Startup] Failed to build the ChatGPT plan provider: {}", e);
             None
         }
     }
@@ -949,9 +949,9 @@ fn build_openai_provider(
 ) -> Option<OpenAiProvider> {
     match resolved_key {
         Some((key, source)) => {
-            crate::log!("[Startup] OpenAI provider configured (key from {})", source);
+            crate::log_legacy!("[Startup] OpenAI provider configured (key from {})", source);
             OpenAiProvider::new(key, default_model.to_string())
-                .map_err(|e| crate::log!("[Startup] Failed to build OpenAI provider: {}", e))
+                .map_err(|e| crate::log_legacy!("[Startup] Failed to build OpenAI provider: {}", e))
                 .ok()
         }
         None => None,
@@ -969,6 +969,7 @@ fn build_openrouter_provider(
     default_model: &str,
 ) -> Option<OpenAiProvider> {
     build_bearer_openai_compatible(
+        crate::llm::ProviderKind::OpenRouter,
         "OpenRouter",
         OPENROUTER_BASE_URL,
         credential,
@@ -997,6 +998,7 @@ fn build_xai_provider(
     default_model: &str,
 ) -> Option<OpenAiProvider> {
     build_bearer_openai_compatible(
+        crate::llm::ProviderKind::XAi,
         "xAI",
         XAI_BASE_URL,
         credential,
@@ -1020,6 +1022,7 @@ fn build_xai_provider(
 /// [`build_local_provider`] deliberately does NOT route through here: it
 /// resolves its own base URL, tolerates an empty key, and logs that base.
 fn build_bearer_openai_compatible(
+    provider_kind: crate::llm::ProviderKind,
     provider_label: &str,
     base_url: &str,
     credential: Option<(AuthType, String)>,
@@ -1029,6 +1032,7 @@ fn build_bearer_openai_compatible(
 ) -> Option<OpenAiProvider> {
     let key = resolve_bearer_key(credential, env_key)?;
     match OpenAiProvider::new_with_base_url(
+        provider_kind,
         key,
         default_model.to_string(),
         base_url,
@@ -1036,11 +1040,11 @@ fn build_bearer_openai_compatible(
         true,
     ) {
         Ok(p) => {
-            crate::log!("[Startup] {} provider configured", provider_label);
+            crate::log_legacy!("[Startup] {} provider configured", provider_label);
             Some(p)
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Failed to build {} provider: {}",
                 provider_label,
                 e
@@ -1096,6 +1100,7 @@ fn build_opencode_free_provider(
         return None;
     }
     match OpenAiProvider::new_with_base_url(
+        crate::llm::ProviderKind::OpenCodeFree,
         String::new(),
         default_model.to_string(),
         OPENCODE_FREE_BASE_URL,
@@ -1103,11 +1108,11 @@ fn build_opencode_free_provider(
         true,
     ) {
         Ok(p) => {
-            crate::log!("[Startup] OpenCode Free provider configured (keyless)");
+            crate::log_legacy!("[Startup] OpenCode Free provider configured (keyless)");
             Some(p)
         }
         Err(e) => {
-            crate::log!("[Startup] Failed to build OpenCode Free provider: {}", e);
+            crate::log_legacy!("[Startup] Failed to build OpenCode Free provider: {}", e);
             None
         }
     }
@@ -1146,7 +1151,7 @@ fn build_local_provider(
         .as_deref()
         .and_then(crate::core::preferences::local_base_url_rejection)
     {
-        crate::log!("[Startup] Omitting the local provider: {}", reason);
+        crate::log_legacy!("[Startup] Omitting the local provider: {}", reason);
         return None;
     }
 
@@ -1160,6 +1165,7 @@ fn build_local_provider(
         .unwrap_or_else(|| prefs::LOCAL_BASE_URL.default_text().to_string());
     let key = local_key_in_scope(&base, stored_key, env_key.map(|k| (k, env_key_host)));
     match OpenAiProvider::new_with_base_url(
+        crate::llm::ProviderKind::Local,
         key.unwrap_or_default(),
         default_model.to_string(),
         &base,
@@ -1167,14 +1173,14 @@ fn build_local_provider(
         true,
     ) {
         Ok(p) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Startup] Local OpenAI-compatible provider configured (base {})",
                 base
             );
             Some(p)
         }
         Err(e) => {
-            crate::log!("[Startup] Failed to build local provider: {}", e);
+            crate::log_legacy!("[Startup] Failed to build local provider: {}", e);
             None
         }
     }
@@ -1196,7 +1202,7 @@ fn local_key_in_scope(
             if crate::core::credential_scope_covers(&stored.base_urls, base) {
                 Some(stored.value)
             } else {
-                crate::log!(
+                crate::log_legacy!(
                     concat!(
                         "[Startup] Not sending the stored 'local' key to {}: its scope is {:?}. \
                          Re-save the key in ",
@@ -1213,7 +1219,7 @@ fn local_key_in_scope(
             if crate::core::credential_scope_covers(std::slice::from_ref(&host), base) {
                 Some(key)
             } else {
-                crate::log!(
+                crate::log_legacy!(
                     "[Startup] Not sending LUCIDOS_LOCAL_API_KEY to {}: it is pinned to {}",
                     base,
                     host

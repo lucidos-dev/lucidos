@@ -19,6 +19,12 @@
 
 set -uo pipefail
 
+# A suite exits with this when its subject is not in the tree: the public
+# mirror strips the release scripts. Its last line says why. A skip is reported
+# as one, never counted as a pass (scripts/lib/test_skip.sh).
+# shellcheck source=scripts/lib/test_skip.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib/test_skip.sh"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT" || exit 1
 
@@ -40,27 +46,36 @@ trap cleanup EXIT
 total=0
 passed=0
 failed=0
+skipped=0
 failed_suites=""
 
 while IFS= read -r suite; do
     [ -n "$suite" ] || continue
     total=$((total + 1))
     log="$LOGDIR/$(printf '%s' "$suite" | tr '/' '_').log"
-    if bash "$suite" >"$log" 2>&1; then
-        passed=$((passed + 1))
-        echo "PASS  $suite"
-    else
-        failed=$((failed + 1))
-        failed_suites="$failed_suites $suite"
-        echo "FAIL  $suite"
-        sed 's/^/        /' "$log"
-    fi
+    bash "$suite" >"$log" 2>&1
+    case $? in
+        0)
+            passed=$((passed + 1))
+            echo "PASS  $suite"
+            ;;
+        "$TEST_SKIP_EXIT")
+            skipped=$((skipped + 1))
+            echo "SKIP  $suite: $(tail -n 1 "$log")"
+            ;;
+        *)
+            failed=$((failed + 1))
+            failed_suites="$failed_suites $suite"
+            echo "FAIL  $suite"
+            sed 's/^/        /' "$log"
+            ;;
+    esac
 done <<EOF
 $suites
 EOF
 
 echo
-echo "scripts/lib suites: $total total, $passed passed, $failed failed"
+echo "scripts/lib suites: $total total, $passed passed, $failed failed, $skipped skipped"
 if [ "$failed" -ne 0 ]; then
     echo "failed:${failed_suites}"
     exit 1

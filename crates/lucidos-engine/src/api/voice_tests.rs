@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::api::actor::{
-    init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN, HEADER_DEVICE_ID,
+    init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
 };
 use crate::api::voice_ticket::{mint, CallTickets, NOT_FROM_THE_SHELL, QUERY_CALL_TICKET};
 use crate::engine::thread_events::MessageOrigin;
@@ -24,8 +24,9 @@ fn headers_with(pairs: &[(&'static str, &str)]) -> HeaderMap {
     headers
 }
 
+/// A paired device as the gateway forwards it: its id and the stamp proving it.
 fn device_headers(device_id: &str) -> HeaderMap {
-    headers_with(&[(HEADER_DEVICE_ID, device_id)])
+    crate::api::gateway_stamp::test_support::stamped_device_headers(device_id)
 }
 
 /// The upgrade's own URI, carrying `ticket` when there is one.
@@ -295,8 +296,8 @@ async fn a_second_call_on_a_busy_thread_is_refused() {
     teardown_test_db(&db_name).await;
 }
 
-/// A ticket mint names its caller like any write. No credential, or a device
-/// id naming no registered row, is refused.
+/// A ticket mint names its caller like any write. No credential, or a typed
+/// device id naming no registered row, is refused.
 #[tokio::test]
 async fn a_caller_naming_nobody_gets_no_ticket() {
     let (pool, db_name) = setup_test_db().await;
@@ -304,7 +305,12 @@ async fn a_caller_naming_nobody_gets_no_ticket() {
     voice_set(&pool, true).await;
     let home = the_home_thread(&pool).await;
 
-    for headers in [HeaderMap::new(), device_headers("nobody-registered")] {
+    let mut typed = HeaderMap::new();
+    typed.insert(
+        crate::api::actor::HEADER_DEVICE_ID,
+        "nobody-registered".parse().unwrap(),
+    );
+    for headers in [HeaderMap::new(), typed] {
         let error = mint(&pool, &line.sessions, &line.tickets, &headers, home)
             .await
             .expect_err("should refuse an unidentified caller");
@@ -444,8 +450,8 @@ async fn a_ticket_opens_its_own_thread_once() {
     teardown_test_db(&db_name).await;
 }
 
-/// The call speaks as the device that minted the ticket. Direct to the
-/// engine there is no header, so the ticket alone names the caller.
+/// The call speaks as the device that minted the ticket, which the gateway
+/// stamps on the upgrade too.
 #[tokio::test]
 async fn the_call_speaks_as_the_device_that_minted_the_ticket() {
     let (pool, db_name) = setup_test_db().await;
@@ -455,7 +461,7 @@ async fn the_call_speaks_as_the_device_that_minted_the_ticket() {
 
     let ticket = line.owner_mints(&pool, home).await.expect("a ticket");
     let admitted = line
-        .dial(&pool, &HeaderMap::new(), home, Some(&ticket))
+        .dial(&pool, &device_headers(OWNERS_PHONE), home, Some(&ticket))
         .await
         .expect("a call from the owner's phone");
     assert!(

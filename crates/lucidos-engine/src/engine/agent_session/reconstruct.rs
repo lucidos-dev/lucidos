@@ -58,7 +58,7 @@ pub(crate) async fn reconstruct_summary(
     let rows = match fetch_relevant_events(pool, thread_id).await {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Reconstruct] Failed to fetch events for thread {}: {}",
                 thread_id,
                 e
@@ -404,6 +404,7 @@ mod tests {
             &bus,
             thread_id,
             ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "sess-1".into(),
                 branch: "claude-code/foo".into(),
@@ -432,6 +433,7 @@ mod tests {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
         )
         .await;
@@ -466,6 +468,7 @@ mod tests {
             &bus,
             thread_id,
             ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "sess-1".into(),
                 branch: "claude-code/trunc".into(),

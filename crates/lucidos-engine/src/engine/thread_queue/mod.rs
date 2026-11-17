@@ -66,6 +66,8 @@ use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::{MessageOrigin, ThreadEvent};
 use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::LucidosEngine;
+
+mod saved_drafts;
 use crate::triggers::TriggerConfig;
 
 /// How long a trigger's oldest queued fire waits before the "significantly
@@ -147,6 +149,8 @@ struct UserWaiter {
 struct QueueState {
     policy: CapacityPolicy,
     queued: VecDeque<QueueEntry>,
+    /// Durable ordinary sends use the user gate, never background capacity.
+    accepted_user_inputs: HashSet<Uuid>,
     active: HashMap<Uuid, ActiveSlot>,
     /// Live gate admissions, keyed by the gate's entry id.
     user_reservations: HashMap<Uuid, UserReservation>,
@@ -361,7 +365,7 @@ const TURN_START_EVENT_TYPES: &[&str] = &[
 /// Thread events after which user occupancy may have moved: a turn starts, a
 /// thread parks on the user, or a turn ends. The drain hint subscriber drains
 /// on them. A missed one only delays a drain: admission reads occupancy fresh.
-fn moves_user_occupancy(event: &ThreadEvent) -> bool {
+pub(crate) fn moves_user_occupancy(event: &ThreadEvent) -> bool {
     TURN_START_EVENT_TYPES.contains(&event.event_type())
         || matches!(
             event,
@@ -438,6 +442,7 @@ impl ThreadQueue {
             state: tokio::sync::Mutex::new(QueueState {
                 policy,
                 queued: VecDeque::new(),
+                accepted_user_inputs: HashSet::new(),
                 active: HashMap::new(),
                 user_reservations: HashMap::new(),
                 user_queued: VecDeque::new(),
@@ -458,7 +463,7 @@ impl ThreadQueue {
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[ThreadQueue] load_policy query failed: {}, using defaults",
                 e
             );
@@ -475,7 +480,7 @@ impl ThreadQueue {
                 match serde_json::from_value(policy_json) {
                     Ok(p) => p,
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[ThreadQueue] CapacityPolicyChanged payload unparseable: {} — using defaults",
                             e
                         );
@@ -576,7 +581,7 @@ impl ThreadQueue {
             "spawn submitted with no origin and no parent linkage: {request:?}"
         );
         if !attributed {
-            log!(
+            log_legacy!(
                 "[ThreadQueue] unattributed {:?} spawn submitted; its first message has no origin",
                 request.kind()
             );
@@ -692,7 +697,7 @@ impl ThreadQueue {
                 // resolve completion so the awaiting submitter (cron loop /
                 // missed-grace catch-up) proceeds to the next occurrence rather
                 // than hanging on a fire that will never run.
-                log!(
+                log_legacy!(
                     "[ThreadQueue] Coalesced redundant cron fire for trigger '{}'",
                     trigger_name
                         .as_deref()
@@ -853,11 +858,55 @@ impl ThreadQueue {
     /// — paused or at its cap — every later entry of it is skipped too);
     /// cross-trigger order is best-effort.
     pub async fn drain(self: &Arc<Self>) {
-        let (to_admit, to_drop, woke) = {
+        if let Err(error) = self.load_accepted_inputs().await {
+            log_legacy!("[ThreadQueue] Could not load accepted inputs: {}", error);
+        }
+        let (to_admit, to_drop, woke, user_inputs) = {
             let mut state = self.state.lock().await;
             let running = self.read_user_occupancy(&mut state, None).await;
             let mut to_admit: Vec<QueueEntry> = Vec::new();
             let mut to_drop: Vec<(QueueEntry, String)> = Vec::new();
+            let mut user_inputs = Vec::new();
+            let mut i = 0;
+            while i < state.queued.len() {
+                let id = state.queued[i].id;
+                if state.accepted_user_inputs.contains(&id)
+                    && !self.bus.accepted_input_has_predecessor(id)
+                    && self.executor.get().is_some()
+                {
+                    let entry = state.queued.remove(i).expect("queued input exists");
+                    // People-only input records without taking agent capacity.
+                    // The executor reads the pause in recording order, then
+                    // takes a user slot only if this input wakes the agent.
+                    if matches!(
+                        &entry.request,
+                        ThreadQueueRequest::AgentChat {
+                            user_addressing: Some(_),
+                            ..
+                        }
+                    ) {
+                        user_inputs.push((entry, None, None));
+                        continue;
+                    }
+                    let thread_id = entry.thread_id.expect("accepted input has a thread");
+                    let gate_id = entry.id;
+                    let (wake, ready) = oneshot::channel();
+                    state.user_queued.push_back(UserWaiter {
+                        entry_id: gate_id,
+                        thread_id,
+                        summary: entry.summary.clone(),
+                        queued_at: entry.queued_at,
+                        wake,
+                    });
+                    let guard = UserSlotGuard {
+                        queue: self.clone(),
+                        entry_id: gate_id,
+                    };
+                    user_inputs.push((entry, Some(guard), Some(ready)));
+                } else {
+                    i += 1;
+                }
+            }
 
             // Phase 1 — background reclaims up to its reserved floor first.
             let floor = state.policy.effective_reserved_background();
@@ -873,8 +922,12 @@ impl ThreadQueue {
                 &mut to_drop,
             );
 
-            (to_admit, to_drop, woke)
+            (to_admit, to_drop, woke, user_inputs)
         };
+
+        for (entry, guard, ready) in user_inputs {
+            self.spawn_accepted_user_input(entry, guard, ready);
+        }
 
         for (mut entry, reason) in to_drop {
             if let Some(tx) = entry.completion_tx.take() {
@@ -944,6 +997,17 @@ impl ThreadQueue {
                 let e = &state.queued[i];
                 (e.kind, e.trigger_id.clone())
             };
+            if state.accepted_user_inputs.contains(&state.queued[i].id) {
+                i += 1;
+                continue;
+            }
+            if self.bus.accepted_input_has_predecessor(state.queued[i].id) {
+                if let Some(tid) = &trigger_id {
+                    skipped.insert(tid.clone());
+                }
+                i += 1;
+                continue;
+            }
             if self.trigger_admission_held(kind) {
                 i += 1;
                 continue;
@@ -960,7 +1024,7 @@ impl ThreadQueue {
                 let paused = match self.trigger_configs.read() {
                     Ok(configs) => configs.get(tid).map(|c| c.paused),
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[ThreadQueue] Trigger registry unreadable ({}); leaving {}'s queued fires in place",
                             e,
                             tid
@@ -1055,6 +1119,15 @@ impl ThreadQueue {
                 .iter()
                 .position(|e| e.id == entry_id)
                 .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
+            if state.accepted_user_inputs.contains(&entry_id) {
+                return Err(
+                    "User inputs run through the user priority gate when capacity is available."
+                        .into(),
+                );
+            }
+            if self.bus.accepted_input_has_predecessor(entry_id) {
+                return Err("This input must wait for an earlier accepted input to record.".into());
+            }
             if self.trigger_admission_held(state.queued[idx].kind) {
                 return Err(
                     "trigger admission is held during engine startup or shutdown".to_string(),
@@ -1104,6 +1177,21 @@ impl ThreadQueue {
                 .iter()
                 .position(|e| e.id == entry_id)
                 .ok_or_else(|| "entry is not queued (already running or gone)".to_string())?;
+            let entry = &state.queued[idx];
+            self.at_chain_depth(
+                entry.request.depth(),
+                self.bus.emit_as_trigger(
+                    BusEvent::System(SystemEvent::ThreadQueueDropped {
+                        entry_id,
+                        reason: reason.into(),
+                        actor,
+                    }),
+                    entry.trigger_id.clone(),
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            state.accepted_user_inputs.remove(&entry_id);
             state
                 .queued
                 .remove(idx)
@@ -1112,7 +1200,6 @@ impl ThreadQueue {
         if let Some(tx) = entry.completion_tx.take() {
             let _ = tx.send(());
         }
-        self.emit_dropped(entry_id, reason, actor).await;
         Ok(())
     }
 
@@ -1125,6 +1212,31 @@ impl ThreadQueue {
     async fn finish_entry(self: &Arc<Self>, entry_id: Uuid, completed: bool) {
         let slot = {
             let mut state = self.state.lock().await;
+            let Some(slot) = state.active.get(&entry_id) else {
+                return;
+            };
+            // Durable membership must disappear before the reservation and
+            // completion waiter do. A failed write leaves all three intact.
+            if completed {
+                if let Err(error) = self
+                    .at_chain_depth(
+                        slot.chain_depth,
+                        self.bus.emit_as_trigger(
+                            BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
+                            slot.trigger_id.clone(),
+                        ),
+                    )
+                    .await
+                {
+                    drop(state);
+                    log_legacy!("[ThreadQueue] Completion retained for recovery: {}", error);
+                    self.notify(
+                        "Queued work needs recovery".into(),
+                        "Lucidos could not confirm completion durably. The entry remains in the Thread Queue for recovery.".into(),
+                    ).await;
+                    return;
+                }
+            }
             state.active.remove(&entry_id)
         };
         let Some(mut slot) = slot else {
@@ -1139,20 +1251,6 @@ impl ThreadQueue {
         }
         if let Some(tx) = slot.completion_tx.take() {
             let _ = tx.send(());
-        }
-        // At the entry's depth, for the same reason it states its trigger: this
-        // frame closes that fire, and it goes out on the sibling task that
-        // joined the work rather than on the fire's own.
-        if completed {
-            self.at_chain_depth(
-                slot.chain_depth,
-                self.bus.emit_or_log_as_trigger(
-                    BusEvent::System(SystemEvent::ThreadQueueCompleted { entry_id }),
-                    "[ThreadQueue] ThreadQueueCompleted",
-                    slot.trigger_id.clone(),
-                ),
-            )
-            .await;
         }
         self.drain().await;
     }
@@ -1242,7 +1340,16 @@ impl ThreadQueue {
         thread_id: Uuid,
         summary: String,
     ) -> UserSlotGuard {
-        let entry_id = Uuid::new_v4();
+        self.acquire_user_slot_for_entry(Uuid::new_v4(), thread_id, summary)
+            .await
+    }
+
+    pub(crate) async fn acquire_user_slot_for_entry(
+        self: &Arc<Self>,
+        entry_id: Uuid,
+        thread_id: Uuid,
+        summary: String,
+    ) -> UserSlotGuard {
         let wait = {
             let mut state = self.state.lock().await;
             let running = self.read_user_occupancy(&mut state, Some(thread_id)).await;
@@ -1321,7 +1428,7 @@ impl ThreadQueue {
         .fetch_one(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[ThreadQueue] high-water read failed for {}: {}",
                 thread_id,
                 e
@@ -1385,7 +1492,7 @@ impl ThreadQueue {
                     })
                     .collect(),
                 Err(e) => {
-                    log!("[ThreadQueue] user occupancy read failed: {}", e);
+                    log_legacy!("[ThreadQueue] user occupancy read failed: {}", e);
                     return HashMap::new();
                 }
             };
@@ -1435,7 +1542,7 @@ impl ThreadQueue {
                     }
                 }
             }
-            Err(e) => log!("[ThreadQueue] reservation read failed: {}", e),
+            Err(e) => log_legacy!("[ThreadQueue] reservation read failed: {}", e),
         }
         running
     }
@@ -1517,7 +1624,31 @@ impl ThreadQueue {
         )
         .fetch_all(&self.pool)
         .await?;
-        for u in self.user_entries().await {
+        let ordinary: HashMap<Uuid, bool> = sqlx::query_as::<_, (Uuid, bool)>(
+            "SELECT q.id, EXISTS(SELECT 1 FROM events recorded WHERE recorded.id=(accepted.payload->'data'->>'message_event_id')::uuid) \
+             FROM thread_queue q JOIN events accepted ON accepted.event_type='OrdinarySubmissionAccepted' \
+             AND accepted.payload->'data'->>'entry_id'=q.id::text",
+        ).fetch_all(&self.pool).await?.into_iter().collect();
+        let users = self.user_entries().await;
+        entries.retain_mut(|entry| {
+            if let Some(recorded) = ordinary.get(&entry.id) {
+                entry.kind = "user-chat".into();
+                if *recorded
+                    && users.iter().any(|user| {
+                        user.id == user.thread_id && Some(user.thread_id) == entry.thread_id
+                    })
+                {
+                    return false; // The running thread already represents this work.
+                }
+            }
+            true
+        });
+        for u in users {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == u.id) {
+                entry.status = u.status.to_string();
+                entry.admitted_at = u.admitted_at;
+                continue; // Durable membership and its user gate are one input.
+            }
             entries.push(ThreadQueueEntryView {
                 id: u.id,
                 kind: "user-chat".to_string(),
@@ -1555,14 +1686,14 @@ impl ThreadQueue {
                     }
                 }
                 Err(RecvError::Lagged(n)) => {
-                    log!(
+                    log_legacy!(
                         "[ThreadQueue] drain hint subscriber lagged by {} events; draining",
                         n
                     );
                     self.occupancy_moved().await;
                 }
                 Err(RecvError::Closed) => {
-                    log!("[ThreadQueue] drain hint channel closed — exiting");
+                    log_legacy!("[ThreadQueue] drain hint channel closed — exiting");
                     break;
                 }
             }
@@ -1614,8 +1745,80 @@ impl ThreadQueue {
             .await;
     }
 
-    /// Spawn admitted work and release its slot after execution, even on panic.
-    /// A failed retry deadline check retains the admitted entry for recovery.
+    /// Recovery preserves ordinary user priority. The input remains in the
+    /// durable projection while waiting and owns only the user reservation.
+    fn spawn_accepted_user_input(
+        self: &Arc<Self>,
+        entry: QueueEntry,
+        guard: Option<UserSlotGuard>,
+        ready: Option<oneshot::Receiver<()>>,
+    ) {
+        let Some(executor) = self.executor.get().cloned() else {
+            return; // Durable membership survives an incomplete boot.
+        };
+        let mgr = self.clone();
+        tokio::spawn(async move {
+            let _slot = guard;
+            if let Some(ready) = ready {
+                if ready.await.is_err() {
+                    return;
+                }
+            }
+            let Some(thread_id) = entry.thread_id else {
+                return;
+            };
+            let _awake = crate::core::keep_awake::hold(
+                crate::core::keep_awake::Work::QueueEntry,
+                entry.id.to_string(),
+            );
+            let outcome = async {
+                mgr.bus
+                    .emit(BusEvent::System(SystemEvent::ThreadQueueAdmitted {
+                        entry_id: entry.id,
+                        thread_id: Some(thread_id),
+                        actor: None,
+                    }))
+                    .await?;
+                // Keep the joiner alive across an executor panic so the user
+                // receives the same recovery notice as a failed durable write.
+                let work = ExecutableEntry {
+                    id: entry.id,
+                    request: entry.request,
+                };
+                tokio::spawn(async move { executor.execute(work).await }).await??;
+                mgr.bus
+                    .emit(BusEvent::System(SystemEvent::ThreadQueueCompleted {
+                        entry_id: entry.id,
+                    }))
+                    .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            }
+            .await;
+            match outcome {
+                Ok(()) => {
+                    mgr.state
+                        .lock()
+                        .await
+                        .accepted_user_inputs
+                        .remove(&entry.id);
+                }
+                Err(error) => {
+                    log_legacy!(
+                        "[ThreadQueue] Ordinary input retained for recovery: {}",
+                        error
+                    );
+                    mgr.notify(
+                        "Accepted input needs recovery".into(),
+                        "Lucidos could not finish the accepted input durably. It remains in the Thread Queue for recovery.".into(),
+                    ).await;
+                }
+            }
+        });
+    }
+
+    /// Spawn admitted work and release its slot after durable execution.
+    /// Failed persistence and chat panics retain work for recovery. A
+    /// coding-agent start parked on the owner's card completes.
     ///
     /// **The spawn is where the chain used to end.** `EVENT_TRIGGER_DEPTH`
     /// follows an await chain and not a `tokio::spawn`, so execution read 0
@@ -1629,13 +1832,22 @@ impl ThreadQueue {
         let Some(executor) = self.executor.get().cloned() else {
             // No executor wired (engine still booting) — leave the slot
             // admitted; the boot requeue sweep recovers it on next start.
-            log!(
+            log_legacy!(
                 "[ThreadQueue] No executor installed — entry {} stays admitted unexecuted",
                 entry_id
             );
             return;
         };
         let depth = entry.request.depth();
+        let chat_request = matches!(&entry.request, ThreadQueueRequest::AgentChat { .. });
+        let chat_identity = match &entry.request {
+            ThreadQueueRequest::AgentChat {
+                thread_id,
+                event_id: Some(id),
+                ..
+            } => Uuid::parse_str(id).ok().map(|id| (*thread_id, id)),
+            _ => None,
+        };
         self.register_chain_thread(entry.id, entry.thread_id, depth);
         let executable = ExecutableEntry {
             id: entry.id,
@@ -1650,7 +1862,7 @@ impl ThreadQueue {
                     .drop_retry_if_expired(executable.id, &executable.request)
                     .await?;
                 if !expired {
-                    executor.execute(executable).await;
+                    executor.execute(executable).await?;
                 }
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(!expired)
             },
@@ -1667,27 +1879,59 @@ impl ThreadQueue {
             match outcome {
                 Ok(Ok(completed)) => mgr.finish_entry(entry_id, completed).await,
                 Ok(Err(error)) => {
-                    // Keep the admitted row and slot for recovery. A failed
-                    // time query must never authorize replaying an old fire.
-                    log!(
-                        "[ThreadQueue] Retry deadline check failed for {}: {}",
+                    // The owner's card now holds the turn, and its Allow
+                    // resumes the thread outside this entry.
+                    if crate::engine::agent_session::spawn_gate::awaits_owner(error.as_ref()) {
+                        mgr.finish_entry(entry_id, true).await;
+                        return;
+                    }
+                    if let Some((thread_id, message_id)) = chat_identity {
+                        if mgr.recorded_chat_outcome(thread_id, message_id).await {
+                            mgr.finish_entry(entry_id, true).await;
+                            return;
+                        }
+                    }
+                    // Keep the admitted row and slot for recovery. Neither a
+                    // failed deadline query nor an unpersisted execution
+                    // outcome authorizes completing the only durable work.
+                    log_legacy!(
+                        "[ThreadQueue] Entry {} retained for recovery: {}",
                         entry_id,
                         error
                     );
                     mgr.notify(
-                        "An interrupted run could not be retried".into(),
-                        "Lucidos could not check the retry deadline. The entry remains in the Thread Queue for recovery.".into(),
+                        "Queued work needs recovery".into(),
+                        "Lucidos could not finish the queued work durably. The entry remains in the Thread Queue for recovery.".into(),
                     ).await;
                 }
                 Err(join_err) => {
                     if join_err.is_panic() {
-                        log!(
+                        crate::internal_faults::record_pending(
+                            crate::internal_faults::FaultKind::TaskPanic,
+                        );
+                        log_legacy!(
                             "[ThreadQueue] Entry {} execution panicked: {:?}",
                             entry_id,
                             join_err
                         );
                     }
-                    mgr.complete(entry_id).await;
+                    if let Some((thread_id, message_id)) = chat_identity {
+                        if mgr.recorded_chat_outcome(thread_id, message_id).await {
+                            mgr.finish_entry(entry_id, true).await;
+                            return;
+                        }
+                    }
+                    if chat_request {
+                        // A panic proves neither message recording nor a durable
+                        // terminal outcome. Startup uses the message id to
+                        // choose requeue or thread-level recovery.
+                        mgr.notify(
+                            "Queued chat needs recovery".into(),
+                            "Lucidos could not finish the queued chat. It remains in the Thread Queue for recovery.".into(),
+                        ).await;
+                    } else {
+                        mgr.complete(entry_id).await;
+                    }
                 }
             }
         });
@@ -1701,10 +1945,10 @@ impl ThreadQueue {
     ///
     /// - `queued` rows load back into the in-memory queue (no re-emit).
     /// - `admitted` rows are work the previous process had already started.
-    ///   One rule covers all four kinds: an entry whose `thread_id` names a
-    ///   live `thread_summaries` row completes here, and thread-level recovery
-    ///   (CC auto-resume / chat settle) owns it from there. An entry with no
-    ///   thread re-queues. A trigger entry can re-queue only once: scripts
+    ///   Chat requests with an identity hand off only when that message was
+    ///   recorded. Spawn kinds and legacy chat requests use thread existence
+    ///   instead. Thread-level recovery (CC auto-resume / chat settle) owns
+    ///   recorded work; otherwise it re-queues. A trigger entry can re-queue only once: scripts
     ///   create no thread even when side effects have already happened.
     ///
     /// Draining starts separately via [`Self::start_draining`] once trigger
@@ -1723,6 +1967,12 @@ impl ThreadQueue {
             queued_at: DateTime<Utc>,
             requeued: bool,
             archived: bool,
+            saved_event_id: Option<Uuid>,
+            saved_thread_id: Option<Uuid>,
+            saved_request: Option<serde_json::Value>,
+            accepted_input: bool,
+            ordinary_input: bool,
+            ordinary_request: Option<serde_json::Value>,
         }
         let rows: Vec<Row> = match sqlx::query_as(
             "SELECT q.id, q.kind, q.trigger_id, q.trigger_name, q.thread_id, q.summary, \
@@ -1731,18 +1981,31 @@ impl ThreadQueue {
                WHERE e.event_type = 'ThreadQueued' AND e.payload->'data'->>'entry_id' = q.id::text \
                ORDER BY e.sequence DESC LIMIT 1), false) AS requeued, \
              EXISTS (SELECT 1 FROM snapshot_restore_boundary b WHERE b.singleton AND \
-               NOT EXISTS (SELECT 1 FROM events origin WHERE origin.event_type = 'ThreadQueued' \
-                 AND origin.payload->'data'->>'entry_id' = q.id::text \
-                 GROUP BY origin.payload->'data'->>'entry_id' \
+               NOT EXISTS (SELECT 1 FROM events origin WHERE origin.event_type IN ('ThreadQueued','DraftSubmissionAccepted','OrdinarySubmissionAccepted') \
+                 AND COALESCE(origin.payload->'data'->>'entry_id', \
+                     origin.payload->'data'->'receipt'->>'queue_entry_id') = q.id::text \
+                 GROUP BY COALESCE(origin.payload->'data'->>'entry_id', \
+                     origin.payload->'data'->'receipt'->>'queue_entry_id') \
                  HAVING MIN(origin.sequence) > b.event_sequence)) AS archived \
-             FROM thread_queue q ORDER BY q.sequence",
+             , d.event_id AS saved_event_id, d.thread_id AS saved_thread_id, \
+             accepted.payload->'data'->'request' AS saved_request, \
+             (d.event_id IS NOT NULL OR EXISTS (SELECT 1 FROM events ordinary \
+               WHERE ordinary.event_type='OrdinarySubmissionAccepted' \
+               AND ordinary.payload->'data'->>'entry_id'=q.id::text)) AS accepted_input, \
+             EXISTS (SELECT 1 FROM events ordinary WHERE ordinary.event_type='OrdinarySubmissionAccepted' \
+               AND ordinary.payload->'data'->>'entry_id'=q.id::text) AS ordinary_input, \
+             (SELECT ordinary.payload->'data'->'request' FROM events ordinary \
+               WHERE ordinary.event_type='OrdinarySubmissionAccepted' AND ordinary.payload->'data'->>'entry_id'=q.id::text \
+               ORDER BY ordinary.sequence LIMIT 1) AS ordinary_request \
+             FROM thread_queue q LEFT JOIN draft_submissions d ON d.queue_entry_id=q.id \
+             LEFT JOIN events accepted ON accepted.id=d.event_id ORDER BY q.sequence",
         )
         .fetch_all(&self.pool)
         .await
         {
             Ok(r) => r,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ThreadQueue] recover_persisted_entries query failed: {}",
                     e
                 );
@@ -1752,7 +2015,7 @@ impl ThreadQueue {
         if rows.is_empty() {
             return;
         }
-        log!(
+        log_legacy!(
             "[ThreadQueue] Recovering {} persisted entr(ies) from thread_queue",
             rows.len()
         );
@@ -1769,6 +2032,16 @@ impl ThreadQueue {
         let mut seen_cron: HashSet<String> = HashSet::new();
 
         for row in rows {
+            if row.ordinary_input
+                && self
+                    .state
+                    .lock()
+                    .await
+                    .accepted_user_inputs
+                    .contains(&row.id)
+            {
+                continue;
+            }
             // Queue sequence is its own counter. Only the FIRST originating
             // event authorizes recovery: a later requeue cannot renew archived
             // authority. Missing provenance after restore also fails closed.
@@ -1778,10 +2051,38 @@ impl ThreadQueue {
                 self.emit_dropped(row.id, "snapshot-restored", None).await;
                 continue;
             }
+            if let (Some(event_id), Some(thread_id)) = (row.saved_event_id, row.saved_thread_id) {
+                let valid = row.saved_request.as_ref() == Some(&row.request)
+                    && saved_drafts::validate_saved_request(&row.request, event_id, thread_id)
+                        .is_ok();
+                if !valid {
+                    if let Err(error) = self.notify_invalid_accepted_input(row.id, thread_id).await
+                    {
+                        log_legacy!(
+                            "[ThreadQueue] Could not report invalid accepted draft {}: {}",
+                            row.id,
+                            error
+                        );
+                    }
+                    continue;
+                }
+            }
+            if row.ordinary_input && row.ordinary_request.as_ref() != Some(&row.request) {
+                if let Some(thread_id) = row.thread_id {
+                    if let Err(error) = self.notify_invalid_accepted_input(row.id, thread_id).await
+                    {
+                        log_legacy!(
+                            "[ThreadQueue] Could not report invalid ordinary input: {}",
+                            error
+                        );
+                    }
+                }
+                continue;
+            }
             let request: ThreadQueueRequest = match serde_json::from_value(row.request) {
                 Ok(r) => r,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[ThreadQueue] Entry {} has unparseable request ({}) — dropping",
                         row.id,
                         e
@@ -1824,18 +2125,31 @@ impl ThreadQueue {
                 }
             }
 
-            let requeue = if row.status == "queued" {
+            let requeue = if row.status == "queued" && !row.accepted_input {
                 false // already queued — load silently, keep original queued_at
             } else {
                 // An `admitted` row is work the dead process had already
-                // started. Whether re-running it would DUPLICATE that work
-                // turns on one question, the same for every kind: did a thread
-                // materialize? A spawn kind binds its thread at submit time,
-                // and a trigger fire binds one as soon as it mints one (see
-                // `record_entry_thread`). So the column answers for all four.
-                let thread_exists = match row.thread_id {
-                    Some(tid) => {
-                        match sqlx::query_scalar::<_, bool>(
+                // started. Chat follow-ups need their exact message identity:
+                // thread existence alone says nothing about this input. Spawn
+                // kinds retain the thread-materialization fallback.
+                let thread_exists = if let Some(recorded) =
+                    self.queued_chat_message_recorded(&request).await
+                {
+                    match recorded {
+                        Ok(recorded) => recorded,
+                        Err(error) => {
+                            log_legacy!(
+                                "[ThreadQueue] Could not check queued chat entry {}: {}",
+                                row.id,
+                                error
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    match row.thread_id {
+                        Some(tid) => {
+                            match sqlx::query_scalar::<_, bool>(
                             "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
                         )
                         .bind(tid)
@@ -1849,7 +2163,7 @@ impl ThreadQueue {
                             // transient read error abandons the fire in silence,
                             // with nothing in the inbox to act on.
                             Err(e) => {
-                                log!(
+                                log_legacy!(
                                     "[ThreadQueue] thread_summaries probe failed for entry {} (thread {}): {}, re-queuing",
                                     row.id,
                                     tid,
@@ -1858,8 +2172,9 @@ impl ThreadQueue {
                                 false
                             }
                         }
+                        }
+                        None => false,
                     }
-                    None => false,
                 };
                 if thread_exists {
                     // The work happened, so thread-level recovery owns it. This
@@ -1867,7 +2182,7 @@ impl ThreadQueue {
                     // parked on a question and a second identical run of it:
                     // parking emits no terminal event, so nothing ever
                     // completed the entry and the row is still `admitted`.
-                    log!(
+                    log_legacy!(
                         "[ThreadQueue] Entry {} ({}) already materialized thread {:?}, handing off to thread recovery",
                         row.id,
                         kind.as_str(),
@@ -1890,7 +2205,7 @@ impl ThreadQueue {
                     Ok(true) => continue,
                     Ok(false) => {}
                     Err(error) => {
-                        log!(
+                        log_legacy!(
                             "[ThreadQueue] Failed to check recovered retry deadline for {}: {}",
                             row.id,
                             error
@@ -1909,11 +2224,11 @@ impl ThreadQueue {
                         "requeue-cut-again",
                         "An engine restart interrupted this run twice. Lucidos will not run it again until its next fire.",
                     ).await {
-                        log!("[ThreadQueue] Failed to report repeated interruption for {}: {}", row.id, error);
+                        log_legacy!("[ThreadQueue] Failed to report repeated interruption for {}: {}", row.id, error);
                     }
                     continue;
                 }
-                true
+                row.status != "queued"
             };
 
             let entry = QueueEntry {
@@ -1929,7 +2244,7 @@ impl ThreadQueue {
             };
             if requeue {
                 if let Err(error) = self.try_emit_queued(&entry, true, None).await {
-                    log!(
+                    log_legacy!(
                         "[ThreadQueue] Failed to persist boot requeue for {}: {}",
                         entry.id,
                         error
@@ -1942,7 +2257,32 @@ impl ThreadQueue {
                     seen_cron.insert(tid);
                 }
             }
-            self.state.lock().await.queued.push_back(entry);
+            if row.accepted_input {
+                if let ThreadQueueRequest::AgentChat {
+                    thread_id,
+                    event_id: Some(id),
+                    ..
+                } = &entry.request
+                {
+                    let Ok(message) = Uuid::parse_str(id) else {
+                        self.notify("Accepted input needs recovery".into(), "The accepted input has an invalid message identity and was kept in the Thread Queue.".into()).await;
+                        continue;
+                    };
+                    self.bus
+                        .restore_accepted_input_turn(entry.id, *thread_id, message);
+                }
+            }
+            // A drain before this sweep may already have loaded an accepted
+            // saved draft from the same row.
+            let mut state = self.state.lock().await;
+            if row.ordinary_input && !state.accepted_user_inputs.insert(entry.id) {
+                continue;
+            }
+            if !state.active.contains_key(&entry.id)
+                && !state.queued.iter().any(|queued| queued.id == entry.id)
+            {
+                state.queued.push_back(entry);
+            }
         }
     }
 
@@ -1954,8 +2294,21 @@ impl ThreadQueue {
         self.boot_recovery
             .store(false, std::sync::atomic::Ordering::SeqCst);
         let mgr = self.clone();
+        let mut events = self.bus.subscribe();
         tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DRAIN_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                tokio::select! {
+                    _ = interval.tick() => {},
+                    _ = mgr.bus.input_order.successor_released.notified() => {},
+                    event = events.recv() => match event {
+                        Ok(event) if matches!(event.typed, BusEvent::System(SystemEvent::DraftSubmissionAccepted { .. } | SystemEvent::OrdinarySubmissionAccepted { .. })) => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        _ => continue,
+                    },
+                }
                 mgr.drain().await;
                 let due = {
                     let mut state = mgr.state.lock().await;
@@ -1964,7 +2317,6 @@ impl ThreadQueue {
                 for (title, message) in due {
                     mgr.notify(title, message).await;
                 }
-                tokio::time::sleep(DRAIN_INTERVAL).await;
             }
         });
     }
@@ -2023,7 +2375,7 @@ impl ThreadQueue {
 
     async fn emit_queued(&self, entry: &QueueEntry, requeued: bool, actor: Option<MessageOrigin>) {
         if let Err(error) = self.try_emit_queued(entry, requeued, actor).await {
-            log!("[ThreadQueue] Cannot persist queued entry: {}", error);
+            log_legacy!("[ThreadQueue] Cannot persist queued entry: {}", error);
         }
     }
 

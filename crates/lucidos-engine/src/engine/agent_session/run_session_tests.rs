@@ -112,6 +112,7 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.clone(),
             description: Some("the feature".into()),
             files: vec!["src/feature.rs".into()],
@@ -135,6 +136,7 @@ async fn resume_prompt_is_prefixed_with_applied_change_note() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id,
             requires_restart: false,
             client_update: false,
@@ -256,6 +258,7 @@ async fn resume_prompt_is_prefixed_with_discarded_change_note() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.clone(),
             description: Some("the feature".into()),
             files: vec!["src/feature.rs".into()],
@@ -1122,7 +1125,7 @@ async fn every_turn_another_thread_opened_carries_the_owner_approval_note() {
             "{label}: {text}"
         );
         // Pins the CLI contract the note must teach: the command and its 409.
-        assert!(text.contains("lucidos ask-owner-approval"), "{label}");
+        assert!(text.contains("lucidos ask-permission"), "{label}");
         assert!(text.contains("409"), "{label}");
         // ADR 0475: a spawn is not among the acts it gates.
         assert!(!text.contains("create-top-thread"), "{label}");
@@ -1163,6 +1166,7 @@ fn a_forwarded_redelivery_is_withdrawable_and_its_read_names_the_message() {
     let id = Uuid::new_v4();
     let prompt_sent = Uuid::new_v4();
     let input = crate::runtime::AgentInput {
+        defer_on_steer_failure: false,
         text: "also add a test".into(),
         images: Vec::new(),
         uuid: Uuid::new_v4(),

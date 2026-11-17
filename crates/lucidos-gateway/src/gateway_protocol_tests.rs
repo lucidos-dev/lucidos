@@ -72,7 +72,10 @@ fn pairing_path() -> String {
 
 /// Mint a gateway code on `state` and redeem it as a remote gateway would.
 async fn pair_a_gateway(state: &GatewayState) -> PairAnswer {
-    let code = state.paired_gateways().mint_secret(None).unwrap();
+    let code = state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let (status, body) = call(
         state,
         "POST",
@@ -119,6 +122,8 @@ async fn health_names_the_gateway_protocol() {
     let (status, body) = call(&state, "GET", crate::peers::GATEWAY_HEALTH_PATH, &[], None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["gateway_protocol"], json!(GATEWAY_PROTOCOL));
+    assert!(body.get("gateway_id").is_none());
+    assert!(!body.to_string().contains(state.gateway_id()));
 }
 
 #[tokio::test]
@@ -126,6 +131,7 @@ async fn a_gateway_code_pairs_a_gateway_that_can_then_name_its_pairing() {
     let (state, _dir) = gateway();
     let answer = pair_a_gateway(&state).await;
     assert_eq!(answer.gateway_protocol, GATEWAY_PROTOCOL);
+    assert_eq!(answer.gateway_id.as_deref(), Some(state.gateway_id()));
 
     let (status, body) = call(
         &state,
@@ -138,6 +144,7 @@ async fn a_gateway_code_pairs_a_gateway_that_can_then_name_its_pairing() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["pairing_id"], json!(answer.pairing_id));
     assert_eq!(body["label"], json!("Lucidos on a"));
+    assert_eq!(body["gateway_id"], json!(state.gateway_id()));
 }
 
 #[tokio::test]
@@ -145,7 +152,11 @@ async fn the_label_on_the_code_wins_over_the_one_the_gateway_offers() {
     let (state, _dir) = gateway();
     let code = state
         .paired_gateways()
-        .mint_secret(Some("cloud box".to_string()))
+        .mint_secret(
+            Some("cloud box".to_string()),
+            false,
+            crate::pairing::Minter::PairedDevice,
+        )
         .unwrap();
     let (status, _) = call(
         &state,
@@ -192,7 +203,10 @@ async fn a_device_code_never_pairs_a_gateway() {
 #[tokio::test]
 async fn a_gateway_code_never_pairs_a_device() {
     let (state, _dir) = gateway();
-    let gateway_code = state.paired_gateways().mint_secret(None).unwrap();
+    let gateway_code = state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let (status, _) = call(
         &state,
         "POST",
@@ -218,7 +232,10 @@ async fn a_gateway_code_never_pairs_a_device() {
 #[tokio::test]
 async fn a_gateway_code_works_once() {
     let (state, _dir) = gateway();
-    let code = state.paired_gateways().mint_secret(None).unwrap();
+    let code = state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let path = pair_path();
     let pair = || call(&state, "POST", &path, &[], Some(json!({ "code": code })));
     assert_eq!(pair().await.0, StatusCode::OK);
@@ -302,12 +319,12 @@ async fn unpair_on_b_refuses_the_very_next_call() {
 }
 
 #[tokio::test]
-async fn an_ended_pairing_takes_its_relayed_people() {
+async fn an_ended_pairing_takes_its_relayed_users() {
     let (state, _dir) = gateway();
     let answer = pair_a_gateway(&state).await;
     let seen = crate::gateway_event_log::RelayedDevice {
         device_id: crate::relay::namespaced_device_id(&answer.pairing_id, "d1"),
-        operator_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
+        user_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
         name: "Sam".into(),
         via: "laptop".into(),
         emails: vec![],
@@ -329,14 +346,14 @@ async fn an_ended_pairing_takes_its_relayed_people() {
 }
 
 /// The unpair saved, then the forget failed: the retry answers 404 for the
-/// pairing and still forgets its people.
+/// pairing and still forgets its users.
 #[tokio::test]
-async fn a_retried_unpair_still_forgets_the_relayed_people() {
+async fn a_retried_unpair_still_forgets_the_relayed_users() {
     let (state, _dir) = gateway();
     let answer = pair_a_gateway(&state).await;
     let seen = crate::gateway_event_log::RelayedDevice {
         device_id: crate::relay::namespaced_device_id(&answer.pairing_id, "d1"),
-        operator_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
+        user_id: crate::relay::namespaced_device_id(&answer.pairing_id, "op"),
         name: "Sam".into(),
         via: "laptop".into(),
         emails: vec![],
@@ -444,10 +461,14 @@ fn a_failed_save_records_no_pairing() {
     use crate::remote_gateways::tests::ReadOnlyDir;
     let dir = tempfile::tempdir().unwrap();
     let store = PairedGatewayStore::load(paired_gateways_path(dir.path())).unwrap();
-    let code = store.mint_secret(None).unwrap();
+    let code = store
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     {
         let _locked = ReadOnlyDir::new(dir.path());
-        assert!(store.redeem(&code, Some("A")).is_err());
+        assert!(store
+            .redeem(&code, Some("A"), crate::pairing::OwnerGate::NoDevicePaired)
+            .is_err());
     }
     assert!(store.list().is_empty());
 }
@@ -560,6 +581,8 @@ async fn a_typed_code_pairs_on_the_lan_and_never_from_loopback() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
+    // A gateway with no device yet, so the local mint needs no Allow.
+    let (state, _dir) = gateway();
     let (code, secret) = mint_device(&state).await;
     let loopback = peer_at("127.0.0.1:50000", false);
     let (status, body) = call_from(
@@ -626,7 +649,10 @@ async fn one_lan_device_flooding_costs_another_nothing() {
 async fn a_flood_through_the_routes_never_refuses_a_correct_secret() {
     let (state, _dir) = gateway();
     let (code, device_secret) = mint_device(&state).await;
-    let gateway_secret = state.paired_gateways().mint_secret(None).unwrap();
+    let gateway_secret = state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     for n in 0..1_000u32 {
         let remote = format!("10.0.{}.{}:4000", n / 250, n % 250);
         let peer = Some(pairing::Peer {
@@ -723,8 +749,13 @@ fn rotation_survives_reload_and_first_new_use_revokes_overlap() {
     let dir = tempfile::tempdir().unwrap();
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
-    let code = store.mint_secret(None).unwrap();
-    let GatewayRedemption::Paired { credential, .. } = store.redeem(&code, None).unwrap() else {
+    let code = store
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
+    let GatewayRedemption::Paired { credential, .. } = store
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
+    else {
         panic!()
     };
     let headers = |value: &str| {
@@ -750,11 +781,15 @@ fn rotation_expiry_revocation_and_persistence_failure_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
-    let code = store.mint_secret(None).unwrap();
+    let code = store
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let GatewayRedemption::Paired {
         credential,
         pairing_id,
-    } = store.redeem(&code, None).unwrap()
+    } = store
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
     else {
         panic!()
     };
@@ -803,9 +838,14 @@ fn rotation_expiry_revocation_and_persistence_failure_fail_closed() {
 #[tokio::test]
 async fn rotation_route_authenticates_without_consuming_the_overlap() {
     let (state, _dir) = gateway();
-    let code = state.paired_gateways().mint_secret(None).unwrap();
-    let GatewayRedemption::Paired { credential, .. } =
-        state.paired_gateways().redeem(&code, None).unwrap()
+    let code = state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
+    let GatewayRedemption::Paired { credential, .. } = state
+        .paired_gateways()
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
     else {
         panic!()
     };
@@ -838,8 +878,13 @@ fn recent_gateway_use_does_not_rewrite_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = paired_gateways_path(dir.path());
     let store = PairedGatewayStore::load(path.clone()).unwrap();
-    let code = store.mint_secret(None).unwrap();
-    let GatewayRedemption::Paired { credential, .. } = store.redeem(&code, None).unwrap() else {
+    let code = store
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
+    let GatewayRedemption::Paired { credential, .. } = store
+        .redeem(&code, None, crate::pairing::OwnerGate::NoDevicePaired)
+        .unwrap()
+    else {
         panic!()
     };
     let mut headers = HeaderMap::new();
@@ -850,4 +895,36 @@ fn recent_gateway_use_does_not_rewrite_the_store() {
     std::fs::create_dir(&path).unwrap();
     assert!(store.authorize(&headers).unwrap().is_some());
     assert_eq!(store.list(), before);
+}
+
+#[test]
+fn older_pair_answers_have_no_durable_identity() {
+    let answer: PairAnswer = serde_json::from_value(json!({
+        "pairing_id": "p", "credential": "c", "gateway_protocol": 1
+    }))
+    .unwrap();
+    assert_eq!(answer.gateway_id, None);
+}
+
+#[tokio::test]
+async fn durable_identity_requires_pairing_authentication() {
+    let (state, _dir) = gateway();
+    let (status, body) = call(&state, "GET", &pairing_path(), &[], None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!body.to_string().contains(state.gateway_id()));
+}
+
+#[tokio::test]
+async fn gateway_state_reloads_the_same_durable_identity() {
+    let (state, dir) = gateway();
+    let identity = state.gateway_id().to_string();
+    drop(state);
+    let reloaded = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+    assert_eq!(reloaded.gateway_id(), identity);
+    assert_eq!(
+        pair_a_gateway(&reloaded).await.gateway_id.as_deref(),
+        Some(identity.as_str())
+    );
+    let (other, _other_dir) = gateway();
+    assert_ne!(other.gateway_id(), identity);
 }

@@ -7,7 +7,7 @@ use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute}
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
-use crate::llm::{CacheMode, ModelSelection};
+use crate::llm::{CacheMode, ModelSelection, ProviderError};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -97,7 +97,7 @@ impl OpenAiProvider {
                                     "name": name,
                                     "arguments": serde_json::to_string(tool_input)
                                         .unwrap_or_else(|e| {
-                                            log!("[OpenAI] Failed to serialize tool arguments for Responses API: {}", e);
+                                            log_legacy!("[OpenAI] Failed to serialize tool arguments for Responses API: {}", e);
                                             "{}".to_string()
                                         }),
                                 }));
@@ -324,6 +324,7 @@ impl OpenAiProvider {
                 if let Some(data_str) = line.strip_prefix("data: ") {
                     let prev_len = content.len();
                     let done = Self::process_responses_chunk(
+                        self.provider_kind.label(),
                         &current_event_type,
                         data_str,
                         &mut content,
@@ -333,7 +334,7 @@ impl OpenAiProvider {
                     )
                     .map_err(|e| match e.downcast::<ChatGptPlanError>() {
                         Err(e) => crate::llm::stream_failure(
-                            e.to_string(),
+                            e,
                             on_token.is_some() && prev_len > 0,
                             STREAM_LOG_TAG,
                         ),
@@ -359,8 +360,39 @@ impl OpenAiProvider {
         Self::build_llm_response(content, tool_calls, meta)
     }
 
+    /// Finds an announced call by its item id, then by its call id.
+    fn find_call(
+        tool_calls: &[AccumulatedToolCall],
+        item_id_map: &HashMap<String, usize>,
+        item_id: &str,
+        call_id: &str,
+    ) -> Option<usize> {
+        item_id_map
+            .get(item_id)
+            .copied()
+            .or_else(|| {
+                if call_id.is_empty() {
+                    return None;
+                }
+                tool_calls.iter().position(|tc| tc.id == call_id)
+            })
+            .filter(|&idx| idx < tool_calls.len())
+    }
+
+    /// Applies a finished frame: its arguments replace the streamed ones and
+    /// its name fills a blank one.
+    fn settle_call(tc: &mut AccumulatedToolCall, name: Option<&str>, arguments: Option<&str>) {
+        if let Some(args) = arguments.filter(|a| !a.is_empty()) {
+            tc.arguments_json = args.to_string();
+        }
+        if let Some(name) = name.filter(|_| tc.name.is_empty()) {
+            tc.name = name.to_string();
+        }
+    }
+
     /// Process a single Responses API SSE event. Returns `true` when the stream is done.
     fn process_responses_chunk(
+        provider: &str,
         event_type: &str,
         data_str: &str,
         content: &mut String,
@@ -424,18 +456,40 @@ impl OpenAiProvider {
                 }
             }
 
+            // The finished frames carry the full arguments and are
+            // authoritative over any delta that was missed.
             "response.function_call_arguments.done" => {
+                let item_id = data.get("item_id").and_then(|i| i.as_str()).unwrap_or("");
                 let call_id = data.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
-                if let Some(full_args) = data.get("arguments").and_then(|a| a.as_str()) {
-                    if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == call_id) {
-                        tc.arguments_json = full_args.to_string();
-                    }
+                if let Some(idx) = Self::find_call(tool_calls, item_id_map, item_id, call_id) {
+                    Self::settle_call(
+                        &mut tool_calls[idx],
+                        data.get("name").and_then(|n| n.as_str()),
+                        data.get("arguments").and_then(|a| a.as_str()),
+                    );
                 }
-                if let Some(name) = data.get("name").and_then(|n| n.as_str()) {
-                    if let Some(tc) = tool_calls.iter_mut().find(|tc| tc.id == call_id) {
-                        if tc.name.is_empty() {
-                            tc.name = name.to_string();
-                        }
+            }
+
+            "response.output_item.done" => {
+                if let Some(item) = data.get("item") {
+                    if item.get("type").and_then(|t| t.as_str()) == Some("function_call") {
+                        let text = |key: &str| item.get(key).and_then(|v| v.as_str());
+                        let item_id = text("id").unwrap_or("");
+                        let call_id = text("call_id").unwrap_or("");
+                        let idx = Self::find_call(tool_calls, item_id_map, item_id, call_id)
+                            .unwrap_or_else(|| {
+                                tool_calls.push(AccumulatedToolCall {
+                                    id: call_id.to_string(),
+                                    name: String::new(),
+                                    arguments_json: String::new(),
+                                });
+                                let idx = tool_calls.len() - 1;
+                                if !item_id.is_empty() {
+                                    item_id_map.insert(item_id.to_string(), idx);
+                                }
+                                idx
+                            });
+                        Self::settle_call(&mut tool_calls[idx], text("name"), text("arguments"));
                     }
                 }
             }
@@ -461,21 +515,7 @@ impl OpenAiProvider {
                 if let Some(plan) = ChatGptPlanError::from_error_object(error_object) {
                     return Err(Box::new(plan));
                 }
-                let error_msg = data
-                    .pointer("/response/error/message")
-                    .or_else(|| data.pointer("/error/message"))
-                    .or_else(|| data.get("message"))
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("Unknown error");
-                let error_code = data
-                    .pointer("/response/error/code")
-                    .or_else(|| data.pointer("/error/code"))
-                    .or_else(|| data.get("code"))
-                    .and_then(|c| c.as_str())
-                    .unwrap_or("unknown");
-                return Err(
-                    format!("OpenAI Responses API error [{}]: {}", error_code, error_msg).into(),
-                );
+                return Err(ProviderError::from_stream_error(provider, error_object).into());
             }
 
             _ => {}
@@ -493,6 +533,7 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(self.provider_kind).await?;
         let model = selection.model.unwrap_or(&self.model);
         let mut body = self.build_responses_body(model, messages, tools, system_prompt, &selection);
         if let Some(tool) = selection.forced_tool {
@@ -513,14 +554,14 @@ impl OpenAiProvider {
                 .iter()
                 .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
                 .collect();
-            log!(
+            log_legacy!(
                 "[OpenAI] Responses API request: model={}, tools={}, tool_names={:?}",
                 model,
                 tools_arr.len(),
                 names
             );
         } else {
-            log!("[OpenAI] Responses API request: model={}, tools=0", model);
+            log_legacy!("[OpenAI] Responses API request: model={}, tools=0", model);
         }
 
         let mut bearer = match self.plan_bearer(model).await? {
@@ -554,7 +595,18 @@ impl OpenAiProvider {
             let status = resp.status();
             if !status.is_success() {
                 let request_id = crate::llm::call_trace::request_id_of(resp.headers());
+                let error_headers = resp.headers().clone();
                 let error_body = resp.text().await.unwrap_or_default();
+                if let Some(cap) = crate::llm::metered::http_spend_cap(
+                    self.provider_kind,
+                    status.as_u16(),
+                    &error_headers,
+                    &error_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
                 let plan_error = self.plan_tokens().and_then(|_| {
                     ChatGptPlanError::from_http(status.as_u16(), &error_body, request_id.clone())
                 });
@@ -568,7 +620,7 @@ impl OpenAiProvider {
                 ) {
                     HttpFailureStep::Refresh => {
                         if let (Some(tokens), Some(rejected)) = (self.plan_tokens(), &bearer) {
-                            log!("[OpenAI] ChatGPT plan rejected its token ({status}); refreshing once");
+                            log_legacy!("[OpenAI] ChatGPT plan rejected its token ({status}); refreshing once");
                             bearer = Some(tokens.after_rejection(rejected).await?);
                             refreshed = true;
                             continue;
@@ -587,25 +639,23 @@ impl OpenAiProvider {
                     self.observe_plan_failure(&plan_error).await;
                     return Err(Box::new(plan_error));
                 }
-                log!(
+                log_legacy!(
                     "[OpenAI] Responses API error ({}, request_id={}): {}",
                     status,
                     request_id.as_deref().unwrap_or("none"),
                     &error_body[..error_body.floor_char_boundary(500)]
                 );
                 return Err(crate::llm::not_served::failure(
+                    self.provider_kind.label(),
                     status.as_u16(),
                     &error_body,
-                    crate::llm::with_retry_context(
-                        format!("OpenAI Responses API error ({}): {}", status, error_body),
-                        attempt,
-                    ),
+                    attempt,
                 ));
             }
 
             match self.parse_responses_stream(resp, &on_token).await {
                 Ok(response) => {
-                    log!(
+                    log_legacy!(
                         "[OpenAI] Responses API result: text={}chars, tool_calls={}",
                         response.content.as_ref().map(|c| c.len()).unwrap_or(0),
                         response.tool_calls.len()
@@ -616,7 +666,7 @@ impl OpenAiProvider {
                             .iter()
                             .map(|tc| tc.name.as_str())
                             .collect();
-                        log!("[OpenAI] Tool calls: {:?}", names);
+                        log_legacy!("[OpenAI] Tool calls: {:?}", names);
                     }
                     return Ok(LlmResponse {
                         prefill,
@@ -630,11 +680,10 @@ impl OpenAiProvider {
                         self.observe_plan_failure(plan_error).await;
                         return Err(e);
                     }
-                    let err_str = e.to_string();
-                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
+                    if crate::llm::retry_after_stream_error(model, &*e, attempt).await {
                         continue;
                     }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
+                    return Err(crate::llm::retry_failure(e, attempt));
                 }
             }
         }
@@ -644,7 +693,7 @@ impl OpenAiProvider {
 impl OpenAiProvider {
     /// Log a plan failure, and pause plan requests when it is the limit.
     async fn observe_plan_failure(&self, error: &ChatGptPlanError) {
-        log!("[OpenAI] ChatGPT plan error: {}", error.log_line());
+        log_legacy!("[OpenAI] ChatGPT plan error: {}", error.log_line());
         if let Some(access) = self.plan_access() {
             access.pause.observe(error).await;
         }
@@ -1166,7 +1215,7 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut item_id_map = std::collections::HashMap::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_responses_chunk(
+        OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","service_tier":"flex","usage":{"input_tokens":10,"output_tokens":2}}}"#,
             &mut content,
@@ -1178,7 +1227,7 @@ mod tests {
         assert_eq!(meta.service_tier, Some(crate::llm::ServiceTier::Flex));
 
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_responses_chunk(
+        OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","service_tier":"default","usage":{"input_tokens":10,"output_tokens":2}}}"#,
             &mut content,
@@ -1232,6 +1281,7 @@ mod tests {
 
         // Mid-stream text delta.
         OpenAiProvider::process_responses_chunk(
+            "OpenAI",
             "response.output_text.delta",
             r#"{"delta":"ok"}"#,
             &mut content,
@@ -1242,7 +1292,7 @@ mod tests {
         .unwrap();
 
         // Terminal event — `meta` populated from the embedded Response.
-        let done = OpenAiProvider::process_responses_chunk(
+        let done = OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","model":"gpt-5.6-luna-2026-04-01","usage":{"input_tokens":11,"output_tokens":3,"input_tokens_details":{"cached_tokens":4}}}}"#,
             &mut content,
@@ -1275,7 +1325,7 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut item_id_map = std::collections::HashMap::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_responses_chunk(
+        OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","usage":{"input_tokens":42,"output_tokens":0,"input_tokens_details":{"cached_tokens":12}}}}"#,
             &mut content,
@@ -1296,7 +1346,7 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut item_id_map = std::collections::HashMap::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_responses_chunk(
+        OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.completed",
             r#"{"response":{"status":"completed","usage":{"input_tokens":5476,"output_tokens":9,"input_tokens_details":{"cache_write_tokens":5435,"cached_tokens":0}}}}"#,
             &mut content,
@@ -1321,6 +1371,7 @@ mod tests {
             r#"{{"response":{{"status":"completed",{echo}"usage":{{"input_tokens":16500,"output_tokens":9,"input_tokens_details":{details}}}}}}}"#
         );
         OpenAiProvider::process_responses_chunk(
+            "OpenAI",
             "response.completed",
             &data,
             &mut content,
@@ -1408,6 +1459,7 @@ mod tests {
         let mut item_id_map = std::collections::HashMap::new();
         let mut meta = StreamMeta::default();
         OpenAiProvider::process_responses_chunk(
+            "OpenAI",
             "response.completed",
             r#"{"response":{"status":"completed","usage":{"input_tokens":42,"output_tokens":0}}}"#,
             &mut content,
@@ -1430,7 +1482,7 @@ mod tests {
         let mut item_id_map: HashMap<String, usize> = HashMap::new();
         let mut meta = StreamMeta::default();
 
-        let done = OpenAiProvider::process_responses_chunk(
+        let done = OpenAiProvider::process_responses_chunk("OpenAI", 
             "response.incomplete",
             r#"{"response":{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":50,"output_tokens":4096}}}"#,
             &mut content,
@@ -1456,6 +1508,7 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         let err = OpenAiProvider::process_responses_chunk(
+            "OpenAI",
             "error",
             r#"{"type":"error","code":"server_error","message":"The server had an error"}"#,
             &mut content,
@@ -1468,6 +1521,135 @@ mod tests {
 
         assert!(err.contains("server_error"), "got: {err}");
         assert!(err.contains("The server had an error"), "got: {err}");
+    }
+
+    /// Feeds `(event, data)` pairs through the parser and returns the calls.
+    fn tool_calls_from(events: &[(&str, &str)]) -> Vec<AccumulatedToolCall> {
+        let mut content = String::new();
+        let mut tools: Vec<AccumulatedToolCall> = Vec::new();
+        let mut item_id_map: HashMap<String, usize> = HashMap::new();
+        let mut meta = StreamMeta::default();
+        for (event, data) in events {
+            OpenAiProvider::process_responses_chunk(
+                "OpenAI",
+                event,
+                data,
+                &mut content,
+                &mut tools,
+                &mut item_id_map,
+                &mut meta,
+            )
+            .unwrap();
+        }
+        tools
+    }
+
+    const ADDED_A: (&str, &str) = (
+        "response.output_item.added",
+        r#"{"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"load_knowhow","arguments":""}}"#,
+    );
+    const ADDED_B: (&str, &str) = (
+        "response.output_item.added",
+        r#"{"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"load_knowhow","arguments":""}}"#,
+    );
+
+    #[test]
+    fn a_call_whose_deltas_arrive_keeps_its_arguments() {
+        let tools = tool_calls_from(&[
+            ADDED_A,
+            (
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"fc_a","delta":"{\"id\":"}"#,
+            ),
+            (
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"fc_a","delta":"\"x\"}"}"#,
+            ),
+        ]);
+        assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
+    }
+
+    /// The Responses API keys `function_call_arguments.done` by `item_id`
+    /// and sends no `call_id`.
+    #[test]
+    fn the_arguments_done_event_is_found_by_item_id() {
+        let tools = tool_calls_from(&[
+            ADDED_A,
+            (
+                "response.function_call_arguments.done",
+                r#"{"item_id":"fc_a","arguments":"{\"id\":\"x\"}"}"#,
+            ),
+        ]);
+        assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
+    }
+
+    #[test]
+    fn the_finished_item_supplies_arguments_when_no_delta_arrived() {
+        let tools = tool_calls_from(&[
+            ADDED_A,
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"load_knowhow","arguments":"{\"id\":\"x\"}"}}"#,
+            ),
+        ]);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
+    }
+
+    #[test]
+    fn a_finished_item_never_announced_is_added() {
+        let tools = tool_calls_from(&[(
+            "response.output_item.done",
+            r#"{"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"load_knowhow","arguments":"{\"id\":\"x\"}"}}"#,
+        )]);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].id, "call_a");
+        assert_eq!(tools[0].name, "load_knowhow");
+        assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
+    }
+
+    #[test]
+    fn a_finished_item_after_deltas_does_not_duplicate_the_call() {
+        let tools = tool_calls_from(&[
+            ADDED_A,
+            (
+                "response.function_call_arguments.delta",
+                r#"{"item_id":"fc_a","delta":"{\"id\":\"x\"}"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"load_knowhow","arguments":"{\"id\":\"x\"}"}}"#,
+            ),
+        ]);
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].arguments_json, r#"{"id":"x"}"#);
+    }
+
+    #[test]
+    fn parallel_calls_keep_their_own_arguments() {
+        let tools = tool_calls_from(&[
+            ADDED_A,
+            ADDED_B,
+            (
+                "response.function_call_arguments.done",
+                r#"{"item_id":"fc_b","arguments":"{\"id\":\"b\"}"}"#,
+            ),
+            (
+                "response.output_item.done",
+                r#"{"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"load_knowhow","arguments":"{\"id\":\"a\"}"}}"#,
+            ),
+        ]);
+        assert_eq!(tools[0].arguments_json, r#"{"id":"a"}"#);
+        assert_eq!(tools[1].arguments_json, r#"{"id":"b"}"#);
+    }
+
+    #[test]
+    fn a_non_function_item_adds_no_call() {
+        let tools = tool_calls_from(&[(
+            "response.output_item.done",
+            r#"{"item":{"type":"message","id":"msg_1"}}"#,
+        )]);
+        assert!(tools.is_empty());
     }
 
     // --- Prefill beats (ADR 0556) ---
@@ -1589,9 +1771,15 @@ mod tests {
     async fn a_turn_returns_a_pair_whose_beat_reads_the_turn() {
         let (base, bodies) =
             super::super::serve_recording("/v1/responses", COMPLETED_TURN, PREFILL_REPLY).await;
-        let provider =
-            OpenAiProvider::new_with_base_url("k".into(), SOL.into(), &base, Vec::new(), false)
-                .unwrap();
+        let provider = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
+            "k".into(),
+            SOL.into(),
+            &base,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         let turn = provider
             .chat_responses(
                 &tree_turn(),
@@ -1689,9 +1877,15 @@ mod tests {
     #[tokio::test]
     async fn the_platform_body_is_byte_identical_to_the_pre_plan_build() {
         let (base, bodies) = serve_raw().await;
-        let provider =
-            OpenAiProvider::new_with_base_url("k".into(), SOL.into(), &base, Vec::new(), false)
-                .unwrap();
+        let provider = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
+            "k".into(),
+            SOL.into(),
+            &base,
+            Vec::new(),
+            false,
+        )
+        .unwrap();
         let turn = ModelSelection::model(SOL)
             .with_effort(Some("high"))
             .with_forced_tool(Some("request_read"))
@@ -2149,6 +2343,7 @@ mod tests {
                 let mut item_id_map: HashMap<String, usize> = HashMap::new();
                 let mut meta = StreamMeta::default();
                 OpenAiProvider::process_responses_chunk(
+                    "OpenAI",
                     event,
                     chunk,
                     &mut content,

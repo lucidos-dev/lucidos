@@ -1,7 +1,8 @@
-import { useState } from 'preact/hooks';
+import { useMemo, useState } from 'preact/hooks';
 import { connectionStatus, visibleWorkspaceName } from '../../store/store';
-import { crossWorkspaceUnreadTotal, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
+import { notificationsMenuUnreadTotal, refreshOtherWorkspacesUnread } from '../../store/actions/app-badge';
 import { connectionNotice, connectionNoticeSentence, connectionPhrase } from '../../utils/connectionNotice';
+import { createMenuTapGuard } from '../../utils/menuTapGuard';
 import { Overlay } from '../shared/Overlay';
 import { LucidosMarkIcon } from '../shared/icons';
 import { BrandBadge, UnreadBrandBadge, brandBadgeLabel, brandTooltipRows, unreadBadgeLabel } from './BrandBadge';
@@ -51,6 +52,7 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow, homeInRow }: {
    *  on both thread pane rows; the thread drawer's row has no Home icon. */
   homeInRow: boolean;
 }) {
+  const tapGuard = useMemo(createMenuTapGuard, []);
   return (
     <>
       {/* Centred from CSS, so no measure pass and no hidden first frame: the
@@ -68,7 +70,7 @@ function LucidosMenu({ open, onClose, anchor, actionsInRow, homeInRow }: {
         portal
         panelClass="surface-box surface-raised brand-menu"
         panelRole="menu"
-        panelProps={{ 'aria-label': MENU_NAME }}
+        panelProps={{ 'aria-label': MENU_NAME, ...tapGuard }}
       >
         <BrandMenuRows onClose={onClose} actionsInRow={actionsInRow} homeInRow={homeInRow} />
       </Overlay>
@@ -123,7 +125,7 @@ export function BrandMenuButton({ placement = 'cluster' }: { placement?: 'cluste
   // a screen reader reaches it; the mark is the element both land on. Without
   // this the count would be silent on the two panes the bell never appears on,
   // which is the whole reason it rides the mark.
-  const unreadCount = crossWorkspaceUnreadTotal.value;
+  const unreadCount = notificationsMenuUnreadTotal.value;
   // The state badge is click-through for the same reason, so the mark speaks
   // what it stands for too: the jobs in flight, or a version to take.
   const activity = liveActivityRows();

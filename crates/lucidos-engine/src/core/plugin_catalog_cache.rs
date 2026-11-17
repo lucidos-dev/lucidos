@@ -74,14 +74,14 @@ pub fn load(workspace_path: &Path) -> CachedCatalog {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CachedCatalog::default(),
         Err(e) => {
-            log!("[PluginCatalogCache] read {} failed: {e}", path.display());
+            log_legacy!("[PluginCatalogCache] read {} failed: {e}", path.display());
             return CachedCatalog::default();
         }
     };
     match serde_json::from_str(&text) {
         Ok(cached) => cached,
         Err(e) => {
-            log!("[PluginCatalogCache] parse {} failed: {e}", path.display());
+            log_legacy!("[PluginCatalogCache] parse {} failed: {e}", path.display());
             CachedCatalog::default()
         }
     }
@@ -154,7 +154,7 @@ pub fn record_scan_failure(workspace_path: &Path, error: &str) {
 
 fn write_or_log(workspace_path: &Path, cached: &CachedCatalog, what: &str) {
     if let Err(e) = save(workspace_path, cached) {
-        log!("[PluginCatalogCache] {what} failed: {e}");
+        log_legacy!("[PluginCatalogCache] {what} failed: {e}");
     }
 }
 

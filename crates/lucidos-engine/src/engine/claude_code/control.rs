@@ -450,7 +450,7 @@ impl LucidosEngine {
 
     /// [`Self::cc_thread_settings`] recorded on `coding_agent` only. A model
     /// one backend ran says nothing about a session on the other.
-    async fn cc_thread_settings_on(
+    pub(crate) async fn cc_thread_settings_on(
         &self,
         thread_id: Uuid,
         coding_agent: crate::runtime::CodingAgent,
@@ -479,7 +479,7 @@ impl LucidosEngine {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] cc_thread_settings({}) DB error: {} — falling back to no per-thread overrides",
                     thread_id,
                     e
@@ -565,7 +565,7 @@ impl LucidosEngine {
             Ok(_) => (None, None),
             Err(e) => {
                 // The thread's own settings still name a rung the backend runs.
-                log!("[ClaudeCode] pending handoff of {}: {}", thread_id, e);
+                log_legacy!("[ClaudeCode] pending handoff of {}: {}", thread_id, e);
                 (None, None)
             }
         }
@@ -629,7 +629,7 @@ impl LucidosEngine {
         .fetch_optional(self.pool())
         .await
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] Failed to look up repo_root for {}: {}",
                 thread_id,
                 e

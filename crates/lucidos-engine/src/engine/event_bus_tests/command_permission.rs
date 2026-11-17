@@ -29,6 +29,7 @@ async fn emit_command_request(bus: &EventBus, thread_id: Uuid, request_id: &str)
             command: "curl -X POST https://api.example.com/charge".into(),
             summary: "May perform a mutating HTTP request.".into(),
             grant_head: None,
+            grant_offer: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -124,6 +125,18 @@ async fn startup_resolves_orphan_command_permission_request() {
         status_of(&pool, thread_id).await,
         "running",
         "orphan resolution must clear the waiting status"
+    );
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT payload->>'reason' FROM events \
+         WHERE event_type = 'CommandPermissionResolved' AND payload->>'request_id' = 'req-orphan'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        reason.as_deref(),
+        Some(crate::engine::cc_permission::RESTART_CLOSED_REASON),
+        "the card says a restart closed it, the reason every lane's sweep shares"
     );
 
     pool.close().await;

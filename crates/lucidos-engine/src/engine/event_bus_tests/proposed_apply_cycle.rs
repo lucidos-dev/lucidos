@@ -35,6 +35,7 @@ async fn coding_agent_idled_does_not_set_proposed_until_change_proposed() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -207,6 +208,7 @@ async fn external_repo_idle_with_changes_never_shows_apply_discard() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -266,6 +268,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
     let events = vec![
         (
             ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "s1".into(),
                 branch: "claude-code/fix".into(),
@@ -294,11 +297,13 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             EventMeta::NONE,
         ),
         (
             ThreadEvent::ChangeProposed {
+                content: Default::default(),
                 change_id: "c1".into(),
                 description: Some("Fix".into()),
                 files: vec!["f.rs".into()],
@@ -317,6 +322,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
         ),
         (
             ThreadEvent::ChangeApplied {
+                content: Default::default(),
                 change_id: "c1".into(),
                 requires_restart: false,
                 client_update: false,
@@ -341,6 +347,7 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             EventMeta::NONE,
         ),
@@ -416,6 +423,7 @@ async fn change_applied_persists_device_actor_in_payload() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: "change-actor-test".into(),
             requires_restart: false,
             client_update: false,
@@ -477,6 +485,7 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("Fix".into()),
             files: vec!["src/main.rs".into()],
@@ -498,41 +507,6 @@ async fn seed_pending_change(bus: &EventBus, thread_id: Uuid, branch: &str) -> U
     change_id
 }
 
-/// `ChangeApplied` is built in one place, the emitter that takes the change's
-/// `ApplyClaim`. Every apply claims before it reads the row. So a second
-/// `ChangeApplied` for one change cannot happen, and the bus needs no filter
-/// for it (ADR 0442). A second construction site would bypass the claim.
-#[test]
-fn change_applied_is_built_only_by_the_claim_holding_emitter() {
-    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                rust_sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut files = Vec::new();
-    rust_sources(&src, &mut files);
-    let builders: Vec<String> = files
-        .iter()
-        .filter(|p| {
-            let name = p.to_string_lossy();
-            !name.contains("_tests") && !name.ends_with("event.rs")
-        })
-        .filter(|p| {
-            std::fs::read_to_string(p)
-                .unwrap()
-                .contains("event: ThreadEvent::ChangeApplied {")
-        })
-        .map(|p| p.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
-        .collect();
-    assert_eq!(builders, vec!["engine/change_ops_emitters.rs".to_string()]);
-}
-
 /// Two engines on one database each hold their own apply claims, so the claim
 /// cannot stop both from applying one change. The database refuses the second
 /// `ChangeApplied` (ADR 0442).
@@ -545,6 +519,7 @@ async fn the_database_refuses_a_second_change_applied_for_one_change() {
     let applied = || BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,
@@ -603,6 +578,7 @@ async fn slow_path_change_applied_carries_stashed_apply_actor() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,
@@ -696,6 +672,7 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_b.to_string(),
             description: Some("Fix v2".into()),
             files: vec!["src/main.rs".into()],
@@ -892,7 +869,7 @@ fn post_apply_refresh_runs_only_for_the_accepted_change_applied() {
         .expect("emit_change_applied must emit ChangeApplied");
     let tail = &emitters[emit_pos..];
     assert!(
-        tail.contains("Ok(res) => res.is_some()"),
+        tail.contains("Ok(Some(_)) => Ok(true)"),
         "emit_change_applied must emit via `emit` (not `emit_or_log`) and read the \
          outcome, so a failed emit fires no refresh"
     );
@@ -970,4 +947,41 @@ fn discard_change_notifies_apply_all_driver_so_batch_advances() {
         "discard_change must notify the Apply-All driver (Failed / WITHDRAWN_MEMBER_REASON) so a \
          batch member discarded mid-batch advances the batch instead of stalling it"
     );
+}
+
+mod guard_tests {
+    /// `ChangeApplied` is built in one place, the emitter that takes the change's
+    /// `ApplyClaim`. Every apply claims before it reads the row. So a second
+    /// `ChangeApplied` for one change cannot happen, and the bus needs no filter
+    /// for it (ADR 0442). A second construction site would bypass the claim.
+    #[test]
+    fn change_applied_is_built_only_by_the_claim_holding_emitter() {
+        fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    rust_sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_sources(&src, &mut files);
+        let builders: Vec<String> = files
+            .iter()
+            .filter(|p| {
+                let name = p.to_string_lossy();
+                !name.contains("_tests") && !name.ends_with("event.rs")
+            })
+            .filter(|p| {
+                std::fs::read_to_string(p)
+                    .unwrap()
+                    .contains("event: ThreadEvent::ChangeApplied {")
+            })
+            .map(|p| p.strip_prefix(&src).unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(builders, vec!["engine/change_ops_emitters.rs".to_string()]);
+    }
 }

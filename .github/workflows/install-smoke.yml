@@ -584,10 +584,12 @@ jobs:
     # for a NON-draft rc: accept both `prereleased` and `released` (rc creation
     # can surface either action) and guard on prerelease==true so the real GA
     # publish never triggers it.
+    # Rolling Beta carries only updater assets and has already passed this gate.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
       && ((github.event_name == 'release'
-           && github.event.release.prerelease == true)
+           && github.event.release.prerelease == true
+           && startsWith(github.event.release.tag_name, 'rc-'))
           || (github.event_name == 'workflow_dispatch' && inputs.dmg_tag != ''))
     # `contents: write` is what makes a DRAFT release readable, and it is the only
     # reason this job needs write at all: it downloads and verifies, it never
@@ -863,7 +865,7 @@ jobs:
           # bytes came from and is exactly the field to compare against the tag.
           # The gateway tells only a credentialed caller its `release`, so this
           # read sends the local token the gateway wrote at startup.
-          token_file="$HOME/.lucidos/local-token"
+          token_file="$HOME/.lucidos/private/local-token"
           [ -r "$token_file" ] || {
             echo "::error::local token missing at $token_file: the gateway writes it at startup"
             diagnostics
@@ -1114,8 +1116,11 @@ jobs:
 
       - name: Build the prebuilt headless tarball (the download artifact)
         shell: bash
+        env:
+          LUCIDOS_E2E_FREE_FLOOR_MIN_GB: "1"
         run: |
           set -euo pipefail
+          echo "Memory gate: disposable CI runner uses a 1 GB floor; critical pressure and compressor checks remain active."
           version="$(tr -d ' \t\r\n' < RELEASE)"
           ./scripts/build-headless.sh --triple "$TRIPLE" --version "$version" --out-dir dist/headless
           echo "--- artifacts:"; ls -la dist/headless
@@ -1198,7 +1203,7 @@ jobs:
           echo "$gw" | grep -q '"role":"gateway"' || { echo "::error::gateway health missing role=gateway: $gw"; exit 1; }
           # The gateway tells only a credentialed caller its `release`, so the
           # release read goes through gateway_curl with the local token.
-          token_file="$HOME/.lucidos/local-token"
+          token_file="$HOME/.lucidos/private/local-token"
           [ -r "$token_file" ] || {
             echo "::error::local token missing at $token_file: the gateway writes it at startup, so the service did not come up as expected"
             exit 1

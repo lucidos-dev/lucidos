@@ -155,6 +155,7 @@ async fn driver_task_parses_stdout_into_typed_events() {
             text,
             duration_ms,
             error,
+            ..
         } => {
             assert_eq!(text, "done");
             assert_eq!(duration_ms, 42);
@@ -198,6 +199,7 @@ async fn only_the_first_input_carries_the_owed_session_context() {
         agent
             .input_tx
             .send(AgentInput {
+                defer_on_steer_failure: false,
                 text: text.to_string(),
                 images: Vec::new(),
                 uuid: uuid::Uuid::new_v4(),
@@ -224,6 +226,7 @@ async fn only_the_first_input_carries_the_owed_session_context() {
 
 fn input_text(text: &str) -> AgentInput {
     AgentInput {
+        defer_on_steer_failure: false,
         text: text.to_string(),
         images: Vec::new(),
         uuid: uuid::Uuid::new_v4(),
@@ -633,6 +636,7 @@ async fn a_line_split_around_an_input_still_arrives_whole() {
     agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "go on".into(),
             images: vec![],
             uuid: uuid::Uuid::new_v4(),
@@ -690,6 +694,7 @@ async fn a_split_last_line_ended_by_stdout_eof_still_arrives() {
         agent
             .input_tx
             .send(AgentInput {
+                defer_on_steer_failure: false,
                 text: "go on".into(),
                 images: vec![],
                 uuid: uuid::Uuid::new_v4(),
@@ -840,11 +845,11 @@ fn a_side_question_message_carries_the_question_then_each_image() {
 const SIDE_QUESTION_REPLAY: &str =
     r#"{"type":"user","message":{"role":"user","content":"q"},"isReplay":true}"#;
 
-/// A shell stand-in for Claude Code: it logs the line it reads to `log`,
-/// replays it, then answers with a `result` whose text is `answer`.
+/// A shell stand-in for Claude Code: it logs billing controls and the prompt
+/// to `log`, skips controls, replays the prompt, then answers with `answer`.
 fn answer_side_question_script(log: &Path, answer: &str) -> String {
     format!(
-        r#"read l; printf '%s\n' "$l" >> {log}; printf '{SIDE_QUESTION_REPLAY}\n'; printf '{{"type":"result","subtype":"success","is_error":false,"result":"{answer}"}}\n'"#,
+        r#"while read -r l; do printf '%s\n' "$l" >> {log}; case "$l" in *control_request*) continue;; esac; break; done; printf '{SIDE_QUESTION_REPLAY}\n'; printf '{{"type":"result","subtype":"success","is_error":false,"result":"{answer}"}}\n'"#,
         log = log.display(),
     )
 }
@@ -901,6 +906,7 @@ async fn a_withdraw_never_overtakes_its_input() {
     agent
         .input_tx
         .send(AgentInput {
+            defer_on_steer_failure: false,
             text: "never mind this".into(),
             images: vec![],
             uuid: input_uuid,
@@ -1011,9 +1017,77 @@ async fn a_side_question_is_answered_past_unrelated_lines() {
     let stdin_log = std::fs::read_to_string(&log).unwrap();
     assert_eq!(
         stdin_log.lines().count(),
-        1,
-        "only the side question: {stdin_log}"
+        3,
+        "billing requests and the side question: {stdin_log}"
     );
+}
+
+#[tokio::test]
+async fn session_copy_billing_comes_from_its_own_control_replies() {
+    use crate::runtime::billing_provider::BillingAttribution;
+    let initialize = |provider: &str| {
+        serde_json::json!({
+        "type":"control_response", "response":{
+            "request_id":BILLING_INITIALIZE_REQUEST_ID, "subtype":"success",
+            "response":{"account":{"apiProvider":provider,"apiKeySource":"none","tokenSource":"claude-login"}}
+        }
+    }).to_string()
+    };
+    let status = |custom: bool| {
+        let mut rows = vec![
+            serde_json::json!({"label":"Version","value":"fixture"}),
+            serde_json::json!({"label":"Session ID","value":"fixture"}),
+            serde_json::json!({"label":"cwd","value":"/tmp/fixture"}),
+        ];
+        if custom {
+            rows.push(
+                serde_json::json!({"label":"Anthropic base URL","value":"https://example.com"}),
+            );
+        }
+        serde_json::json!({"type":"control_response","response":{
+            "request_id":BILLING_STATUS_REQUEST_ID,"subtype":"success",
+            "response":{"sections":[{"title":"Session","rows":rows}]}
+        }})
+        .to_string()
+    };
+    for (frames, expected) in [
+        (vec![initialize("gateway")], "claude-gateway"),
+        (
+            vec![initialize("firstParty"), status(false)],
+            "anthropic-subscription",
+        ),
+        (vec![status(false), initialize("vertex")], "vertex"),
+        (vec![initialize("firstParty")], "unknown"),
+        (
+            vec![initialize("firstParty"), status(false), status(true)],
+            "unknown",
+        ),
+        (vec![], "unknown"),
+    ] {
+        let mut script = String::from("read -r init; read -r status; read -r question; ");
+        for frame in frames {
+            script.push_str(&format!("printf '%s\\n' '{frame}'; "));
+        }
+        script.push_str(&format!("printf '%s\\n' '{SIDE_QUESTION_REPLAY}'; "));
+        script.push_str(r#"printf '%s\n' '{"type":"result","subtype":"error_max_turns","usage":{"input_tokens":10,"output_tokens":2}}'; sleep 30"#);
+        let reply = ask_session_copy_of(
+            spawn_cold_fake(&script),
+            "q\n",
+            deadline_in(std::time::Duration::from_secs(5)),
+            TIMED_OUT,
+        )
+        .await
+        .unwrap();
+        assert!(reply.answer.is_err());
+        assert_eq!(reply.usage.unwrap().input_tokens, 10);
+        assert_eq!(reply.billing.provider_id(), expected);
+        if expected == "unknown" {
+            assert!(matches!(
+                reply.billing,
+                BillingAttribution::Unresolved { .. }
+            ));
+        }
+    }
 }
 
 /// A resumed session with a background task still running reports the task

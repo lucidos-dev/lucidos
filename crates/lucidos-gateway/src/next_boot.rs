@@ -69,13 +69,13 @@ pub fn take(app_data: &Path) -> Vec<String> {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => crate::log!("[Gateway] could not clear {}: {e}", path.display()),
+        Err(e) => crate::log_legacy!("[Gateway] could not clear {}: {e}", path.display()),
     }
     let raw = match raw {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
         Err(e) => {
-            crate::log!("[Gateway] could not read {}: {e}", path.display());
+            crate::log_legacy!("[Gateway] could not read {}: {e}", path.display());
             return Vec::new();
         }
     };
@@ -83,7 +83,7 @@ pub fn take(app_data: &Path) -> Vec<String> {
         Ok(record) if record.quit => Vec::new(),
         Ok(record) => record.restore,
         Err(e) => {
-            crate::log!("[Gateway] ignoring unreadable {}: {e}", path.display());
+            crate::log_legacy!("[Gateway] ignoring unreadable {}: {e}", path.display());
             Vec::new()
         }
     }

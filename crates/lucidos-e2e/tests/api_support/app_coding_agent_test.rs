@@ -7,8 +7,8 @@
 //! emits ChangeProposed → Apply) is covered by browser e2e.
 
 use crate::support::{
-    base_url, db_url, git, git_in, http_client, seed_app_cc_thread_summary, user_client,
-    workspace_path,
+    as_stamped_device, base_url, db_url, git, git_in, http_client, seed_app_cc_thread_summary,
+    user_client, workspace_path, E2E_DEVICE_ID,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -307,7 +307,11 @@ async fn app_coding_agent_lifecycle() {
     // be quiet: an unrelated test's uncommitted file makes the engine refuse
     // the merge outright. See `workspace_tree_lock`.
     let tree = crate::support::workspace_tree_lock().write().await;
-    let resp = client.post(&apply_url).send().await.expect("apply");
+    // Sign after waiting for the shared tree, rather than at client creation.
+    let resp = as_stamped_device(client.post(&apply_url), E2E_DEVICE_ID)
+        .send()
+        .await
+        .expect("apply");
     drop(tree);
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.expect("apply JSON");
@@ -427,8 +431,8 @@ async fn app_coding_agent_concurrent_apply() {
 
     // Fire concurrently. MERGE_MUTEX inside change_ops serialises the actual
     // ff-merge, but both requests are alive in the engine at the same time.
-    let req_a = client.post(&url_a).send();
-    let req_b = client.post(&url_b).send();
+    let req_a = as_stamped_device(client.post(&url_a), E2E_DEVICE_ID).send();
+    let req_b = as_stamped_device(client.post(&url_b), E2E_DEVICE_ID).send();
     let (resp_a, resp_b) = tokio::join!(req_a, req_b);
     let body_a: serde_json::Value = resp_a.expect("apply A").json().await.expect("JSON A");
     let body_b: serde_json::Value = resp_b.expect("apply B").json().await.expect("JSON B");

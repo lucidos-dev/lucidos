@@ -1,6 +1,6 @@
 /** The engine-log breadcrumb channel: a fire-and-forget POST that surfaces as a
  *  `[Client/<category>]` line in the engine's log. Under the gateway that log is
- *  `~/.lucidos/gateway/gateway.log`: see `docs/client-logs.md`.
+ *  `gateway.log` in the gateway data dir: see `docs/client-logs.md`.
  *
  *  Deliberately a LEAF module: basePath and restoreSourceGeneration have no
  *  runtime store dependencies. `postClientLog` used to live in utils/liveness,
@@ -18,14 +18,16 @@ import { sourceGeneration } from './restoreSourceGeneration';
  *  Never throws and never rejects — telemetry must not be able to break a caller
  *  or turn into an unhandled rejection. The engine caps `category`/`message` at
  *  256 chars and the serialized `data` at 4KB (see api/internal.rs) and answers
- *  400 over that; keep payloads small. */
+ *  400 over that; keep payloads small.
+ *  Category and code are candidates for sharing: the engine recognizes only its
+ *  fixed vocabulary. Unknown labels, message text and all data stay private. */
 export function postClientLog(category: string, message: string, data: Record<string, unknown>): void {
   try {
     const generation = sourceGeneration();
     fetch(`${API}/internal/client-log`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-lucidos-restore-generation': generation ?? 'none' },
-      body: JSON.stringify({ category, message, data }),
+      body: JSON.stringify({ category, code: message, message, data }),
       keepalive: true,
     }).catch(() => { /* fire-and-forget */ });
   } catch {

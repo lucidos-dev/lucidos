@@ -195,10 +195,6 @@ async fn answered_as_gateway(client: &reqwest::Client, scheme: &str, port: u16) 
     body.get("role").and_then(|v| v.as_str()) == Some(GATEWAY_ROLE)
 }
 
-/// How long a peer gateway may take to answer a handed-off OAuth callback,
-/// its own engine hop included.
-const HANDOFF_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Hand an OAuth callback to the peer gateway on `port`, as its status and page.
 ///
 /// `query` holds only the fields a browser's callback carries
@@ -215,7 +211,7 @@ pub async fn hand_off_oauth_callback(
     let url = format!("{scheme}://127.0.0.1:{port}{handoff}?{query}");
     let res = client
         .get(&url)
-        .timeout(HANDOFF_TIMEOUT)
+        .timeout(crate::oauth_callback::HANDOFF_TIMEOUT)
         .send()
         .await
         .ok()?;

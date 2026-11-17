@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-10-21
+- **Amended by**: [0715: Named update channels](0715-update-channels.md). It replaces the single address and the workspace-hosted candidate.
 
 ## Context
 

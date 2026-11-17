@@ -5,8 +5,9 @@
 //! command changed so the Undo is not a blind button.
 
 use super::*;
-use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
+use crate::api::thread_reach::refuse_without_authority;
 use crate::engine::command_permission::{command_checkpoint_origin, CommandCheckpointOrigin};
+use crate::engine::permission::Action;
 
 #[derive(Deserialize)]
 pub(super) struct CommandCheckpointUndoRequest {
@@ -37,7 +38,7 @@ pub(super) async fn undo_command_checkpoint(
     {
         Ok(()) => StatusCode::OK.into_response(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[CommandCheckpoint] undo failed for {}: {}",
                 body.checkpoint_id,
                 e
@@ -67,14 +68,9 @@ pub(in crate::api) async fn authorize_checkpoint_undo(
                 format!("[ERROR] no command checkpoint with id {checkpoint_id}"),
             )
         })?;
-    refuse_without_authority(
-        bus,
-        headers,
-        Some(origin.thread_id),
-        ThreadReachVerb::Revert,
-    )
-    .await
-    .map_err(|e| (e.status_code(), format!("[ERROR] {e}")))?;
+    refuse_without_authority(bus, headers, Some(origin.thread_id), Action::Revert)
+        .await
+        .map_err(|e| (e.status_code(), format!("[ERROR] {e}")))?;
     Ok(origin)
 }
 

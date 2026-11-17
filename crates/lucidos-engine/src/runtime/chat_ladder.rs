@@ -270,7 +270,7 @@ pub async fn upgrade_from_enabled(pool: &PgPool, event_bus: &EventBus, routes: &
     {
         Ok(enabled) => enabled,
         Err(e) => {
-            log!("[IntelligenceLadder] Reading the enabled models to upgrade failed: {e}");
+            log_legacy!("[IntelligenceLadder] Reading the enabled models to upgrade failed: {e}");
             return;
         }
     };
@@ -289,10 +289,10 @@ pub async fn upgrade_from_enabled(pool: &PgPool, event_bus: &EventBus, routes: &
             )
             .await
             {
-                log!("[IntelligenceLadder] Saving the upgraded chat ladder failed: {e}");
+                log_legacy!("[IntelligenceLadder] Saving the upgraded chat ladder failed: {e}");
                 return;
             }
-            log!(
+            log_legacy!(
                 "[IntelligenceLadder] The chat ladder now lists the {} models that were enabled",
                 enabled.len()
             );
@@ -302,7 +302,7 @@ pub async fn upgrade_from_enabled(pool: &PgPool, event_bus: &EventBus, routes: &
         .execute(pool)
         .await
     {
-        log!("[IntelligenceLadder] Clearing the chat ladder upgrade failed: {e}");
+        log_legacy!("[IntelligenceLadder] Clearing the chat ladder upgrade failed: {e}");
     }
 }
 

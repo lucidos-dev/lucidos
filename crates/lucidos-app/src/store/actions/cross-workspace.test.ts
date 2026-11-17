@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { WorkspaceInfo } from '../../api/client/apps';
 
 const mocks = vi.hoisted(() => ({
   fetchWorkspaces: vi.fn(),
@@ -83,12 +84,12 @@ const gwEntry = (
   ...overrides,
 });
 
-const wsInfo = (overrides: Partial<{ name: string; port: number | null; engine_running: boolean }>) => ({
+const wsInfo = (overrides: Partial<WorkspaceInfo>): WorkspaceInfo => ({
+  id: overrides.name ?? 'other-ws',
   name: 'other-ws',
   path: '/tmp/x',
-  port: 5175 as number | null,
-  engine_running: true,
-  engine_version: 'test',
+  port: 5175,
+  health: 'healthy',
   ...overrides,
 });
 
@@ -421,8 +422,18 @@ describe('openThreadInWorkspace — served directly on an engine port', () => {
     );
   });
 
+  it('matches a renamed workspace on its slug', async () => {
+    mocks.fetchWorkspaces.mockResolvedValue({
+      workspaces: [wsInfo({ id: 'other-ws', name: 'Other Work', port: 5175 })],
+    });
+
+    await openThreadInWorkspace('other-ws', TID);
+
+    expect(mocks.windowOpen).toHaveBeenCalledWith(`https://localhost:5175/#thread=${TID}`, 'lucidos-ws-other-ws');
+  });
+
   it('toasts when the workspace exists but the engine is not running', async () => {
-    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'other-ws', engine_running: false })] });
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'other-ws', health: 'unhealthy' })] });
 
     await openThreadInWorkspace('other-ws', TID);
 
@@ -742,7 +753,7 @@ describe('ensureCrossWorkspaceThreadTitle', () => {
     const t = '3c2419a1-aaaa-bbbb-cccc-ddddeeeeffff';
     mocks.workspaceId = null;
     stubLocation('https://localhost:5173');
-    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'stopped', engine_running: false })] });
+    mocks.fetchWorkspaces.mockResolvedValue({ workspaces: [wsInfo({ name: 'stopped', health: 'unhealthy' })] });
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
 

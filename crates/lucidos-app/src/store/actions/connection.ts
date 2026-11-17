@@ -1,8 +1,8 @@
-import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
+import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, agentSandboxUnavailable, agentSandboxTruncationUnguarded, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, threadListFetched, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import { checkHealth } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
 import type { ConnectionStatus } from '../types';
-import { connectThreadEvents, reviveThreadEvents } from './thread-sync';
+import { connectThreadEvents, reviveThreadEvents } from './thread-stream';
 import { repairGapState } from '../eventGap';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, retryStaleOpenThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
 import { refreshThreadList } from './thread-list-refresh';
@@ -14,11 +14,11 @@ import { resyncPluginCatalog } from './plugin-marketplaces';
 import { loadPreferences } from './preferences';
 import { loadReleaseNotices } from './releaseNotices';
 import { loadReaderDevices } from './reader-devices';
-import { loadPeople } from './people';
+import { loadUsers } from './users';
 import { reloadChangelogIfRead } from './whatsNew';
 import { releaseNoticeDismissed } from '../releaseNotices';
 import { flushUndeliveredComposeDrafts } from './compose';
-import { isNewerVersion } from '../../utils/version';
+import { isNewerBuildId } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { postClientLog } from '../../utils/clientLog';
@@ -235,9 +235,9 @@ function runResumeSync(): void {
   // a notice, never when a new one arrives. So an upgraded workspace showed
   // nothing until the reader opened the What's New page by hand.
   void loadReleaseNotices();
-  // No frame says the operators changed while the stream was down.
+  // No frame says the users changed while the stream was down.
   void loadReaderDevices();
-  void loadPeople();
+  void loadUsers();
   // The changelog the engine serves follows its release too, and What's New
   // opened during the restart holds a failed read.
   void reloadChangelogIfRead();
@@ -577,6 +577,8 @@ async function runConnectionCheck(): Promise<boolean> {
     // Only an explicit `false` flips to unconfigured; absent (older engine) or
     // true keeps the configured default so onboarding never shows spuriously.
     llmConfigured.value = health.llm_configured !== false;
+    agentSandboxUnavailable.value = health.agent_sandbox_unavailable ?? null;
+    agentSandboxTruncationUnguarded.value = health.agent_sandbox_truncation_unguarded === true;
     // Providers the engine actually has configured → filters the model picker.
     // `undefined` (older engine) keeps the current value; `null` means "don't
     // filter"; an array narrows to those backends. Reflects a runtime swap.
@@ -588,7 +590,7 @@ async function runConnectionCheck(): Promise<boolean> {
     }
     if (health.latest_engine_version) {
       latestEngineVersion.value = health.latest_engine_version;
-      if (health.engine_version && isNewerVersion(health.latest_engine_version, health.engine_version)) {
+      if (health.engine_version && isNewerBuildId(health.latest_engine_version, health.engine_version)) {
         restartRequired.value = true;
       }
     }
@@ -609,7 +611,7 @@ async function runConnectionCheck(): Promise<boolean> {
     if (health.latest_tauri_app_version && health.latest_tauri_app_version !== 'unknown') {
       latestTauriAppVersion.value = health.latest_tauri_app_version;
       const appVersion = window.__LUCIDOS_APP_VERSION__;
-      if (appVersion && isNewerVersion(health.latest_tauri_app_version, appVersion)) {
+      if (appVersion && isNewerBuildId(health.latest_tauri_app_version, appVersion)) {
         updateAvailable.value = true;
       }
     }

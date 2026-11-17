@@ -57,6 +57,44 @@ entry's removal condition should name them).
 
 ## 1. Temporary measures & workarounds
 
+### Legacy log lines during typed migration
+
+- **Added:** 2026-11-16
+- **Lives in:** The engine and gateway logging macros and call sites.
+  The shared diagnostic log renderer handles their untyped records (ADR 0717).
+- **Impermanent because:** Legacy sites lack compile-time value classification
+  while the typed `log!` migration proceeds. Maintainer bundles render them
+  as `<unstructured line>` so they cannot expose conversation text.
+- **Removal / resolution condition:** Migrate every engine and gateway site,
+  then delete `log_legacy!`. Verify no references remain with
+  `rg 'log_legacy!' crates/`, and run compile-fail and renderer marker tests.
+- **Status:** `open`; planned for migration, not yet installed.
+- **Investigation:** n/a; the diagnostic-bundle implementation tracks removal.
+
+### Diagnostic fault UI adoption
+
+- **Added:** 2026-11-16
+- **Lives in:** The `InternalFaultRecorded` and `DiagnosticBundleSent` rows in
+  `crates/lucidos-app/src/store/actions/sse-event-coverage.test.ts`.
+- **Impermanent because:** Phase 6 installs the persisted fault signal before
+  phase 10 installs the Debugging count and report UI. No current shell surface
+  holds either state.
+- **Removal / resolution condition:** In diagnostic-bundle phase 10, wire both
+  events to the Debugging view's refresh signal, including SSE gap recovery,
+  and remove both `NO_UI_STATE` rows. Verify the count changes on a fault and
+  resets only after a successful send, including reconnects.
+- **Status:** `active`.
+- **Investigation:** n/a; the approved diagnostic-bundle plan owns adoption.
+
+### Saved-draft approval availability
+
+- **Added:** 2026-11-11
+- **Lives in:** `api/thread_reach.rs::proposable` and `api/owner_approval.rs::checked_request`.
+- **Impermanent because:** The typed saved-draft service has no supported transport yet. An approval card would promise an unavailable action.
+- **Removal / resolution condition:** Wire the shared service to HTTP, tool and CLI surfaces under ADR 0651. Verify ordinary-send serialization and transport authorization before enabling approvals.
+- **Status:** `resolved` 2026-11-13. HTTP, the `threads` tool and the CLI now share `DraftSubmissionService::submit_as_agent`, and `submit-draft` cards are proposable.
+- **Investigation:** n/a
+
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 ### Undo key monitor for URL previews
@@ -406,7 +444,9 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Lives in:** `crates/lucidos-app/src/utils/pageHealthLog.ts` (the
   counters), `pageHealthLog.report.ts` (the reporter), their test, and
   `pageHealthLog.install.ts`. `main.tsx` imports the install file second, and
-  `shellStartup.ts` calls `startPageHealthLog`.
+  `shellStartup.ts` calls `startPageHealthLog`. Resource/crash diagnostics also
+  live in `utils/crashMonitor.ts`, `pageResources.ts`, `crashBreadcrumbs.ts`, `crashStorage.ts`
+  and their tests. `liveness.ts` calls `recoveredStartup`.
 - **Impermanent because:** pure telemetry chasing a bug. On the iOS PWA, text
   editing degrades over a long session: the edit menu (Paste) mostly stops
   opening and caret moves lag, in the composer and in Search Everywhere alike. A
@@ -416,13 +456,43 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   main-thread lag, frame rate, animation-frame calls, DOM size, animations,
   live listeners, intervals and observers. The lines land in
   `~/.lucidos/gateway/gateway.log`; `docs/client-logs.md` covers reading them.
-- **Removal / resolution condition:** the trend across a degraded session
+  The resource diagnostics investigate crash-reloads as well: bounded local
+  samples survive a kill and attach to likely-crash startup reports.
+  The heartbeat records the last hide without moving its last visible time.
+  Records hold the document start, omit zero sample fields, and retain the
+  latest hide state (hidden, pagehide, or persisted pagehide), with reads in flight.
+  Worker marks record ping, pong, restart, controller change, update call,
+  update found, and unregister. They add no ping or timer.
+  Thread-open uses two-second sampling for twenty seconds.
+  Wake uses 500 ms sampling for fifteen seconds while visible, then the existing cadence.
+  Coalesced transcript/resource-mount samples cover early crash-reloads.
+
+  Build stamps distinguish the writer from the reporting bundle.
+  Immediate wake, stream, admission, iframe-load and transcript marks identify resume work.
+  Samples add request count, oldest age and collection cost, without request paths.
+  Widget SDK frames report bounded media and image counts on resource changes.
+  The host sums mounted frames as `frameVideoLoaded`, `frameVideoPixels` and `frameImagePixels`.
+  `uniqueImagePixels` deduplicates host images by URL; `imagePixels` counts every draw.
+  Reports contain no resource paths. Removed frames stop contributing.
+  This also lives in SDK `widgetResources.ts`, host `utils/frameResources.ts`
+  and `store/actions/widget-frame-bridge.ts`.
+  Samples are evicted before events within the existing byte caps.
+  The latest wake, stream, admission, hide and worker marks survive mount churn.
+  A shared capture guard preserves the prior document before either startup path writes.
+- **Removal / resolution condition:** remove the death diagnostics when each
+  death class has a cause or a fix, checked with phone logs.
+  Verify through a per-workspace diagnostic audit.
+
+  Resolve both the editing degradation and crash-reload investigations before removing their shared reporter. For editing,
+  the trend across a degraded session
   names the cause and that cause is fixed, or two months pass with no episode.
   Verify by confirming no open work reads the line. Then delete both modules,
   the test, the install file, its import in `main.tsx`, and the call in
-  `shellStartup.ts`.
+  `shellStartup.ts`. Remove the resource/crash utilities and tests, and
+  unwrap `recoveredStartup` in `liveness.ts`, retaining its startup fields.
+  Verify removal from the tree and a per-workspace diagnostic audit.
 - **Status:** active
-- **Investigation:** none.
+- **Investigation:** iOS PWA crash-reloads and editing degradation.
 
 ### App frame load probe
 
@@ -1530,6 +1600,44 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** open
 - **Investigation:** `webkit-desktop-blank-thread`
 
+### The render probe's absent-target report
+
+- **Added:** 2026-11-15
+- **Lives in:** `reportAbsentThreadRender` in
+  `crates/lucidos-app/src/utils/threadRenderProbe.ts`, called by the settle
+  probe in `ThreadView.tsx` when the focused thread is not in the store.
+- **Impermanent because:** a cold notification open can sit on its skeleton
+  before its thread reaches the store, and the settle probe returned silently
+  then. One stuck open was attributed to restore admission's device storage
+  step and fixed. Another left no trace. This line names the admission phase
+  and the count and age of in-flight requests, so the next one says which owner
+  held it. It costs one line per such open on a WebKit client.
+- **Removal / resolution condition:** when `notification-cold-open-loading`
+  closes, delete `reportAbsentThreadRender` and its tests, and restore the
+  settle probe's silent return. Verify no open work reads a
+  `class=target-absent` line.
+- **Status:** open
+- **Investigation:** `notification-cold-open-loading`
+
+### Device storage release log
+
+- **Added:** 2026-11-15
+- **Lives in:** the `released_on_hide` log in `releaseDeviceDatabases`,
+  `crates/lucidos-app/src/store/deviceDatabase.ts`. The release itself is
+  permanent; only the log is temporary.
+- **Impermanent because:** the stall cause is not proven. On the iPhone the old
+  page often woke just before the notification's new page. A transaction it
+  left open would block the new page's device storage. Healthy taps show the
+  same wake, so it is a race. The line names what the hiding page still held,
+  so the next incident shows whether the old page was the holder.
+- **Removal / resolution condition:** the next iPhone stall incident has a
+  `[Client/device-database] released_on_hide` line from the old page, or shows
+  that none was written. Record the verdict under
+  `notification-cold-open-loading`, then delete the `postClientLog` call and
+  its test. Verify no open work reads the line.
+- **Status:** active
+- **Investigation:** `notification-cold-open-loading`
+
 ### Click-lag main-thread blocker probe
 
 - **Added:** 2026-06-24 (registered 2026-06-29 by the nightly harden sweep — the
@@ -2500,8 +2608,71 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   Postgres password file. Check by running `cat` on a key file from a chat
   `run_bash` with the rule disabled: the read must fail. Then decide whether the
   rule stays as an early, friendlier refusal, or goes along with its tests.
-- **Status:** active
+- **Status:** resolved 2026-11-11. Every agent-steered spawn runs in the OS
+  sandbox, which hides the private subtree and each older private entry
+  (ADR 0645). The rule stays, by decision 10: an early, clearer refusal, and
+  the only line when the owner opts out. `SECRET_PATHS` now names the subtree
+  plus the older names, from `lucidos_home::private`.
 - **Investigation:** n/a (see ADR 0516)
+
+### Live output timing log
+
+- **Added:** 2026-11-11
+- **Lives in:** `crates/lucidos-engine/src/voice/live_timing_log.rs`, and its
+  `timing` field and two call sites in `voice/live.rs` (`TurnState`,
+  `map_event`).
+- **Impermanent because:** it answers one question for the live voice call
+  review (`docs/plans/2026-11-11-live-voice-call-review.md`, F3). Do the
+  `gpt-live-1` worded output deltas carry `end_ms`? Do their arrival holes sit
+  over abutting timestamps? Does the talker's audio ever run dry?
+- **Removal / resolution condition:** one Live call on a build with this log
+  has its `[Voice] Timing:` lines read and recorded in the plan's F3 section.
+  Then F3 is built or dropped on that evidence, and the module, field and call
+  sites go.
+- **Status:** active
+- **Investigation:** none.
+
+### A sandboxed agent cannot list this machine's workspaces
+
+- **Added:** 2026-11-10
+- **Lives in:** the "Listing this machine's workspaces" section of
+  `system-knowhow/best-practices.md`, and `system-knowhow/scripts/list-workspaces.sh`.
+- **Impermanent because:** every listing route needs the machine-local token,
+  which the agent sandbox hides (ADR 0645). The helper and
+  `lucidos workspaces review` both fail there. The engine's
+  `GET /api/v1/workspaces` runs `scripts/status.sh`, which only a source
+  checkout has.
+- **Removal / resolution condition:** an engine route projects the gateway's
+  listing (names and health, nothing else) on every install shape, the way
+  `GET /api/v1/workspace-label` already reads it. Check from a sandboxed chat
+  `run_bash` on a packaged install: the documented call lists the workspaces.
+  Then point the knowhow at it and drop its sandbox note.
+- **Status:** resolved 2026-11-11. `GET /api/v1/workspaces` now projects the
+  gateway's listing over loopback, and `lucidos workspaces list` prints it.
+  The helper script is gone.
+- **Investigation:** n/a (see ADR 0645)
+
+### Local token proves nothing
+
+- **Added:** 2026-11-10
+- **Lives in:** `LOCAL_TOKEN_PROVES_OWNER` and `local_process_origin` in
+  `crates/lucidos-engine/src/api/local_auth.rs`. `api::actor` reads the token's
+  meaning only through `local_process_origin`.
+- **Impermanent because:** every subprocess Lucidos starts runs as the owner
+  with no OS sandbox, so any of them can read `~/.lucidos/local-token`. Until
+  that changes, the token lets a process reach the engine but proves no owner.
+  A caller holding only the token is an `UnattestedCaller`, and an owner-only
+  act it attempts is refused or asks the owner. This costs a hand-typed
+  `lucidos` command in a plain terminal one tap per owner-only act.
+- **Removal / resolution condition:** subprocesses run in a sandbox, or as a
+  separate OS user, that cannot read `~/.lucidos/local-token`. The sandbox
+  design lives in its own thread, "OS sandbox for agent subprocesses". Check by
+  running `cat ~/.lucidos/local-token` from a chat `run_bash`: the read must
+  fail. Then set the const to `true` and invert
+  `the_local_token_does_not_prove_the_owner_today`. Drop the plain-terminal
+  residual from the unattested-callers ADR.
+- **Status:** active
+- **Investigation:** n/a (see `docs/plans/2026-11-10-unattested-callers-and-gateway-stamps.md`)
 
 ## 2. Model-tolerance measures
 
@@ -3840,7 +4011,128 @@ event that retires it.
   rename, and the search found only this row. The alias and its sentence went,
   and `docs/generated/agent-surface.json` was regenerated without it.
 
+### Older homes keep their private entries in place
+
+- **Added:** 2026-11-10
+- **Lives in:** `lucidos_home::private::entry_in` and `legacy_entries`
+  (`crates/lucidos-home/src/private.rs`), `lucidos_private_entry_in` in
+  `scripts/lib/storage_root.sh`, and its byte-identical copy in
+  `scripts/lib/service.sh`.
+- **What it is:** a home an older release used keeps its secrets and control
+  files directly in `~/.lucidos`, and new binaries resolve each one there.
+  Only a fresh home uses `~/.lucidos/private` (ADR 0645). The agent sandbox
+  denies the old names one by one, from `legacy_entries`.
+- **Impermanent because:** a shipped binary opens the old paths and cannot be
+  patched. An engine re-adopted across an upgrade (ADR 0461), a CLI it
+  spawned, or a dev worktree built from an older branch all do. A move with
+  links broke them: the engine socket guard refuses a linked `run`, and the
+  `network.toml` writer renames a file over its link. So nothing moves until
+  no such binary can run.
+- **Removal / resolution condition:** two releases have shipped carrying
+  `entry_in`, so every binary a switch can re-adopt resolves both places. Then
+  add a move without links: each old entry renames into the subtree under its
+  lock, and `entry_in` finds it there by rule 2. Keep `legacy_entries` in the
+  sandbox's deny list until the move has run on the machine.
+- **Status:** active
+
+### Peer auth kept while adopted engines run
+
+- **Added:** 2026-11-10
+- **Lives in:** `SuperuserAuth::PeerForAdoptedEngines` and `pg_ident_conf` /
+  `os_user_name` in `crates/lucidos-gateway/src/postgres.rs`, chosen by
+  `GatewayState::superuser_auth` in `server.rs`.
+- **What it is:** the bundled cluster's superuser signs in by password
+  (ADR 0645). While another workspace runs an engine the gateway adopted, the
+  cluster keeps the previous release's peer rule for the superuser instead.
+- **Impermanent because:** an adopted engine got its database URL from an
+  older gateway image, which handed it no password. Dropping peer auth under
+  it would fail each new connection, and sqlx recycles its pool within about
+  30 minutes. The rule exists only for engines of a release before this one.
+- **Removal / resolution condition:** two releases have shipped carrying the
+  password. Then delete the variant, the ident helpers and
+  `superuser_auth`, and pass `Password` alone. An engine that outlived two
+  switches loses new connections once, until its next restart.
+- **Status:** removed (2026-11-16). ADR 0720 removes the peer variant, ident
+  helpers and adoption tracking because a later peer downgrade would expose the
+  superuser to already-running agents. Bundled authentication remains password-only;
+  older passwordless engines need the owner's Switch action for new connections.
+### Old relay user header
+
+- **Added:** 2026-11-11
+- **Lives in:** `LEGACY_HEADER_RELAY_OPERATOR`, its signature header and
+  `LEGACY_OPERATOR_BINDING` in `crates/lucidos-gateway/src/relay.rs`, read by
+  `signed_user` and sent by `signed_claim_headers`; the strip list
+  `RELAY_USER_HEADERS`.
+- **Impermanent because:** the user rename (ADR 0655) renamed the relay header
+  to `x-lucidos-relay-user`. A gateway older than that sends and reads only the
+  old pair, and two machines never update at once.
+- **Removal / resolution condition:** two releases have shipped since the
+  rename, so every supported gateway sends and reads the new pair. Then delete
+  the legacy constants, the second entry in `signed_user`, the legacy pair in
+  `signed_claim_headers`, and the tests
+  `an_older_a_with_the_operator_header_still_names_its_user` and
+  `a_new_a_also_signs_the_operator_header_for_an_older_b`.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### SDK threadPeople alias
+
+- **Added:** 2026-11-11
+- **Lives in:** `people` in `packages/lucidos-sdk/src/threadUsers.ts`, which also names
+  the caller `person`, and its entry in `packages/lucidos-sdk/src/threads.ts`.
+- **Impermanent because:** the user rename (ADR 0655) made
+  `lucidos.threads.users` the name. Apps users wrote call
+  `lucidos.threads.people`, and they are not ours to migrate.
+- **Removal / resolution condition:** two releases have shipped with the
+  deprecation in `system-knowhow/js-sdk.md`, and `rg -n 'threads\.people'`
+  over `system-knowhow/` and the shipped apps finds only the deprecation line. Then delete the
+  alias and its sentence in `system-knowhow/js-sdk.md`.
+- **Status:** `active`.
+- **Investigation:** none.
+
+### User rename wire aliases
+
+- **Added:** 2026-11-11
+- **Lives in:** the legacy user HTTP routes in gateway `users_api.rs`,
+  engine `api/users.rs` and `api/gateway_signals.rs`.
+  The gateway signal constant `ENGINE_USERS_CHANGED_PATH` lives in `users_api.rs`.
+  Snapshot fallback lives in `gateway_users.rs`; gateway device and pairing
+  adapters live in `auth_api.rs`.
+  Browser adapters live in `api/client/control.ts`, `api/client/gatewayUsersCompat.ts` and `api/client/pairing.ts`.
+- **Impermanent because:** gateways, engines and remote workspace frontends
+  update independently. The rename must preserve identity and pairing choices
+  while either endpoint speaks the preceding wire contract (ADR 0655).
+- **Removal / resolution condition:** two releases have shipped after the
+  rename, and every supported gateway and engine uses the new contract.
+  Switch `ENGINE_USERS_CHANGED_PATH` to `/api/v1/users/changed` before removing engine aliases.
+  Remove the legacy HTTP routes, snapshot and browser fallbacks, old response
+  fields and query names together with their compatibility tests.
+- **Status:** `active`.
+- **Investigation:** none.
+
 ---
+
+### `lucidos ask-owner-approval`, the retired spelling of `ask-permission`
+
+- **Added:** 2026-11-14
+- **Lives in:** the `alias` on `Command::AskPermission` in
+  `crates/lucidos-cli/src/main.rs` and its test
+  `the_retired_ask_spelling_still_parses_and_is_hidden`. Also the
+  `crates/lucidos-cli/src/main.rs` and `docs/generated/agent-surface.json`
+  rows of `docs/retired-term-exceptions.tsv`. Two sentences name the alias:
+  the end of § "`lucidos ask-permission`" in `system-knowhow/lucidos-cli.md`,
+  and the end of the retired term's entry in `docs/glossary.md`.
+- **What it is:** ADR 0688 renamed the command. A Claude Code or Codex session
+  resumed across the switch keeps the system prompt it started with, so it
+  still runs the old name. The hidden alias runs `ask-permission` for it.
+- **Impermanent because:** only a session started before the rename knows the
+  old name. No shipped prompt or help text teaches it. The two sentences above
+  only name it as retired.
+- **Removal condition:** the next tagged release after the one that ships ADR
+  0688. Then delete the alias, its test, both exceptions rows and the two
+  sentences. Run `./scripts/codegen.sh`, and confirm
+  `./scripts/check-retired-terms.sh` still passes.
+- **Status:** active.
 
 ## 4. Open investigations (parents)
 
@@ -3927,6 +4219,23 @@ measure now eligible for removal** — search this file for the id to find them 
 - **Status:** open
 - **Measures referencing this investigation:** The render probe's WebKit
   surface (§1).
+
+### `notification-cold-open-loading`: a notification opens on a skeleton
+
+- **Opened:** 2026-11-15
+- **Lives in:** n/a (investigation)
+- **Impermanent because:** an investigation closes once its question is
+  answered. An iOS PWA notification open can stay on the transcript skeleton
+  until the user reloads. One case was restore admission's device storage
+  step, fixed by retiring a stalled connection
+  (`docs/plans/2026-11-15-phone-notification-recovery-and-thread-cost.md`).
+  Another case left no admission or request trace.
+- **Removal / resolution condition:** every stuck open over a representative
+  iOS-PWA usage window is attributed by a `class=target-absent` line, and each
+  named owner is fixed. If none occurs on a build carrying the report, close it.
+- **Status:** open
+- **Measures referencing this investigation:** The render probe's absent-target
+  report (§1); Device storage release log (§1).
 
 ### `cc-reasoning-dormant` — CC coding-agent "Thinking" step shows nothing
 

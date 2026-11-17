@@ -296,10 +296,14 @@ pub(crate) async fn ask_for_buckets(
             Ok(judgment) => match judgment.answers.choice(WAKE_QUESTION_ID) {
                 Some(answer) => return Some((backend, answer.clone())),
                 None => {
-                    crate::log!("[TurnEnd] The {backend:?} expected wake decision gave no answer")
+                    crate::log_legacy!(
+                        "[TurnEnd] The {backend:?} expected wake decision gave no answer"
+                    )
                 }
             },
-            Err(e) => crate::log!("[TurnEnd] The {backend:?} expected wake decision failed: {e}"),
+            Err(e) => {
+                crate::log_legacy!("[TurnEnd] The {backend:?} expected wake decision failed: {e}")
+            }
         }
     }
     None
@@ -314,7 +318,7 @@ pub(crate) async fn decide_and_record(
     ask: impl std::future::Future<Output = Option<(DecisionBackend, ChoiceAnswer)>>,
 ) -> Option<ExpectedWake> {
     let Some((backend, answer)) = ask.await else {
-        crate::log!(
+        crate::log_legacy!(
             "[TurnEnd] No expected wake for thread {thread_id}: the decision failed, so the \
              bare reread cap applies"
         );
@@ -324,7 +328,9 @@ pub(crate) async fn decide_and_record(
     match record_expected_wake(bus, thread_id, wake.clone(), None).await {
         Ok(()) => Some(wake),
         Err(e) => {
-            crate::log!("[TurnEnd] Recording the expected wake for thread {thread_id} failed: {e}");
+            crate::log_legacy!(
+                "[TurnEnd] Recording the expected wake for thread {thread_id} failed: {e}"
+            );
             None
         }
     }
@@ -373,7 +379,7 @@ pub(crate) async fn stated_this_turn(
         }
     };
     read.unwrap_or_else(|e| {
-        crate::log!("[TurnEnd] Expected wakes of {thread_id} unreadable: {e}");
+        crate::log_legacy!("[TurnEnd] Expected wakes of {thread_id} unreadable: {e}");
         true
     })
 }
@@ -417,7 +423,7 @@ impl crate::engine::LucidosEngine {
     async fn decide_expected_wake(&self, thread_id: Uuid, pending: &PendingWake, reply: &str) {
         let call = self.aux_call(ContextPurpose::ExpectedWakeDecision).await;
         let system_one = self
-            .turn_end_system_one(JudgmentSite::ExpectedWakeDecision, call.attempt_timeout())
+            .judgment_system_one(JudgmentSite::ExpectedWakeDecision, call.attempt_timeout())
             .await;
         let chat = expected_wake_decision_chat_judge(
             call.provider(),

@@ -257,6 +257,11 @@ describe('the final score of a closed run', () => {
     expect(math.landed).toBe(2);
   });
 
+  it('scores a warm wake the last real request kept warm as pings spent for nothing', () => {
+    const math = keepAliveMath(closed({ ...ended, beats: 2, cost_usd: 0.12, saved_usd: 0, context_tokens: 118_000 }))!;
+    expect(math.score).toEqual({ keepWarm: 0.12, noKeepAlive: 0 });
+  });
+
   it('scores an ended run on a cold cache like a stopped one, with no row to mark', () => {
     const math = keepAliveMath(closed({ ...ended, beats: 1, cost_usd: 0.06, saved_usd: undefined, context_tokens: 118_000 } as CacheKeepAliveStatus))!;
     expect(math.score!.keepWarm).toBeCloseTo(0.06 + 0.7375);

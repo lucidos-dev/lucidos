@@ -26,7 +26,7 @@ vi.mock('../../../utils/platform', () => ({
 const popOutApp = vi.hoisted(() => vi.fn());
 vi.mock('../../../store/actions/apps', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../../store/actions/apps')>()),
-  getAppFrameSrc: () => '/dev/app/habit-tracker/',
+  appPopoutHref: () => '/dev/app/habit-tracker/',
   popOutApp,
 }));
 

@@ -1,4 +1,3 @@
-import { rungLockedReason } from './rungLockedReason';
 import { useEffect } from 'preact/hooks';
 import {
   chatLadder, chatModels, effectiveThreadStatus, showToast, threadMap,
@@ -7,6 +6,7 @@ import {
   getComposeSelectionOverride, resolveModel, resolveProvider, resolveReasoningEffort,
 } from '../../store/composeSelections';
 import {
+  chatTurnSelection,
   resolveActiveThreadModel,
   resolveActiveThreadProvider,
   resolveActiveThreadReasoningEffort,
@@ -17,8 +17,7 @@ import {
   PROVIDER_DEFAULT_EFFORT_LABEL, rememberProvider,
 } from '../../store/actions/models';
 import { accountChatEffort } from '../../store/actions/preferences';
-import { ApiError, fetchSwitchEstimate, recordChatSettings } from '../../api/client';
-import { TURN_RUNNING_REASON } from '@lucidos/engine-constants';
+import { fetchSwitchEstimate, recordChatSettings } from '../../api/client';
 import { useModelSelection, type ModelSelectionPatch } from '../../hooks/useModelSelection';
 import { decodePair, encodePair, pairLabelOf } from '../../store/modelSelection';
 import { displayModelName } from '../../store/thread-events/exchange';
@@ -44,17 +43,12 @@ export interface ChatRungStateProps {
   composeContext: boolean;
 }
 
-/** Whether the engine refused a pick because a turn runs. */
-function isTurnRunningRefusal(err: unknown): boolean {
-  return err instanceof ApiError && (err.body as { reason?: unknown } | undefined)?.reason === TURN_RUNNING_REASON;
-}
-
 /** What the rung control knows about the Lucidos Agent thread it belongs to:
  *  the chat ladder's rungs, the pair in force, and how a pick commits.
  *
  *  A draft's pick is the draft's own override (or the pending slot before a
  *  draft exists). A started thread's pick is recorded on the engine, and only
- *  between turns: while a turn runs the rung is locked (ADR 0544). Neither
+ *  for the next turn, including while a turn runs (ADR 0544). Neither
  *  reaches the account preference, so a pick never leaks to another draft or
  *  thread. */
 export function useChatRungState({ threadId, composeContext: perDraft }: ChatRungStateProps) {
@@ -69,18 +63,9 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     if (chatLadder.peek().status === 'failed') void loadChatLadder();
   }, []);
 
-  /** Why a started thread's rung cannot change now, read at call time. */
-  const lockedNow = (): string | null => {
-    if (perDraft || !threadId) return null;
-    const thread = threadMap.value.get(threadId);
-    return rungLockedReason(thread ? effectiveThreadStatus(thread) : null);
-  };
-  /** Says why when the rung is locked now, and reports whether it was. */
-  const refusedWhileLocked = (): boolean => {
-    const locked = lockedNow();
-    if (locked) showToast(locked, 'info');
-    return locked !== null;
-  };
+  const thread = threadId ? threadMap.value.get(threadId) : undefined;
+  const running = !perDraft && !!thread && ['running', 'waiting_for_user_answer', 'paused'].includes(effectiveThreadStatus(thread));
+  const turn = chatTurnSelection(threadId);
 
   const modelValue = perDraft ? resolveModel(threadId) : resolveActiveThreadModel(threadId);
   const effortValue = perDraft
@@ -153,6 +138,17 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     position: at === -1 ? null : { at: at + 1, of: onRungs.length },
     intelligence: at === -1 ? null : rungIntelligence(onRungs[at]),
   };
+  if (running && turn.live?.model) {
+    const live = turn.live;
+    const liveAt = onRungs.findIndex(r => encodePair(r.model, r.effort) === encodePair(live.model!, live.reasoning_effort || null));
+    face.name = labelOf(live.model!);
+    face.effort = live.reasoning_effort || null;
+    face.position = liveAt < 0 ? null : { at: liveAt + 1, of: onRungs.length };
+    face.intelligence = liveAt < 0 ? null : rungIntelligence(onRungs[liveAt]);
+  }
+  if (running && turn.pending) {
+    face.nextTurn = `${labelOf(turn.pending.model ?? modelValue)}${turn.pending.reasoning_effort ? ` · ${turn.pending.reasoning_effort}` : ''}${turn.pending.provider ? ` · ${turn.pending.provider}` : ''}`;
+  }
   // The face is whole once the ladder and the registry have each answered, or
   // failed: the registry relabels the model and adds its context-window twins.
   // Until then the pill stays unseen, so it draws once, whole.
@@ -219,13 +215,10 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     return choice === 'switch';
   }
 
-  /** Record a started thread's pick on the engine. A turn may start while the
-   *  user reads the switch dialog, so the lock is checked before and after it. */
+  /** Persist the next-turn selection, even if a turn starts during the dialog. */
   async function recordStartedPick(startedThreadId: string, encoded: string, provider: string | undefined) {
     const label = pairLabelOf(selection.rows, encoded, provider);
-    if (refusedWhileLocked()) return false;
     if (!await startedPickProceeds(startedThreadId, encoded, provider, label)) return false;
-    if (refusedWhileLocked()) return false;
     const pair = decodePair(encoded);
     try {
       await recordChatSettings(startedThreadId, {
@@ -234,8 +227,7 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
         provider,
       });
     } catch (err) {
-      if (isTurnRunningRefusal(err)) showToast(rungLockedReason('running')!, 'info');
-      else showToast(`Could not switch to ${label}: ${errorDetail(err)}`, 'error');
+      showToast(`Could not switch to ${label}: ${errorDetail(err)}`, 'error');
       return false;
     }
     if (provider) void rememberProvider(pair.model, provider);
@@ -246,7 +238,7 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
     const label = pairLabelOf(selection.rows, encoded, provider);
     if (perDraft || !threadId) selection.pick(encoded, provider);
     else if (!await recordStartedPick(threadId, encoded, provider)) return;
-    if (!quiet) showToast(`Model: ${label}`, 'success');
+    if (!quiet) showToast(`${running ? 'Next turn' : 'Model'}: ${label}`, 'success');
   }
 
   /** Commit a row: a rung, or the ladder link out to Settings > Intelligence. */
@@ -264,12 +256,11 @@ export function useChatRungState({ threadId, composeContext: perDraft }: ChatRun
   /** Move one row up (-1) or down (1) the rung list, saying nothing more: the
    *  label shows the new pair. */
   function step(direction: -1 | 1) {
-    if (refusedWhileLocked()) return;
     const target = direction === -1 ? steps.prev : steps.next;
     if (target === null) return;
     const commit = rungPick(target);
     void pick(commit.encoded, undefined, true);
   }
 
-  return { lockedReason: lockedNow(), shown, rungList, providerStep, pickRung, steps, step };
+  return { lockedReason: null, shown, rungList, providerStep, pickRung, steps, step };
 }

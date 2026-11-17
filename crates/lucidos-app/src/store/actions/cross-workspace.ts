@@ -1,3 +1,4 @@
+import { retryTransportRead } from '../../../../../packages/lucidos-sdk/src/_transport';
 import { signal } from '@preact/signals';
 import { showToast, workspaceName } from '../store';
 import { fetchWorkspaces } from '../../api/client';
@@ -27,11 +28,9 @@ import {
   type LinkedWorkspace,
 } from '../../utils/threadLinkWorkspace';
 
-/** Hash-channel deep link to a thread. Hash (not `?thread=`) is deliberate:
- *  `startClient` strips `?thread=` unconditionally to defuse stale SW deep-
- *  links, so the query channel can't be repurposed for user-initiated
- *  cross-workspace navigation. */
-export const THREAD_HASH_RE = /^#thread=([0-9a-f-]+)$/;
+import { THREAD_HASH_RE } from './threadHash';
+export { THREAD_HASH_RE } from './threadHash';
+
 
 /** Where a peer workspace is reachable, and what to name the tab that shows it.
  *
@@ -145,8 +144,10 @@ async function resolveWorkspaceBaseUrl(
     return reachOnThisGateway(entry.id);
   }
   const { workspaces } = await fetchWorkspaces();
-  const entry = workspaces.find(w => w.name === workspace);
-  if (!entry || !entry.engine_running || entry.port == null) return null;
+  const entry =
+    workspaces.find(w => w.name === workspace) ??
+    workspaces.find(w => w.id === slugifyWorkspaceName(workspace));
+  if (!entry || entry.health !== 'healthy') return null;
   return {
     base: `${location.protocol}//${location.hostname}:${entry.port}`,
     tabKey: workspace,
@@ -395,7 +396,7 @@ export async function ensureCrossWorkspaceThreadTitle(
       lazyStart: false,
     });
     if (!reach) return;
-    const res = await fetch(`${reach.base}/api/v1/threads/${threadId}`);
+    const res = await retryTransportRead(() => fetch(`${reach.base}/api/v1/threads/${threadId}`));
     if (!res.ok) return;
     const summary = (await res.json()) as { title?: string };
     const title = summary.title?.trim();

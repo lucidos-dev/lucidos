@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::oneshot;
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use super::integration::{
     closed_lanes_opened_here, create_lane_branch, ensure_lane_worktree, land_integration,
     lane_worktrees, main_before_last_move, retire_lane_worktree, verify_integration,
-    IntegrationLanding, LaneWorktree,
+    IntegrationCertification, IntegrationLanding, LaneWorktree,
 };
 use super::landing::{
     find_landing_merge, publish_clean_pass, CleanPass, LandingInput, LandingMerge, LandingStep,
@@ -30,7 +31,7 @@ use super::lane_thread::{
 use super::recovery::{batch_recovery, BatchRecovery, LaneRecord, LaneRestore};
 use super::snapshot::LaneSnapshot;
 use super::state::{Lane, LaneRemoval, Place, ResolvingBatch};
-use super::LaneMember;
+use super::{LaneHoldRelease, LaneMember};
 use crate::core::changes::{Change, ChangeStatus};
 use crate::engine::agent_session::spawn_claim::SpawnClaim;
 use crate::engine::agent_session::{build_lane_catch_up_prompt, build_lane_thread_prompt};
@@ -113,7 +114,13 @@ pub(crate) enum LaneMsg {
     /// Recovery rebuilt the lane from events. The driver handles nothing
     /// before it (`UntilRestored`).
     Restored(Box<LaneRestore>),
+    /// The hold on clean arrivals for this batch reached its cap.
+    HoldCapReached(Uuid),
 }
+
+/// How long the lane holds clean arrivals for one batch that hardens again
+/// after a catch-up (ADR 0694).
+const ARRIVAL_HOLD_CAP: Duration = Duration::from_secs(15 * 60);
 
 const QUEUED_BEHIND_BATCH: &str = "Queued in the landing lane. It would not merge cleanly onto \
      main while a batch resolves, so it resolves in the next batch.";
@@ -121,6 +128,8 @@ const GATHERING_FOR_PRESS: &str = "Queued in the landing lane. It would not merg
      main, so it resolves in one batch with the rest of the Apply All.";
 const RESOLVING_IN_BATCH: &str = "It would not merge cleanly onto main, so it resolves in a \
      lane batch. It lands when the batch does.";
+const HELD_FOR_BATCH: &str = "Queued in the landing lane. A lane batch is hardening again \
+     after catching up with main, so it lands after that batch, in arrival order.";
 const WAITING_FOR_ORIGIN: &str = "Queued in the landing lane. origin did not take the push, so \
      it lands on the lane's next try.";
 const LANDING_FAILED: &str = "The landing lane could not land this change";
@@ -164,6 +173,9 @@ struct Driver {
     /// Waiting members a pass returned because `origin` refused it. They pass
     /// again when `origin` answers, even while a batch holds the queue.
     origin_waiters: HashSet<Uuid>,
+    /// Members the hold cap released while their apply claim was busy. They
+    /// pass once the claim frees, even while a batch holds the queue.
+    cap_owed: HashSet<Uuid>,
     /// Every message waits here until recovery restored the lane.
     until_restored: UntilRestored<LaneMsg>,
 }
@@ -173,7 +185,9 @@ impl LucidosEngine {
     /// already written let recovery rebuild the lane at the next start.
     pub(crate) fn notify_landing_lane(&self, msg: LaneMsg) {
         if self.landing_lane_tx.send(msg).is_err() {
-            log!("[LandingLane] driver gone, dropping a message; recovery rebuilds the lane");
+            log_legacy!(
+                "[LandingLane] driver gone, dropping a message; recovery rebuilds the lane"
+            );
         }
     }
 
@@ -289,7 +303,7 @@ impl LucidosEngine {
     pub fn start_landing_lane_driver(self: &Arc<Self>) {
         let rx = crate::engine::LANDING_LANE_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            log!("[LandingLane] driver receiver missing, lane not started");
+            log_legacy!("[LandingLane] driver receiver missing, lane not started");
             return;
         };
         let mut driver = Driver {
@@ -303,6 +317,7 @@ impl LucidosEngine {
             waiting_for_origin: None,
             batch_waiting_for_origin: None,
             origin_waiters: HashSet::new(),
+            cap_owed: HashSet::new(),
             until_restored: UntilRestored::default(),
         };
         // Weak: the claims live on the engine, so a strong handle would cycle.
@@ -319,7 +334,7 @@ impl LucidosEngine {
                     driver.handle(msg).await;
                 }
             }
-            log!("[LandingLane] driver exiting, channel closed");
+            log_legacy!("[LandingLane] driver exiting, channel closed");
         });
         self.start_lane_thread_closure_feed();
     }
@@ -355,14 +370,14 @@ impl LucidosEngine {
         let restore = match self.read_lane_restore().await {
             Ok(restore) => restore,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[LandingLane] recovery could not read the lane: {}; it starts empty",
                     e
                 );
                 LaneRestore::default()
             }
         };
-        log!(
+        log_legacy!(
             "[LandingLane] recovered {} waiting change(s), batch open: {}",
             restore.lane.waiting().len(),
             restore.lane.resolving().is_some()
@@ -420,7 +435,14 @@ impl Driver {
                 self.withdraw(change_id, reason, None).await;
             }
             LaneMsg::ClaimReleased(change_id) => {
-                log!("[LandingLane] {} is free to claim again", change_id);
+                log_legacy!("[LandingLane] {} is free to claim again", change_id);
+                if self.cap_owed.remove(&change_id) && self.lane.queue_held() {
+                    let taken = self.lane.take_members(&HashSet::from([change_id]));
+                    let members = self.claim_members(taken, None).await;
+                    self.note_cap_owed(&members, [change_id]);
+                    self.run_pass(members).await;
+                    self.announce().await;
+                }
                 self.run_waiting().await;
             }
             LaneMsg::OriginAnswered => self.retry_origin().await,
@@ -448,11 +470,12 @@ impl Driver {
             }
             LaneMsg::PressSubmitted(press_id) => {
                 if self.lane.submit_press(press_id) {
-                    log!("[LandingLane] press {} is in, the queue passes", press_id);
+                    log_legacy!("[LandingLane] press {} is in, the queue passes", press_id);
                     self.run_waiting().await;
                 }
             }
             LaneMsg::Restored(restore) => self.restore(*restore).await,
+            LaneMsg::HoldCapReached(batch_id) => self.hold_cap_reached(batch_id).await,
         }
         self.publish();
     }
@@ -494,6 +517,9 @@ impl Driver {
                     });
                 }
                 Ok(queued(change_id, thread, RESOLVING_IN_BATCH))
+            }
+            Place::Waiting if self.lane.is_held(change_id) => {
+                Ok(queued(change_id, sub.change_thread(), HELD_FOR_BATCH))
             }
             Place::Waiting if self.lane.queue_held() => {
                 Ok(queued(change_id, sub.change_thread(), self.why_waiting()))
@@ -540,6 +566,12 @@ impl Driver {
                 "[LandingLane] ChangeQueued",
             )
             .await;
+        if self.lane.arrival_hold().is_some() {
+            self.lane.hold(member);
+            self.actors.insert(change_id, sub.actor);
+            self.announce().await;
+            return Ok(queued(change_id, thread, HELD_FOR_BATCH));
+        }
         // Every arrival tries `main` first, whatever batch resolves: the
         // merge decides, not the files it touches (ADR 0480).
         let mut members = self.claim_waiting(None).await;
@@ -627,7 +659,7 @@ impl Driver {
                     self.leave_resolved(member, change).await;
                 }
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[LandingLane] could not read {}: {}; the next lane message tries again",
                         member.change_id,
                         e
@@ -647,7 +679,7 @@ impl Driver {
         let Some(reason) = unqueue_reason_for(change.as_ref().map(Change::status)) else {
             return;
         };
-        log!(
+        log_legacy!(
             "[LandingLane] {} is no longer pending, leaving the lane",
             member.change_id
         );
@@ -670,7 +702,7 @@ impl Driver {
     /// Record why `origin` could not take a landing. The next lane message
     /// tries again.
     fn wait_for_origin(&mut self, why: String) {
-        log!("[LandingLane] waiting for origin: {}", why);
+        log_legacy!("[LandingLane] waiting for origin: {}", why);
         self.waiting_for_origin = Some(why);
     }
 
@@ -680,8 +712,11 @@ impl Driver {
         if self.waiting_for_origin.is_none() {
             return;
         }
-        log!("[LandingLane] origin answered, trying the landing again");
+        log_legacy!("[LandingLane] origin answered, trying the landing again");
         self.land_batch_waiting_for_origin();
+        if self.lane.arrival_hold().is_some() {
+            return;
+        }
         let waiters = std::mem::take(&mut self.origin_waiters);
         let taken = if self.lane.queue_held() {
             self.lane.take_members(&waiters)
@@ -754,18 +789,20 @@ impl Driver {
                 continue;
             };
             let outcome = PassOutcome::of(step, publication.failed.as_deref());
-            if let Some(landed) = outcome.settles_source() {
-                settle.push(m.settle(landed));
-            }
+            let source_settle = outcome.settles_source().map(|landed| m.settle(landed));
             let answer = match outcome {
-                PassOutcome::Lands(merge) => Ok(self.announce_landing(m, Some(merge)).await),
-                PassOutcome::AlreadyOnMain => Ok(self.announce_landing(m, None).await),
+                PassOutcome::Lands(merge) => self.announce_landing(m, Some(merge)).await,
+                PassOutcome::AlreadyOnMain => self.announce_landing(m, None).await,
                 PassOutcome::Fails(e) => Err(self.fail_member(m, e).await),
                 PassOutcome::SetAside => {
                     set_aside.push(m);
                     continue;
                 }
             };
+            if let Some(mut source) = source_settle {
+                source.landed &= answer.is_ok();
+                settle.push(source);
+            }
             answers.insert(*change_id, answer);
         }
         self.take_in_set_aside(set_aside, publication.main_now(), &mut answers)
@@ -798,7 +835,7 @@ impl Driver {
             }
             return;
         };
-        log!(
+        log_legacy!(
             "[LandingLane] batch {} opened with {} member(s), lane thread {}",
             batch.batch_id,
             set_aside.len(),
@@ -819,7 +856,7 @@ impl Driver {
         let branch = lane_branch(batch.batch_id);
         if let Err(e) = create_lane_branch(&self.repo_root, &branch, &batch.base_sha).await {
             // Opening the lane thread tries again.
-            log!("[LandingLane] could not create {} yet: {}", branch, e);
+            log_legacy!("[LandingLane] could not create {} yet: {}", branch, e);
         }
         for m in set_aside {
             let id = m.member.change_id;
@@ -867,7 +904,7 @@ impl Driver {
                 )
                 .await
             {
-                log!("[LandingLane] plan marker for {}: {}", lane.branch, e);
+                log_legacy!("[LandingLane] plan marker for {}: {}", lane.branch, e);
             }
             let briefs: Vec<_> = briefs.iter().map(OwnedBrief::as_brief).collect();
             let prompt = build_lane_thread_prompt(&briefs);
@@ -888,15 +925,21 @@ impl Driver {
                 self.land_when_free(batch_id, thread_id);
             }
             LaneThreadEnd::Stopped => {
-                log!(
+                log_legacy!(
                     "[LandingLane] lane thread {} stopped; batch {} waits for its next turn",
                     thread_id,
                     batch_id
                 );
+                if self
+                    .batch_waiting_for_origin
+                    .is_some_and(|(id, _)| id == batch_id)
+                {
+                    self.batch_waiting_for_origin = None;
+                }
                 if self.landing == Some(batch_id) {
                     self.landing = None;
-                    self.announce().await;
                 }
+                self.announce().await;
             }
             LaneThreadEnd::Failed(reason) => self.fail_batch(batch_id, reason, None, None).await,
         }
@@ -912,12 +955,12 @@ impl Driver {
                     batch_id,
                     hold: Box::new(hold),
                 }),
-                Ok(None) => log!(
+                Ok(None) => log_legacy!(
                     "[LandingLane] a new run holds lane thread {}; its end lands batch {}",
                     thread_id,
                     batch_id
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[LandingLane] could not hold lane thread {}: {}",
                     thread_id,
                     e
@@ -930,6 +973,9 @@ impl Driver {
     /// branch, catch it up with `main`, and move `main`. A catch-up conflict
     /// goes back to the same lane thread as a follow-up turn.
     async fn land_batch(&mut self, batch_id: Uuid, hold: SpawnClaim) {
+        if self.landing != Some(batch_id) {
+            return;
+        }
         let Some(batch) = self.lane.resolving_batch(batch_id).cloned() else {
             return;
         };
@@ -948,7 +994,38 @@ impl Driver {
             }
         };
         let order = crate::landing_gateway::landing_order().await;
-        match land_integration(&MAIN_LOCKS, &self.repo_root, &order, &lane.path).await {
+        let certification =
+            IntegrationCertification::load(self.engine.pool(), &self.repo_root, &lane.branch).await;
+        match land_integration(
+            &MAIN_LOCKS,
+            &self.repo_root,
+            &order,
+            &lane.path,
+            &certification,
+        )
+        .await
+        {
+            Ok(IntegrationLanding::NeedsHardening { caught_up }) => {
+                drop(hold);
+                self.landing = None;
+                self.batch_waiting_for_origin = None;
+                self.announce().await;
+                if caught_up {
+                    self.hold_arrivals(batch_id).await;
+                    spawn_lane_turn(
+                        &self.engine, batch_id, batch.lane_thread_id,
+                        "Main advanced and merged cleanly into this integration branch. Run /harden on the updated head before finishing this landing.".into(),
+                        None,
+                    );
+                } else if let Err(e) = self.engine.create_notification(
+                    "Landing awaits hardening",
+                    "The integration head has no current full hardening. Continue the landing thread and run /harden before finishing.",
+                    None, Some(batch.lane_thread_id), None,
+                    crate::scheduler::notifications::Tap::Modal, None,
+                ).await {
+                    log_legacy!("[LandingLane] could not announce missing hardening: {}", e);
+                }
+            }
             Ok(IntegrationLanding::Landed { pre, post }) => {
                 if pre != post {
                     self.push_after(&order);
@@ -956,7 +1033,7 @@ impl Driver {
                 let mut landed = Vec::new();
                 for (change_id, merge) in merges {
                     if let Some(m) = self.held.remove(&change_id) {
-                        landed.push(self.land_member(m, &merge).await);
+                        landed.extend(self.land_member(m, &merge).await);
                     }
                 }
                 self.waiting_for_origin = None;
@@ -971,7 +1048,7 @@ impl Driver {
                 self.announce().await;
             }
             Ok(IntegrationLanding::CatchUpConflict { main_sha, commits }) => {
-                log!(
+                log_legacy!(
                     "[LandingLane] main moved under batch {} and conflicts with it; back to its lane thread",
                     batch_id
                 );
@@ -1022,11 +1099,23 @@ impl Driver {
 
     /// Announce one member's landing merge under its claim, and count it
     /// landed. Returns what settling its source thread needs.
-    async fn land_member(&mut self, m: PassMember, merge: &LandingMerge) -> (Change, String) {
+    async fn land_member(
+        &mut self,
+        m: PassMember,
+        merge: &LandingMerge,
+    ) -> Option<(Change, String)> {
         let settle = (m.change.clone(), m.member.snapshot_sha.clone());
-        self.lane.landed(m.member.change_id);
-        self.announce_landing(m, Some(merge)).await;
-        settle
+        let change_id = m.member.change_id;
+        if let Err(error) = self.announce_landing(m, Some(merge)).await {
+            log_legacy!(
+                "[LandingLane] Could not record merged change {}: {}",
+                change_id,
+                error
+            );
+            return None;
+        }
+        self.lane.landed(change_id);
+        Some(settle)
     }
 
     /// Close a batch whose members all landed: announce it, release the
@@ -1039,8 +1128,10 @@ impl Driver {
         hold: Option<SpawnClaim>,
         landed: Vec<(Change, String)>,
     ) {
-        log!("[LandingLane] batch {} landed", batch.batch_id);
+        log_legacy!("[LandingLane] batch {} landed", batch.batch_id);
         self.landing = None;
+        self.release_arrivals(batch.batch_id, LaneHoldRelease::BatchLanded)
+            .await;
         self.engine
             .event_bus
             .emit_or_log(
@@ -1071,11 +1162,16 @@ impl Driver {
         actor: Option<MessageOrigin>,
         hold: Option<SpawnClaim>,
     ) {
+        if self.lane.resolving_batch(batch_id).is_none() {
+            return;
+        }
+        self.release_arrivals(batch_id, LaneHoldRelease::BatchFailed)
+            .await;
         let Some(batch) = self.lane.end_batch(batch_id) else {
             return;
         };
         self.landing = None;
-        log!("[LandingLane] batch {} failed: {}", batch_id, reason);
+        log_legacy!("[LandingLane] batch {} failed: {}", batch_id, reason);
         self.engine
             .event_bus
             .emit_or_log(
@@ -1107,7 +1203,7 @@ impl Driver {
             None => match self.engine.changes().get_by_id(change_id).await {
                 Ok(change) => change,
                 Err(e) => {
-                    log!("[LandingLane] could not read {}: {}", change_id, e);
+                    log_legacy!("[LandingLane] could not read {}: {}", change_id, e);
                     None
                 }
             },
@@ -1117,7 +1213,7 @@ impl Driver {
             None => match super::queued_thread(self.engine.pool(), change_id).await {
                 Ok(thread) => thread,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[LandingLane] could not find where {} queued: {}",
                         change_id,
                         e
@@ -1131,7 +1227,7 @@ impl Driver {
                 self.emit_unqueued(thread, change_id, UnqueueReason::BatchFailed, None)
                     .await;
             }
-            None => log!(
+            None => log_legacy!(
                 "[LandingLane] {} left the lane unannounced; the next start unqueues it",
                 change_id
             ),
@@ -1161,7 +1257,7 @@ impl Driver {
                     .hold_thread_for_worktree_reset(thread_id)
                     .await
                     .unwrap_or_else(|e| {
-                        log!(
+                        log_legacy!(
                             "[LandingLane] could not hold lane thread {}: {}",
                             thread_id,
                             e
@@ -1170,7 +1266,7 @@ impl Driver {
                     }),
             };
             let Some(hold) = hold else {
-                log!(
+                log_legacy!(
                     "[LandingLane] a run holds lane thread {}; its end removes {}",
                     thread_id,
                     lane.branch
@@ -1215,7 +1311,7 @@ impl Driver {
                 )
                 .await
             {
-                log!(
+                log_legacy!(
                     "[LandingLane] stopping lane thread {}: {}",
                     batch.lane_thread_id,
                     e
@@ -1226,7 +1322,11 @@ impl Driver {
 
     /// Announce a landed member under its claim. `None` means its snapshot
     /// was already on `main`, so nothing merged.
-    async fn announce_landing(&self, m: PassMember, merge: Option<&LandingMerge>) -> ApplyResult {
+    async fn announce_landing(
+        &self,
+        m: PassMember,
+        merge: Option<&LandingMerge>,
+    ) -> Result<ApplyResult, String> {
         let engine = &self.engine;
         let change = &m.change;
         let thread = m.thread();
@@ -1242,13 +1342,13 @@ impl Driver {
                     m.actor,
                     None,
                 )
-                .await;
-            return ApplyResult::noop(
+                .await?;
+            return Ok(ApplyResult::noop(
                 change.id,
                 change.thread_id,
                 change.files.len(),
                 "Change already present on main, marked applied.",
-            );
+            ));
         };
         let commits =
             commits_in_range(&self.repo_root, &merge.first_parent, &merge.merge_sha).await;
@@ -1266,7 +1366,7 @@ impl Driver {
                     &merge.merge_sha,
                 )),
             )
-            .await;
+            .await?;
         engine
             .emit_entity_events_for_change_apply(
                 &change.files,
@@ -1276,7 +1376,7 @@ impl Driver {
                 change.thread_id,
             )
             .await;
-        ApplyResult::applied_with_merge(
+        Ok(ApplyResult::applied_with_merge(
             change.id,
             change.thread_id,
             change.requires_restart,
@@ -1284,14 +1384,14 @@ impl Driver {
             merge.merge_sha.clone(),
             &commits,
             change.files.len(),
-        )
+        ))
     }
 
     /// The lane could not land a member: it leaves the lane, still pending,
     /// and the failure is announced. Returns the message for the caller.
     async fn fail_member(&self, m: PassMember, error: &str) -> String {
         let message = format!("{LANDING_FAILED}: {error}. It is still pending; apply it again.");
-        log!("[LandingLane] {}: {}", m.member.change_id, message);
+        log_legacy!("[LandingLane] {}: {}", m.member.change_id, message);
         self.emit_unqueued(
             m.thread(),
             m.member.change_id,
@@ -1328,11 +1428,100 @@ impl Driver {
             .await;
     }
 
+    /// Hold clean arrivals while batch `batch_id` hardens again after its
+    /// catch-up, so no landing moves `main` under it before it lands. A hold
+    /// already open keeps its arrivals and its cap.
+    async fn hold_arrivals(&mut self, batch_id: Uuid) {
+        if !self.lane.hold_arrivals(batch_id) {
+            return;
+        }
+        log_legacy!(
+            "[LandingLane] batch {} hardens again; clean arrivals wait for it",
+            batch_id
+        );
+        self.engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::LaneArrivalsHeld { batch_id }),
+                "[LandingLane] LaneArrivalsHeld",
+            )
+            .await;
+        self.arm_hold_cap(batch_id, ARRIVAL_HOLD_CAP);
+        self.announce().await;
+    }
+
+    fn arm_hold_cap(&self, batch_id: Uuid, after: Duration) {
+        let engine = self.engine.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(after).await;
+            engine.notify_landing_lane(LaneMsg::HoldCapReached(batch_id));
+        });
+    }
+
+    /// End the hold for `batch_id`, if one is open, and announce it. Returns
+    /// the arrivals it held, in arrival order. They still wait in the queue.
+    async fn release_arrivals(&mut self, batch_id: Uuid, cause: LaneHoldRelease) -> Vec<Uuid> {
+        let Some(arrivals) = self.lane.release_arrivals(batch_id) else {
+            return Vec::new();
+        };
+        log_legacy!(
+            "[LandingLane] batch {} releases {} held arrival(s): {:?}",
+            batch_id,
+            arrivals.len(),
+            cause
+        );
+        self.engine
+            .event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::LaneArrivalsReleased {
+                    batch_id,
+                    cause,
+                    arrivals: arrivals.clone(),
+                }),
+                "[LandingLane] LaneArrivalsReleased",
+            )
+            .await;
+        arrivals
+    }
+
+    /// The cap passed with the batch still open: the held arrivals, and the
+    /// members `origin` refused meanwhile, pass in queue order. What waited
+    /// behind the batch before the hold keeps waiting for it.
+    async fn hold_cap_reached(&mut self, batch_id: Uuid) {
+        let mut passing: HashSet<Uuid> = self
+            .release_arrivals(batch_id, LaneHoldRelease::CapReached)
+            .await
+            .into_iter()
+            .collect();
+        if passing.is_empty() {
+            self.announce().await;
+            return;
+        }
+        passing.extend(std::mem::take(&mut self.origin_waiters));
+        let taken = self.lane.take_members(&passing);
+        let members = self.claim_members(taken, None).await;
+        self.note_cap_owed(&members, passing);
+        self.run_pass(members).await;
+        self.announce().await;
+    }
+
+    /// Remember each id `claim_members` sent back to waiting because its
+    /// claim was busy, so [`LaneMsg::ClaimReleased`] passes it.
+    fn note_cap_owed(&mut self, members: &[PassMember], ids: impl IntoIterator<Item = Uuid>) {
+        let waiting: HashSet<Uuid> = self.lane.waiting().iter().map(|m| m.change_id).collect();
+        let claimed: HashSet<Uuid> = members.iter().map(|m| m.member.change_id).collect();
+        self.cap_owed.extend(
+            ids.into_iter()
+                .filter(|id| !claimed.contains(id) && waiting.contains(id)),
+        );
+    }
+
     /// Start the next pass once the queue is free.
     async fn run_waiting(&mut self) {
         if self.lane.queue_held() || self.lane.waiting().is_empty() {
             return;
         }
+        self.cap_owed.clear();
         let members = self.claim_waiting(None).await;
         self.run_pass(members).await;
     }
@@ -1405,6 +1594,10 @@ impl Driver {
         if let Some(batch) = self.lane.resolving().cloned() {
             self.restore_batch(batch).await;
         }
+        if let Some(hold) = self.lane.arrival_hold() {
+            let held_for = Duration::from_secs(restore.hold_age_secs.unwrap_or(0));
+            self.arm_hold_cap(hold.batch_id, ARRIVAL_HOLD_CAP.saturating_sub(held_for));
+        }
         self.run_waiting().await;
     }
 
@@ -1420,7 +1613,7 @@ impl Driver {
                     retire_lane_worktree(self.engine.pool(), &self.repo_root, lane).await;
                 }
             }
-            Err(e) => log!("[LandingLane] could not list lane branches: {}", e),
+            Err(e) => log_legacy!("[LandingLane] could not list lane branches: {}", e),
         }
     }
 
@@ -1435,7 +1628,7 @@ impl Driver {
         let held = self.lane.held_of(change_ids);
         for &change_id in &held.waiting {
             if let Err(e) = self.remove(change_id, actor.clone()).await {
-                log!(
+                log_legacy!(
                     "[LandingLane] {} did not leave the lane: {:?}",
                     change_id,
                     e
@@ -1444,7 +1637,7 @@ impl Driver {
         }
         if let Some(batch_id) = held.batch {
             if let Err(e) = self.cancel(batch_id, actor).await {
-                log!("[LandingLane] batch {} not canceled: {}", batch_id, e);
+                log_legacy!("[LandingLane] batch {} not canceled: {}", batch_id, e);
             }
         }
         held.members()
@@ -1480,7 +1673,7 @@ impl Driver {
                     self.landing = Some(batch_id);
                     self.land_when_free(batch_id, batch.lane_thread_id);
                 }
-                BatchRecovery::AwaitLaneThread => log!(
+                BatchRecovery::AwaitLaneThread => log_legacy!(
                     "[LandingLane] batch {} waits for lane thread {}",
                     batch_id,
                     batch.lane_thread_id
@@ -1490,7 +1683,7 @@ impl Driver {
                         .await;
                 }
             },
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[LandingLane] could not read lane thread {}: {}; batch {} stays open",
                 batch.lane_thread_id,
                 e,
@@ -1509,7 +1702,7 @@ impl Driver {
                 Ok(Some(merge)) => merge,
                 Ok(None) => continue,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[LandingLane] could not search main for {}: {}",
                         member.change_id,
                         e
@@ -1520,12 +1713,12 @@ impl Driver {
             let Some(m) = self.held.remove(&member.change_id) else {
                 continue;
             };
-            log!(
+            log_legacy!(
                 "[LandingLane] {} landed as {} before a restart, announcing it",
                 member.change_id,
                 merge.merge_sha
             );
-            healed.push(self.land_member(m, &merge).await);
+            healed.extend(self.land_member(m, &merge).await);
         }
         healed
     }
@@ -1539,7 +1732,7 @@ impl Driver {
                 Ok(Some(merge)) => merge,
                 Ok(None) => continue,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[LandingLane] could not search main for {}: {}",
                         member.change_id,
                         e
@@ -1557,7 +1750,7 @@ impl Driver {
             if !change.is_pending() {
                 continue;
             }
-            log!(
+            log_legacy!(
                 "[LandingLane] {} landed as {} before a restart, announcing it",
                 member.change_id,
                 merge.merge_sha
@@ -1569,8 +1762,13 @@ impl Driver {
                 claim,
                 actor: None,
             };
-            self.announce_landing(m, Some(&merge)).await;
-            self.spawn_settle_source(change, snapshot, true);
+            match self.announce_landing(m, Some(&merge)).await {
+                Ok(_) => self.spawn_settle_source(change, snapshot, true),
+                Err(error) => log_legacy!(
+                    "[LandingLane] Could not record recovered landing: {}",
+                    error
+                ),
+            }
         }
     }
 
@@ -1644,7 +1842,7 @@ impl LucidosEngine {
             .redecide_branch_work(thread_id, branch, &repo_root, None, finished)
             .await
         {
-            log!(
+            log_legacy!(
                 "[LandingLane] deciding the work on {} again failed: {}",
                 branch,
                 e
@@ -1666,14 +1864,14 @@ impl LucidosEngine {
         let hold = match self.hold_thread_for_worktree_reset(thread_id).await {
             Ok(Some(hold)) => hold,
             Ok(None) => {
-                log!(
+                log_legacy!(
                     "[LandingLane] a run holds thread {}, leaving its worktree as it is",
                     thread_id
                 );
                 return;
             }
             Err(e) => {
-                log!("[LandingLane] could not hold thread {}: {}", thread_id, e);
+                log_legacy!("[LandingLane] could not hold thread {}: {}", thread_id, e);
                 return;
             }
         };
@@ -1684,7 +1882,7 @@ impl LucidosEngine {
         if let Err(e) =
             crate::engine::change_ops::reset_worktree_to_main_after_apply(&worktree).await
         {
-            log!("[LandingLane] kept worktree {}: {}", worktree.display(), e);
+            log_legacy!("[LandingLane] kept worktree {}: {}", worktree.display(), e);
         }
         drop(hold);
     }
@@ -1815,10 +2013,11 @@ pub(super) async fn load_lane_records(pool: &sqlx::PgPool) -> Result<Vec<LaneRec
     let floor = crate::core::snapshot::boundary::read(pool)
         .await?
         .map_or(0, |b| b.event_sequence);
-    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
-        "SELECT event_type, payload FROM events \
+    let rows: Vec<(String, serde_json::Value, i64)> = sqlx::query_as(
+        "SELECT event_type, payload, EXTRACT(EPOCH FROM now() - created)::bigint FROM events \
          WHERE sequence > $1 AND (event_type IN ('ChangeQueued', 'ChangeUnqueued', 'LaneBatchStarted', \
-                              'LaneBatchLanded', 'LaneBatchFailed') \
+                              'LaneBatchLanded', 'LaneBatchFailed', 'LaneArrivalsHeld', \
+                              'LaneArrivalsReleased') \
             OR (event_type = 'ChangeApplied' \
                 AND payload->>'change_id' IN \
                     (SELECT payload->>'change_id' FROM events WHERE event_type = 'ChangeQueued'))) \
@@ -1829,13 +2028,13 @@ pub(super) async fn load_lane_records(pool: &sqlx::PgPool) -> Result<Vec<LaneRec
     .await?;
     Ok(rows
         .iter()
-        .filter_map(|(event_type, payload)| lane_record(event_type, payload))
+        .filter_map(|(event_type, payload, age_secs)| lane_record(event_type, payload, *age_secs))
         .collect())
 }
 
-/// One stored event as a [`LaneRecord`]. Thread events store their fields
-/// flat, system events under `data`.
-fn lane_record(event_type: &str, payload: &serde_json::Value) -> Option<LaneRecord> {
+/// One stored event, written `age_secs` ago, as a [`LaneRecord`]. Thread
+/// events store their fields flat, system events under `data`.
+fn lane_record(event_type: &str, payload: &serde_json::Value, age_secs: i64) -> Option<LaneRecord> {
     let field = |name: &str| payload.get(name).and_then(|v| v.as_str());
     let change_id = || field("change_id").and_then(|s| Uuid::parse_str(s).ok());
     let data = payload.get("data");
@@ -1858,6 +2057,11 @@ fn lane_record(event_type: &str, payload: &serde_json::Value) -> Option<LaneReco
             members: serde_json::from_value(data?.get("members")?.clone()).ok()?,
         },
         "LaneBatchLanded" | "LaneBatchFailed" => LaneRecord::BatchEnded(data_uuid("batch_id")?),
+        "LaneArrivalsHeld" => LaneRecord::ArrivalsHeld {
+            batch_id: data_uuid("batch_id")?,
+            age_secs: u64::try_from(age_secs).unwrap_or(0),
+        },
+        "LaneArrivalsReleased" => LaneRecord::ArrivalsReleased(data_uuid("batch_id")?),
         _ => return None,
     })
 }

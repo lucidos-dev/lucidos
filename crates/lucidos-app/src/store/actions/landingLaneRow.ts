@@ -51,6 +51,8 @@ export type MainCheckLine =
   | { kind: 'running'; runUrl: string | null }
   | {
       kind: 'red';
+      repair?: MainCheck['repair'];
+      flakyOnly?: boolean;
       checkId: string;
       summary: string;
       /** The thread that owns the red, or `null` on an engine that names none. */
@@ -85,6 +87,16 @@ export interface LaneViewInput {
 
 /** The main check as its line in the lane row says it. */
 function mainCheckLine(check: MainCheck, closing: string | null): MainCheckLine | null {
+  if (check.repair && (check.state === 'red' || check.repair.state !== 'none')) {
+    const threadId = check.repair.state === 'running' ? check.repair.fix_thread_id : undefined;
+    return {
+      kind: 'red', repair: check.repair, flakyOnly: check.state !== 'red',
+      checkId: check.check_id ?? '',
+      summary: check.summary ?? 'flaky tests',
+      fixThread: threadId ? { threadId, title: threadTitle(threadId, undefined) ?? FIX_THREAD_FALLBACK_TITLE } : null,
+      closing: !!check.check_id && closing === check.check_id,
+    };
+  }
   switch (check.state) {
     case 'passed':
       return { kind: 'passing' };

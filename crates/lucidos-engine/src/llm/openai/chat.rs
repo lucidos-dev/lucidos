@@ -9,7 +9,7 @@ use crate::llm::prefill::{pair_of, BeatShape, PrefillPair, StableEnd, TurnRoute}
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
-use crate::llm::ModelSelection;
+use crate::llm::{ModelSelection, ProviderError};
 use futures::StreamExt;
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -320,7 +320,7 @@ impl OpenAiProvider {
                                         "name": name,
                                         "arguments": serde_json::to_string(input)
                                             .unwrap_or_else(|e| {
-                                                crate::log!("[OpenAI] Failed to serialize tool arguments: {}", e);
+                                                crate::log_legacy!("[OpenAI] Failed to serialize tool arguments: {}", e);
                                                 "{}".to_string()
                                             }),
                                     }
@@ -548,14 +548,20 @@ impl OpenAiProvider {
                     }
 
                     let prev_len = content.len();
-                    Self::process_chat_chunk(data_str, &mut content, &mut tool_call_map, &mut meta)
-                        .map_err(|e| {
-                            crate::llm::stream_failure(
-                                e.to_string(),
-                                on_token.is_some() && prev_len > 0,
-                                STREAM_LOG_TAG,
-                            )
-                        })?;
+                    Self::process_chat_chunk(
+                        self.provider_kind.label(),
+                        data_str,
+                        &mut content,
+                        &mut tool_call_map,
+                        &mut meta,
+                    )
+                    .map_err(|e| {
+                        crate::llm::stream_failure(
+                            e,
+                            on_token.is_some() && prev_len > 0,
+                            STREAM_LOG_TAG,
+                        )
+                    })?;
                     if content.len() > prev_len {
                         if let Some(cb) = on_token {
                             // Floor defensively — `prev_len` is a byte length
@@ -577,6 +583,7 @@ impl OpenAiProvider {
     /// counts from there. `finish_reason` rides the LAST per-choice chunk
     /// alongside (or instead of) the delta payload.
     fn process_chat_chunk(
+        provider: &str,
         data_str: &str,
         content: &mut String,
         tool_call_map: &mut Vec<AccumulatedToolCall>,
@@ -585,7 +592,7 @@ impl OpenAiProvider {
         let data: serde_json::Value = serde_json::from_str(data_str)?;
 
         if let Some(error) = data.get("error") {
-            return Err(format_stream_error(error).into());
+            return Err(stream_error(provider, error).into());
         }
 
         // Top-level usage object (final include_usage chunk has choices: []).
@@ -681,6 +688,7 @@ impl OpenAiProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(self.provider_kind).await?;
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
         let ChatBody {
@@ -730,10 +738,27 @@ impl OpenAiProvider {
 
             let status = resp.status();
             if !status.is_success() {
+                let error_headers = resp.headers().clone();
                 let error_body = resp.text().await.unwrap_or_default();
+                if let Some(cap) = crate::llm::metered::http_spend_cap(
+                    self.provider_kind,
+                    status.as_u16(),
+                    &error_headers,
+                    &error_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
 
                 if crate::llm::is_retryable_status(status.as_u16())
                     && attempt <= crate::llm::MAX_RETRIES
+                    && !ProviderError::from_http(
+                        self.provider_kind.label(),
+                        status.as_u16(),
+                        &error_body,
+                    )
+                    .tools_unsupported()
                 {
                     let delay = crate::llm::retry_delay(attempt, 1);
                     crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
@@ -742,12 +767,10 @@ impl OpenAiProvider {
                 }
 
                 return Err(crate::llm::not_served::failure(
+                    self.provider_kind.label(),
                     status.as_u16(),
                     &error_body,
-                    crate::llm::with_retry_context(
-                        format!("OpenAI API error ({}): {}", status, error_body),
-                        attempt,
-                    ),
+                    attempt,
                 ));
             }
 
@@ -764,11 +787,10 @@ impl OpenAiProvider {
                     });
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
+                    if crate::llm::retry_after_stream_error(model, &*e, attempt).await {
                         continue;
                     }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
+                    return Err(crate::llm::retry_failure(e, attempt));
                 }
             }
         }
@@ -786,43 +808,32 @@ const PROVIDER_DETAIL_MAX: usize = 300;
 /// engine with a huge index.
 const MAX_STREAMED_TOOL_CALLS: usize = 1024;
 
-/// Render one Chat Completions SSE error frame as a single readable line.
+/// Read one Chat Completions SSE error frame as a [`ProviderError`].
 ///
-/// This builder serves OpenRouter and local servers as well as OpenAI, and
+/// This reader serves OpenRouter and local servers as well as OpenAI, and
 /// they disagree about which field names the failure. OpenAI sends `type`;
-/// OpenRouter sends `code` plus a `metadata` object and no `type` at all. A
-/// `type`-only reader therefore labelled EVERY OpenRouter failure `unknown`
-/// and dropped the one field saying why. The Responses path already falls
-/// back to `code`, so this is the two paths agreeing rather than a new rule.
-fn format_stream_error(error: &serde_json::Value) -> String {
-    let label = scalar_label(error.get("type"))
-        .or_else(|| scalar_label(error.get("code")))
-        .unwrap_or_else(|| "unknown".to_string());
-
+/// OpenRouter sends `code` plus a `metadata` object and no `type` at all. The
+/// shared parser reads both. OpenRouter's upstream cause joins the message.
+fn stream_error(provider: &str, error: &serde_json::Value) -> ProviderError {
     // A local OpenAI-compatible server often sends `{"error": "..."}` with no
     // object around it. Reading only `error.message` there discarded the only
-    // text the frame had and reported "Unknown streaming error".
+    // text the frame had.
     let message = error
         .as_str()
         .or_else(|| error.get("message").and_then(|m| m.as_str()))
         .filter(|m| !m.is_empty())
         .unwrap_or("Unknown streaming error");
-
-    match provider_detail(error.get("metadata")) {
-        Some(detail) => format!("OpenAI streaming error [{label}]: {message} ({detail})"),
-        None => format!("OpenAI streaming error [{label}]: {message}"),
-    }
-}
-
-/// A JSON scalar as a bare label: `429`, never `"429"`. `None` for absent,
-/// null, empty, or a container, so the caller can fall through to the next
-/// candidate field.
-fn scalar_label(value: Option<&serde_json::Value>) -> Option<String> {
-    match value? {
-        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
+    let message = match provider_detail(error.get("metadata")) {
+        Some(detail) => format!("{message} ({detail})"),
+        None => message.to_string(),
+    };
+    let mut frame = if error.is_object() {
+        error.clone()
+    } else {
+        serde_json::json!({})
+    };
+    frame["message"] = serde_json::Value::String(message);
+    ProviderError::from_stream_error(provider, &frame)
 }
 
 /// The upstream cause OpenRouter tucks into `metadata`, as one bounded line.
@@ -874,6 +885,58 @@ fn truncate_detail(mut detail: String) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_tool_support_refusal_does_not_retry_http_500() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                async {
+                    (
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({"error": {
+                            "message": "tools param requires --jinja flag",
+                            "type": "server_error"
+                        }})),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let provider = super::OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
+            "test-key".into(),
+            "custom-model".into(),
+            &base,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
+        let error = provider
+            .chat_completions(
+                &[],
+                &[],
+                crate::llm::ModelSelection::model("custom-model"),
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        let error = error.downcast_ref::<crate::llm::ProviderError>().unwrap();
+        assert!(error.tools_unsupported());
+        assert_eq!(error.attempts, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     use super::*;
 
     #[test]
@@ -885,6 +948,7 @@ mod tests {
         // A hostile OpenAI-compatible host sends a tool_call index near u32::MAX.
         // Without the cap this grows `tools` to billions of entries and OOMs.
         let result = OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{"tool_calls":[{"index":4000000000,"id":"x","function":{"name":"f","arguments":"{}"}}]}}]}"#,
             &mut content,
             &mut tools,
@@ -908,6 +972,7 @@ mod tests {
 
         // Mid-stream text chunk: no finish_reason yet, no usage.
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
             &mut content,
             &mut tools,
@@ -917,6 +982,7 @@ mod tests {
 
         // Per-choice terminal chunk: empty delta, finish_reason set.
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             &mut content,
             &mut tools,
@@ -925,7 +991,7 @@ mod tests {
         .unwrap();
 
         // include_usage final chunk: empty choices, usage carried alone.
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"model":"google/gemini-3.8-flash","choices":[],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49,"prompt_tokens_details":{"cached_tokens":12}}}"#,
             &mut content,
             &mut tools,
@@ -963,7 +1029,7 @@ mod tests {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":12}}}"#,
             &mut content,
             &mut tools,
@@ -981,7 +1047,7 @@ mod tests {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[],"usage":{"prompt_tokens":5476,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":5435}}}"#,
             &mut content,
             &mut tools,
@@ -1015,6 +1081,7 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":0}}"#,
             &mut content,
             &mut tools,
@@ -1033,7 +1100,7 @@ mod tests {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":99}}}"#,
             &mut content,
             &mut tools,
@@ -1054,13 +1121,14 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"length"}]}"#,
             &mut content,
             &mut tools,
             &mut meta,
         )
         .unwrap();
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[],"usage":{"prompt_tokens":16000,"completion_tokens":0,"total_tokens":16000}}"#,
             &mut content,
             &mut tools,
@@ -1091,6 +1159,7 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{"role":"assistant"},"finish_reason":null}]}"#,
             &mut content,
             &mut tools,
@@ -1098,6 +1167,7 @@ mod tests {
         )
         .unwrap();
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             &mut content,
             &mut tools,
@@ -1180,6 +1250,7 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{"content":"partial answer"},"finish_reason":"stop"}]}"#,
             &mut content,
             &mut tools,
@@ -1201,7 +1272,7 @@ mod tests {
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
 
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]},"finish_reason":"tool_calls"}]}"#,
             &mut content,
             &mut tools,
@@ -1225,6 +1296,7 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             &mut content,
             &mut tools,
@@ -1232,6 +1304,7 @@ mod tests {
         )
         .unwrap();
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[],"usage":{"completion_tokens":0}}"#,
             &mut content,
             &mut tools,
@@ -1259,13 +1332,14 @@ mod tests {
         let mut meta = StreamMeta::default();
 
         OpenAiProvider::process_chat_chunk(
+            "OpenAI",
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
             &mut content,
             &mut tools,
             &mut meta,
         )
         .unwrap();
-        OpenAiProvider::process_chat_chunk(
+        OpenAiProvider::process_chat_chunk("OpenAI", 
             r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":0,"total_tokens":900}}"#,
             &mut content,
             &mut tools,
@@ -1285,12 +1359,22 @@ mod tests {
     /// message it fails with. Every error-frame test goes through the real
     /// entry point rather than calling the formatter directly.
     fn stream_error_for(frame: &str) -> String {
+        stream_error_from(crate::llm::ProviderKind::OpenAi, frame)
+    }
+
+    fn stream_error_from(provider: crate::llm::ProviderKind, frame: &str) -> String {
         let mut content = String::new();
         let mut tools: Vec<AccumulatedToolCall> = Vec::new();
         let mut meta = StreamMeta::default();
-        OpenAiProvider::process_chat_chunk(frame, &mut content, &mut tools, &mut meta)
-            .expect_err("an error frame must fail the chunk")
-            .to_string()
+        OpenAiProvider::process_chat_chunk(
+            provider.label(),
+            frame,
+            &mut content,
+            &mut tools,
+            &mut meta,
+        )
+        .expect_err("an error frame must fail the chunk")
+        .to_string()
     }
 
     /// OpenRouter sends `code` and `metadata` and no `type`, so a
@@ -1299,14 +1383,15 @@ mod tests {
     /// provider that actually produced the error.
     #[test]
     fn an_openrouter_error_frame_labels_the_code_and_names_the_provider() {
-        let msg = stream_error_for(
+        let msg = stream_error_from(
+            crate::llm::ProviderKind::OpenRouter,
             r#"{"error":{"code":429,"message":"Provider returned error",
                 "metadata":{"provider_name":"Chutes","raw":"rate limit exceeded"}}}"#,
         );
         assert_eq!(
             msg,
-            "OpenAI streaming error [429]: Provider returned error \
-             (Chutes: rate limit exceeded)"
+            "OpenRouter error (429): Provider returned error (Chutes: rate limit exceeded). \
+             OpenRouter says this account hit its rate limit."
         );
     }
 
@@ -1315,22 +1400,22 @@ mod tests {
     /// nothing else in the frame to say.
     #[test]
     fn an_error_frame_with_no_type_and_no_code_stays_unknown() {
-        assert_eq!(
-            stream_error_for(r#"{"error":{"message":"ERROR"}}"#),
-            "OpenAI streaming error [unknown]: ERROR"
-        );
+        let msg = stream_error_for(r#"{"error":{"message":"ERROR"}}"#);
+        assert!(msg.starts_with("OpenAI error: ERROR. "), "{msg}");
+        assert!(msg.contains("does not recognise"), "{msg}");
     }
 
     /// Regression: OpenAI's own frames carry `type`, which still wins over
     /// `code` when both are present.
     #[test]
     fn an_openai_error_frame_still_labels_the_type() {
-        assert_eq!(
-            stream_error_for(
-                r#"{"error":{"type":"server_error","code":"internal",
-                    "message":"upstream failed"}}"#
-            ),
-            "OpenAI streaming error [server_error]: upstream failed"
+        let msg = stream_error_for(
+            r#"{"error":{"type":"server_error","code":"internal",
+                "message":"upstream failed"}}"#,
+        );
+        assert!(
+            msg.starts_with("OpenAI error [internal]: upstream failed. "),
+            "{msg}"
         );
     }
 
@@ -1351,18 +1436,19 @@ mod tests {
 
         let msg = stream_error_for(&frame);
         assert!(!msg.contains('\n'), "must stay one line: {msg}");
-        assert!(msg.ends_with("…)"), "must be marked as truncated: {msg}");
-        assert!(msg.len() < 400, "must stay bounded, got {}", msg.len());
-        assert!(msg.starts_with("OpenAI streaming error [502]: Provider returned error (Chutes: "));
+        assert!(msg.contains("…)"), "must be marked as truncated: {msg}");
+        assert!(msg.len() < 500, "must stay bounded, got {}", msg.len());
+        assert!(msg.starts_with("OpenAI error (502): Provider returned error (Chutes: "));
     }
 
     /// An error frame carrying nothing usable must still fail the stream,
     /// rather than being read as an ordinary empty chunk.
     #[test]
     fn an_empty_error_object_still_fails_the_stream() {
-        assert_eq!(
-            stream_error_for(r#"{"error":{}}"#),
-            "OpenAI streaming error [unknown]: Unknown streaming error"
+        let msg = stream_error_for(r#"{"error":{}}"#);
+        assert!(
+            msg.starts_with("OpenAI error: Unknown streaming error. "),
+            "{msg}"
         );
     }
 
@@ -1371,9 +1457,10 @@ mod tests {
     /// frame carried.
     #[test]
     fn a_bare_string_error_keeps_its_text() {
-        assert_eq!(
-            stream_error_for(r#"{"error":"context window exceeded"}"#),
-            "OpenAI streaming error [unknown]: context window exceeded"
+        let msg = stream_error_for(r#"{"error":"context window exceeded"}"#);
+        assert!(
+            msg.starts_with("OpenAI error: context window exceeded. "),
+            "{msg}"
         );
     }
 
@@ -1381,35 +1468,38 @@ mod tests {
     /// appended a literal "(null)" to an otherwise clean error.
     #[test]
     fn a_null_provider_body_appends_nothing() {
-        assert_eq!(
-            stream_error_for(
-                r#"{"error":{"code":502,"message":"Provider returned error",
-                    "metadata":{"provider_name":"Chutes","raw":null}}}"#
-            ),
-            "OpenAI streaming error [502]: Provider returned error (Chutes)"
+        let msg = stream_error_for(
+            r#"{"error":{"code":502,"message":"Provider returned error",
+                "metadata":{"provider_name":"Chutes","raw":null}}}"#,
+        );
+        assert!(
+            msg.starts_with("OpenAI error (502): Provider returned error (Chutes). "),
+            "{msg}"
         );
     }
 
-    /// Deliberate consequence of carrying `code`: the retry classifier reads
-    /// the formatted string, so a transient upstream status now reaches it.
-    /// Before, every OpenRouter frame read `[unknown]` and no retry fired.
-    /// A genuine client error still must not retry.
+    /// The numeric `code` an OpenRouter frame carries names the failure, so a
+    /// transient upstream status retries and a client error does not.
     #[test]
-    fn a_transient_upstream_status_now_reaches_the_retry_classifier() {
-        let transient =
-            stream_error_for(r#"{"error":{"code":502,"message":"Provider returned error"}}"#);
-        assert!(
-            crate::llm::is_retryable_error(&transient),
-            "502 must retry: {transient}"
-        );
-
-        let client_error = stream_error_for(
-            r#"{"error":{"code":400,"message":"invalid request: bad tool schema"}}"#,
-        );
-        assert!(
-            !crate::llm::is_retryable_error(&client_error),
-            "400 must not retry: {client_error}"
-        );
+    fn a_transient_upstream_status_reaches_the_retry_classifier() {
+        let retries = |frame: &str| {
+            let mut meta = StreamMeta::default();
+            let err = OpenAiProvider::process_chat_chunk(
+                "OpenAI",
+                frame,
+                &mut String::new(),
+                &mut Vec::new(),
+                &mut meta,
+            )
+            .expect_err("an error frame must fail the chunk");
+            crate::llm::error_is_retryable(&*err)
+        };
+        assert!(retries(
+            r#"{"error":{"code":502,"message":"Provider returned error"}}"#
+        ));
+        assert!(!retries(
+            r#"{"error":{"code":400,"message":"invalid request: bad tool schema"}}"#
+        ));
     }
 
     /// Regression: after a tool call the agentic loop packs the ToolResult and
@@ -2011,9 +2101,15 @@ mod tests {
         let (base, bodies) =
             super::super::serve_recording("/v1/chat/completions", COMPLETED_TURN, PREFILL_REPLY)
                 .await;
-        let provider =
-            OpenAiProvider::new_with_base_url("k".into(), CLAUDE.into(), &base, Vec::new(), true)
-                .unwrap();
+        let provider = OpenAiProvider::new_with_base_url(
+            crate::llm::ProviderKind::OpenAi,
+            "k".into(),
+            CLAUDE.into(),
+            &base,
+            Vec::new(),
+            true,
+        )
+        .unwrap();
         let turn = provider
             .chat_completions(
                 &history(),
@@ -2055,8 +2151,14 @@ mod tests {
                 let mut content = String::new();
                 let mut tools: Vec<AccumulatedToolCall> = Vec::new();
                 let mut meta = StreamMeta::default();
-                OpenAiProvider::process_chat_chunk(chunk, &mut content, &mut tools, &mut meta)
-                    .unwrap();
+                OpenAiProvider::process_chat_chunk(
+                    "OpenAI",
+                    chunk,
+                    &mut content,
+                    &mut tools,
+                    &mut meta,
+                )
+                .unwrap();
             })
             .await;
             trace.first_delta.is_some()

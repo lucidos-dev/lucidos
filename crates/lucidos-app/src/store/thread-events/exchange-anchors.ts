@@ -1,3 +1,4 @@
+import type { SavedScroll } from '../savedScroll';
 // The store reads these, so this module ships in the entry chunk. Keep
 // transcript render code out of it (ADR 0288).
 import type { ThreadStatus } from '../../generated/thread-lifecycle';
@@ -6,6 +7,7 @@ import { isChangeLifecycleEvent, type Exchange } from './exchange';
 import type { ThreadState } from './thread-meta';
 import type { OngoingGroup } from '../store';
 import type { CodingAgentExit } from './thread-event-types';
+import type { ProviderError } from '../../generated/thread-event-wire';
 
 /** The failure card's content: what a `ResponseFailed` step says, and which
  *  event said it. */
@@ -15,6 +17,10 @@ export interface ExchangeError {
   /** Set when the coding agent's process exited on its own, which swaps the
    *  generic card for one that explains it and offers Try again. */
   agentExit?: CodingAgentExit;
+  /** The code the provider attached to the failed turn. A policy block gets
+   *  its own card and is never resumed. */
+  providerError?: ProviderError;
+  spendCap?: { provider: string; resets_at: string | null; message: string };
   /** The `ResponseFailed`'s OWN event id. `ChatExchange` stamps it on the card
    *  as `data-event-id`, which is what resolves a notification deep-link to a
    *  failure (`scrollToEventAndPulse`) and pulses the card itself.
@@ -28,7 +34,7 @@ export interface ExchangeError {
 /** The error a failed exchange carries, or null when it didn't fail. */
 export function exchangeError(exchange: Exchange): ExchangeError | null {
   for (const { event } of exchange.steps) {
-    if (event.type === 'ResponseFailed') return { message: event.error, agentExit: event.agent_exit, eventId: event._eventId };
+    if (event.type === 'ResponseFailed') return { message: event.error, agentExit: event.agent_exit, providerError: event.provider_error, spendCap: event.spend_cap, eventId: event._eventId };
   }
   return null;
 }
@@ -80,8 +86,8 @@ export function exchangeStarterId(exchange: Exchange): string | undefined {
   return exchange.userEvent._eventId;
 }
 
-/** The Ongoing groups whose rows open on what needs the user rather than on
- *  the saved reading position (ADR 0409). */
+/** The Ongoing groups whose rows land on what needs the user unless
+ *  the saved reading position has already reached it (ADR 0409). */
 export type LandingGroup = Extract<OngoingGroup, 'blocked' | 'review'>;
 
 /** Where opening a thread from Blocked or Review lands.
@@ -126,6 +132,21 @@ export function landingTarget(exchanges: Exchange[], status: ThreadStatus, group
     if (card) return { kind: 'card', eventId: card };
   }
   return { kind: 'card-not-loaded', newestTurnId };
+}
+
+/** Whether the saved place has reached the landing target's turn.
+ *  Compare turn indices: a failure card carries a step id, while a saved
+ *  line or anchor carries the starter id. Rows name events within a turn.
+ *  Legacy offsets prove no ordering. */
+export function readerHasReached(exchanges: Exchange[], target: LandingTarget, saved: SavedScroll | null): boolean {
+  if (saved?.kind === 'live-edge') return true;
+  if (!saved || saved.kind === 'offset') return false;
+  if (target.kind === 'card-not-loaded' || !target.eventId) return false;
+  const targetIndex = exchangeIndexHoldingEvent(exchanges, target.eventId);
+  const savedIndex = saved.kind === 'row'
+    ? exchangeIndexHoldingEvent(exchanges, saved.rowEventId)
+    : exchanges.findIndex(ex => exchangeStarterId(ex) === saved.eventId);
+  return targetIndex >= 0 && savedIndex >= targetIndex;
 }
 
 /** The start of the newest turn that proposed a change, or null. A per-commit

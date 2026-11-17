@@ -72,6 +72,95 @@ fn a_question_or_a_counter_proposal_never_approves() {
     assert!(!approves(&HumanInput::Other));
 }
 
+#[test]
+fn approval_for_later_and_implementation_are_distinct() {
+    use super::plan_approval::{approves_target, ApprovalTarget};
+    let later = picked("Commit plan for later");
+    assert!(!approves(&later));
+    assert!(approves_target(&later, ApprovalTarget::PlanForLater));
+    assert!(!approves_target(
+        &picked("Approve here"),
+        ApprovalTarget::PlanForLater
+    ));
+    assert!(approves_target(
+        &typed("for later"),
+        ApprovalTarget::PlanForLater
+    ));
+    assert!(!approves_target(
+        &typed("for later?"),
+        ApprovalTarget::PlanForLater
+    ));
+    assert!(!approves(&typed("for later")));
+    assert!(!approves(&picked("Approve design")));
+    assert!(!approves_target(&later, ApprovalTarget::Design));
+    assert!(approves_target(
+        &picked("Approve design"),
+        ApprovalTarget::Design
+    ));
+    assert!(approves_target(
+        &typed("approve design"),
+        ApprovalTarget::Design
+    ));
+    assert!(!approves_target(
+        &typed("approve design?"),
+        ApprovalTarget::Design
+    ));
+}
+
+#[test]
+fn recommended_labels_preserve_the_approval_target() {
+    use super::plan_approval::{approves_target, ApprovalTarget};
+    assert!(approves_target(
+        &picked("Commit plan for later (Recommended)"),
+        ApprovalTarget::PlanForLater
+    ));
+    for label in [
+        "Commit plan for later (Recommended)",
+        "Commit plan for later  (Recommended)",
+        "Commit plan for later(Recommended)",
+        "Approve design(Recommended)",
+        "Approve design  (Recommended)",
+        "Request changes(Recommended)",
+        "Request changes  (Recommended)",
+        "Approve design (Recommended)",
+        "Approve design and plan here (Recommended)",
+        "Request changes (Recommended)",
+    ] {
+        assert!(!approves(&picked(label)), "{label}");
+    }
+    assert!(!approves_target(
+        &picked("Request changes (Recommended)"),
+        ApprovalTarget::Design
+    ));
+    assert!(!approves(&typed("approve (recommended)")));
+}
+
+#[test]
+fn only_an_explicit_selected_variant_can_revise_a_proposal() {
+    use super::plan_approval::picked_plan_variant;
+    assert!(picked_plan_variant(&picked("Frontend only")));
+    for label in [
+        "Approve",
+        "Approve (Recommended)",
+        "Approve plan",
+        "Yes, approve",
+        "LGTM (Recommended)",
+        "Go ahead (recommended)",
+        "Approve here",
+        "Continue here",
+        "Approve design",
+        "Approve design and plan here",
+        "Commit plan for later",
+        "Request changes",
+        "Implement in a fresh session: a rung on codex",
+        "",
+    ] {
+        assert!(!picked_plan_variant(&picked(label)), "{label}");
+    }
+    assert!(!picked_plan_variant(&typed("approve")));
+    assert!(!picked_plan_variant(&HumanInput::Other));
+}
+
 /// A thread whose agent session works `BRANCH`, plus its bus.
 struct Owned {
     bus: EventBus,
@@ -92,6 +181,7 @@ async fn session_of_kind(
     bus.emit(BusEvent::Thread {
         thread_id: thread,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".to_string(),
             branch: branch.to_string(),
@@ -148,6 +238,8 @@ impl Owned {
                     worktree_path: None,
                     multi_select: false,
                     owner_approval: None,
+                    unattested_act: None,
+                    permission_request: None,
                 },
                 meta: EventMeta {
                     channel: Some(EventChannel::ClaudeCode),
@@ -164,6 +256,7 @@ impl Owned {
             .emit(BusEvent::Thread {
                 thread_id: self.thread,
                 event: ThreadEvent::UserQuestionAnswered {
+                    compose: None,
                     tool_use_id: tool_use_id.into(),
                     quiet: false,
                     answer,
@@ -227,6 +320,137 @@ async fn approved(pool: &sqlx::PgPool, repo: &std::path::Path) -> bool {
         Err(PlanApprovalError::NotApproved) => false,
         Err(e) => panic!("unexpected: {e}"),
     }
+}
+
+#[tokio::test]
+async fn revised_variants_require_a_direct_plan_card_and_never_override_batch_binding() {
+    use crate::engine::permission::batch::{Batch, BatchItem};
+    use crate::engine::permission::{Action, Holder, Lifetime, PermissionRequest, PickedBy};
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = make_test_repo().await;
+    let owned = session_for(&pool, BRANCH).await;
+    propose(&pool, &repo).await;
+    owned
+        .tap(
+            &["Approve (Recommended)", "Frontend only"],
+            "Frontend only",
+            device(),
+        )
+        .await;
+    assert!(
+        user_picked_plan_variant(&pool, &owned.thread.to_string(), &repo, BRANCH)
+            .await
+            .unwrap()
+    );
+    owned
+        .tap(&["Codex", "Claude Code"], "Codex", device())
+        .await;
+    assert!(
+        !user_picked_plan_variant(&pool, &owned.thread.to_string(), &repo, BRANCH)
+            .await
+            .unwrap()
+    );
+    let (card, options) = owned.ask(&["Approve", "Frontend only"]).await;
+    let selected = options[1].clone();
+    owned
+        .answer(
+            &card,
+            AnswerKind::Selected {
+                option_id: selected.id.clone(),
+            },
+            device(),
+        )
+        .await;
+    let marked_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT planned_at FROM planned_branches WHERE branch_name = $1")
+            .bind(BRANCH)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let binding = PlanBinding {
+        repo_root: canonical_repo_root(&repo),
+        branch_name: BRANCH.into(),
+        plan_path: "docs/plans/x.md".into(),
+        marked_at,
+        digest: "0".repeat(64),
+    };
+    let parent = session_for(&pool, "parent").await;
+    let batch_card = "batch-plan-variant";
+    parent
+        .bus
+        .emit(BusEvent::Thread {
+            thread_id: parent.thread,
+            event: ThreadEvent::UserQuestionAsked {
+                tool_use_id: batch_card.into(),
+                cc_session_id: String::new(),
+                options: vec![],
+                question: "Run the batch?".into(),
+                worktree_path: None,
+                multi_select: false,
+                owner_approval: None,
+                unattested_act: None,
+                permission_request: Some(PermissionRequest {
+                    action: Action::RunBatch,
+                    breadth: None,
+                    prepared: None,
+                    choices: Default::default(),
+                    lines: None,
+                    unattested_act: None,
+                    batch: Some(Batch {
+                        items: vec![BatchItem::CardAnswer {
+                            thread_id: owned.thread,
+                            tool_use_id: card,
+                            option_id: selected.id,
+                            option_label: selected.label,
+                            card_digest: "card".into(),
+                            plan: Some(binding),
+                        }],
+                        digest: "batch".into(),
+                    }),
+                }),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    parent
+        .bus
+        .emit(BusEvent::Thread {
+            thread_id: parent.thread,
+            event: ThreadEvent::PermissionGranted {
+                permission_id: Uuid::new_v4(),
+                action: Action::RunBatch,
+                breadth: None,
+                lifetime: Lifetime::Once,
+                holder: Holder::Thread {
+                    thread_id: parent.thread,
+                },
+                request_tool_use_id: batch_card.into(),
+                picked_by: PickedBy::Tap,
+                pattern: None,
+            },
+            meta: EventMeta::with_actor(device()),
+        })
+        .await
+        .unwrap();
+    assert!(
+        !user_picked_plan_variant(&pool, &owned.thread.to_string(), &repo, BRANCH)
+            .await
+            .unwrap()
+    );
+    assert!(matches!(
+        user_approved_plan_for(
+            &pool,
+            &repo,
+            BRANCH,
+            Some(&owned.thread.to_string()),
+            ApprovalTarget::Implementation
+        )
+        .await,
+        Err(PlanApprovalError::PlanChanged)
+    ));
+    pool.close().await;
+    teardown_test_db(&db).await;
 }
 
 const CARD: [&str; 2] = ["Approve", "Request changes"];
@@ -348,6 +572,42 @@ async fn a_branch_no_session_started_still_approves() {
     let _other = session_for(&pool, "another-branch").await;
     propose(&pool, &repo).await;
     assert!(approved(&pool, &repo).await, "a human's own branch");
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A git read that failed is unknown: the binding fails closed, but as an
+/// unreadable plan, never as a changed one. That holds when git cannot
+/// spawn, and when it runs and fails rather than finding no plan.
+#[tokio::test]
+async fn a_plan_git_cannot_read_is_unreadable_not_changed() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = make_test_repo().await;
+    propose(&pool, &repo).await;
+    let marked_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT planned_at FROM planned_branches WHERE branch_name = $1")
+            .bind(BRANCH)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let broken = repo.join("broken");
+    std::fs::create_dir(&broken).unwrap();
+    std::fs::write(broken.join(".git"), "gitdir: /nonexistent\n").unwrap();
+    for root in [repo.join("gone"), broken] {
+        let binding = PlanBinding {
+            repo_root: root.to_string_lossy().into_owned(),
+            branch_name: BRANCH.into(),
+            plan_path: "docs/plans/x.md".into(),
+            marked_at,
+            digest: "0".repeat(64),
+        };
+        let held = super::plan_approval::binding_still_holds(&pool, &binding, &repo, BRANCH).await;
+        assert!(
+            matches!(held, Err(PlanApprovalError::PlanUnreadable(_))),
+            "{}: {held:?}",
+            root.display()
+        );
+    }
     pool.close().await;
     teardown_test_db(&db).await;
 }
@@ -572,6 +832,95 @@ async fn a_legacy_external_thread_reads_its_durable_flag() {
             .unwrap(),
         None,
         "a session older than coding_agent_kind still counts as external"
+    );
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn a_plan_only_pick_cannot_be_used_for_implementation() {
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = make_test_repo().await;
+    let owned = session_for(&pool, BRANCH).await;
+    propose(&pool, &repo).await;
+    owned
+        .tap(
+            &["Approve here", "Commit plan for later"],
+            "Commit plan for later",
+            device(),
+        )
+        .await;
+    assert!(matches!(
+        approve_plan(&pool, &repo, BRANCH, None).await,
+        Err(PlanApprovalError::NotApproved)
+    ));
+    assert!(
+        approve_plan_for(&pool, &repo, BRANCH, None, true)
+            .await
+            .unwrap()
+            .unwrap()
+            .plan_only
+    );
+    assert_eq!(
+        plan_marker_state(&pool, &repo, BRANCH).await,
+        PlanMarkerState::Present(PlanMarkerKind::PlanOnly)
+    );
+    propose(&pool, &repo).await;
+    owned.tap(&CARD, "Approve", device()).await;
+    assert!(matches!(
+        approve_plan_for(&pool, &repo, BRANCH, None, true).await,
+        Err(PlanApprovalError::NotApproved)
+    ));
+    assert!(approved(&pool, &repo).await);
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn design_approval_never_grants_implementation_permission() {
+    use crate::engine::thread_events::PlanKind;
+    let (pool, db) = setup_test_db().await;
+    let (_tmp, repo) = make_test_repo().await;
+    let owned = session_for(&pool, BRANCH).await;
+    record_planned_with_kind(
+        &pool,
+        &repo,
+        BRANCH,
+        PlanMarkerKind::Proposed,
+        Some("docs/plans/example-design.md"),
+        None,
+        &[],
+        "abc",
+        PlanKind::Design,
+    )
+    .await
+    .unwrap();
+    owned
+        .tap(
+            &["Approve design", "Approve design and plan here"],
+            "Approve design",
+            device(),
+        )
+        .await;
+    let result = approve_plan(&pool, &repo, BRANCH, None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(result.plan_only);
+    assert_eq!(
+        plan_marker_state(&pool, &repo, BRANCH).await,
+        PlanMarkerState::Present(PlanMarkerKind::PlanOnly)
+    );
+    propose(&pool, &repo).await;
+    let stored: String =
+        sqlx::query_scalar("SELECT kind FROM planned_branches WHERE branch_name = $1")
+            .bind(BRANCH)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored, "implementation",
+        "a new mark carries its explicit kind"
     );
     pool.close().await;
     teardown_test_db(&db).await;

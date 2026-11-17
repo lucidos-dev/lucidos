@@ -1,5 +1,5 @@
 //! Finding this machine's gateway, for the commands that talk to it rather
-//! than to a workspace engine (`lucidos pair`, `lucidos update-address`).
+//! than to a workspace engine (`lucidos pair`, `lucidos update-channel`).
 //!
 //! They resolve their own target instead of going through `crate::workspace`.
 //! A gateway serves every workspace, so no workspace names it.

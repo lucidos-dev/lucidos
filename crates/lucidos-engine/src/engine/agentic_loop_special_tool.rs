@@ -76,17 +76,17 @@ pub(crate) fn parse_relation(
 }
 
 /// Parse the optional `coding_agent` argument from `run_coding_agent`.
-/// Defaults to Claude Code for existing callers. Accepts the canonical
-/// kebab-case values plus the common underscore alias for Claude Code; returns
-/// an explicit error for typos so a request for Codex never silently starts CC.
+/// `None` means the caller named no agent. Accepts the canonical kebab-case
+/// values plus the underscore alias for Claude Code. A typo is an error, so a
+/// request for Codex never silently starts Claude Code.
 pub(crate) fn parse_coding_agent(
     args: &serde_json::Value,
-) -> Result<crate::runtime::CodingAgent, String> {
+) -> Result<Option<crate::runtime::CodingAgent>, String> {
     match args.get("coding_agent") {
-        None | Some(serde_json::Value::Null) => Ok(crate::runtime::CodingAgent::ClaudeCode),
+        None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => match s.as_str() {
-            "claude-code" | "claude_code" => Ok(crate::runtime::CodingAgent::ClaudeCode),
-            "codex" => Ok(crate::runtime::CodingAgent::Codex),
+            "claude-code" | "claude_code" => Ok(Some(crate::runtime::CodingAgent::ClaudeCode)),
+            "codex" => Ok(Some(crate::runtime::CodingAgent::Codex)),
             other => Err(format!(
                 "coding_agent must be \"claude-code\" or \"codex\", got {:?}",
                 other
@@ -96,6 +96,40 @@ pub(crate) fn parse_coding_agent(
             "coding_agent must be \"claude-code\" or \"codex\", got {}",
             other
         )),
+    }
+}
+
+/// The agent a spawn runs: the requested one, or the first installed in
+/// `CodingAgent::ALL` order (Claude Code first) when none was named. A request for a missing agent is refused
+/// and names what is installed, so the model never reports a session that
+/// cannot start.
+pub(crate) fn pick_installed_coding_agent(
+    requested: Option<crate::runtime::CodingAgent>,
+    is_installed: impl Fn(crate::runtime::CodingAgent) -> bool,
+) -> Result<crate::runtime::CodingAgent, String> {
+    use crate::runtime::CodingAgent;
+    if let Some(agent) = requested.filter(|a| is_installed(*a)) {
+        return Ok(agent);
+    }
+    let installed: Vec<CodingAgent> = CodingAgent::ALL
+        .into_iter()
+        .filter(|a| is_installed(*a))
+        .collect();
+    match (requested, installed.first()) {
+        (None, Some(first)) => Ok(*first),
+        (Some(asked), Some(alt)) => Err(format!(
+            "{} is not installed on this machine. {} is installed: retry with \
+             coding_agent \"{}\", or omit coding_agent.",
+            asked.display_name(),
+            alt.display_name(),
+            alt.as_str()
+        )),
+        (_, None) => Err(
+            "No coding agent is installed on this machine, so no session can start. \
+             Tell the user to install Claude Code or Codex, or to set its binary path in \
+             Settings › Coding agents."
+                .to_string(),
+        ),
     }
 }
 
@@ -220,6 +254,18 @@ fn child_report_contract(mode: WakeMode) -> &'static str {
              a failure, since the user reads the result in that thread. Its report is \
              filed for your next turn."
         }
+    }
+}
+
+impl LucidosEngine {
+    /// Resolves the agent for a same-workspace spawn from the binaries the
+    /// spawn itself would find, honouring each agent's binary-path preference.
+    async fn pick_installed_coding_agent(
+        &self,
+        requested: Option<crate::runtime::CodingAgent>,
+    ) -> Result<crate::runtime::CodingAgent, String> {
+        let installed = crate::runtime::installed_coding_agents(self.pool()).await;
+        pick_installed_coding_agent(requested, |agent| installed.contains(&agent))
     }
 }
 
@@ -425,7 +471,7 @@ impl LucidosEngine {
                     Ok(r) => r,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
-                let coding_agent = match parse_coding_agent(tool_args) {
+                let requested_agent = match parse_coding_agent(tool_args) {
                     Ok(agent) => agent,
                     Err(e) => return Some(format!("Error: {}", e)),
                 };
@@ -468,7 +514,7 @@ impl LucidosEngine {
                             prompt,
                             target_ws,
                             relation,
-                            coding_agent,
+                            requested_agent.unwrap_or(crate::runtime::CodingAgent::ClaudeCode),
                             tool_args,
                             SpawnSource {
                                 thread_id,
@@ -478,6 +524,13 @@ impl LucidosEngine {
                         .await,
                     );
                 }
+                // The target workspace may set its own binary path, so only
+                // this branch can judge installation. A refusal is the tool
+                // result the model reads, never a queued session.
+                let coding_agent = match self.pick_installed_coding_agent(requested_agent).await {
+                    Ok(agent) => agent,
+                    Err(e) => return Some(format!("Error: {e}")),
+                };
                 // The model and effort pins, checked against the backend that
                 // will actually run them. A bad id fails the spawn HERE, in the
                 // same turn. The caller then learns its pin did not apply, and
@@ -994,12 +1047,20 @@ impl LucidosEngine {
             model: model.as_deref(),
             reasoning_effort: reasoning_effort.as_deref(),
         };
+        let verdict = crate::engine::agent_session::spawn_gate::thread_spawn_verdict(
+            self.event_bus.pool(),
+            &self.trigger_configs,
+            source.thread_id,
+        )
+        .await;
         match crate::engine::http::workspace_client::spawn_coding_agent_in_workspace(
             cross_workspace_http_client(),
             &target,
             &spawn,
             &ctx,
             &target.proto,
+            crate::api::base_path::gateway_port().as_deref(),
+            &verdict,
         )
         .await
         {
@@ -1033,6 +1094,15 @@ impl LucidosEngine {
             );
         }
 
+        // An ask naming a prepared permission request shows the engine's card.
+        use crate::engine::permission::prepare::{prepared_ask, PreparedAsk};
+        let (questions, permission_request) =
+            match prepared_ask(self.pool(), thread_id, &questions).await {
+                Ok(PreparedAsk::Ordinary) => (questions, None),
+                Ok(PreparedAsk::Request { request, questions }) => (questions, Some(request)),
+                Err(refusal) => return ChatAskOutcome::failed(format!("Error: {refusal}")),
+            };
+
         use crate::engine::agent_question::{card_message, CardMessage};
         let message = card_message(tool_args).map(|text| CardMessage { text, meta });
         let outcome = self
@@ -1044,14 +1114,14 @@ impl LucidosEngine {
                 crate::engine::agent_question::QuestionAsker {
                     cc_session_id: String::new(),
                     channel: EventChannel::Chat,
-                    owner_approval: None,
+                    permission_request,
                 },
             )
             .await;
         let outcome = match outcome {
             Ok(o) => o,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[AskUserQuestion] chat walk failed for {thread_id}/{tool_use_id}: {e}"
                 );
                 return ChatAskOutcome::failed(format!("Error: ask_user_question failed: {e}"));
@@ -1142,10 +1212,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_coding_agent_defaults_to_claude_code() {
+    fn parse_coding_agent_leaves_an_omitted_agent_unnamed() {
+        assert_eq!(parse_coding_agent(&json!({})).unwrap(), None);
         assert_eq!(
-            parse_coding_agent(&json!({})).unwrap(),
-            crate::runtime::CodingAgent::ClaudeCode
+            parse_coding_agent(&json!({"coding_agent": null})).unwrap(),
+            None
         );
     }
 
@@ -1153,8 +1224,54 @@ mod tests {
     fn parse_coding_agent_accepts_codex() {
         assert_eq!(
             parse_coding_agent(&json!({"coding_agent": "codex"})).unwrap(),
-            crate::runtime::CodingAgent::Codex
+            Some(crate::runtime::CodingAgent::Codex)
         );
+    }
+
+    #[test]
+    fn an_omitted_agent_prefers_claude_code_when_both_are_installed() {
+        use crate::runtime::CodingAgent;
+        assert_eq!(
+            pick_installed_coding_agent(None, |_| true),
+            Ok(CodingAgent::ClaudeCode)
+        );
+    }
+
+    #[test]
+    fn an_omitted_agent_falls_back_to_the_installed_one() {
+        use crate::runtime::CodingAgent;
+        assert_eq!(
+            pick_installed_coding_agent(None, |a| a == CodingAgent::Codex),
+            Ok(CodingAgent::Codex)
+        );
+    }
+
+    #[test]
+    fn an_explicit_installed_agent_is_kept() {
+        use crate::runtime::CodingAgent;
+        assert_eq!(
+            pick_installed_coding_agent(Some(CodingAgent::Codex), |_| true),
+            Ok(CodingAgent::Codex)
+        );
+    }
+
+    #[test]
+    fn an_explicit_missing_agent_is_refused_and_names_the_installed_one() {
+        use crate::runtime::CodingAgent;
+        let err =
+            pick_installed_coding_agent(Some(CodingAgent::ClaudeCode), |a| a == CodingAgent::Codex)
+                .unwrap_err();
+        assert!(err.contains("Claude Code is not installed"), "{err}");
+        assert!(err.contains("\"codex\""), "{err}");
+    }
+
+    #[test]
+    fn no_installed_agent_refuses_an_omitted_or_explicit_request() {
+        use crate::runtime::CodingAgent;
+        for requested in [None, Some(CodingAgent::Codex)] {
+            let err = pick_installed_coding_agent(requested, |_| false).unwrap_err();
+            assert!(err.contains("No coding agent is installed"), "{err}");
+        }
     }
 
     #[test]

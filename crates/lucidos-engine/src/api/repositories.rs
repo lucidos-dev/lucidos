@@ -484,7 +484,7 @@ async fn thread_owns_a_coding_agent_worktree(pool: &sqlx::PgPool, thread_id: Uui
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Repositories] Failed to check thread {} is a coding-agent thread: {}",
             thread_id,
             e
@@ -522,7 +522,7 @@ async fn lookup_app_pathspec(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Repositories] Failed to look up the app folder for thread {}: {}",
             thread_id,
             e
@@ -721,7 +721,7 @@ async fn resolve_recorded_branch(
     .await
     {
         Some(found) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Repositories] Thread {} recorded branch '{}' is gone; diffing '{}', which contains its last commit",
                 thread_id,
                 recorded,

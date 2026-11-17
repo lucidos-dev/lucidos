@@ -54,6 +54,7 @@ pub(crate) async fn seed_cc_thread(bus: &EventBus, thread_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -164,6 +165,8 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: cc_meta(),
     })
@@ -200,6 +203,8 @@ pub(crate) async fn emit_answered_question(
             worktree_path: None,
             multi_select: matches!(answer, AnswerKind::MultiSelected { .. }),
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: cc_meta(),
     })
@@ -210,6 +215,7 @@ pub(crate) async fn emit_answered_question(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer,

@@ -131,11 +131,14 @@ pub struct ThreadSummary {
     pub section: String,
     /// Number of child threads still active (non-zero means parent is "ongoing").
     pub active_children_count: i64,
-    /// Direct children that are not in flight and hold a live *event wait*.
-    /// Such a child has not finished (ADR 0254), so the parent waits on it.
-    /// Disjoint from `active_children_count`. Read by the frontend's Waiting
-    /// dot and waiting indicator, and by no backend predicate.
-    pub waiting_children_count: i64,
+    /// Direct children with `awaited_by_parent` set: the *awaited children*
+    /// (ADR 0672). Read by the frontend's Waiting dot and waiting indicator,
+    /// and by the turn-end read decision.
+    pub awaited_children_count: i64,
+    /// This thread's parent waits on it: its finish wakes the parent, and it
+    /// is unfinished (active, holding a live event wait, or awaiting a child
+    /// of its own). The waiting indicator lists the children it names.
+    pub awaited_by_parent: bool,
     /// Total number of child threads (active + completed).
     pub total_children_count: i64,
     /// Number of *event waits* this thread currently holds unresolved. Read as
@@ -277,13 +280,15 @@ pub struct ThreadSummary {
     /// the draft's picks (the DB is the authoritative store, like `compose_text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_selection: Option<serde_json::Value>,
-    /// The thread's *compose epoch* (`docs/glossary.md`): how many times a
-    /// submission has consumed its compose slot. The client echoes it on every
+    /// The thread's *compose epoch* (`docs/glossary.md`): the generation advanced by
+    /// each submission or Stop restoration. The client echoes it on every
     /// compose PUT so the engine can refuse a write composed before a
     /// submission that has since landed. Carried on the summary because a
     /// reload is one of the two places a device learns it (the other is the
     /// `ThreadComposeChanged` broadcast).
     pub compose_epoch: i64,
+    /// Exact Stop additions retained across PUTs until consumption.
+    pub compose_restorations: serde_json::Value,
     /// Pending changes held by this thread's *sub-threads*, at any depth, not
     /// counting its own. Filled only by `list_thread_summaries`, the list an
     /// agent reads its children from, so it is omitted rather than zero on
@@ -307,6 +312,10 @@ pub struct ThreadSummary {
     /// The *thread link*: `thread:<workspace>/<thread_id>`, by [`thread_link`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<String>,
+    /// The *thread liveness*, filled by `thread_liveness::attach` on the
+    /// same list and search paths.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<crate::engine::thread_liveness::ThreadLiveness>,
 }
 
 /// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
@@ -411,7 +420,8 @@ struct ThreadRow {
     message_count: i64,
     section: String,
     active_children_count: i64,
-    waiting_children_count: i64,
+    awaited_children_count: i64,
+    awaited_by_parent: bool,
     total_children_count: i64,
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
@@ -455,6 +465,7 @@ struct ThreadRow {
     compose_mode: Option<String>,
     compose_selection: Option<serde_json::Value>,
     compose_epoch: i64,
+    compose_restorations: serde_json::Value,
 }
 
 /// Per-event projection snapshot carried on persisted thread events
@@ -488,9 +499,11 @@ pub struct ThreadAggregate {
     /// See `ThreadSummary::summary_version`.
     pub summary_version: i64,
     pub active_children_count: i64,
-    /// See `ThreadSummary::waiting_children_count`. Carried on the per-event
-    /// SSE aggregate so a parent's Waiting dot follows its children live.
-    pub waiting_children_count: i64,
+    /// See `ThreadSummary::awaited_children_count`. Carried on the per-event
+    /// SSE aggregate so a parent's Waiting dot follows its descendants live.
+    pub awaited_children_count: i64,
+    /// See `ThreadSummary::awaited_by_parent`.
+    pub awaited_by_parent: bool,
     pub total_children_count: i64,
     /// Count of descendants (transitive) currently blocking this thread's
     /// archive. See `ThreadSummary::blocking_descendant_count`. Carried on the
@@ -576,6 +589,37 @@ pub struct ThreadAggregate {
     pub state: ThreadState,
 }
 
+/// Whether `ancestor` sits above `thread` in the thread tree, at any depth.
+/// A thread is not its own ancestor.
+///
+/// Mirrors the `ancestors` CTE in `engine::event_bus_projection_propagation`,
+/// including its lack of a depth cap: `parent_thread_id` is stamped once at
+/// spawn from an already-existing thread, so the graph is a forest and the
+/// walk terminates.
+pub(crate) async fn is_thread_ancestor(
+    pool: &sqlx::PgPool,
+    ancestor: uuid::Uuid,
+    thread: uuid::Uuid,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH RECURSIVE ancestors AS ( \
+            SELECT parent_thread_id AS thread_id \
+            FROM thread_summaries \
+            WHERE thread_id = $1 AND parent_thread_id IS NOT NULL \
+            UNION ALL \
+            SELECT t.parent_thread_id AS thread_id \
+            FROM thread_summaries t \
+            JOIN ancestors a ON t.thread_id = a.thread_id \
+            WHERE t.parent_thread_id IS NOT NULL \
+         ) \
+         SELECT EXISTS (SELECT 1 FROM ancestors WHERE thread_id = $2)",
+    )
+    .bind(thread)
+    .bind(ancestor)
+    .fetch_one(pool)
+    .await
+}
+
 /// Fetch the projection snapshot for a thread. Polymorphic over executor —
 /// callers pass either a `&PgPool` (HTTP handlers) or `&mut *tx` (inside an
 /// open transaction, for read-your-write semantics in `EventBus::emit()`).
@@ -616,7 +660,8 @@ fn row_to_thread_aggregate(
         status: ThreadStatus::parse(&r.status),
         summary_version: r.summary_version,
         active_children_count: r.active_children_count,
-        waiting_children_count: r.waiting_children_count,
+        awaited_children_count: r.awaited_children_count,
+        awaited_by_parent: r.awaited_by_parent,
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
@@ -686,7 +731,7 @@ fn thread_cols(alias: &str) -> String {
     format!(
         "{a}.thread_id::text, {a}.title, {a}.first_message, {a}.source, {a}.initiator, {a}.created_at, {a}.last_activity, \
         {a}.last_user_action, {a}.last_agent_action, \
-        {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.waiting_children_count::bigint, {a}.total_children_count::bigint, \
+        {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.awaited_children_count::bigint, {a}.awaited_by_parent, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, {a}.is_stopped_child, {a}.read_requested, {a}.reply_seen_devices, {a}.apply_in_flight, \
         {a}.live_event_wait_count::bigint, {a}.live_event_waits, {a}.cache_keep_alive_status, \
         {a}.status, {a}.summary_version, {a}.coding_agent_change_state, {a}.coding_agent_unproposed_reason, {a}.coding_agent_requires_restart, \
@@ -703,7 +748,7 @@ fn thread_cols(alias: &str) -> String {
         {repo_name} AS cc_repo_name, \
         {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, {a}.coding_agents, \
         {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode, {a}.compose_selection, \
-        {a}.compose_epoch",
+        {a}.compose_epoch, {a}.compose_restorations",
         a = alias,
         repo_name = repo_name_expr(&format!("{alias}.cc_repo_id")),
     )
@@ -745,7 +790,7 @@ impl EventStore {
         .fetch_optional(&self.pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[ThreadStore] thread_display_title query failed: {}", e);
+            log_legacy!("[ThreadStore] thread_display_title query failed: {}", e);
             None
         });
         let (title, first_message) = row?;
@@ -776,7 +821,8 @@ fn row_to_thread_summary(
         home: r.is_home,
         section: r.section,
         active_children_count: r.active_children_count,
-        waiting_children_count: r.waiting_children_count,
+        awaited_children_count: r.awaited_children_count,
+        awaited_by_parent: r.awaited_by_parent,
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
@@ -814,11 +860,13 @@ fn row_to_thread_summary(
         compose_mode: r.compose_mode,
         compose_selection: r.compose_selection,
         compose_epoch: r.compose_epoch,
+        compose_restorations: r.compose_restorations,
         pending_sub_thread_change_count: None,
         has_draft: None,
         draft_preview: None,
         draft_length: None,
         link: None,
+        liveness: None,
     })
 }
 
@@ -1030,7 +1078,11 @@ mod compose;
 mod drafts;
 mod events;
 
-pub use compose::{consume_compose_slot, ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
+pub(crate) use compose::{compose_report_cols, pin_legacy_compose_agents, restore_compose_slot};
+pub use compose::{
+    consume_compose_slot, ComposeReport, ComposeReportRow, ComposeRestoration, COMPOSE_REPORT_COLS,
+    MAX_COMPOSE_IMAGES, MAX_COMPOSE_SELECTION_BYTES, MAX_COMPOSE_TEXT_BYTES,
+};
 
 pub use drafts::{
     attach_reader_fields, char_length, has_draft, text_preview, thread_link, DraftSummary,

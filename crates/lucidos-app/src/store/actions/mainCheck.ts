@@ -18,7 +18,9 @@ export type MainCheckFrame =
   | 'MainCheckPassed'
   | 'MainCheckFailed'
   | 'MainCheckAbandoned'
-  | 'MainCheckRedClosed';
+  | 'MainCheckSuperseded'
+  | 'MainCheckRedClosed'
+  | 'MainCheckRepairStarted';
 
 const text = (value: unknown): string | undefined =>
   typeof value === 'string' && value !== '' ? value : undefined;
@@ -27,6 +29,15 @@ const text = (value: unknown): string | undefined =>
  *  except a start, which is always the newest check. */
 export function mainCheckAfter(current: MainCheck, frame: MainCheckFrame, data: Record<string, unknown>): MainCheck {
   const checkId = text(data.check_id);
+  if (frame === 'MainCheckRepairStarted') {
+    if (current.repair?.fix_thread_id !== text(data.fix_thread_id)) return current;
+    return { ...current, repair: { ...current.repair, state: 'running',
+      started_by: data.started_by === 'auto' ? 'auto' : 'fix-now', waiting_on: [] } };
+  }
+  // A repair-aware snapshot carries concurrent check and red state together.
+  // Its whole-server update is authoritative over individual verdict frames.
+  if (current.repair) return current;
+  if (frame === 'MainCheckFailed' && data.superseded_by_fix) return current;
   if (frame === 'MainCheckStarted') {
     return { state: 'running', check_id: checkId, from_sha: text(data.from_sha), to_sha: text(data.to_sha) };
   }
@@ -47,6 +58,9 @@ export function mainCheckAfter(current: MainCheck, frame: MainCheckFrame, data: 
       };
     case 'MainCheckAbandoned':
       return IDLE_MAIN_CHECK;
+    case 'MainCheckSuperseded':
+      // The next check's `MainCheckStarted` follows at once and replaces it.
+      return current;
     case 'MainCheckRedClosed':
       return current.state === 'red' ? IDLE_MAIN_CHECK : current;
   }

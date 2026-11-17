@@ -97,6 +97,20 @@ vi.mock('./menu', async () => {
   return { ...actual, switchMenuItem: (...args: unknown[]) => switchMenuItem(...args) };
 });
 vi.mock('./in-app-notification-toast', () => ({ dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args) }));
+// Resolves whether the app opened, as the real one does. Its own tests cover
+// the cache-miss re-scan and the toast for an unknown id.
+const INSTALLED_APP = 'habit-tracker';
+const openAppById = vi.fn((id: string, _source?: string, _fragment?: string) =>
+  Promise.resolve(id === INSTALLED_APP));
+vi.mock('./apps', async () => {
+  const actual = await vi.importActual<typeof import('./apps')>('./apps');
+  return { ...actual, openAppById: (...args: [string, string?, string?]) => openAppById(...args) };
+});
+const replaceNavState = vi.fn();
+vi.mock('./navigation', async () => {
+  const actual = await vi.importActual<typeof import('./navigation')>('./navigation');
+  return { ...actual, replaceNavState: () => replaceNavState() };
+});
 // Partial store mock: only the toast is stubbed. A narrow stub would break the
 // modules that pull other store exports in transitively (wipPreview reads
 // `wipPreviewThreadId` at import time).
@@ -108,6 +122,8 @@ vi.mock('../store', async () => {
 const { handleHashLocation, setupHashDeeplinkRouting, _resetThreadHashLandingForTesting } =
   await import('./hash-deeplink-router');
 const { landingHash } = await import('../../utils/workspaceLanding');
+const { appLandingHash } = await import('./appHash');
+const { appPseudoFullscreen, focusedThreadId, threadsLoaded, wipPreviewThreadId } = await import('../store');
 
 /** Let queued microtasks (the landing's awaits) run to completion. */
 const flush = () => new Promise<void>(resolve => { setTimeout(resolve, 0); });
@@ -141,6 +157,11 @@ describe('hash-deeplink-router', () => {
     dispatchDeepLink.mockClear();
     showToast.mockClear();
     switchMenuItem.mockClear();
+    openAppById.mockClear();
+    replaceNavState.mockClear();
+    appPseudoFullscreen.value = false;
+    wipPreviewThreadId.value = null;
+    focusedThreadId.value = null;
     documentListeners.clear();
     windowListeners.clear();
     visibilityValue = 'visible';
@@ -198,6 +219,66 @@ describe('hash-deeplink-router', () => {
       setUrl('http://localhost/#notifications-and-more');
       handleHashLocation();
       expect(switchMenuItem).not.toHaveBeenCalled();
+    });
+  });
+
+  // The fourth channel: the tab a remote workspace's app popout opens.
+  describe('the #app= popout landing channel', () => {
+    it('opens the installed app in pseudo-fullscreen and consumes the hash', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith(INSTALLED_APP, 'a popout link', undefined);
+      expect(appPseudoFullscreen.value).toBe(true);
+      expect(currentUrl.value, 'the consumed hash must be stripped')
+        .toBe('http://localhost/dev@peer/');
+    });
+
+    it('shows the live app, even when the seeded history restored a WIP preview', async () => {
+      // A new tab seeds its history from the opener, WIP preview included. The
+      // WIP auto-revert keeps it while its thread is focused and threads load.
+      focusedThreadId.value = 'thread-7';
+      threadsLoaded.value = false;
+      wipPreviewThreadId.value = 'thread-7';
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      await flush();
+      expect(wipPreviewThreadId.value).toBeNull();
+      expect(replaceNavState, 'the history row must match the live app').toHaveBeenCalledTimes(1);
+    });
+
+    it('carries the app fragment through, escapes and all', async () => {
+      const fragment = 'week=3&view=list';
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP, fragment })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith(INSTALLED_APP, 'a popout link', fragment);
+    });
+
+    it('opens nothing and stays in the normal layout for an unknown id', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: 'not-installed' })}`);
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledWith('not-installed', 'a popout link', undefined);
+      expect(appPseudoFullscreen.value).toBe(false);
+      expect(currentUrl.value).toBe('http://localhost/dev@peer/');
+    });
+
+    it('does not re-fire on a resume once consumed', async () => {
+      setUrl(`http://localhost/dev@peer/${appLandingHash({ appId: INSTALLED_APP })}`);
+      handleHashLocation();
+      handleHashLocation();
+      await flush();
+      expect(openAppById).toHaveBeenCalledTimes(1);
+    });
+
+    it('swallows none of the other channels', () => {
+      for (const hash of ['#notifications', `#thread=${THREAD_ID}`, buildNavigateHash(), '#apps', '#application=x']) {
+        setUrl(`http://localhost/${hash}`);
+        _resetThreadHashLandingForTesting();
+        handleHashLocation();
+      }
+      expect(openAppById).not.toHaveBeenCalled();
     });
   });
 

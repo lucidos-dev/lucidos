@@ -11,6 +11,23 @@ use tokio::sync::Notify;
 /// Far shorter than the stub's hour-long interval.
 const WOKEN_WITHIN: Duration = Duration::from_secs(5);
 
+#[tokio::test]
+async fn automatic_build_policy_is_workspace_persistent_and_defaults_to_auto() {
+    use crate::core::prefs;
+    use crate::test_support::{seed_preference, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    assert!(super::automatic_source_builds_enabled(&pool).await);
+    seed_preference(&pool, prefs::FOLLOW_MAIN_BUILD.key(), "on-switch")
+        .await
+        .unwrap();
+    assert!(!super::automatic_source_builds_enabled(&pool).await);
+    seed_preference(&pool, prefs::FOLLOW_MAIN_BUILD.key(), "auto")
+        .await
+        .unwrap();
+    assert!(super::automatic_source_builds_enabled(&pool).await);
+    teardown_test_db(&db).await;
+}
+
 /// A paired gateway landed: the task asks `origin` now, not in an hour.
 #[tokio::test]
 async fn a_nudge_ends_the_wait_before_the_interval() {
@@ -44,7 +61,9 @@ struct StubHost {
     follows: AtomicUsize,
     answered: AtomicUsize,
     builds: AtomicUsize,
+    manual_builds: std::sync::atomic::AtomicBool,
     refusals: Mutex<Vec<String>>,
+    followed: Mutex<Vec<(String, String)>>,
     nudge: Notify,
 }
 
@@ -57,6 +76,10 @@ impl FollowHost for StubHost {
 
     async fn follow_interval(&self) -> Duration {
         Duration::from_secs(3600)
+    }
+
+    async fn automatic_builds_enabled(&self) -> bool {
+        !self.manual_builds.load(Ordering::SeqCst)
     }
 
     async fn landing_order(&self) -> LandingOrder {
@@ -79,6 +102,10 @@ impl FollowHost for StubHost {
     async fn follow_refused(&self, reason: String) {
         self.refusals.lock().unwrap().push(reason);
     }
+
+    async fn main_followed(&self, from: String, to: String) {
+        self.followed.lock().unwrap().push((from, to));
+    }
 }
 
 fn followed() -> FollowOutcome {
@@ -88,16 +115,39 @@ fn followed() -> FollowOutcome {
     }
 }
 
-/// A pulled version builds and waits for a tap. The lane hears that
-/// `origin` answered.
+/// A pulled version builds and waits for a tap, and goes on record for the
+/// main check. The lane hears that `origin` answered.
 #[tokio::test]
 async fn a_followed_main_starts_a_build_and_wakes_the_lane() {
     let host = Arc::new(StubHost::default());
     let mut follower = Follower::default();
     follower.react(&host, followed()).await;
+    assert_eq!(
+        *host.followed.lock().unwrap(),
+        vec![("a".to_string(), "b".to_string())]
+    );
     assert_eq!(host.builds.load(Ordering::SeqCst), 1);
     assert_eq!(host.answered.load(Ordering::SeqCst), 1);
     assert!(host.refusals.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn manual_mode_keeps_following_and_nudging_without_builds() {
+    let host = Arc::new(StubHost::default());
+    host.manual_builds.store(true, Ordering::SeqCst);
+    let mut follower = Follower::default();
+    for _ in 0..3 {
+        host.nudge.notify_one();
+        tokio::time::timeout(WOKEN_WITHIN, wait_for_next_round(host.as_ref()))
+            .await
+            .unwrap();
+        follower.react(&host, followed()).await;
+    }
+    assert_eq!(host.builds.load(Ordering::SeqCst), 0);
+    assert_eq!(host.answered.load(Ordering::SeqCst), 3);
+    host.manual_builds.store(false, Ordering::SeqCst);
+    follower.react(&host, followed()).await;
+    assert_eq!(host.builds.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

@@ -66,6 +66,14 @@ type BackupProviderEntry = (
 /// rather than re-deriving 24h of its own.
 pub const BACKUP_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
 
+/// A backup is "overdue" once the newest good one is older than this. The
+/// app-shell banner warns at this line, where `stale` only colours a status line.
+///
+/// A different concept from [`BACKUP_STALE_AFTER_SECONDS`]: a manual-only
+/// workspace is routinely a day old, and nagging at 24h would train users to
+/// dismiss the banner.
+pub const BACKUP_OVERDUE_AFTER_SECONDS: i64 = 7 * 24 * 60 * 60;
+
 /// Check whether a backup schedule value represents an active (enabled) schedule.
 pub fn is_schedule_active(value: &str) -> bool {
     !value.is_empty() && value != "off"
@@ -78,23 +86,28 @@ pub fn is_schedule_active(value: &str) -> bool {
 /// nowhere to upload, and a destination with the cron off runs nothing.
 ///
 /// The ONE place that rule is written. `api::backup::schedule_response` decides
-/// which cron to REPORT with it, and [`backups_are_configured`] decides what the
-/// picker's row says. Two copies of it would let the Backup page and the picker
-/// disagree about whether an install is set up.
+/// which cron to REPORT with it. [`backups_are_configured`] is deliberately
+/// looser: a manual-only workspace runs no cron but is still set up.
 pub fn schedule_will_run(schedule: Option<&str>, provider: Option<&str>) -> bool {
-    provider.is_some_and(|p| !p.is_empty()) && schedule.is_some_and(is_schedule_active)
+    provider_is_set(provider) && schedule.is_some_and(is_schedule_active)
 }
 
-/// Are this workspace's backups set up: [`schedule_will_run`] against what is
-/// stored?
+fn provider_is_set(provider: Option<&str>) -> bool {
+    provider.is_some_and(|p| !p.is_empty())
+}
+
+/// Are this workspace's backups set up: is a destination stored?
+///
+/// The schedule is not part of it. "Manual only" stores schedule `off`, and
+/// that is a way of using backups, not a lack of them. The app-shell banner
+/// reads the same rule (`backupIsConfigured`).
 ///
 /// A read failure propagates rather than reading as `false`. "Not set up" is a
 /// verdict the picker states out loud, so a transient `sqlx` failure must not be
 /// dressed up as one.
 pub async fn backups_are_configured(pool: &PgPool) -> Result<bool, BoxError> {
     let provider = prefs::BACKUP_PROVIDER.try_stored(pool).await?;
-    let schedule = prefs::BACKUP_SCHEDULE.try_stored(pool).await?;
-    Ok(schedule_will_run(schedule.as_deref(), provider.as_deref()))
+    Ok(provider_is_set(provider.as_deref()))
 }
 
 /// Read the backup retention count from preferences. A missing or unparseable
@@ -443,14 +456,14 @@ pub async fn load_last_run(pool: &PgPool) -> Option<BackupLastRun> {
     let raw = match prefs::BACKUP_LAST_RUN.try_stored(pool).await {
         Ok(raw) => raw?,
         Err(e) => {
-            crate::log!("[Backup] Could not read {key}: {e}");
+            crate::log_legacy!("[Backup] Could not read {key}: {e}");
             return None;
         }
     };
     match serde_json::from_str(&raw) {
         Ok(run) => Some(run),
         Err(e) => {
-            crate::log!("[Backup] Ignoring malformed {key}: {e}");
+            crate::log_legacy!("[Backup] Ignoring malformed {key}: {e}");
             None
         }
     }
@@ -492,7 +505,7 @@ pub async fn load_recent_runs(pool: &PgPool, limit: i64) -> Vec<BackupRunSummary
     {
         Ok(rows) => rows,
         Err(e) => {
-            crate::log!("[Backup] Failed to load recent runs: {e}");
+            crate::log_legacy!("[Backup] Failed to load recent runs: {e}");
             return Vec::new();
         }
     };
@@ -823,7 +836,7 @@ pub async fn restore_archive_into(
         }
     }
     for warning in &warnings {
-        log!("[Restore] {warning}");
+        log_legacy!("[Restore] {warning}");
     }
 
     // Phase 4: restore the database dump into the provisioned Postgres. Skipped
@@ -841,7 +854,7 @@ pub async fn restore_archive_into(
                 // The restore succeeded, so failing it now would be wrong. The
                 // leftover is a full database dump in the workspace root.
                 if let Err(e) = std::fs::remove_file(&dump_path) {
-                    log!(
+                    log_legacy!(
                         "[Backup] Restore done, but {} was not removed: {}",
                         dump_path.display(),
                         e
@@ -861,7 +874,7 @@ pub async fn restore_archive_into(
         let store = key_store::resolve()?;
         let name = key_store::secrets_key_name(&database);
         if let Some(parked) = key_store::replace_keeping(store.as_ref(), &name, &key)? {
-            log!(
+            log_legacy!(
                 "[Restore] Kept the secret store key the restore replaced as {}",
                 store.describe(&parked)
             );
@@ -890,7 +903,7 @@ pub async fn create_backup(
     provider: &dyn BackupProvider,
     progress: impl Fn(&str, usize, usize) + Send + Sync + 'static,
 ) -> Result<BackupEntry, BoxError> {
-    crate::log!(
+    crate::log_legacy!(
         "[Backup] Starting backup to {} (provider: {})",
         provider.name(),
         provider.id()
@@ -975,7 +988,7 @@ async fn seal_and_upload(
         tokio::task::spawn_blocking(move || -> Result<(PathBuf, usize), BoxError> {
             let (_, compress_end, encrypt_end) = estimate_weights(ws_bytes);
             // Phase 3: encrypt with per-chunk progress (compress_end% → encrypt_end%)
-            crate::log!("[Backup] Phase 3/4: encrypt");
+            crate::log_legacy!("[Backup] Phase 3/4: encrypt");
             progress("encrypting", compress_end, 100);
             let encrypted_path = temp_path.join(format!("backup{suffix}"));
             {
@@ -1007,7 +1020,7 @@ async fn seal_and_upload(
     };
 
     // Phase 4: upload with progress (encrypt_end% → 100%)
-    crate::log!("[Backup] Phase 4/4: upload");
+    crate::log_legacy!("[Backup] Phase 4/4: upload");
     progress("uploading", encrypt_end, 100);
     let workspace_name = workspace_archive_name(workspace);
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
@@ -1025,7 +1038,7 @@ async fn seal_and_upload(
         .upload(&encrypted_path, &filename, &upload_progress)
         .await?;
     let size_bytes = std::fs::metadata(&encrypted_path)?.len();
-    crate::log!("[Backup] Complete: {} ({} bytes)", filename, size_bytes);
+    crate::log_legacy!("[Backup] Complete: {} ({} bytes)", filename, size_bytes);
 
     Ok(BackupEntry {
         id: backup_id,
@@ -1109,11 +1122,11 @@ pub async fn prune_old_backups(
     for entry in to_delete {
         match provider.delete(&entry.id).await {
             Ok(()) => {
-                crate::log!("[Backup] Pruned old backup: {}", entry.filename);
+                crate::log_legacy!("[Backup] Pruned old backup: {}", entry.filename);
                 deleted += 1;
             }
             Err(e) => {
-                crate::log!("[Backup] Failed to prune {}: {}", entry.filename, e);
+                crate::log_legacy!("[Backup] Failed to prune {}: {}", entry.filename, e);
             }
         }
     }
@@ -1280,7 +1293,7 @@ fn move_contents(src: &Path, dest: &Path) -> Result<(), BoxError> {
         let dest_path = dest.join(entry.file_name());
         // Try rename first (fast, same filesystem), fall back to copy+delete
         if let Err(e) = std::fs::rename(&src_path, &dest_path) {
-            crate::log!(
+            crate::log_legacy!(
                 "[Backup] rename failed for {}, falling back to copy: {}",
                 src_path.display(),
                 e
@@ -1317,8 +1330,14 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> Result<(), BoxError> {
 /// URL does not parse, so the caller fails loudly. Otherwise it would spawn a
 /// subprocess that inherits zero `PG*` vars and gets a confusing connection
 /// error from libpq.
+///
+/// A URL signing in with the boot password names the boot password file
+/// instead, so the tool's environment holds no password.
 fn apply_pg_env(cmd: &mut std::process::Command, database_url: &str) -> Result<(), BoxError> {
-    for (key, value) in lucidos_pg_url::PgUrl::parse(database_url)?.env() {
+    let mut url = lucidos_pg_url::PgUrl::parse(database_url)?;
+    crate::core::use_boot_passfile(&mut url);
+    cmd.env_remove("PGPASSWORD");
+    for (key, value) in url.env() {
         cmd.env(key, value);
     }
     Ok(())
@@ -1588,7 +1607,7 @@ fn terminate_other_connections(database_url: &str) -> Result<(), BoxError> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] Warning: failed to terminate other connections: {}",
             stderr
         );
@@ -1693,7 +1712,7 @@ impl BackupIgnore {
             Ok(content) => Self::parse(&content),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Backup] Could not read {} ({}); ignoring it",
                     path.display(),
                     e
@@ -1722,7 +1741,7 @@ impl BackupIgnore {
             if line.contains(['*', '?', '[']) {
                 match glob::Pattern::new(line) {
                     Ok(pat) => patterns.push(IgnorePattern::Glob(pat)),
-                    Err(e) => crate::log!(
+                    Err(e) => crate::log_legacy!(
                         "[Backup] Skipping malformed .backupignore pattern {:?}: {}",
                         line,
                         e
@@ -1811,7 +1830,7 @@ fn skip_if_vanished<T>(path: &Path, result: std::io::Result<T>) -> Result<Option
     match result {
         Ok(value) => Ok(Some(value)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            crate::log!("[Backup] Skipping vanished path {}: {}", path.display(), e);
+            crate::log_legacy!("[Backup] Skipping vanished path {}: {}", path.display(), e);
             Ok(None)
         }
         Err(e) => Err(e.into()),
@@ -1937,7 +1956,7 @@ fn append_file<W: std::io::Write>(
     }
     let padded = append_exact(builder, &mut header_for_file(&before), archive_path, &file)?;
     if let Some(drift) = copy_drift(&before, &file.metadata()?, padded) {
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] {} changed while it was archived: it {}",
             path.display(),
             drift
@@ -2025,7 +2044,7 @@ fn walkdir(root: &Path) -> Result<Vec<PathBuf>, BoxError> {
         // One line per walk, not one per link. The walk runs before
         // `is_excluded_workspace_path`, so it meets every symlink under
         // `.lucidos/` too, and a dev workspace has hundreds of those.
-        crate::log!(
+        crate::log_legacy!(
             "[Backup] Skipped {} symlink(s); only a relocated {}/ is followed",
             skipped,
             crate::core::DATA_DIR
@@ -2121,7 +2140,7 @@ fn walkdir_inner(
                     // reading by name. Deeper ones are `.lucidos/` noise and
                     // stay in the count.
                     if dir == root {
-                        crate::log!("[Backup] Not following symlink {}", path.display());
+                        crate::log_legacy!("[Backup] Not following symlink {}", path.display());
                     }
                 }
             }

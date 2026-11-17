@@ -43,7 +43,7 @@ impl EventStore {
                 .map(|id| (id, found.get(&id).copied()))
                 .collect(),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventStore] change statuses unreadable, child reports keep their \
                      original change state: {}",
                     e

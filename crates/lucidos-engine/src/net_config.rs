@@ -11,7 +11,7 @@
 //!      Set but unparseable → log a warning, ignore it, continue (never panic,
 //!      never silently widen the bind).
 //!   3. `LUCIDOS_BIND_ALL` truthy → all interfaces (`[::]`, dual-stack).
-//!   4. Machine + per-workspace config: if `~/.lucidos/network.toml`'s
+//!   4. Machine + per-workspace config: if `network.toml`'s
 //!      `[engine] inherit` is true (the default) the engine binds the gateway's
 //!      `[gateway] bind`; otherwise it binds this workspace's own `network_bind`
 //!      preference. Either value maps `"loopback"|"all"|<IP>` (invalid IP →
@@ -45,7 +45,7 @@ pub enum BindChoice {
     Address(IpAddr),
 }
 
-/// The machine-global `~/.lucidos/network.toml`, parsed with safe defaults.
+/// The machine-global `network.toml`, parsed with safe defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkToml {
     /// `[gateway] bind` — `loopback` | `all` | `<IP>`. `None` = unset → loopback.
@@ -87,9 +87,9 @@ fn default_true() -> bool {
     true
 }
 
-/// `~/.lucidos/network.toml`. `None` only when `HOME` is unset.
+/// The private entry `network.toml`. `None` only when `HOME` is unset.
 pub fn network_toml_path() -> Option<PathBuf> {
-    Some(lucidos_home::path()?.join("network.toml"))
+    lucidos_home::private_entry(lucidos_home::private::NETWORK_TOML)
 }
 
 /// Read + parse the machine-global config. Any failure (missing file, unreadable,
@@ -102,7 +102,7 @@ pub fn read_network_toml() -> NetworkToml {
         Ok(contents) => parse_network_toml(&contents),
         Err(e) => {
             if let Some(warning) = read_failure_warning(&path, &e) {
-                crate::log!("{warning}");
+                crate::log_legacy!("{warning}");
             }
             NetworkToml::default()
         }
@@ -131,8 +131,8 @@ pub fn parse_network_toml(contents: &str) -> NetworkToml {
             engine_inherit: raw.engine.map(|e| e.inherit).unwrap_or(true),
         },
         Err(e) => {
-            crate::log!(
-                "[NetConfig] malformed ~/.lucidos/network.toml ({e}); using safe defaults (loopback)"
+            crate::log_legacy!(
+                "[NetConfig] malformed network.toml ({e}); using safe defaults (loopback)"
             );
             NetworkToml::default()
         }
@@ -148,7 +148,7 @@ pub fn parse_bind_value(value: &str) -> BindChoice {
         _ => match value.trim().parse::<IpAddr>() {
             Ok(ip) => BindChoice::Address(ip),
             Err(_) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[NetConfig] invalid bind address '{value}' — falling back to loopback only"
                 );
                 BindChoice::Loopback
@@ -214,13 +214,41 @@ pub fn tls_scheme() -> &'static str {
     )
 }
 
-/// The scheme order for a resilient intra-host call to a PEER Lucidos process
-/// (e.g. the engine → gateway restart callback). The peer's scheme normally
-/// matches ours (both derive it the same way), but this returns the resolved
-/// scheme FIRST and the other protocol SECOND so a mismatch still connects —
-/// i.e. it supports both protocols by construction. Reads the process env.
-pub fn peer_scheme_order() -> [&'static str; 2] {
-    match tls_scheme() {
+/// The gateway's own cert and key, handed to a gateway-spawned engine by
+/// `lucidos-gateway` `stack.rs`. Unset when the gateway serves plain HTTP. The
+/// engine never serves with them: it reads only `LUCIDOS_TLS_*`.
+pub const GATEWAY_TLS_CERT_ENV: &str = "LUCIDOS_GATEWAY_TLS_CERT";
+pub const GATEWAY_TLS_KEY_ENV: &str = "LUCIDOS_GATEWAY_TLS_KEY";
+
+/// The scheme order for this engine's loopback call to its gateway: the
+/// gateway's scheme first, the other protocol second. Reads the process env.
+pub fn gateway_scheme_order() -> [&'static str; 2] {
+    let env = |name| std::env::var(name).ok();
+    gateway_scheme_order_from(
+        (
+            env(GATEWAY_TLS_CERT_ENV).as_deref(),
+            env(GATEWAY_TLS_KEY_ENV).as_deref(),
+        ),
+        (
+            env("LUCIDOS_TLS_CERT").as_deref(),
+            env("LUCIDOS_TLS_KEY").as_deref(),
+        ),
+    )
+}
+
+/// Pure half of [`gateway_scheme_order`]. The gateway's TLS handoff decides
+/// first. A gateway-spawned engine serves plain HTTP behind a TLS gateway, so
+/// its own scheme says nothing then. Without a handoff, its own scheme is the
+/// best guess: a directly launched engine, or a plain gateway.
+pub fn gateway_scheme_order_from(
+    gateway_tls: (Option<&str>, Option<&str>),
+    own_tls: (Option<&str>, Option<&str>),
+) -> [&'static str; 2] {
+    let first = match tls_scheme_from(gateway_tls.0, gateway_tls.1) {
+        SCHEME_HTTPS => SCHEME_HTTPS,
+        _ => tls_scheme_from(own_tls.0, own_tls.1),
+    };
+    match first {
         SCHEME_HTTPS => [SCHEME_HTTPS, SCHEME_HTTP],
         _ => [SCHEME_HTTP, SCHEME_HTTPS],
     }
@@ -247,7 +275,7 @@ pub fn resolve_engine_bind(
         if !trimmed.is_empty() {
             match trimmed.parse::<IpAddr>() {
                 Ok(ip) => return BindChoice::Address(ip),
-                Err(_) => crate::log!(
+                Err(_) => crate::log_legacy!(
                     "[NetConfig] invalid LUCIDOS_BIND_ADDR '{trimmed}' — ignoring, falling back"
                 ),
             }
@@ -358,6 +386,31 @@ pub fn install_crypto_provider() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_gateway_scheme_comes_from_its_handoff_before_our_own() {
+        let tls = (Some("/c.pem"), Some("/k.pem"));
+        let none = (None, None);
+        // Gateway-spawned engine behind a TLS gateway: plain itself.
+        assert_eq!(
+            gateway_scheme_order_from(tls, none),
+            [SCHEME_HTTPS, SCHEME_HTTP]
+        );
+        // No handoff: a plain gateway, or a directly launched engine.
+        assert_eq!(
+            gateway_scheme_order_from(none, none),
+            [SCHEME_HTTP, SCHEME_HTTPS]
+        );
+        assert_eq!(
+            gateway_scheme_order_from(none, tls),
+            [SCHEME_HTTPS, SCHEME_HTTP]
+        );
+        // A blank handoff names no TLS.
+        assert_eq!(
+            gateway_scheme_order_from((Some(" "), Some("/k.pem")), none),
+            [SCHEME_HTTP, SCHEME_HTTPS]
+        );
+    }
 
     const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
     /// A synthetic address from the CGNAT range Tailscale hands out. Invented,

@@ -166,6 +166,15 @@ async fn one_draft_by_id_carries_its_whole_text() {
         .expect("get")
         .expect("a draft");
     assert_eq!(one.text.as_deref(), Some(long.as_str()));
+    let detail = serde_json::to_value(&one).expect("serialize detail");
+    assert_eq!(detail["snapshot"]["text"], long);
+    // A newly inserted projection starts at revision zero. Preserve that
+    // token too; a reader must not invent its own revision.
+    assert_eq!(detail["snapshot"]["draft_revision"], 0);
+    assert_eq!(detail["snapshot"]["compose_epoch"], 0);
+    assert_eq!(detail["snapshot"]["image_hashes"], serde_json::json!([]));
+    let listing = serde_json::to_value(&listed[0]).expect("serialize listing");
+    assert!(listing.get("snapshot").is_none(), "lists remain previews");
     assert!(store.get_draft(WS, none).await.expect("get").is_none());
     assert!(store
         .get_draft(WS, Uuid::new_v4())
@@ -173,6 +182,77 @@ async fn one_draft_by_id_carries_its_whole_text() {
         .expect("get")
         .is_none());
 
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// A revision names the whole compose report, including image-only drafts and
+/// selection-only edits. The read must not assemble it from separate queries.
+#[tokio::test]
+async fn draft_snapshot_tracks_ordered_images_and_selection_edits() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let images = serde_json::json!(["b".repeat(64), "a".repeat(64)]);
+    let id = insert_draft_thread(&pool, "Images", "", images.clone(), Some(1)).await;
+    let selection = serde_json::json!({"model": "test-model", "reasoningEffort": "high"});
+    sqlx::query("UPDATE thread_summaries SET compose_mode = 'chat', compose_selection = $2 WHERE thread_id = $1")
+        .bind(id).bind(&selection).execute(&pool).await.expect("set selection");
+    let read =
+        || async { serde_json::to_value(store.get_draft(WS, id).await.unwrap().unwrap()).unwrap() };
+    let before = read().await;
+    assert_eq!(before["snapshot"]["text"], "");
+    assert_eq!(before["snapshot"]["image_hashes"], images);
+    assert_eq!(before["snapshot"]["mode"], "chat");
+    assert_eq!(before["snapshot"]["selection"], selection);
+    sqlx::query("UPDATE thread_summaries SET compose_selection = '{\"model\":\"another-model\"}' WHERE thread_id = $1")
+        .bind(id).execute(&pool).await.expect("edit only selection");
+    let after = read().await;
+    assert!(
+        after["snapshot"]["summary_version"].as_i64().unwrap()
+            > before["snapshot"]["summary_version"].as_i64().unwrap()
+    );
+    assert_eq!(
+        after["snapshot"]["compose_epoch"],
+        before["snapshot"]["compose_epoch"]
+    );
+    assert_eq!(after["snapshot"]["selection"]["model"], "another-model");
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// I7: the draft revision an agent sends by moves only with the saved draft.
+/// Activity and a new title move `summary_version` and must leave it alone.
+#[tokio::test]
+async fn the_draft_revision_moves_only_with_the_draft() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+    let id = insert_draft_thread(&pool, "Busy", "saved text", no_images(), Some(1)).await;
+    let read =
+        || async { serde_json::to_value(store.get_draft(WS, id).await.unwrap().unwrap()).unwrap() };
+    let revision = |v: &serde_json::Value| v["snapshot"]["draft_revision"].as_i64().unwrap();
+    let before = read().await;
+
+    sqlx::query(
+        "UPDATE thread_summaries SET last_activity = now() + interval '1 minute', \
+         title = 'Renamed', status = 'running' WHERE thread_id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .expect("touch the row");
+    let touched = read().await;
+    assert!(
+        touched["snapshot"]["summary_version"].as_i64()
+            > before["snapshot"]["summary_version"].as_i64()
+    );
+    assert_eq!(revision(&touched), revision(&before));
+
+    sqlx::query("UPDATE thread_summaries SET compose_text = 'edited' WHERE thread_id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .expect("edit the draft");
+    assert_eq!(revision(&read().await), revision(&before) + 1);
     pool.close().await;
     teardown_test_db(&db).await;
 }

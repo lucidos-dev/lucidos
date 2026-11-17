@@ -58,6 +58,7 @@ async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
 
 fn proposed(change_id: Uuid, description: &str, files: &[String], set_aside: bool) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: change_id.to_string(),
         description: Some(description.into()),
         files: files.to_vec(),
@@ -287,6 +288,7 @@ async fn handed_off_work_withdraws_the_pending_change_unannounced() {
             worktree_path: None,
             worktree_head_sha: Some(branch_head(&repo).await),
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -345,6 +347,7 @@ async fn an_integrated_child_hands_up_hardened_work_and_never_proposes() {
         &bus,
         thread_id,
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: BRANCH.into(),
@@ -640,6 +643,7 @@ async fn the_branch_moved_unless_the_last_idle_recorded_its_head() {
         worktree_path: None,
         worktree_head_sha: sha.map(str::to_string),
         bg_bash_pending: false,
+        turn_end: None,
     };
 
     assert!(branch_moved_since_last_idle(&pool, thread_id, &repo, BRANCH).await);
@@ -858,6 +862,7 @@ async fn a_hold_withdraws_an_open_change_the_turn_committed_past() {
             worktree_path: None,
             worktree_head_sha: Some(head),
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -956,6 +961,7 @@ async fn work_after_a_queued_change_waits_for_its_landing() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,

@@ -4,10 +4,6 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-fn api_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api")
-}
-
 /// A route-registering function that is NOT part of the `/api/v1` router.
 ///
 /// Every other one must be a `router()` that `create_router` merges, and the
@@ -16,6 +12,11 @@ fn api_dir() -> PathBuf {
 ///
 /// The third column is prose for a reader: nothing keys on it.
 const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
+    (
+        "internal_faults.rs",
+        "internal_faults_middleware_records_only_our_response_and_preserves_bodies",
+        "an inline test's own router",
+    ),
     (
         "restore_generation.rs",
         "durable_boundary_fences_before_handler_without_waiting_for_hello",
@@ -48,9 +49,9 @@ const MOUNTED_ELSEWHERE: &[(&str, &str, &str)] = &[
         "an inline test's stand-in gateway",
     ),
     (
-        "workspace_label.rs",
+        "gateway_control.rs",
         "stand_in_gateway",
-        "an inline test's stand-in gateway",
+        "the tests' shared stand-in gateway",
     ),
 ];
 
@@ -67,80 +68,10 @@ const COMPUTED_ROUTE_REACH: &[(&str, &str, Reach)] = &[
     // the gateway calls it, so like the rest of the `/internal/` tree no app
     // frame may.
     ("internal.rs", "router", Reach::Agent),
+    // The outbound workspace call, its path shared with the stamp crate. Only
+    // a thread's own subprocess holding an origin token may call it.
+    ("workspace_calls.rs", "router", Reach::Agent),
 ];
-
-/// Every route the `/api/v1` router serves, with the methods each answers.
-///
-/// Built from the shared scan, filtered to the functions this mount owns. A
-/// registering function that is neither merged here nor declared above is a
-/// panic. Skipping one silently is how a route would reach an app unasked.
-fn scan_routes() -> BTreeMap<String, BTreeSet<String>> {
-    let mod_src =
-        std::fs::read_to_string(api_dir().join("mod.rs")).expect("api/mod.rs is readable");
-    let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for hit in crate::api::route_scan::scan_api_routes() {
-        let elsewhere = MOUNTED_ELSEWHERE
-            .iter()
-            .any(|(file, func, _)| *file == hit.file && *func == hit.func);
-        if elsewhere {
-            continue;
-        }
-        let module = hit.file.trim_end_matches(".rs").trim_end_matches("/mod");
-        assert!(
-            hit.func == "router" && mod_src.contains(&format!(".merge({module}::router())")),
-            "{}::{} registers a route and nothing says where it is mounted. Merge it \
-             into create_router, or declare it in MOUNTED_ELSEWHERE.",
-            hit.file,
-            hit.func
-        );
-        if hit.path.is_empty() {
-            let declared = COMPUTED_ROUTE_REACH
-                .iter()
-                .any(|(file, func, _)| *file == hit.file && *func == hit.func);
-            assert!(
-                declared,
-                "{} registers a computed route. Add it to COMPUTED_ROUTE_REACH \
-                 with its answer.",
-                hit.file
-            );
-            continue;
-        }
-        found.entry(hit.path).or_default().extend(hit.methods);
-    }
-    found
-}
-
-#[test]
-fn every_api_route_states_whether_an_app_may_reach_it() {
-    let scanned = scan_routes();
-    // The check can say no. Without this, an empty or broken scan would pass
-    // every loop below while proving nothing.
-    assert!(
-        scanned.len() > 150 && scanned.contains_key("/data/*path"),
-        "the route scan found {} routes, so it is not reading the routers",
-        scanned.len()
-    );
-
-    let declared: BTreeSet<&str> = ROUTE_REACH.iter().map(|(p, _, _)| *p).collect();
-    let unanswered: Vec<&String> = scanned
-        .keys()
-        .filter(|p| !declared.contains(p.as_str()))
-        .collect();
-    assert!(
-        unanswered.is_empty(),
-        "these routes do not say whether an app may reach them. Add a row to \
-         ROUTE_REACH in app_reach.rs, default Host unless an app needs it: {unanswered:?}"
-    );
-
-    let stale: Vec<&&str> = declared
-        .iter()
-        .filter(|p| !scanned.contains_key(**p))
-        .collect();
-    assert!(
-        stale.is_empty(),
-        "ROUTE_REACH answers for routes that no longer exist: {stale:?}"
-    );
-}
 
 #[test]
 fn an_unclassified_route_is_denied() {
@@ -151,6 +82,18 @@ fn an_unclassified_route_is_denied() {
     // And a method the row does not list is denied on an allowed route.
     assert!(app_may_call("/models", "GET"));
     assert!(!app_may_call("/models", "DELETE"));
+}
+
+#[test]
+fn host_log_transfer_routes_are_agent_only() {
+    for route in [
+        "/engine/host-log-transfer/prepare",
+        "/engine/host-log-transfer/:id/execute",
+        "/engine/host-log-transfer/:id/status",
+    ] {
+        assert_eq!(entry_for(route), Some((Reach::Agent, &[][..])));
+        assert!(!app_may_call(route, "POST"));
+    }
 }
 
 #[test]
@@ -165,28 +108,6 @@ fn a_denied_route_lists_no_methods() {
             assert!(
                 !methods.is_empty(),
                 "{path} is app-reachable with no method"
-            );
-        }
-    }
-}
-
-#[test]
-fn an_app_route_lists_only_methods_the_route_serves() {
-    let scanned = scan_routes();
-    for (path, reach, methods) in ROUTE_REACH {
-        if *reach != App {
-            continue;
-        }
-        let served = scanned
-            .get(*path)
-            .unwrap_or_else(|| panic!("{path} is not a route"));
-        if served.contains("ANY") {
-            continue;
-        }
-        for method in *methods {
-            assert!(
-                served.contains(*method),
-                "{path} is app-reachable for {method}, which it does not serve"
             );
         }
     }
@@ -626,4 +547,107 @@ fn the_routes_that_motivated_the_hatch_are_open() {
     assert!(app_may_call("/env-vars", "GET"));
     assert!(app_may_call("/models", "GET"));
     assert!(app_may_call("/notifications", "POST"));
+}
+
+mod guard_tests {
+    use super::*;
+
+    fn api_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/api")
+    }
+
+    /// Every route the `/api/v1` router serves, with the methods each answers.
+    ///
+    /// Built from the shared scan, filtered to the functions this mount owns. A
+    /// registering function that is neither merged here nor declared above is a
+    /// panic. Skipping one silently is how a route would reach an app unasked.
+    fn scan_routes() -> BTreeMap<String, BTreeSet<String>> {
+        let mod_src =
+            std::fs::read_to_string(api_dir().join("mod.rs")).expect("api/mod.rs is readable");
+        let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for hit in crate::api::route_scan::scan_api_routes() {
+            let elsewhere = MOUNTED_ELSEWHERE
+                .iter()
+                .any(|(file, func, _)| *file == hit.file && *func == hit.func);
+            if elsewhere {
+                continue;
+            }
+            let module = hit.file.trim_end_matches(".rs").trim_end_matches("/mod");
+            assert!(
+                hit.func == "router" && mod_src.contains(&format!(".merge({module}::router())")),
+                "{}::{} registers a route and nothing says where it is mounted. Merge it \
+             into create_router, or declare it in MOUNTED_ELSEWHERE.",
+                hit.file,
+                hit.func
+            );
+            if hit.path.is_empty() {
+                let declared = COMPUTED_ROUTE_REACH
+                    .iter()
+                    .any(|(file, func, _)| *file == hit.file && *func == hit.func);
+                assert!(
+                    declared,
+                    "{} registers a computed route. Add it to COMPUTED_ROUTE_REACH \
+                 with its answer.",
+                    hit.file
+                );
+                continue;
+            }
+            found.entry(hit.path).or_default().extend(hit.methods);
+        }
+        found
+    }
+
+    #[test]
+    fn every_api_route_states_whether_an_app_may_reach_it() {
+        let scanned = scan_routes();
+        // The check can say no. Without this, an empty or broken scan would pass
+        // every loop below while proving nothing.
+        assert!(
+            scanned.len() > 150 && scanned.contains_key("/data/*path"),
+            "the route scan found {} routes, so it is not reading the routers",
+            scanned.len()
+        );
+
+        let declared: BTreeSet<&str> = ROUTE_REACH.iter().map(|(p, _, _)| *p).collect();
+        let unanswered: Vec<&String> = scanned
+            .keys()
+            .filter(|p| !declared.contains(p.as_str()))
+            .collect();
+        assert!(
+            unanswered.is_empty(),
+            "these routes do not say whether an app may reach them. Add a row to \
+         ROUTE_REACH in app_reach.rs, default Host unless an app needs it: {unanswered:?}"
+        );
+
+        let stale: Vec<&&str> = declared
+            .iter()
+            .filter(|p| !scanned.contains_key(**p))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "ROUTE_REACH answers for routes that no longer exist: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn an_app_route_lists_only_methods_the_route_serves() {
+        let scanned = scan_routes();
+        for (path, reach, methods) in ROUTE_REACH {
+            if *reach != App {
+                continue;
+            }
+            let served = scanned
+                .get(*path)
+                .unwrap_or_else(|| panic!("{path} is not a route"));
+            if served.contains("ANY") {
+                continue;
+            }
+            for method in *methods {
+                assert!(
+                    served.contains(*method),
+                    "{path} is app-reachable for {method}, which it does not serve"
+                );
+            }
+        }
+    }
 }

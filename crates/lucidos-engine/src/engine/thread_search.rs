@@ -137,7 +137,7 @@ pub(crate) async fn combined_thread_search(
         let embedding = match engine.embedder.embed(q).await {
             Ok(e) => e,
             Err(e) => {
-                log!("[Search] embedder failed, degrading to text-only: {}", e);
+                log_legacy!("[Search] embedder failed, degrading to text-only: {}", e);
                 return None;
             }
         };
@@ -152,7 +152,7 @@ pub(crate) async fn combined_thread_search(
         {
             Ok(r) => r,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Search] semantic search failed, degrading to text-only: {}",
                     e
                 );
@@ -173,7 +173,7 @@ pub(crate) async fn combined_thread_search(
         {
             Ok(r) => Some(r),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Search] thread aggregation failed, degrading to text-only: {}",
                     e
                 );

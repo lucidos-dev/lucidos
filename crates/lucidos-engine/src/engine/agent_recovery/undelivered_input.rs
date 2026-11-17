@@ -10,7 +10,7 @@
 
 use uuid::Uuid;
 
-use super::USER_CLICKED_CONTINUE_REASON;
+use super::{OWNER_ALLOWED_START_REASON, USER_CLICKED_CONTINUE_REASON};
 
 /// What a coding agent was owed and never read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,8 +43,8 @@ type Row = (Uuid, String, serde_json::Value);
 ///
 /// A thread whose agent never engaged has no conversation to resume, so every
 /// reason hands it the prompts it was never given. A thread whose agent engaged
-/// resumes its session, and only Continue replays what a failed start left
-/// unread.
+/// resumes its session. Only Continue and the owner's Allow of a parked start
+/// replay what a failed start left unread.
 pub(crate) async fn resume_input(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
@@ -55,6 +55,7 @@ pub(crate) async fn resume_input(
     }
     match continue_reason {
         Some(USER_CLICKED_CONTINUE_REASON) => undelivered_input(pool, thread_id).await,
+        Some(OWNER_ALLOWED_START_REASON) => owed_input(pool, thread_id, Owed::ParkedStart).await,
         _ => None,
     }
 }
@@ -84,7 +85,7 @@ async fn agent_never_engaged(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
         .fetch_one(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[Recovery] Could not tell whether the agent of thread {} engaged: {}",
                 thread_id,
                 e
@@ -94,7 +95,8 @@ async fn agent_never_engaged(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
 }
 
 /// Every message of a thread whose agent never engaged, oldest first, minus the
-/// ones the user took back.
+/// ones the user took back and all input through a start the owner refused.
+/// The refusal anchor also supports older per-message cancellation events.
 async fn unengaged_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<UndeliveredInput> {
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT m.id, m.event_type, m.payload FROM events m \
@@ -104,13 +106,22 @@ async fn unengaged_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Undeliv
                  WHERE t.thread_id = $1 \
                    AND t.event_type = 'QueuedMessageRemoved' \
                    AND t.payload->>'removed_message_id' = m.id::text) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM events r \
+                 JOIN events a ON a.id::text = r.payload->>'request_event_id' \
+                   AND a.thread_id = $1 \
+                 WHERE r.thread_id = $1 \
+                   AND r.event_type = 'ResponseCanceled' \
+                   AND r.payload->>'cause' = $2 \
+                   AND a.sequence >= m.sequence) \
           ORDER BY m.sequence ASC",
     )
     .bind(thread_id)
+    .bind(crate::engine::thread_events::CancelCause::Refused.as_str())
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Recovery] Could not read the messages of unengaged thread {}: {}",
             thread_id,
             e
@@ -126,6 +137,16 @@ async fn unengaged_input(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Undeliv
     }))
 }
 
+/// Which unread messages a resume carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owed {
+    /// The human messages the latest failed starts left unread.
+    FailedStarts,
+    /// Every message since the agent last read one, whoever sent it. The spawn
+    /// gate refused each before any spawn, so the agent never saw them.
+    ParkedStart,
+}
+
 /// The human messages the thread's latest failed starts left unread, oldest
 /// first, or `None` when the agent read everything it was sent.
 ///
@@ -138,6 +159,11 @@ pub(crate) async fn undelivered_input(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> Option<UndeliveredInput> {
+    owed_input(pool, thread_id, Owed::FailedStarts).await
+}
+
+/// The messages `owed` names on `thread_id`, oldest first.
+async fn owed_input(pool: &sqlx::PgPool, thread_id: Uuid, owed: Owed) -> Option<UndeliveredInput> {
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT e.id, e.event_type, e.payload FROM events e \
           WHERE e.thread_id = $1 AND e.event_type = ANY($2::text[]) \
@@ -154,23 +180,24 @@ pub(crate) async fn undelivered_input(
     .fetch_all(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[Recovery] Could not read thread {} for an undelivered message: {}",
             thread_id,
             e
         );
         Vec::new()
     });
-    undelivered_input_from(&rows)
+    owed_input_from(&rows, owed)
 }
 
-/// [`undelivered_input`] over events, newest first.
-fn undelivered_input_from(newest_first: &[Row]) -> Option<UndeliveredInput> {
+/// [`owed_input`] over events, newest first.
+fn owed_input_from(newest_first: &[Row], owed: Owed) -> Option<UndeliveredInput> {
+    let parked = owed == Owed::ParkedStart;
     let mut messages = Vec::new();
     for (id, event_type, payload) in newest_first {
         match event_type.as_str() {
-            "ResponseFailed" if is_start_failure(payload) => {}
-            "MessageReceived" if is_human(payload) => {
+            "ResponseFailed" if parked || is_start_failure(payload) => {}
+            "MessageReceived" if parked || is_human(payload) => {
                 let text = payload.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 messages.push((*id, text, payload));
             }
@@ -250,7 +277,7 @@ mod tests {
         let message = user_says("add prompt caching");
         let newest_first = vec![start_failure(), message.clone()];
         assert_eq!(
-            undelivered_input_from(&newest_first),
+            owed_input_from(&newest_first, Owed::FailedStarts),
             Some(UndeliveredInput {
                 text: "add prompt caching".into(),
                 image_hashes: vec![],
@@ -259,11 +286,29 @@ mod tests {
         );
     }
 
+    /// The owner allowed a start the spawn gate refused. Its message came
+    /// from a process, and its failure was no start failure, yet it is owed.
+    #[test]
+    fn an_allowed_start_carries_the_message_the_gate_parked() {
+        let gate_refusal = event("ResponseFailed", json!({ "error": "waits for the owner" }));
+        let parked = event(
+            "MessageReceived",
+            json!({ "text": "run the suite", "mode": "agent" }),
+        );
+        let read = event("CodingAgentInputRead", json!({}));
+        let newest_first = vec![gate_refusal, parked, read, user_says("earlier")];
+        assert_eq!(
+            owed_input_from(&newest_first, Owed::ParkedStart).map(|u| u.text),
+            Some("run the suite".into())
+        );
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
+    }
+
     #[test]
     fn it_survives_a_second_start_failure_on_a_retry() {
         let newest_first = vec![start_failure(), start_failure(), user_says("first request")];
         assert_eq!(
-            undelivered_input_from(&newest_first).map(|u| u.text),
+            owed_input_from(&newest_first, Owed::FailedStarts).map(|u| u.text),
             Some("first request".into())
         );
     }
@@ -272,7 +317,7 @@ mod tests {
     fn several_messages_come_back_in_the_order_they_were_sent() {
         let newest_first = vec![user_says("second"), start_failure(), user_says("first")];
         assert_eq!(
-            undelivered_input_from(&newest_first).map(|u| u.text),
+            owed_input_from(&newest_first, Owed::FailedStarts).map(|u| u.text),
             Some("first\n\nsecond".into())
         );
     }
@@ -287,7 +332,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            undelivered_input_from(&newest_first).map(|u| u.image_hashes),
+            owed_input_from(&newest_first, Owed::FailedStarts).map(|u| u.image_hashes),
             Some(vec!["h1".to_string(), "h2".to_string()])
         );
     }
@@ -298,7 +343,7 @@ mod tests {
             event("ResponseCanceled", json!({ "cause": "user_stop" })),
             user_says("stopped on purpose"),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
@@ -308,7 +353,7 @@ mod tests {
             event("CodingAgentInputRead", json!({})),
             user_says("already read"),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
@@ -318,7 +363,7 @@ mod tests {
             event("ResponseGenerated", json!({ "text": "done" })),
             user_says("answered long ago"),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
@@ -330,7 +375,7 @@ mod tests {
             ),
             user_says("was read"),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
@@ -339,7 +384,7 @@ mod tests {
             event("ResponseFailed", json!({ "error": "old" })),
             user_says("was read"),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
@@ -351,11 +396,11 @@ mod tests {
                 json!({ "text": "Your changes have not been hardened.", "mode": "engine" }),
             ),
         ];
-        assert_eq!(undelivered_input_from(&newest_first), None);
+        assert_eq!(owed_input_from(&newest_first, Owed::FailedStarts), None);
     }
 
     #[test]
     fn a_thread_with_no_failure_owes_nothing() {
-        assert_eq!(undelivered_input_from(&[]), None);
+        assert_eq!(owed_input_from(&[], Owed::FailedStarts), None);
     }
 }

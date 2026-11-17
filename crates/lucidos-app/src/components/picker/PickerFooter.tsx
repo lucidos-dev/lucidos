@@ -19,6 +19,7 @@ import { Disclosure } from '../shared/Disclosure';
 import { HiddenFileInput } from '../shared/HiddenFileInput';
 import type { CreateNote, RestoreBlocker, RestoreDraft } from './workspaceForms';
 import {
+  AWAITING_OWNER_NOTE,
   HTTPS_ONLY_NOTE,
   TRUST_NOTE,
   remoteGatewayBlocker,
@@ -73,6 +74,8 @@ export interface PickerFooterProps {
   onCancelRemote: () => void;
   /** Which remote gateway the last Pair added, or null. */
   pairedRemote: string | null;
+  /** The other gateway waits for one of its paired devices to tap Allow. */
+  remoteAwaitingOwner: boolean;
 }
 
 export function pickerFooter(p: PickerFooterProps): VNode {
@@ -295,16 +298,19 @@ export function pickerFooter(p: PickerFooterProps): VNode {
             Settings → Access → Pair a gateway for a code and its https address.
           </p>
           <p class="ws-picker-note ws-picker-note-warn">{TRUST_NOTE}</p>
-          {remoteField('Address', 'address', 'https://lucidos.example.com')}
-          <RemoteHeadersEditor rows={p.remoteDraft.headers ?? []} onChange={headers => p.onRemoteDraft({ headers })} disabled={p.busy} />
-          {remoteField('Gateway pairing secret', 'code', 'lgp_…')}
           {remoteField('Short name', 'name', 'cloud')}
-          {p.pairedRemote && (
-            <p class="ws-picker-note">Paired with {p.pairedRemote}.</p>
-          )}
+          {remoteField('Gateway pairing secret', 'code', 'lgp_…')}
+          <RemoteHeadersEditor rows={p.remoteDraft.headers ?? []} onChange={headers => p.onRemoteDraft({ headers })} disabled={p.busy} />
+          {remoteField('Address', 'address', 'https://lucidos.example.com')}
           {remoteBlocker?.kind === 'plain-http' && (
             <p class="ws-picker-note ws-picker-note-warn">{HTTPS_ONLY_NOTE}</p>
           )}
+          {p.pairedRemote && (
+            <p class="ws-picker-note">Paired with {p.pairedRemote}.</p>
+          )}
+          <Disclosure open={p.remoteAwaitingOwner}>
+            <p class="ws-picker-note" role="status">{AWAITING_OWNER_NOTE}</p>
+          </Disclosure>
           <div class="ws-picker-inline">
             <button
               class="ws-picker-btn ws-picker-btn-confirm"

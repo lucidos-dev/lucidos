@@ -32,6 +32,9 @@ import {
   PREF_JUDGMENT_EXPECTED_WAKE_DECISION,
   PREF_MODEL_EXPECTED_WAKE_DECISION,
   PREF_REASONING_EXPECTED_WAKE_DECISION,
+  PREF_JUDGMENT_PERMISSION_ANSWER,
+  PREF_MODEL_PERMISSION_ANSWER,
+  PREF_REASONING_PERMISSION_ANSWER,
   PREF_MODEL_WAKE_DECISION,
   PREF_REASONING_WAKE_DECISION,
 } from '@lucidos/preference-catalog';
@@ -178,7 +181,8 @@ export type JudgmentSite =
   | 'query-classification'
   | 'read-decision'
   | 'wake-decision'
-  | 'expected-wake-decision';
+  | 'expected-wake-decision'
+  | 'permission-answer';
 
 /** Every site with a control, in the order the provider rows list them. */
 export const JUDGMENT_SITES: readonly JudgmentSite[] = [
@@ -187,6 +191,7 @@ export const JUDGMENT_SITES: readonly JudgmentSite[] = [
   'read-decision',
   'wake-decision',
   'expected-wake-decision',
+  'permission-answer',
 ];
 
 export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
@@ -195,6 +200,7 @@ export const JUDGMENT_PREFERENCE_KEY: Record<JudgmentSite, string> = {
   'read-decision': PREF_JUDGMENT_READ_DECISION.key,
   'wake-decision': PREF_JUDGMENT_WAKE_DECISION.key,
   'expected-wake-decision': PREF_JUDGMENT_EXPECTED_WAKE_DECISION.key,
+  'permission-answer': PREF_JUDGMENT_PERMISSION_ANSWER.key,
 };
 
 /** The model half of the site's *model selection*, used while it runs on chat.
@@ -205,6 +211,7 @@ export const JUDGMENT_MODEL_KEY: Record<JudgmentSite, BackgroundModelKey> = {
   'read-decision': 'model_read_decision',
   'wake-decision': PREF_MODEL_WAKE_DECISION.key,
   'expected-wake-decision': PREF_MODEL_EXPECTED_WAKE_DECISION.key,
+  'permission-answer': PREF_MODEL_PERMISSION_ANSWER.key,
 };
 
 /** The effort half, written with the model and never on its own. */
@@ -214,6 +221,7 @@ export const JUDGMENT_REASONING_KEY: Record<JudgmentSite, BackgroundReasoningKey
   'read-decision': 'reasoning_read_decision',
   'wake-decision': PREF_REASONING_WAKE_DECISION.key,
   'expected-wake-decision': PREF_REASONING_EXPECTED_WAKE_DECISION.key,
+  'permission-answer': PREF_REASONING_PERMISSION_ANSWER.key,
 };
 
 /** What each site is called on screen. */
@@ -223,6 +231,7 @@ export const JUDGMENT_SITE_LABEL: Record<JudgmentSite, string> = {
   'read-decision': 'Read decision',
   'wake-decision': 'Wake decision',
   'expected-wake-decision': 'Expected wake',
+  'permission-answer': 'Permission answer',
 };
 
 /** Where its control is, for a provider row to point at. */
@@ -232,6 +241,7 @@ export const JUDGMENT_SITE_LOCATION: Record<JudgmentSite, string> = {
   'read-decision': 'Models → Background tasks',
   'wake-decision': 'Models → Background tasks',
   'expected-wake-decision': 'Models → Background tasks',
+  'permission-answer': 'Models → Background tasks',
 };
 
 /** The row an unset preference runs on. Mirrors the engine's

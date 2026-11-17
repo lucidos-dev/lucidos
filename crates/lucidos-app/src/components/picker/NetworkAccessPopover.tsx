@@ -1,7 +1,7 @@
 /**
  * Body of the picker's machine-global **Network access** popover: the gateway
  * bind (loopback / tailnet-or-IP / all interfaces) plus the "engines inherit
- * gateway bind" toggle. Both are persisted to `~/.lucidos/network.toml` by the
+ * gateway bind" toggle. Both are persisted to the machine-global `network.toml` by the
  * gateway control plane, so the value is shared by every Lucidos gateway on
  * this machine.
  *

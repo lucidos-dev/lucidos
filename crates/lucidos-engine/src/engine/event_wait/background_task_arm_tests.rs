@@ -26,7 +26,14 @@ async fn run(s: &Stores, thread_id: Uuid, delivery: CompletionDelivery, command:
     };
     let (task_id, _finished) = s
         .registry
-        .spawn_task(command, Path::new("/tmp"), &[], Some(thread_id), spec)
+        .spawn_task(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            command,
+            Path::new("/tmp"),
+            &[],
+            Some(thread_id),
+            spec,
+        )
         .await
         .expect("spawn");
     task_id

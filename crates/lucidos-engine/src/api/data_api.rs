@@ -160,7 +160,7 @@ async fn serve_workspace_data(
     let Some(rel) = served else {
         // Logged because `request_logger` skips `/data`, so a refusal is
         // otherwise invisible to whoever has to explain the 404.
-        log!("[data] refused {} on the /data mount", req.uri().path());
+        log_legacy!("[data] refused {} on the /data mount", req.uri().path());
         return StatusCode::NOT_FOUND.into_response();
     };
     let served = if is_directory {
@@ -169,7 +169,7 @@ async fn serve_workspace_data(
         rel.clone()
     };
     if let Err((_, why)) = validate_resolved_read(&data_dir, &served) {
-        log!(
+        log_legacy!(
             "[data] refused {} on the /data mount: {}",
             req.uri().path(),
             why
@@ -187,7 +187,7 @@ async fn serve_workspace_data(
             super::file_response::sandbox_documents(resp.map(axum::body::Body::new), path_type)
         }
         Err(e) => {
-            log!("[data] ServeDir failed: {}", e);
+            log_legacy!("[data] ServeDir failed: {}", e);
             StatusCode::NOT_FOUND.into_response()
         }
     }
@@ -262,7 +262,7 @@ fn list_data_inner(data_dir: &std::path::Path, pattern: Option<&glob::Pattern>) 
                     }
                 }
             }
-            Err(e) => log!("[data_api] Failed to walk {}: {}", subdir.display(), e),
+            Err(e) => log_legacy!("[data_api] Failed to walk {}: {}", subdir.display(), e),
         }
     }
     files.sort();
@@ -329,7 +329,7 @@ pub(super) async fn read_data(
             contained
         };
     let Some(file_path) = file_path else {
-        log!("[data] refused {path}: it resolves outside its tree through a symlink");
+        log_legacy!("[data] refused {path}: it resolves outside its tree through a symlink");
         return (StatusCode::NOT_FOUND, "File not found").into_response();
     };
     let content_type = content_type_for_ext(&extension_of(&path));
@@ -365,7 +365,7 @@ async fn write_artifact_data(
     profile_cache: &crate::engine::user_profile::UserProfileCache,
     artifact_path: &str,
     body: &[u8],
-    writer_thread_id: Option<uuid::Uuid>,
+    announcement: crate::core::WriteAnnouncement,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     // `write_and_commit` takes `impl AsRef<[u8]>`, so pass the raw bytes: a
     // binary upload (PNG, PDF, …) would otherwise be silently mangled by a
@@ -382,10 +382,7 @@ async fn write_artifact_data(
             artifact_path,
             body,
             &format!("Update {}", artifact_path),
-            crate::core::WriteAnnouncement::Entity {
-                source: Some("data_api".to_string()),
-                writer_thread_id,
-            },
+            announcement,
         )
         .await?;
     // Only once the write has landed: a failed one must not publish content
@@ -459,7 +456,17 @@ pub(super) async fn write_data(
             state.engine.user_profile_cache(),
             artifact_path,
             body.as_ref(),
-            actor.source_thread_id(),
+            crate::core::WriteAnnouncement::Entity {
+                writer_thread_id: actor.source_thread_id(),
+                source: Some("data_api".into()),
+                writer: crate::core::artifact_writer::ArtifactWriterOrigin::from_actor(
+                    &actor,
+                    headers
+                        .get(crate::api::app_reach::APP_ID_HEADER)
+                        .map(|h| String::from_utf8_lossy(h.as_bytes()))
+                        .as_deref(),
+                ),
+            },
         )
         .await
         {
@@ -737,6 +744,13 @@ pub(super) async fn edit_data(
                 new_string: op.replace.as_deref(),
                 replace_all: false,
                 writer_thread_id: actor.source_thread_id(),
+                writer_origin: crate::core::artifact_writer::ArtifactWriterOrigin::from_actor(
+                    &actor,
+                    headers
+                        .get(crate::api::app_reach::APP_ID_HEADER)
+                        .map(|h| String::from_utf8_lossy(h.as_bytes()))
+                        .as_deref(),
+                ),
                 commit: None,
                 message: None,
             })
@@ -779,9 +793,10 @@ pub(super) async fn edit_data(
 /// POST /api/v1/data/upload — upload a file into data/artifacts/imported/
 pub(super) async fn upload_data(
     State(state): State<AppState>,
+    headers: HeaderMap,
     multipart: Multipart,
 ) -> impl IntoResponse {
-    super::artifacts::upload_file(State(state), multipart).await
+    super::artifacts::upload_file(State(state), headers, multipart).await
 }
 
 /// Routes for the `/data*` surface. The wildcard `/data/*path` write route
@@ -1401,7 +1416,13 @@ mod tests {
             &cache,
             "user_profile.md",
             b"# Profile\n\nDrinks tea.\n",
-            None,
+            crate::core::WriteAnnouncement::Entity {
+                writer_thread_id: None,
+                source: Some("data_api".into()),
+                writer: crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                    crate::engine::event_bus::ArtifactWriter::Person,
+                ),
+            },
         )
         .await
         .expect("write must land");
@@ -1429,7 +1450,13 @@ mod tests {
                 &cache,
                 path,
                 b"theirs",
-                None,
+                crate::core::WriteAnnouncement::Entity {
+                    writer_thread_id: None,
+                    source: Some("data_api".into()),
+                    writer: crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                        crate::engine::event_bus::ArtifactWriter::Person,
+                    ),
+                },
             )
             .await
             .expect("write must land");
@@ -1501,7 +1528,13 @@ mod tests {
             &cache,
             "user_profile.md",
             b"never landed",
-            None,
+            crate::core::WriteAnnouncement::Entity {
+                writer_thread_id: None,
+                source: Some("data_api".into()),
+                writer: crate::core::artifact_writer::ArtifactWriterOrigin::Known(
+                    crate::engine::event_bus::ArtifactWriter::Person,
+                ),
+            },
         )
         .await
         .err();

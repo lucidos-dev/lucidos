@@ -27,6 +27,8 @@ const TOUCH = '@media (pointer: coarse)';
 const REACH = '.scroll-to-top::before, .scroll-to-bottom::before, .follow-toggle::before';
 const SURFACE = '.scroll-to-top, .scroll-to-bottom, .follow-toggle';
 const CHEVRONS = '.scroll-to-top, .scroll-to-bottom';
+const SIDE_BY_SIDE = '.thread-pane:has(.scroll-to-bottom.visible) .follow-toggle';
+const SIDE_BY_SIDE_REACH = `${SIDE_BY_SIDE}::before`;
 
 /** The one rule in `css` with this selector at this at-rule scope. */
 function rule(css: string, selector: string, atRules = ''): Map<string, string> {
@@ -61,10 +63,10 @@ describe('the scroll chevrons reach past their circle on touch', () => {
     expect(before.get('position'), 'absolute, so it moves neither the circle nor the glyph').toBe('absolute');
     expect(before.get('inset')).toBe('calc(-1 * var(--scroll-chevron-reach))');
     expect(before.has('background'), 'the reach is never painted').toBe(false);
-    // Besides it, only the two trims where the stacked pair face each other.
+    // Besides it, only the two trims where the side-by-side pair face each other.
     expect(cssRules(chevronCss).filter(r => r.selector.includes('::before') && /scroll-to-|follow-toggle/.test(r.selector))
       .map(r => r.selector))
-      .toEqual([REACH, '.scroll-to-bottom::before', '.follow-toggle::before']);
+      .toEqual([REACH, '.scroll-to-bottom::before', SIDE_BY_SIDE_REACH]);
   });
 
   it('takes no tap while its chevron is hidden', () => {
@@ -99,12 +101,14 @@ describe('the scroll chevrons reach past their circle on touch', () => {
   });
 
   it('meets, never overlaps, between the down chevron and the follow toggle', () => {
-    // The chevron stands one stack gap over the toggle. Each reaches half of it.
-    expect(rule(chevronCss, '.scroll-to-bottom').get('bottom'))
-      .toBe('calc(var(--scroll-chevron-inset) + var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))');
+    // The chevron shares the toggle's row, and the toggle slides one stack gap
+    // to its left while it shows. Each reaches half the gap toward the other.
+    expect(rule(chevronCss, '.scroll-to-bottom').get('bottom')).toBe('var(--scroll-chevron-inset)');
+    expect(rule(chevronCss, SIDE_BY_SIDE).get('transform'))
+      .toBe('translateX(calc(-1 * (var(--scroll-chevron-size) + var(--scroll-chevron-stack-gap))))');
     expect(touchRoot().get('--scroll-chevron-stack-gap')).toBe('var(--scroll-chevron-reach)');
     const half = 'calc(-0.5 * var(--scroll-chevron-stack-gap))';
-    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('bottom')).toBe(half);
-    expect(rule(chevronCss, '.follow-toggle::before', TOUCH).get('top')).toBe(half);
+    expect(rule(chevronCss, '.scroll-to-bottom::before', TOUCH).get('left')).toBe(half);
+    expect(rule(chevronCss, SIDE_BY_SIDE_REACH, TOUCH).get('right')).toBe(half);
   });
 });

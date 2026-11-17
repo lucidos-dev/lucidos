@@ -509,7 +509,7 @@ pub(crate) async fn latest_todo_list(
         .get("items")
         .and_then(|v| serde_json::from_value::<Vec<TodoItem>>(v.clone()).ok())
     else {
-        log!(
+        log_legacy!(
             "[Todo] malformed TodoListWritten payload for thread {}",
             thread_id
         );
@@ -569,7 +569,7 @@ impl LucidosEngine {
             Ok(0) => return (Some(0), false),
             Ok(open) => open,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Todo] Could not read the todo list for thread {}: {}. \
                      Not asking whether this turn leaves work unwatched.",
                     thread_id,
@@ -580,7 +580,7 @@ impl LucidosEngine {
         };
         let child_probe = holds_live_child(&self.pool, thread_id).await;
         if let Err(e) = &child_probe {
-            log!(
+            log_legacy!(
                 "[Todo] Could not read the live children of thread {}: {}. \
                  Not asking whether this turn leaves work unwatched.",
                 thread_id,
@@ -662,7 +662,7 @@ pub async fn settle_open_todos(
         Ok(Some(found)) => found,
         Ok(None) => return,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Todo] settle_open_todos query failed for thread {}: {}",
                 thread_id,
                 e
@@ -704,7 +704,7 @@ pub async fn settle_open_todos(
         Ok(true) => TodoStatus::Waiting,
         Ok(false) => TodoStatus::Abandoned,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Todo] settle_open_todos could not resolve whether thread {} was parked: {} \
                  (leaving the list untouched; the next terminator retries)",
                 thread_id,

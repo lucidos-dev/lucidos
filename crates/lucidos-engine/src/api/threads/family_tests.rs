@@ -160,6 +160,7 @@ async fn settle_after_child_completion(bus: &EventBus, pool: &PgPool, parent_id:
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }
     } else {
         ThreadEvent::ResponseGenerated {
@@ -215,6 +216,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: format!("test-session-{}", child_id),
             branch: "claude-code/test".into(),
@@ -247,6 +249,7 @@ async fn spawn_child(bus: &EventBus, pool: &PgPool, parent_id: Uuid, bring_to_id
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: EventMeta::NONE,
         })
@@ -299,6 +302,7 @@ async fn spawn_cc_child(
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),
@@ -327,6 +331,7 @@ async fn spawn_cc_child(
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -336,6 +341,7 @@ async fn spawn_cc_child(
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::ChangeProposed {
+                content: Default::default(),
                 change_id: Uuid::new_v4().to_string(),
                 description: Some("Test change".into()),
                 files: vec!["test.rs".into()],
@@ -859,6 +865,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-orphan".into(),
             branch: "claude-code/test".into(),
@@ -894,6 +901,8 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::ClaudeCode),
@@ -915,6 +924,7 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -990,6 +1000,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
     bus.emit(BusEvent::Thread {
         thread_id: fresh_child,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "fresh-session".into(),
             branch: "claude-code/fresh".into(),
@@ -1302,7 +1313,7 @@ fn every_refusal_carries_the_blocker_the_menu_shows() {
             "descendants_blocking",
         ),
         (
-            "waiting child",
+            "child awaiting an answer",
             vec![idle_chat(target), waiting(child)],
             Blocker::DescendantQuestion,
             "descendants_blocking",

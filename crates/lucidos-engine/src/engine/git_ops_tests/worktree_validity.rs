@@ -367,51 +367,225 @@ async fn install_coding_agent_diff_hook_sets_worktree_local_hooks_and_chains_com
     );
 }
 
+fn write_test_hook(dir: &std::path::Path, name: &str, body: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+    #[cfg(unix)]
+    make_executable(&path);
+}
+
+async fn add_hook_test_worktree(
+    repo: &std::path::Path,
+    base: &std::path::Path,
+    name: &str,
+) -> std::path::PathBuf {
+    let wt = base.join(name);
+    let branch = format!("claude-code/{name}");
+    let out = worktree_add(repo, &wt, &["-b", &branch]).await.unwrap();
+    assert!(out.status.success(), "fixture worktree_add failed");
+    wt
+}
+
+async fn commit_in_worktree(
+    wt: &std::path::Path,
+    file: &str,
+    env: &[(&str, &std::ffi::OsStr)],
+) -> std::process::Output {
+    tokio::fs::write(wt.join(file), file).await.unwrap();
+    let _ = git_cmd(&["add", file], wt).await.unwrap();
+    git_cmd_env(&["commit", "-m", "agent commit"], wt, env)
+        .await
+        .unwrap()
+}
+
+/// UA-2327. The worktree's own `core.hooksPath` override reads back as the
+/// effective value. A reinstall then kept chaining to `.git/hooks` after the
+/// repo set its own hooks dir.
 #[tokio::test]
-async fn install_coding_agent_diff_hook_preserves_prior_custom_hooks_path() {
+async fn reinstall_follows_the_repos_hooks_path_not_the_worktree_override() {
     let (_tmp, repo) = make_test_repo().await;
     let wt_base = tempfile::tempdir().unwrap();
-    let wt = wt_base.path().join("thread-custom-hook");
-    let out = worktree_add(&repo, &wt, &["-b", "claude-code/custom-hook"])
-        .await
-        .unwrap();
-    assert!(out.status.success(), "fixture worktree_add failed");
-
-    let custom_dir = wt.join(".custom-hooks");
-    let custom_hook = custom_dir.join("post-commit");
-    tokio::fs::create_dir_all(&custom_dir).await.unwrap();
-    tokio::fs::write(&custom_hook, "#!/bin/sh\nexit 0\n")
-        .await
-        .unwrap();
-    #[cfg(unix)]
-    make_executable(&custom_hook);
-
-    let enable = git_cmd(&["config", "extensions.worktreeConfig", "true"], &repo)
-        .await
-        .unwrap();
-    assert!(enable.status.success());
-    let set_custom = git_cmd(
-        &["config", "--worktree", "core.hooksPath", ".custom-hooks"],
-        &wt,
-    )
-    .await
-    .unwrap();
-    assert!(set_custom.status.success());
+    let wt = add_hook_test_worktree(&repo, wt_base.path(), "stale-chain").await;
 
     install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+    let out = git_cmd(&["config", "core.hooksPath", ".githooks"], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture git config failed");
     install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
 
-    let hook_script = tokio::fs::read_to_string(wt.join(".lucidos/git-hooks/post-commit"))
+    let hooks = wt.join(".lucidos/git-hooks");
+    let post_commit = std::fs::read_to_string(hooks.join("post-commit")).unwrap();
+    let chain = wt.join(".githooks/post-commit");
+    assert!(
+        post_commit.contains(&format!("CHAIN='{}'", chain.display())),
+        "post-commit: {post_commit}"
+    );
+    let pre_commit = std::fs::read_to_string(hooks.join("pre-commit")).unwrap();
+    let target = wt.join(".githooks/pre-commit");
+    assert!(
+        pre_commit.contains(&format!("HOOK='{}'", target.display())),
+        "pre-commit: {pre_commit}"
+    );
+}
+
+/// A relative `core.hooksPath` resolves against the worktree root, as git does.
+/// Every hook keeps its arguments, stdin and exit status, and post-commit runs
+/// both the Diff refresh and the repo's own hook.
+#[tokio::test]
+async fn a_relative_repo_hooks_path_runs_every_hook_with_args_and_stdin() {
+    let (_tmp, repo) = make_test_repo().await;
+    let out = git_cmd(&["config", "core.hooksPath", ".githooks"], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture git config failed");
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = add_hook_test_worktree(&repo, wt_base.path(), "relative-hooks").await;
+    let logs = wt_base.path().join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let log = |name: &str| shell_single_quote_for_test(&logs.join(name).to_string_lossy());
+
+    let repo_hooks = wt.join(".githooks");
+    write_test_hook(
+        &repo_hooks,
+        "pre-commit",
+        &format!(": > {}\n", log("pre-commit")),
+    );
+    write_test_hook(
+        &repo_hooks,
+        "commit-msg",
+        &format!("cat \"$1\" > {}\n", log("commit-msg")),
+    );
+    write_test_hook(
+        &repo_hooks,
+        "post-commit",
+        &format!(": > {}\n", log("post-commit")),
+    );
+    write_test_hook(
+        &repo_hooks,
+        "pre-push",
+        &format!(
+            "echo \"$1 $2\" > {}\ncat >> {}\n",
+            log("pre-push"),
+            log("pre-push")
+        ),
+    );
+    // A fake `lucidos` on PATH records that the Diff refresh ran.
+    let bin = wt_base.path().join("bin");
+    write_test_hook(
+        &bin,
+        "lucidos",
+        &format!("echo \"$1\" > {}\n", log("diff-hook")),
+    );
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+
+    let env = [
+        ("LUCIDOS_THREAD_ID", std::ffi::OsStr::new("agent-thread")),
+        ("PATH", std::ffi::OsStr::new(&path)),
+    ];
+    let commit = commit_in_worktree(&wt, "change.txt", &env).await;
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let read_log = |name: &str| std::fs::read_to_string(logs.join(name));
+    assert!(read_log("pre-commit").is_ok(), "pre-commit never ran");
+    assert_eq!(read_log("commit-msg").unwrap().trim(), "agent commit");
+    assert!(
+        read_log("post-commit").is_ok(),
+        "repo post-commit never ran"
+    );
+    assert_eq!(
+        read_log("diff-hook").unwrap().trim(),
+        "coding-agent-diff-hook"
+    );
+
+    let remote = wt_base.path().join("remote.git");
+    let out = git_cmd(&["init", "--bare", &remote.to_string_lossy()], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture bare init failed");
+    let remote_url = remote.to_string_lossy().to_string();
+    let out = git_cmd(&["remote", "add", "origin", &remote_url], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture remote add failed");
+    let push = git_cmd_env(&["push", "origin", "HEAD:refs/heads/pushed"], &wt, &env)
         .await
         .unwrap();
     assert!(
-        hook_script.contains(&custom_hook.to_string_lossy().to_string()),
-        "reinstall must preserve the originally chained custom hooksPath"
+        push.status.success(),
+        "push failed: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
+    let pre_push = read_log("pre-push").unwrap();
+    assert!(
+        pre_push.starts_with(&format!("origin {remote_url}")),
+        "pre-push: {pre_push}"
     );
     assert!(
-        !hook_script
-            .contains(".lucidos/git-hooks/post-commit\nCHAIN='.lucidos/git-hooks/post-commit'"),
-        "reinstall must not chain the Lucidos hook to itself"
+        pre_push.contains("refs/heads/pushed"),
+        "pre-push stdin: {pre_push}"
+    );
+}
+
+/// git runs no hooks under an empty `core.hooksPath`, so the worktree forwards
+/// to none. The Diff refresh still installs.
+#[tokio::test]
+async fn an_empty_repo_hooks_path_forwards_no_hooks() {
+    let (_tmp, repo) = make_test_repo().await;
+    write_test_hook(&repo.join(".git/hooks"), "pre-commit", "exit 1\n");
+    let out = git_cmd(&["config", "core.hooksPath", ""], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture git config failed");
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = add_hook_test_worktree(&repo, wt_base.path(), "empty-hooks").await;
+
+    install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+
+    let hooks = wt.join(".lucidos/git-hooks");
+    assert!(hooks.join("post-commit").exists());
+    assert!(!hooks.join("pre-commit").exists());
+    let env = [("LUCIDOS_THREAD_ID", std::ffi::OsStr::new("agent-thread"))];
+    let commit = commit_in_worktree(&wt, "free.txt", &env).await;
+    assert!(
+        commit.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+}
+
+#[tokio::test]
+async fn an_absolute_repo_hooks_path_failing_pre_commit_blocks_the_commit() {
+    let (_tmp, repo) = make_test_repo().await;
+    let hooks_dir = tempfile::tempdir().unwrap();
+    write_test_hook(
+        hooks_dir.path(),
+        "pre-commit",
+        "echo blocked by absolute hook >&2\nexit 1\n",
+    );
+    let hooks_value = hooks_dir.path().to_string_lossy().to_string();
+    let out = git_cmd(&["config", "core.hooksPath", &hooks_value], &repo)
+        .await
+        .unwrap();
+    assert!(out.status.success(), "fixture git config failed");
+    let wt_base = tempfile::tempdir().unwrap();
+    let wt = add_hook_test_worktree(&repo, wt_base.path(), "absolute-hooks").await;
+
+    install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
+
+    let env = [("LUCIDOS_THREAD_ID", std::ffi::OsStr::new("agent-thread"))];
+    let commit = commit_in_worktree(&wt, "blocked.txt", &env).await;
+    assert!(!commit.status.success(), "a failing pre-commit must block");
+    assert!(
+        String::from_utf8_lossy(&commit.stderr).contains("blocked by absolute hook"),
+        "stderr: {}",
+        String::from_utf8_lossy(&commit.stderr)
     );
 }
 

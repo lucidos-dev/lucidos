@@ -1,8 +1,8 @@
 //! Waking the thread's own agent with what the caller just said.
 //!
-//! A delegated utterance is a message on a chat thread, so it takes the path a
-//! typed one takes: `pre_emit_chat_message_received` records it, and
-//! `process_message_with_steps` runs the turn. Voice adds no admission rule.
+//! A delegated utterance reaches `process_message_with_steps` with its durable
+//! voice delegation as the turn's anchor. Its spoken message was recorded by
+//! the call loop; the doer emits no duplicate typed message.
 //! Single-flight admission is what turns a second utterance mid-turn into an
 //! injection rather than a race.
 //!
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::thread_lifecycle::ThreadType;
-use crate::engine::{LucidosEngine, PreEmittedOrigin};
+use crate::engine::{LucidosEngine, PreEmittedOrigin, RestOfSentence};
 
 /// Which agent holds a thread, as far as a call is concerned.
 ///
@@ -71,7 +71,7 @@ pub async fn doer_for(pool: &sqlx::PgPool, thread_id: Uuid) -> ThreadDoer {
         },
         Ok(None) => ThreadDoer::NoSuchThread,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Voice] Could not read who holds thread {}: {}",
                 thread_id,
                 e
@@ -122,6 +122,17 @@ pub trait TurnStarter: Send + Sync {
     /// What this buys is the round LEARNING it mid-flight. Otherwise the doer
     /// finishes without knowing what the caller was told in its name.
     async fn overheard(&self, thread_id: Uuid, spoken: &str);
+
+    /// The caller's sentence went on after the talker asked about it. Offer
+    /// the rest to the turn that took the ask.
+    ///
+    /// `asked_turn` is the prompt that turn was given: the ask's
+    /// `WorkDelegated` row, or the anchor of the turn the ask went into.
+    /// Another turn running on the thread is never given the words.
+    ///
+    /// An offer, like [`Self::overheard`]. The words already have their own
+    /// row, so a turn not running yet reads them from history instead.
+    async fn continued(&self, thread_id: Uuid, asked_turn: Uuid, words: &str);
 }
 
 /// How a spoken aside is framed for the running turn.
@@ -132,6 +143,16 @@ pub trait TurnStarter: Send + Sync {
 const SAID_ALOUD: &str = "[SAID ALOUD] The caller heard this from you just now, \
                           on the call. It is what they already know. Carry on \
                           with your work; nothing here is a new request.";
+
+/// How the rest of an asked sentence is framed for the turn it started.
+///
+/// The turn may already have read these words from the thread, so the framing
+/// says they are the same words rather than a second request.
+const SENTENCE_WENT_ON: &str = "[SENTENCE WENT ON] The caller kept talking after \
+                                you were asked. These words finish the request \
+                                you are working on. You may already have read \
+                                them in the thread: they are the same words, \
+                                not a new request.";
 
 /// The shipping implementation: the ordinary chat turn, unchanged.
 pub struct ThreadTurn {
@@ -172,7 +193,7 @@ impl TurnStarter for ThreadTurn {
         // path the same way: stronger here would still leave typing open.
         let doer = doer_for(self.engine.pool(), thread_id).await;
         if doer != ThreadDoer::LucidosAgent {
-            log!(
+            log_legacy!(
                 "[Voice] Not waking thread {}: a call reaches the Lucidos Agent only, and this thread reads {:?}",
                 thread_id,
                 doer
@@ -259,7 +280,7 @@ impl TurnStarter for ThreadTurn {
                 // No terminator here. The turn settles its own exchange,
                 // anchored to its originating event, and an unanchored copy is
                 // what the idempotency gate cannot match.
-                Err(e) => log!("[Voice] The turn a spoken message started failed: {}", e),
+                Err(e) => log_legacy!("[Voice] The turn a spoken message started failed: {}", e),
             }
         });
         // The same panic monitoring every other spawn site uses. Without it a
@@ -291,8 +312,36 @@ impl TurnStarter for ThreadTurn {
             },
         );
         if injected {
-            log!("[Voice] The running turn was told what was said aloud");
+            log_legacy!("[Voice] The running turn was told what was said aloud");
         }
+    }
+
+    async fn continued(&self, thread_id: Uuid, asked_turn: Uuid, words: &str) {
+        let words = words.trim();
+        if words.is_empty() {
+            return;
+        }
+        let offered = self.engine.inject_the_rest_of_a_sentence(
+            thread_id,
+            asked_turn,
+            crate::engine::InjectedPrompt {
+                text: format!("{}\n\n{}", SENTENCE_WENT_ON, words),
+                event_id: Some(asked_turn),
+                mode: ActorMode::Human,
+                spawning_event_id: None,
+                images: None,
+                origin: None,
+                kind: crate::engine::InjectedPromptKind::SpokenContinuation,
+            },
+        );
+        log_legacy!(
+            "[Voice] The rest of the asked sentence {}",
+            match offered {
+                RestOfSentence::Injected => "reached the turn that took the ask",
+                RestOfSentence::Held => "waits on the live turn for its ask",
+                RestOfSentence::LeftToHistory => "is left to the thread's history",
+            }
+        );
     }
 }
 

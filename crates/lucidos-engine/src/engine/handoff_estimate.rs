@@ -209,6 +209,30 @@ pub(crate) fn estimate(
     }
 }
 
+/// The default and risk choices on another installed backend.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OtherBackendRungs {
+    pub coding_agent: crate::runtime::CodingAgent,
+    pub floor_rung: IntelligenceRung,
+    pub risk_rung: Option<IntelligenceRung>,
+}
+
+impl OtherBackendRungs {
+    pub fn on_ladder(ladder: &IntelligenceLadder) -> Option<Self> {
+        if !ladder.climbs {
+            return None;
+        }
+        let floor = ladder.default_intelligence_rung.as_ref()?;
+        let at = ladder.on_position_of(floor)?;
+        let on = ladder.pairs();
+        Some(Self {
+            coding_agent: ladder.coding_agent?,
+            floor_rung: floor.clone(),
+            risk_rung: on.get(at + 1).filter(|_| at + 2 < on.len()).cloned(),
+        })
+    }
+}
+
 /// The rungs a checkpoint run that declares the *default floor* offers a
 /// thread. The agent hands off onto one of them.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -220,6 +244,8 @@ pub struct FloorRungs {
     /// it. The agent takes it for security work or a costly one-way door.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub risk_rung: Option<IntelligenceRung>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_backends: Vec<OtherBackendRungs>,
 }
 
 impl FloorRungs {
@@ -236,6 +262,7 @@ impl FloorRungs {
         let below = |at: usize| on.get(at).filter(|_| thread_at < at).cloned();
         let risk_at = default_at + 1;
         Self {
+            other_backends: Vec::new(),
             floor_rung: below(default_at),
             risk_rung: below(risk_at).filter(|_| risk_at + 1 < on.len()),
         }

@@ -46,7 +46,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
 }));
 
 // The poll opens the event stream when the engine answers, and a test has none.
-vi.mock('../actions/thread-sync', () => ({
+vi.mock('../actions/thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),

@@ -950,61 +950,6 @@ fn api_handlers_never_drive_a_coding_agent_session_directly() {
 
 // ── One failed apply, one card ──
 
-/// A caller of `apply_change` must not emit its own `ChangeApplyFailed`.
-///
-/// The apply path announces every failure it decides, then returns the same
-/// text as `Err`. A caller that emits on that `Err` therefore writes the event
-/// a second time, and the thread draws two identical "Change failed" cards.
-/// Four callers did: both no-live-session paths in `apply_now`, and both
-/// auto-apply paths in `claude_code/spawn.rs`.
-///
-/// Whole-tree rather than a hand-kept file list. The callers are spread over
-/// six modules, and a new one must inherit the rule without being enrolled.
-/// Test sources are skipped: this file names the banned tokens to assert on
-/// them, and would otherwise match itself.
-#[test]
-fn apply_change_callers_do_not_re_announce_the_failure() {
-    for (path, source) in engine_sources() {
-        for block in apply_change_result_blocks(&source) {
-            for banned in ["emit_apply_failed(", "ThreadEvent::ChangeApplyFailed"] {
-                assert!(
-                    !block.contains(banned),
-                    "{path} handles an apply_change result with `{banned}`. The apply path \
-                     already emitted that failure, so this draws the same card twice. Log it \
-                     and let the event stand, as apply_all_driver.rs does. Block was:\n{block}"
-                );
-            }
-        }
-    }
-}
-
-/// Every non-test `.rs` under this crate's `src/`, as (display path, contents).
-fn engine_sources() -> Vec<(String, String)> {
-    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
-        let entries = std::fs::read_dir(dir).expect("engine src must be readable");
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk(&path, root, out);
-                continue;
-            }
-            let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if !name.ends_with(".rs") || name.contains("_test") {
-                continue;
-            }
-            let rel = path.strip_prefix(root).unwrap_or(&path);
-            out.push((
-                rel.to_string_lossy().into_owned(),
-                std::fs::read_to_string(&path).expect("source must be readable"),
-            ));
-        }
-    }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut out = Vec::new();
-    walk(&root, &root, &mut out);
-    out
-}
-
 /// Byte offset of every live `.apply_change(` call in `source`. A
 /// commented-out call is skipped, so naming the method in prose costs nothing.
 fn apply_change_call_offsets(source: &str) -> Vec<usize> {
@@ -1059,33 +1004,6 @@ const APPLY_CHANGE_CALLERS: &[(&str, &str)] = &[
         "requesting: the `changes` LLM tool, via change_action_refusal",
     ),
 ];
-
-/// A new `apply_change` caller cannot land unclassified.
-///
-/// The `changes` LLM tool was exactly this gap. It merged a branch whose
-/// coding agent was mid-turn, because it was a requesting surface that nobody
-/// had enrolled. Whole-tree, so the next one inherits the question.
-#[test]
-fn every_apply_change_caller_is_classified() {
-    let mut found: Vec<String> = engine_sources()
-        .into_iter()
-        .filter(|(_, source)| !apply_change_call_offsets(source).is_empty())
-        .map(|(path, _)| path)
-        .collect();
-    found.sort();
-    let mut enrolled: Vec<String> = APPLY_CHANGE_CALLERS
-        .iter()
-        .map(|(path, _)| (*path).to_string())
-        .collect();
-    enrolled.sort();
-    assert_eq!(
-        found, enrolled,
-        "the set of apply_change callers moved. Add the file to APPLY_CHANGE_CALLERS with its \
-         reason. A surface a person or an agent drives must call \
-         api::changes::change_action_refusal first, or it will merge a branch whose coding agent \
-         is still writing to it. An engine-internal path must not."
-    );
-}
 
 /// The block that handles each `apply_change` result in `source`.
 ///
@@ -1288,5 +1206,91 @@ mod unknown_worktree_lookup_is_not_a_no {
             "git clean -fd must not run in the primary checkout"
         );
         assert_eq!(rev_parse(&repo, UNHELD).await, before);
+    }
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// A caller of `apply_change` must not emit its own `ChangeApplyFailed`.
+    ///
+    /// The apply path announces every failure it decides, then returns the same
+    /// text as `Err`. A caller that emits on that `Err` therefore writes the event
+    /// a second time, and the thread draws two identical "Change failed" cards.
+    /// Four callers did: both no-live-session paths in `apply_now`, and both
+    /// auto-apply paths in `claude_code/spawn.rs`.
+    ///
+    /// Whole-tree rather than a hand-kept file list. The callers are spread over
+    /// six modules, and a new one must inherit the rule without being enrolled.
+    /// Test sources are skipped: this file names the banned tokens to assert on
+    /// them, and would otherwise match itself.
+    #[test]
+    fn apply_change_callers_do_not_re_announce_the_failure() {
+        for (path, source) in engine_sources() {
+            for block in apply_change_result_blocks(&source) {
+                for banned in ["emit_apply_failed(", "ThreadEvent::ChangeApplyFailed"] {
+                    assert!(
+                        !block.contains(banned),
+                        "{path} handles an apply_change result with `{banned}`. The apply path \
+                     already emitted that failure, so this draws the same card twice. Log it \
+                     and let the event stand, as apply_all_driver.rs does. Block was:\n{block}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every non-test `.rs` under this crate's `src/`, as (display path, contents).
+    fn engine_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir).expect("engine src must be readable");
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                    continue;
+                }
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if !name.ends_with(".rs") || name.contains("_test") {
+                    continue;
+                }
+                let rel = path.strip_prefix(root).unwrap_or(&path);
+                out.push((
+                    rel.to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&path).expect("source must be readable"),
+                ));
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        walk(&root, &root, &mut out);
+        out
+    }
+
+    /// A new `apply_change` caller cannot land unclassified.
+    ///
+    /// The `changes` LLM tool was exactly this gap. It merged a branch whose
+    /// coding agent was mid-turn, because it was a requesting surface that nobody
+    /// had enrolled. Whole-tree, so the next one inherits the question.
+    #[test]
+    fn every_apply_change_caller_is_classified() {
+        let mut found: Vec<String> = engine_sources()
+            .into_iter()
+            .filter(|(_, source)| !apply_change_call_offsets(source).is_empty())
+            .map(|(path, _)| path)
+            .collect();
+        found.sort();
+        let mut enrolled: Vec<String> = APPLY_CHANGE_CALLERS
+            .iter()
+            .map(|(path, _)| (*path).to_string())
+            .collect();
+        enrolled.sort();
+        assert_eq!(
+            found, enrolled,
+            "the set of apply_change callers moved. Add the file to APPLY_CHANGE_CALLERS with its \
+         reason. A surface a person or an agent drives must call \
+         api::changes::change_action_refusal first, or it will merge a branch whose coding agent \
+         is still writing to it. An engine-internal path must not."
+        );
     }
 }

@@ -515,6 +515,7 @@ async fn seed_cc_thread(bus: &crate::engine::event_bus::EventBus, thread_id: Uui
     bus.emit(crate::engine::event_bus::BusEvent::Thread {
         thread_id,
         event: crate::engine::thread_events::ThreadEvent::SessionStarted {
+            sandbox: None,
             session_id: String::new(),
             branch: "lucidos-claude-code-repo-example-repo-implement-the-ticket".into(),
             repo_id: None,
@@ -553,6 +554,7 @@ async fn seed_idle(
             worktree_path: worktree_path.map(str::to_string),
             worktree_head_sha: head_sha.map(str::to_string),
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: cc_meta(),
     })

@@ -56,6 +56,7 @@ fn continuation_started_event_accepts_legacy_session_recovered_alias() {
 #[test]
 fn change_proposed_event_can_carry_engine_origin() {
     let event = ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: "abc".into(),
         description: Some("stale session cleanup".into()),
         files: vec!["src/main.rs".into()],
@@ -97,6 +98,7 @@ fn change_proposed_event_origin_defaults_to_none_when_missing() {
 #[test]
 fn change_proposed_event_can_carry_orphan_recovery_origin() {
     let event = ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: "def".into(),
         description: Some("orphan cleanup".into()),
         files: vec!["src/lib.rs".into()],

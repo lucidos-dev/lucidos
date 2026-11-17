@@ -29,6 +29,8 @@ fn user_question_asked_serialization() {
         worktree_path: Some("/tmp/cc-abc".into()),
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["type"], "UserQuestionAsked");
@@ -110,6 +112,8 @@ fn user_question_asked_empty_options_skipped() {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert!(
@@ -132,6 +136,8 @@ fn user_question_asked_event_type() {
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     };
     assert_eq!(event.event_type(), "UserQuestionAsked");
     assert!(event.is_persisted(), "UserQuestionAsked must be persisted");
@@ -147,6 +153,8 @@ fn user_question_asked_carries_multi_select() {
         worktree_path: None,
         multi_select: true,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     };
     let v = serde_json::to_value(&event).unwrap();
     assert_eq!(v["multi_select"], true);
@@ -165,6 +173,7 @@ fn user_question_asked_carries_multi_select() {
 #[test]
 fn user_question_answered_selected_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_1".into(),
         quiet: false,
         answer: AnswerKind::Selected {
@@ -181,6 +190,7 @@ fn user_question_answered_selected_serialization() {
 #[test]
 fn user_question_answered_free_text_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_1".into(),
         quiet: false,
         answer: AnswerKind::FreeText {
@@ -196,6 +206,7 @@ fn user_question_answered_free_text_serialization() {
 #[test]
 fn user_question_answered_canceled_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_1".into(),
         quiet: false,
         answer: AnswerKind::Canceled,
@@ -207,6 +218,7 @@ fn user_question_answered_canceled_serialization() {
 #[test]
 fn user_question_answered_multi_selected_serialization() {
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_1".into(),
         quiet: false,
         answer: AnswerKind::MultiSelected {
@@ -246,6 +258,7 @@ fn user_question_answered_multi_selected_with_text_serialization() {
     // New shape: MultiSelected carrying the prompt textarea's contents
     // alongside the toggled option ids. Round-trips with `text` present.
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_2".into(),
         quiet: false,
         answer: AnswerKind::MultiSelected {
@@ -276,6 +289,7 @@ fn user_question_answered_multi_selected_with_text_serialization() {
 #[test]
 fn user_question_answered_event_type() {
     let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: "tu_1".into(),
         quiet: false,
         answer: AnswerKind::Canceled,
@@ -306,5 +320,109 @@ fn user_question_round_trips_through_db_payload() {
             raw,
             parsed.err()
         );
+    }
+}
+
+/// Stored rows of the retired single-use card still read, though nothing
+/// emits them now (ADR 0387 history).
+#[test]
+fn retired_allow_once_rows_still_deserialize() {
+    let thread = uuid::Uuid::new_v4();
+    let cases = [
+        serde_json::json!({
+            "type": "OwnerApprovalRequested", "request_id": "owner-approval:abc",
+            "approval": { "verb": "apply", "target_thread_id": thread },
+            "question": "Let this thread act outside its own subtree, once?"
+        }),
+        serde_json::json!({
+            "type": "OwnerApprovalSpent", "tool_use_id": "toolu-1#q0",
+            "verb": "restore-snapshot", "target_workspace_id": "demo",
+            "snapshot_handle": "snap-1"
+        }),
+        serde_json::json!({ "type": "UnattestedActSpent", "tool_use_id": "toolu-2#q0" }),
+        serde_json::json!({
+            "type": "UserQuestionAsked", "tool_use_id": "toolu-3#q0", "cc_session_id": "s",
+            "question": "q", "multi_select": false,
+            "owner_approval": { "verb": "archive", "target_thread_id": thread }
+        }),
+    ];
+    for stored in cases {
+        let event: ThreadEvent = serde_json::from_value(stored.clone())
+            .unwrap_or_else(|e| panic!("{stored} no longer reads: {e}"));
+        assert_eq!(serde_json::to_value(&event).unwrap(), stored);
+    }
+}
+
+/// A stored thread card names no workspace or snapshot.
+#[test]
+fn legacy_owner_approval_decodes_without_snapshot_authority() {
+    let old: OwnerApproval = serde_json::from_value(serde_json::json!({
+        "verb": "apply", "target_thread_id": uuid::Uuid::new_v4()
+    }))
+    .unwrap();
+    assert!(old.target_workspace_id.is_none());
+    assert!(old.snapshot_handle.is_none());
+}
+
+/// The stored spellings of the retired verbs still read, so an old card's
+/// timeline still renders.
+#[test]
+fn a_retired_verb_still_reads_from_a_stored_card() {
+    use crate::engine::permission::Action;
+    for (wire, verb) in [
+        ("create-top-thread", Action::CreateTopThread),
+        ("detach-child", Action::DetachChild),
+    ] {
+        let stored: OwnerApproval =
+            serde_json::from_value(serde_json::json!({ "verb": wire })).unwrap();
+        assert_eq!(stored.verb, verb);
+        assert_eq!(stored.target_thread_id, None);
+        assert_eq!(serde_json::to_value(verb).unwrap(), wire);
+    }
+}
+
+mod guard_tests {
+    /// No code emits a retired event or writes a retired card field. Their
+    /// variants stay only so stored rows read.
+    #[test]
+    fn nothing_emits_a_retired_allow_once_event() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let retired = [
+            "ThreadEvent::OwnerApprovalRequested {",
+            "ThreadEvent::OwnerApprovalSpent {",
+            "ThreadEvent::UnattestedActSpent {",
+            "owner_approval: Some(",
+            "unattested_act: Some(",
+        ];
+        // A match pattern reads a variant, and a boxed act is the live
+        // `permission_request.unattested_act`, not the retired top-level field.
+        let reads = |line: &str| line.contains("{ .. }") || line.contains("Some(Box::new(");
+        let mut hits = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let is_test = rel.contains("test") || rel.ends_with("/tests.rs");
+                if path.extension().is_none_or(|e| e != "rs") || is_test {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).unwrap();
+                for line in text.lines().filter(|l| !reads(l)) {
+                    if retired.iter().any(|needle| line.contains(needle)) {
+                        hits.push(format!("{rel}: {}", line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "retired emits remain: {hits:#?}");
     }
 }

@@ -871,7 +871,7 @@ describe('loadAllThreads — compose preservation', () => {
   });
 
   function mockComposeApiResponse(threadId: string, composeText: string, composeImages: string[] = []) {
-    (fetchThreads as any).mockResolvedValue({
+    const response = {
       saved: [],
       active_threads: [],
       composing: [],
@@ -894,8 +894,32 @@ describe('loadAllThreads — compose preservation', () => {
         compose_images: composeImages,
         compose_mode: null,
       }],
-    });
+    };
+    (fetchThreads as any).mockResolvedValue(response);
+    return response;
   }
+
+  it.each([false, true])('saved-draft acceptance during a list read reconciles with pending edit=%s', async (localEdit) => {
+    const { handleGlobalEvent } = await import('./thread-sync');
+    const { setDraft } = await import('../composeDrafts');
+    const { noteLocalComposeEdit } = await import('../composeSync');
+    const stale = mockComposeApiResponse('t1', 'saved content', ['saved-image']);
+    let release!: (response: typeof stale) => void;
+    (fetchThreads as any).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const reading = loadAllThreads();
+    if (localEdit) {
+      setDraft('t1', { text: 'later local edit', image_hashes: ['local-image'], mode: 'lucidos' });
+      noteLocalComposeEdit('t1');
+    }
+    mockComposeApiResponse('t1', '');
+    const readsBefore = vi.mocked(fetchThreads).mock.calls.length;
+    handleGlobalEvent('DraftSubmissionAccepted', { thread_id: 't1' });
+    release(stale);
+    await reading;
+    expect(vi.mocked(fetchThreads).mock.calls.length).toBe(readsBefore + 1);
+    expect(getDraft('t1').text).toBe(localEdit ? 'later local edit' : '');
+    expect(getDraft('t1').image_hashes).toEqual(localEdit ? ['local-image'] : []);
+  });
 
   /** Plant a fake textarea matching `[data-role="prompt-input"]` and mark it as
    *  document.activeElement so isComposeFocusedHere() returns true. */

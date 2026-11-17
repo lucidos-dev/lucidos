@@ -102,6 +102,14 @@ pub enum HandOver {
 pub struct DeviceStore;
 
 impl DeviceStore {
+    /// Registered native clients, identified by the desktop registration token.
+    pub async fn native_push_devices(pool: &sqlx::PgPool) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT id FROM devices WHERE position($1 in user_agent) > 0")
+            .bind(DESKTOP_APP_UA_TOKEN)
+            .fetch_all(pool)
+            .await
+    }
+
     /// Register or update a device (upsert by id). Returns `(device, inserted)`
     /// where `inserted` is true iff a new row was created (false on
     /// last-seen-at refresh).
@@ -179,7 +187,7 @@ impl DeviceStore {
         {
             Ok(r) => r,
             Err(e) => {
-                log!("[Devices] friendly_name({}) failed: {}", id, e);
+                log_legacy!("[Devices] friendly_name({}) failed: {}", id, e);
                 None
             }
         };
@@ -202,7 +210,7 @@ impl DeviceStore {
         {
             Ok(d) => d,
             Err(e) => {
-                log!("[Devices] tooltip_info({}) failed: {}", id, e);
+                log_legacy!("[Devices] tooltip_info({}) failed: {}", id, e);
                 return None;
             }
         };

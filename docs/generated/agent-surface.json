@@ -97,17 +97,20 @@
         "name": "apps"
       },
       {
-        "aliases": [],
+        "aliases": [
+          "ask-owner-approval"
+        ],
         "commands": [],
         "flags": [
           "help",
           "reason",
           "snapshot",
           "target-workspace",
-          "thread"
+          "thread",
+          "workspace"
         ],
         "hidden": false,
-        "name": "ask-owner-approval"
+        "name": "ask-permission"
       },
       {
         "aliases": [],
@@ -518,6 +521,48 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "run"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "hold-secs"
+            ],
+            "hidden": false,
+            "name": "run"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "confinement-tests"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "list"
               },
               {
@@ -661,6 +706,170 @@
         ],
         "hidden": false,
         "name": "data-store"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "revoke"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "list"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "all",
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "revoke"
+          }
+        ],
+        "flags": [
+          "help",
+          "port"
+        ],
+        "hidden": false,
+        "name": "devices"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "host-transfer-status"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "prepare-host-transfer"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "query"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "transfer-host-logs"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help"
+            ],
+            "hidden": false,
+            "name": "host-transfer-status"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "directory",
+              "help",
+              "host",
+              "reason",
+              "user"
+            ],
+            "hidden": false,
+            "name": "prepare-host-transfer"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "byte-limit",
+              "contains",
+              "help",
+              "json",
+              "label",
+              "limit",
+              "pid",
+              "regex",
+              "since",
+              "until"
+            ],
+            "hidden": false,
+            "name": "query"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "transfer-host-logs"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "diagnostic-log"
       },
       {
         "aliases": [],
@@ -1268,7 +1477,7 @@
             "commands": [],
             "flags": [],
             "hidden": false,
-            "name": "ask-owner-approval"
+            "name": "ask-permission"
           },
           {
             "aliases": [],
@@ -1457,6 +1666,21 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "run"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "confinement-tests"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "list"
               },
               {
@@ -1507,6 +1731,64 @@
             "flags": [],
             "hidden": false,
             "name": "data-store"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "revoke"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "devices"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "host-transfer-status"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "prepare-host-transfer"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "query"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "transfer-host-logs"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "diagnostic-log"
           },
           {
             "aliases": [],
@@ -1769,6 +2051,13 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "setting"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "status"
               }
             ],
@@ -1970,6 +2259,35 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "batch"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "revoke"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "permissions"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "approve"
               },
               {
@@ -1978,6 +2296,13 @@
                 "flags": [],
                 "hidden": false,
                 "name": "mark"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "start"
               },
               {
                 "aliases": [],
@@ -2019,6 +2344,13 @@
             "flags": [],
             "hidden": false,
             "name": "proxy"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [],
+            "hidden": false,
+            "name": "ps"
           },
           {
             "aliases": [],
@@ -2236,6 +2568,13 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "create-draft"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "detach"
               },
               {
@@ -2271,7 +2610,21 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "pause-automation"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "search"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "submit-draft"
               }
             ],
             "flags": [],
@@ -2387,7 +2740,21 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
-                "name": "reset"
+                "name": "add"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "remove"
               },
               {
                 "aliases": [],
@@ -2406,7 +2773,7 @@
             ],
             "flags": [],
             "hidden": false,
-            "name": "update-address"
+            "name": "update-channel"
           },
           {
             "aliases": [],
@@ -2545,7 +2912,84 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "autostart"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "classify"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "create"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "delete"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "device-session"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "rename"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "review"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "start"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "stop"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "trash"
               }
             ],
             "flags": [],
@@ -2643,12 +3087,28 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "setting"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "status"
               }
             ],
             "flags": [],
             "hidden": false,
             "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help"
+            ],
+            "hidden": false,
+            "name": "setting"
           },
           {
             "aliases": [],
@@ -3129,6 +3589,7 @@
           "help",
           "host",
           "label",
+          "manage",
           "port",
           "qr"
         ],
@@ -3142,7 +3603,84 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "help",
+              "items"
+            ],
+            "hidden": false,
+            "name": "batch"
+          },
+          {
+            "aliases": [],
+            "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "batch"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "help"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "revoke"
+              }
+            ],
+            "flags": [],
+            "hidden": false,
+            "name": "help"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "all",
               "help"
+            ],
+            "hidden": false,
+            "name": "list"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "permission-id"
+            ],
+            "hidden": false,
+            "name": "revoke"
+          }
+        ],
+        "flags": [
+          "help"
+        ],
+        "hidden": false,
+        "name": "permissions"
+      },
+      {
+        "aliases": [],
+        "commands": [
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "plan-only"
             ],
             "hidden": false,
             "name": "approve"
@@ -3176,6 +3714,13 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "start"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "state"
               }
             ],
@@ -3189,12 +3734,23 @@
             "flags": [
               "files",
               "help",
+              "kind",
               "plan",
               "security-fix",
               "simple"
             ],
             "hidden": false,
             "name": "mark"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "kind"
+            ],
+            "hidden": false,
+            "name": "start"
           },
           {
             "aliases": [],
@@ -3287,6 +3843,13 @@
         ],
         "hidden": false,
         "name": "proxy"
+      },
+      {
+        "aliases": [],
+        "commands": [],
+        "flags": [],
+        "hidden": false,
+        "name": "ps"
       },
       {
         "aliases": [],
@@ -3835,6 +4398,25 @@
             "aliases": [],
             "commands": [],
             "flags": [
+              "app",
+              "coding-agent",
+              "effort",
+              "help",
+              "image",
+              "mode",
+              "model",
+              "provider",
+              "repo",
+              "retry-key",
+              "text"
+            ],
+            "hidden": false,
+            "name": "create-draft"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
               "help",
               "thread"
             ],
@@ -3911,6 +4493,13 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "create-draft"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "detach"
               },
               {
@@ -3953,7 +4542,21 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "pause-automation"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "search"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "submit-draft"
               }
             ],
             "flags": [],
@@ -3982,10 +4585,34 @@
             "commands": [],
             "flags": [
               "help",
+              "reason",
+              "thread"
+            ],
+            "hidden": false,
+            "name": "pause-automation"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
               "limit"
             ],
             "hidden": false,
             "name": "search"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "epoch",
+              "help",
+              "retry-key",
+              "revision",
+              "thread"
+            ],
+            "hidden": false,
+            "name": "submit-draft"
           }
         ],
         "flags": [
@@ -4294,7 +4921,25 @@
         "commands": [
           {
             "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port",
+              "use"
+            ],
+            "hidden": false,
+            "name": "add"
+          },
+          {
+            "aliases": [],
             "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "add"
+              },
               {
                 "aliases": [],
                 "commands": [],
@@ -4307,7 +4952,14 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
-                "name": "reset"
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "remove"
               },
               {
                 "aliases": [],
@@ -4336,7 +4988,17 @@
               "port"
             ],
             "hidden": false,
-            "name": "reset"
+            "name": "list"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "port"
+            ],
+            "hidden": false,
+            "name": "remove"
           },
           {
             "aliases": [],
@@ -4364,7 +5026,7 @@
           "port"
         ],
         "hidden": false,
-        "name": "update-address"
+        "name": "update-channel"
       },
       {
         "aliases": [],
@@ -4713,7 +5375,100 @@
         "commands": [
           {
             "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "off",
+              "on",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "autostart"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "evidence",
+              "help",
+              "origin"
+            ],
+            "hidden": false,
+            "name": "classify"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "autostart",
+              "help",
+              "reason",
+              "slug"
+            ],
+            "hidden": false,
+            "name": "create"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "delete"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "device",
+              "help",
+              "out",
+              "reason",
+              "ttl"
+            ],
+            "hidden": false,
+            "name": "device-session"
+          },
+          {
+            "aliases": [],
             "commands": [
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "autostart"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "classify"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "create"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "delete"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "device-session"
+              },
               {
                 "aliases": [],
                 "commands": [],
@@ -4726,7 +5481,49 @@
                 "commands": [],
                 "flags": [],
                 "hidden": false,
+                "name": "list"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "rename"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "restore"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
                 "name": "review"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "start"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "stop"
+              },
+              {
+                "aliases": [],
+                "commands": [],
+                "flags": [],
+                "hidden": false,
+                "name": "trash"
               }
             ],
             "flags": [],
@@ -4738,10 +5535,69 @@
             "commands": [],
             "flags": [
               "help",
+              "json"
+            ],
+            "hidden": false,
+            "name": "list"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "rename"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "restore"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
               "port"
             ],
             "hidden": false,
             "name": "review"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "start"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help",
+              "reason"
+            ],
+            "hidden": false,
+            "name": "stop"
+          },
+          {
+            "aliases": [],
+            "commands": [],
+            "flags": [
+              "help"
+            ],
+            "hidden": false,
+            "name": "trash"
           }
         ],
         "flags": [
@@ -4819,10 +5675,13 @@
       "BackupKeyRevealed",
       "BackupRecipientSet",
       "ProxyConfigRejected",
+      "ModelSpendCapReached",
+      "ModelSpendCapHoldEnded",
       "ModelNotServedObserved",
       "ThreadsDeleted",
       "RecoveryProgress",
       "MemoryCorrected",
+      "MemoryExtractionFailed",
       "Toast",
       "ArtifactImported",
       "TriggerCreated",
@@ -4866,7 +5725,8 @@
       "PresenceCheck",
       "NativePushRequested",
       "NativePushDismissRequested",
-      "OperatorsChanged",
+      "UsersChanged",
+      "PairingRequestsChanged",
       "PluginInstalled",
       "PluginLocalChangesMerged",
       "PluginUninstalled",
@@ -4935,21 +5795,31 @@
       "LaneBatchStarted",
       "LaneBatchLanded",
       "LaneBatchFailed",
+      "LaneArrivalsHeld",
+      "LaneArrivalsReleased",
       "MainPushFailed",
       "MainFollowRefused",
+      "MainFollowed",
       "MainCheckStarted",
       "MainCheckRunLinked",
       "MainCheckPassed",
       "MainCheckFailed",
+      "MainCheckRepairStarted",
       "MainCheckAbandoned",
+      "MainCheckSuperseded",
       "MainCheckRedClosed",
       "EngineSupervisorRespawned",
+      "InternalFaultRecorded",
+      "DiagnosticBundleSent",
+      "DiagnosticBundleReceived",
       "EmailSent",
       "ProxyModulesReloaded",
       "HandshakeScriptApproved",
       "HandshakeScriptScopeBound",
       "HandshakeScriptInjectsBound",
       "CredentialScopeInferred",
+      "OrdinarySubmissionAccepted",
+      "DraftSubmissionAccepted",
       "ThreadQueued",
       "ThreadQueueAdmitted",
       "ThreadQueueDropped",
@@ -4970,6 +5840,7 @@
       "TextStreamed",
       "ThoughtStreamed",
       "ContextCaptured",
+      "CodingAgentBillingObserved",
       "ModelCallFailed",
       "MemoryRecalled",
       "ToolCalled",
@@ -4978,6 +5849,7 @@
       "WorkingUnderstandingWritten",
       "BackgroundBashStarted",
       "BackgroundBashCompleted",
+      "ConfinementRunStarted",
       "ResponseGenerated",
       "ResponseCanceled",
       "ResponseAborted",
@@ -5015,9 +5887,17 @@
       "WorkItemGateEscalated",
       "WorkItemWatched",
       "WorkItemUnwatched",
-      "PeopleMessagePosted",
+      "UserOnlyMessagePosted",
       "AgentPaused",
       "AgentResumed",
+      "AutomationPaused",
+      "AutomationUnpaused",
+      "PermissionGranted",
+      "PermissionSpent",
+      "PermissionRestored",
+      "PermissionRevoked",
+      "PermissionRequestPrepared",
+      "BatchItemRan",
       "ThreadStarted",
       "ThreadDiscarded",
       "HomeThreadCreated",
@@ -5025,6 +5905,9 @@
       "TriggerStarted",
       "TriggerRunInterrupted",
       "TriggerCompleted",
+      "PlanStarted",
+      "PlanProposed",
+      "PlanApproved",
       "ChangeProposed",
       "ChangeApplied",
       "ChangeDiscarded",
@@ -5045,7 +5928,9 @@
       "ChangeSummarized",
       "CodingAgentSettingsChanged",
       "ChatSettingsChanged",
+      "ChatTurnSettingsResolved",
       "CodingAgentCompacted",
+      "CodingAgentModelSubstituted",
       "SuccessorThreadSpawned",
       "SessionHandedOff",
       "HandoffCheckpointReached",
@@ -5066,6 +5951,8 @@
       "UserQuestionAnswered",
       "OwnerApprovalRequested",
       "OwnerApprovalSpent",
+      "UnattestedActSpent",
+      "MachineMadeWorkspaceChanged",
       "CodingAgentPermissionRequest",
       "CodingAgentPermissionResolved",
       "CommandPermissionRequested",
@@ -5128,6 +6015,7 @@
     "configure",
     "data",
     "events",
+    "media",
     "modelRequest",
     "notifications",
     "oauth",
@@ -5201,6 +6089,7 @@
       "setup_mcp_server": "mcp",
       "start_mcp_server": "mcp",
       "stop_mcp_server": "mcp",
+      "submit_saved_draft": "threads",
       "switch_cache_keep_alive": "threads",
       "triage_threads": "threads",
       "uninstall_plugin": "plugins",

@@ -349,21 +349,21 @@ pub fn apply_default_cache_dir(workspace: &Path) {
         Some(dir) => match created(dir) {
             Ok(()) => {
                 std::env::set_var("FASTEMBED_CACHE_DIR", dir);
-                log!(
+                log_legacy!(
                     @Memory,
                     "Embedding-model cache: {} (shared by every workspace on this machine)",
                     dir.display()
                 );
                 return;
             }
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 @Memory,
                 "Could not create the shared embedding-model cache at {}: {}",
                 dir.display(),
                 e
             ),
         },
-        None => log!(
+        None => log_legacy!(
             @Memory,
             "Neither HOME nor XDG_CACHE_HOME is set, so there is no per-user cache to share"
         ),
@@ -371,7 +371,7 @@ pub fn apply_default_cache_dir(workspace: &Path) {
 
     let own = super::legacy_cache::legacy_cache_path(workspace);
     if let Err(e) = std::fs::create_dir_all(&own) {
-        log!(
+        log_legacy!(
             @Memory,
             "Could not create this workspace's embedding-model cache at {}: {}. Leaving it to \
              fastembed's own default, '{}' relative to the working directory",
@@ -382,7 +382,7 @@ pub fn apply_default_cache_dir(workspace: &Path) {
         return;
     }
     std::env::set_var("FASTEMBED_CACHE_DIR", &own);
-    log!(
+    log_legacy!(
         @Memory,
         "Embedding-model cache: {} (this workspace only, since there is no shared location to use)",
         own.display()
@@ -769,7 +769,7 @@ fn classify_download(
     match result {
         Ok(FileFetch::Cached) => Ok(CacheOutcome::Downloaded),
         Ok(FileFetch::PeerHoldsLock(lock)) => {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Another process is already fetching '{}' into the shared model cache (lock: {}); \
                  waiting for it rather than fetching a second copy",
@@ -827,7 +827,7 @@ pub async fn ensure_model_cached(
         return Ok(CacheOutcome::AlreadyCached);
     }
 
-    log!(
+    log_legacy!(
         @Memory,
         "Fetching {} embedding-model file(s) for '{}' into {}",
         missing.len(),
@@ -1641,7 +1641,7 @@ mod tests {
             // outage skips, it never reds the suite. A non-fetch error is a
             // real bug and still panics.
             Err(e) if is_model_fetch_failure(e.as_ref()) => {
-                eprintln!(
+                crate::log_legacy!(
                     "[real-embedder-tests] SKIP: embedding-model files unavailable \
                      (huggingface.co fetch failed): {e}"
                 );
@@ -1676,7 +1676,7 @@ mod tests {
             // same model right now. Nothing below can be asserted (the cache is
             // still incomplete), and it is not a defect in either process.
             CacheOutcome::PeerDownloading => {
-                eprintln!(
+                crate::log_legacy!(
                     "[real-embedder-tests] SKIP: another process holds the model-download lock"
                 );
                 return;

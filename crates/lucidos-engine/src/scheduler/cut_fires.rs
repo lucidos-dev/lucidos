@@ -118,13 +118,13 @@ async fn find_cut_fires(pool: &PgPool) -> Result<Vec<CutFire>, Error> {
                 });
             }
             (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
-                log!(
+                log_legacy!(
                     "[CutFires] Cannot read fire on thread {}: {}",
                     row.thread_id,
                     error
                 );
             }
-            _ => log!(
+            _ => log_legacy!(
                 "[CutFires] Skipping thread {}: no unresumed restart abort",
                 row.thread_id
             ),
@@ -138,7 +138,7 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
     let fires = match find_cut_fires(pool).await {
         Ok(fires) => fires,
         Err(error) => {
-            log!(
+            log_legacy!(
                 "[CutFires] Could not find interrupted trigger fires: {}",
                 error
             );
@@ -154,7 +154,7 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
                 .get(&fire.trigger_id)
                 .cloned();
             let retry = prepare_retry(pool, &engine.thread_queue, config.as_ref(), &fire).await?;
-            log!(
+            log_legacy!(
                 "[CutFires] Retry decision for thread {}: {:?}",
                 fire.thread_id,
                 retry
@@ -173,11 +173,11 @@ pub(super) async fn settle_cut_trigger_fires(engine: &SharedEngine, pool: &PgPoo
         }
         .await;
         match result {
-            Ok(()) => log!(
+            Ok(()) => log_legacy!(
                 "[CutFires] Reported interrupted fire on thread {}",
                 fire.thread_id
             ),
-            Err(error) => log!(
+            Err(error) => log_legacy!(
                 "[CutFires] Could not report thread {}: {}",
                 fire.thread_id,
                 error
@@ -265,7 +265,7 @@ async fn rebuild_request(
     let request: ThreadQueueRequest = match serde_json::from_value(payload) {
         Ok(request) => request,
         Err(error) => {
-            log!(
+            log_legacy!(
                 "[CutFires] Cannot rebuild request on thread {}: {}",
                 fire.thread_id,
                 error

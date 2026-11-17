@@ -1,6 +1,24 @@
 use super::*;
 
 #[test]
+fn saved_draft_content_is_human_without_device_or_agent_authorship() {
+    let origin = MessageOrigin::SavedDraft {
+        submission_event_id: uuid::Uuid::new_v4(),
+        submitted_by_thread_id: uuid::Uuid::new_v4(),
+    };
+    assert_eq!(origin.mode(), ActorMode::Human);
+    assert_eq!(origin.source_thread_id(), None);
+    assert_eq!(origin.agent(), None);
+    let value = serde_json::to_value(&origin).unwrap();
+    assert_eq!(value["kind"], "saved_draft");
+    assert!(value.get("device_id").is_none());
+    assert_eq!(
+        serde_json::from_value::<MessageOrigin>(value).unwrap(),
+        origin
+    );
+}
+
+#[test]
 fn message_origin_engine_serializes_with_kind_engine() {
     let origin = MessageOrigin::Engine {
         reason: EngineReason::ContinuationStarted,
@@ -235,6 +253,7 @@ fn message_origin_mode_reads_field_for_workspace_and_thread_link() {
         event_id: None,
         user_agent: None,
         mode: ActorMode::Agent,
+        verdict: None,
     };
     let tl = MessageOrigin::ThreadLink {
         thread_id: uuid::Uuid::new_v4(),
@@ -382,6 +401,7 @@ fn only_a_verified_subprocess_names_a_source_thread() {
         event_id: None,
         user_agent: None,
         mode: ActorMode::Agent,
+        verdict: None,
     };
     let device = MessageOrigin::Device {
         device_id: "d1".to_string(),

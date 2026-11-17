@@ -31,6 +31,13 @@ a value. A server whose line reads `Launch: unknown` could not be checked.
 
 ## Checks
 
+Secret-read classification follows the executing sandbox policy; see
+`system-knowhow/agent-sandbox.md`. A launch approval cannot grant access to
+hidden private storage. Keep launch approval distinct from that boundary.
+
+Artifact attribution in `system-knowhow/running-python.md` describes writes after execution.
+It grants no MCP launch permission and changes none of the launch checks below.
+
 For each finding, capture: **location** (the server id), **what's wrong**,
 **which reference owns the rule** (link, don't quote), **suggested fix**.
 
@@ -70,3 +77,8 @@ judgment about a command.
 - **Never edit a server's command to clear a finding.** Set it up again with
   `mcp(action="setup", ...)` only when the user asks. The guard then judges
   the new line.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

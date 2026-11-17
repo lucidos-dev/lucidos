@@ -129,7 +129,7 @@ impl Drop for CheckGuard {
 /// One ingress check, registered on [`WEBHOOK_INGRESS_CRON`].
 pub(crate) async fn run_webhook_ingress_check(engine: SharedEngine, pool: PgPool) {
     let Some(_guard) = CheckGuard::try_acquire() else {
-        log!("[WebhookIngress] Skipping run; the previous cycle is still going");
+        log_legacy!("[WebhookIngress] Skipping run; the previous cycle is still going");
         return;
     };
     if engine.is_shutting_down() {
@@ -137,7 +137,7 @@ pub(crate) async fn run_webhook_ingress_check(engine: SharedEngine, pool: PgPool
     }
     let mut round = watch().begin_round();
     if let Some(reason) = run_cycle(&engine, &pool, &mut round).await {
-        log!("[WebhookIngress] Not probing: {reason}");
+        log_legacy!("[WebhookIngress] Not probing: {reason}");
     }
     watch().last_round_end = Some(round.measured_end.unwrap_or_else(ClockReading::now));
 }
@@ -158,7 +158,7 @@ async fn run_cycle(
     let hooks = match WebhookStore::list(pool).await {
         Ok(hooks) => hooks,
         Err(e) => {
-            log!("[WebhookIngress] The webhook list could not be read: {e}");
+            log_legacy!("[WebhookIngress] The webhook list could not be read: {e}");
             return undetermined(round, "the webhook list could not be read");
         }
     };
@@ -181,7 +181,7 @@ async fn run_cycle(
         Err(e) => {
             // Unknown is neither healthy nor degraded. Emitting on a guess would
             // duplicate a live warning or retract one that still holds.
-            log!("[WebhookIngress] The declared state could not be read: {e}");
+            log_legacy!("[WebhookIngress] The declared state could not be read: {e}");
             return undetermined(round, "the declared state could not be read");
         }
     };
@@ -189,7 +189,7 @@ async fn run_cycle(
     let resolver = match resolver_client() {
         Ok(resolver) => resolver,
         Err(e) => {
-            log!("[WebhookIngress] No resolver client could be built: {e}");
+            log_legacy!("[WebhookIngress] No resolver client could be built: {e}");
             return undetermined(round, "no resolver client could be built");
         }
     };
@@ -207,7 +207,7 @@ async fn run_cycle(
 
     let blocked = local_egress_families(&addresses);
     if !blocked.is_empty() {
-        log!(
+        log_legacy!(
             "[WebhookIngress] This host cannot send to {}:{} over {}, so it judged nothing there",
             ingress.host,
             ingress.port,
@@ -217,7 +217,7 @@ async fn run_cycle(
 
     let slept = round.measure();
     if let Some(slept) = slept {
-        log!(
+        log_legacy!(
             "[WebhookIngress] This computer slept {} seconds around this round, so it judged nothing",
             slept.as_secs()
         );
@@ -229,7 +229,7 @@ async fn run_cycle(
     };
 
     if let Some(spell) = spell {
-        log!(
+        log_legacy!(
             "[WebhookIngress] This computer slept {} minutes while {} was on, so deliveries sent then never arrived",
             spell.as_secs() / 60,
             hook.name
@@ -252,7 +252,7 @@ async fn run_cycle(
     match decision {
         Decision::Nothing => {}
         Decision::Declare => {
-            log!(
+            log_legacy!(
                 "[WebhookIngress] {}:{} is degraded over {}",
                 ingress.host,
                 ingress.port,
@@ -278,7 +278,7 @@ async fn run_cycle(
             // `Recover` is only reached with a declaration in hand, and the
             // recovered set is whatever that declaration named.
             let down = declared?;
-            log!(
+            log_legacy!(
                 "[WebhookIngress] {}:{} recovered after {} seconds",
                 ingress.host,
                 ingress.port,
@@ -335,7 +335,7 @@ async fn probe_each(
     let token = match webhook_probe_token::mint() {
         Ok(token) => token,
         Err(e) => {
-            log!("[WebhookIngress] No probe token could be minted: {e}");
+            log_legacy!("[WebhookIngress] No probe token could be minted: {e}");
             return None;
         }
     };
@@ -375,7 +375,7 @@ async fn out_of_service(
     let declared = match declared_outage(pool).await {
         Ok(declared) => declared,
         Err(e) => {
-            log!("[WebhookIngress] The declared state could not be read: {e}");
+            log_legacy!("[WebhookIngress] The declared state could not be read: {e}");
             return Some(reason);
         }
     };
@@ -383,7 +383,7 @@ async fn out_of_service(
         return Some(reason);
     };
 
-    log!(
+    log_legacy!(
         "[WebhookIngress] Retracting the outage of {}:{}: {reason}",
         down.host,
         down.port

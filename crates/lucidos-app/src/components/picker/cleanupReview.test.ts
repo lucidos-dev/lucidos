@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CleanupRow } from '../../api/client/control';
-import { cleanupTotals, isCleanupSuggested, sortCleanupRows } from './cleanupReview';
+import { cleanupTotals, hasCleanupWork, isCleanupSuggested, isMachineMade, sortCleanupRows } from './cleanupReview';
 
 const now = Date.parse('2026-01-31T12:00:00Z');
 function row(patch: Partial<CleanupRow> = {}): CleanupRow {
@@ -13,6 +13,16 @@ function row(patch: Partial<CleanupRow> = {}): CleanupRow {
     running: false, fingerprint: 'observed', ...patch,
   };
 }
+
+describe('machine-made origins', () => {
+  it('match the gateway split, agent-made workspaces included', () => {
+    expect((['agent', 'demo', 'eval', 'e2e'] as const).every(isMachineMade)).toBe(true);
+    expect((['user', 'unknown'] as const).some(isMachineMade)).toBe(false);
+    const agentMade = row();
+    agentMade.workspace!.origin = 'agent';
+    expect(hasCleanupWork([agentMade], [])).toBe(true);
+  });
+});
 
 describe('cleanup review selection', () => {
   it('suggests only observed stopped harness resources with old activity or elapsed expiry', () => {

@@ -40,6 +40,11 @@ receipts="$receipts| plugin-manifests | $n |\n"
 
 ## Checks
 
+- **Misclassifying plugin artifacts as trigger output.** Check against `system-knowhow/plugins.md` § Artifact provenance.
+  A user-confirmed update backup and an engine-prepared upstream patch remain eligible for workspace memory.
+  Their attribution requires no plugin manifest migration.
+
+
 Plugin notifications follow `system-knowhow/plugins.md` § Affected triggers.
 Flag recipes that treat a trigger warning as restore authority as **broken**.
 The restore confirmation belongs to the snapshot flow.
@@ -96,3 +101,8 @@ call, and setting `engine` in an authored tree is an inline edit.
 
 - **Updates stage the confirm panel, never confirm themselves.** `plugins(action="update", ...)` opens the usual update panel. This audit turn stops there; the user clicks **Update**.
 - **Never edit the installed copy** under `data/`, for the reason § Checks gives. Fix the plugin's own source tree, or propose the change upstream.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

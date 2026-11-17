@@ -2,35 +2,6 @@
 
 use super::*;
 
-/// Concurrent grants must all survive. `append` reads the file, checks the
-/// pattern, then writes it back. Two unsynchronized appends therefore both
-/// read the pre-state, and the winner's rename drops the loser's grant.
-/// Several gates grant in parallel: the command guard, the Claude Code and
-/// MCP lanes, and the Settings editor.
-#[test]
-fn concurrent_appends_keep_every_grant() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = grants_dir(tmp.path());
-    let file = GrantFile::ALL[0];
-    // Create the file first, so every thread races the same read-modify-write
-    // rather than the one-off create.
-    append(&dir, file, "Bash(seed:*)").unwrap();
-
-    let expected: Vec<String> = (0..16).map(|i| format!("Bash(cmd{i}:*)")).collect();
-    std::thread::scope(|scope| {
-        for pattern in &expected {
-            let dir = dir.clone();
-            scope.spawn(move || append(&dir, file, pattern).unwrap());
-        }
-    });
-
-    let got = patterns(&dir, file);
-    for pattern in &expected {
-        assert!(got.contains(pattern), "{pattern} was lost: {got:?}");
-    }
-    assert_eq!(got.len(), expected.len() + 1, "no duplicates: {got:?}");
-}
-
 /// The temp file a write renames from must be unique per process. A shared
 /// name lets two engines on one workspace interleave their bytes. The rename
 /// then publishes the torn result as the authoritative allowlist.
@@ -71,7 +42,7 @@ fn a_grant_in_one_workspace_is_invisible_from_another() {
     let b = grants_dir(&tmp.path().join("workspace-b"));
 
     for file in GrantFile::ALL {
-        append(&a, file, "Bash").unwrap();
+        write_raw(&a, file, "Bash\n").unwrap();
     }
 
     for file in GrantFile::ALL {
@@ -97,91 +68,7 @@ fn an_absent_grants_directory_reads_empty_rather_than_erroring() {
     let missing = grants_dir(&tmp.path().join("never-created"));
     for file in GrantFile::ALL {
         assert!(patterns(&missing, file).is_empty());
-        assert_eq!(read_raw(&missing, file).unwrap(), file.header());
     }
-}
-
-/// A pattern derives from agent or MCP server input, such as a Skill name. A
-/// newline inside it must not smuggle a bare `Bash` grant into the file.
-#[test]
-fn append_refuses_a_pattern_that_would_split_into_extra_grants() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = grants_dir(tmp.path());
-
-    for file in GrantFile::ALL {
-        for pattern in [
-            "Skill(x\nBash\n#:*)",
-            "Mcp(a)\r\nMcp(github:*)",
-            "Bash(ls\t:*)",
-        ] {
-            assert!(
-                append(&dir, file, pattern).is_err(),
-                "{} must refuse {pattern:?}",
-                file.file_name()
-            );
-        }
-        assert!(
-            patterns(&dir, file).is_empty(),
-            "{} must hold no grant after a refused append",
-            file.file_name()
-        );
-    }
-}
-
-#[test]
-fn append_is_idempotent_and_seeds_the_header() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = grants_dir(tmp.path());
-
-    append(&dir, GrantFile::McpTools, "Mcp(slack:channels_list)").unwrap();
-    append(&dir, GrantFile::McpTools, "Mcp(github:*)").unwrap();
-    append(&dir, GrantFile::McpTools, "Mcp(slack:channels_list)").unwrap();
-
-    let body = read_raw(&dir, GrantFile::McpTools).unwrap();
-    assert!(
-        body.starts_with(GrantFile::McpTools.header()),
-        "a file created by append keeps the instructional header"
-    );
-    assert_eq!(
-        patterns(&dir, GrantFile::McpTools),
-        vec![
-            "Mcp(slack:channels_list)".to_string(),
-            "Mcp(github:*)".to_string()
-        ],
-        "a repeat grant must not be appended twice"
-    );
-}
-
-/// A hand-edited file keeps its shape: append adds one line and rewrites
-/// nothing the user typed, including their own comments.
-#[test]
-fn append_preserves_an_existing_file_verbatim() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = grants_dir(tmp.path());
-    let file = GrantFile::CodingAgentTools;
-    write_raw(&dir, file, "# my notes\nBash\nRead\n").unwrap();
-
-    append(&dir, file, "Skill(code-review:*)").unwrap();
-
-    assert_eq!(
-        read_raw(&dir, file).unwrap(),
-        "# my notes\nBash\nRead\nSkill(code-review:*)\n"
-    );
-}
-
-/// An indented line is the same grant, so it must not be appended again. The
-/// reader trims, and the duplicate check has to trim with it.
-#[test]
-fn append_recognises_an_indented_grant_as_already_present() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = grants_dir(tmp.path());
-    let file = GrantFile::CodingAgentTools;
-    let body = "# header\n  Skill(code-review:*)  \n";
-    write_raw(&dir, file, body).unwrap();
-
-    append(&dir, file, "Skill(code-review:*)").unwrap();
-
-    assert_eq!(read_raw(&dir, file).unwrap(), body);
 }
 
 #[test]
@@ -195,7 +82,8 @@ fn write_then_read_round_trips_and_parses() {
 
     write_raw(&dir, GrantFile::AgentCommands, &body).unwrap();
 
-    assert_eq!(read_raw(&dir, GrantFile::AgentCommands).unwrap(), body);
+    let path = GrantFile::AgentCommands.path_in(&dir);
+    assert_eq!(std::fs::read_to_string(path).unwrap(), body);
     assert_eq!(
         patterns(&dir, GrantFile::AgentCommands),
         vec!["Bash(git:*)".to_string(), "Python".to_string()],
@@ -211,7 +99,7 @@ fn the_three_lanes_do_not_share_a_file() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = grants_dir(tmp.path());
 
-    append(&dir, GrantFile::AgentCommands, "Bash").unwrap();
+    write_raw(&dir, GrantFile::AgentCommands, "Bash\n").unwrap();
 
     assert_eq!(patterns(&dir, GrantFile::AgentCommands), vec!["Bash"]);
     assert!(patterns(&dir, GrantFile::CodingAgentTools).is_empty());
@@ -246,7 +134,7 @@ fn a_workspace_never_falls_back_to_the_machine_global_file() {
     let global = tmp.path().join("global");
 
     for file in GrantFile::ALL {
-        append(&global, file, "Bash").unwrap();
+        write_raw(&global, file, "Bash\n").unwrap();
         assert!(
             patterns(&workspace, file).is_empty(),
             "{} must not reach outside its own workspace",
@@ -288,5 +176,49 @@ fn the_wire_name_is_the_file_name() {
         );
         let back: GrantFile = serde_json::from_value(wire).unwrap();
         assert_eq!(back, file, "{file:?} must round-trip");
+    }
+}
+
+/// A mirror reads back as exactly the lines it was written from, and says
+/// what it is. So a downgrade and a reader of the file agree on the grants.
+#[test]
+fn a_mirror_body_parses_back_to_its_lines() {
+    for file in GrantFile::ALL {
+        let lines = vec!["Bash".to_string(), "Mcp(slack:*)".to_string()];
+        let body = file.mirror_body(&lines);
+        assert!(body.starts_with(file.header()), "{}", file.file_name());
+        assert!(body.contains("grants nothing until you import it"));
+        assert_eq!(parse_patterns(&body), lines, "{}", file.file_name());
+    }
+}
+
+/// Each lane recognizes the shapes its own matcher reads. Anything else is
+/// kept but shown as legacy unmapped, never dropped.
+#[test]
+fn each_lane_recognizes_only_the_shapes_its_matcher_reads() {
+    let cases = [
+        (GrantFile::AgentCommands, "Bash", true),
+        (GrantFile::AgentCommands, "Python", true),
+        (GrantFile::AgentCommands, "Bash(git:*)", true),
+        (GrantFile::AgentCommands, "Bash(./x.sh:*)", false),
+        (GrantFile::AgentCommands, "Bash(git status)", false),
+        (GrantFile::AgentCommands, "Read", false),
+        (GrantFile::McpTools, "Mcp(slack:*)", true),
+        (GrantFile::McpTools, "Mcp(slack:channels_list)", true),
+        (GrantFile::McpTools, "Mcp(slack)", false),
+        (GrantFile::McpTools, "Bash", false),
+        (GrantFile::CodingAgentTools, "Read", true),
+        (GrantFile::CodingAgentTools, "Bash(git:*)", true),
+        (GrantFile::CodingAgentTools, "Skill(superpowers:*)", true),
+        (GrantFile::CodingAgentTools, "Edit(/tmp/x", false),
+        (GrantFile::CodingAgentTools, "9lives", false),
+    ];
+    for (file, pattern, want) in cases {
+        assert_eq!(
+            file.recognizes(pattern),
+            want,
+            "{} on {pattern:?}",
+            file.file_name()
+        );
     }
 }

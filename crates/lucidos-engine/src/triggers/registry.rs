@@ -111,7 +111,7 @@ fn apply_to_map(
                 }
             }
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[TriggerRegistry] TriggerCreated payload for {} did not parse: {}",
                     trigger_id,
                     e

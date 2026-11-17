@@ -13,6 +13,11 @@ const state = vi.hoisted(() => ({
   create: vi.fn(async () => {}), complete: vi.fn(async () => {}), reload: vi.fn(),
 }));
 vi.mock('../utils/basePath', () => ({ WORKSPACE_ID: 'test-workspace' }));
+// The real loader reaches the whole store. Its failure path has its own tests.
+vi.mock('../utils/lazyComponent', () => ({ lazyModule: <M>(load: () => Promise<M>) => {
+  let loaded: M | undefined;
+  return { preload: async () => { loaded = await load(); return true; }, isLoaded: () => loaded !== undefined, get: () => loaded! };
+} }));
 vi.mock('./restoreGenerationRecords', () => ({ createRestoreGenerationStore: () => ({
   journalHistorical: state.journal,
   readGeneration: async () => state.generation,
@@ -173,6 +178,36 @@ it('publishes the source origin only after successful reconstruction admission',
   expect(origin.sourceGeneration()).toBe('restored');
 });
 
+
+it('names the step a stalled admission is in, and never admits on the stall', async () => {
+  const app = await setup();
+  const { DeviceDatabaseStalledError } = await import('./deviceDatabase');
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+  const epoch = app.beginRestoreConnection();
+  let release!: () => void;
+  state.journal.mockReturnValueOnce(new Promise((_, reject) => {
+    release = () => reject(new DeviceDatabaseStalledError('test', 'transaction'));
+  }));
+  const hello = app.acceptRestoreHello(epoch, null);
+  await vi.waitFor(() => expect(app.restoreAdmissionPhase()).toBe('journal'));
+  release();
+  await expect(hello).rejects.toBeInstanceOf(DeviceDatabaseStalledError);
+  expect(app.restoreAdmissionReady()).toBe(false);
+  expect(app.restoreAdmissionPhase()).toBe('journal');
+
+  const retry = app.beginRestoreConnection();
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+  expect(await app.acceptRestoreHello(retry, null)).toBe(true);
+  expect(app.restoreAdmissionPhase()).toBe('admitted');
+});
+
+it('keeps a stale hello from moving the current connection phase', async () => {
+  const app = await setup();
+  const old = app.beginRestoreConnection();
+  app.beginRestoreConnection();
+  expect(await app.acceptRestoreHello(old, null)).toBe(false);
+  expect(app.restoreAdmissionPhase()).toBe('awaiting-hello');
+});
 
 it('keeps admission closed after late-source journal failure, and retries on reconnect', async () => {
   const app = await setup();

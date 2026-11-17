@@ -68,6 +68,7 @@ fn idled(has_changes: bool) -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn proposal(
     incomplete: bool,
 ) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id,
         description: Some("work".into()),
         files: vec!["a.rs".into()],
@@ -108,6 +110,7 @@ fn proposal(
 
 fn applied(change_id: Uuid) -> ThreadEvent {
     ThreadEvent::ChangeApplied {
+        content: Default::default(),
         change_id: change_id.to_string(),
         requires_restart: false,
         client_update: false,

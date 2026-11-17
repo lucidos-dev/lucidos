@@ -1,3 +1,4 @@
+import { noteCrashWorker } from '../../utils/crashWorker';
 import { API, json, mutatingFetch, throwIfNotOk, throwIfRefused } from '../../api/client';
 import { showToast, showConfirm } from '../store';
 import { devices, getDeviceId, toggleDevicePush, disablePushForDevices } from './devices';
@@ -5,7 +6,8 @@ import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobi
 import { deviceName } from '../../utils/deviceFriendlyName';
 import { pairedDevices, pairedRows } from './pairedDevices';
 import { errorDetail } from '../../utils/errorDetail';
-import { withBase, SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
+import { SCOPE_PATH, WORKSPACE_ID } from '../../utils/basePath';
+import { workspaceServiceWorkerUrl } from '../../utils/workspaceServiceWorker';
 import { getGatewayTls } from '../../api/client/control';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../../utils/devServerBundle';
 import type { DeviceInfo } from '../../api/types';
@@ -174,6 +176,7 @@ export async function unregisterServiceWorker(): Promise<void> {
   } catch {
     /* best-effort orphan cleanup — don't block the recovery on it */
   }
+  noteCrashWorker(6);
   await existing.unregister();
 }
 
@@ -195,7 +198,7 @@ export async function recoverServiceWorker(): Promise<void> {
   // and registering one here would be the very thing the gate exists to prevent.
   if (isDevServerBundle()) return;
   await unregisterServiceWorker();
-  await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH, updateViaCache: 'none' });
+  await navigator.serviceWorker.register(workspaceServiceWorkerUrl(), { scope: SCOPE_PATH, updateViaCache: 'none' });
   // pushManager.subscribe requires an active worker; calling pre-activation
   // rejects with InvalidStateError. `ready` resolves to the registration that
   // owns the active worker — passing the post-register registration directly
@@ -304,7 +307,7 @@ export async function initPushSubscription(): Promise<boolean> {
   }
 
   try {
-    await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH });
+    await navigator.serviceWorker.register(workspaceServiceWorkerUrl(), { scope: SCOPE_PATH });
 
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {

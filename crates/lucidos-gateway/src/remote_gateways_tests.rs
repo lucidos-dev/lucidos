@@ -144,8 +144,45 @@ fn an_address_must_be_an_https_origin() {
         "ftp://lucidos.example.com",
         "https://169.254.169.254",
         "https://0.0.0.0",
+        "http://192.168.1.10:5252",
+        "http://100.64.0.1",
+        "http://0.0.0.0:5252",
     ] {
         assert!(valid_address(bad).is_err(), "{bad}");
+    }
+}
+
+/// `https` adds nothing on loopback, where nothing crosses a network.
+#[test]
+fn a_loopback_address_may_be_plain_http() {
+    for loopback in [
+        "http://127.0.0.1:5252",
+        "http://127.8.9.10:5252",
+        "http://localhost:5252",
+        "http://[::1]:5252",
+    ] {
+        assert_eq!(valid_address(loopback).unwrap(), loopback);
+    }
+}
+
+#[test]
+fn only_a_loopback_host_counts_as_loopback() {
+    for loopback in [
+        "http://127.0.0.1:1",
+        "https://localhost:1",
+        "http://[::1]:1",
+        "http://[::ffff:127.0.0.1]:1",
+    ] {
+        assert!(is_loopback_origin(loopback), "{loopback}");
+    }
+    for remote in [
+        "http://lucidos.example.com",
+        "https://localhost.example.com",
+        "http://192.168.1.10:5252",
+        "http://[fe80::1]:1",
+        "not an origin",
+    ] {
+        assert!(!is_loopback_origin(remote), "{remote}");
     }
 }
 
@@ -174,6 +211,7 @@ fn the_store_refuses_a_second_gateway_under_one_name() {
     let dir = tempfile::tempdir().unwrap();
     let store = store(&dir);
     let gateway = RemoteGateway {
+        gateway_id: None,
         name: "cloud".to_string(),
         address: "https://cloud.example.com".to_string(),
         pairing_id: "p1".to_string(),
@@ -197,6 +235,7 @@ fn the_store_file_is_owner_only() {
     let store = store(&dir);
     store
         .add(RemoteGateway {
+            gateway_id: None,
             name: "cloud".to_string(),
             address: "https://cloud.example.com".to_string(),
             pairing_id: "p1".to_string(),
@@ -219,7 +258,11 @@ async fn a_pairs_with_b_over_https_and_b_records_the_grant() {
     let b = gateway_b().await;
     let dir = tempfile::tempdir().unwrap();
     let a = store(&dir);
-    let code = b.state.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
 
     let row = add(
         &a,
@@ -247,12 +290,62 @@ async fn a_pairs_with_b_over_https_and_b_records_the_grant() {
         .is_some());
 }
 
+/// Plan invariant 9: B's local process minted the secret, and B has a paired
+/// device. So A waits for that device's Allow, then adds B on a retry.
+#[tokio::test]
+async fn a_waits_for_b_s_owner_then_pairs_on_a_retry() {
+    let b = gateway_b().await;
+    b.state
+        .seed_device_for_test(crate::auth::PairedDevice {
+            id: "device-1".into(),
+            label: "My iPhone".into(),
+            credential_digest: crate::auth::digest("cred-phone"),
+            paired_at: "2020-01-01T00:00:00Z".into(),
+            last_seen_at: None,
+        })
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::LocalProcess)
+        .unwrap();
+    let attempt = || {
+        add(
+            &a,
+            &b.client,
+            A_INSTANCE,
+            "Lucidos on a",
+            request(&b.address, &code, "cloud"),
+        )
+    };
+
+    assert!(matches!(attempt().await, Err(AddError::AwaitingOwner)));
+    assert!(a.list().is_empty(), "nothing is recorded while B waits");
+    let waiting = b.state.pairing_requests();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].1.label, "Lucidos on a");
+    assert!(b
+        .state
+        .answer_pairing_request(&waiting[0].1.id, crate::pairing::PairingAnswer::Allow)
+        .unwrap());
+
+    let row = attempt().await.unwrap();
+    assert_eq!(row.name, "cloud");
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
+}
+
 #[tokio::test]
 async fn removing_b_on_a_asks_b_to_forget_the_grant() {
     let b = gateway_b().await;
     let dir = tempfile::tempdir().unwrap();
     let a = store(&dir);
-    let code = b.state.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     add(
         &a,
         &b.client,
@@ -273,15 +366,19 @@ async fn a_plain_http_address_is_refused_before_the_code_is_spent() {
     let b = gateway_b().await;
     let dir = tempfile::tempdir().unwrap();
     let a = store(&dir);
-    let code = b.state.paired_gateways().mint_secret(None).unwrap();
-    let http = b.address.replace("https://", "http://");
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
+    let http = "http://lucidos.example.com";
 
     let refused = add(
         &a,
         &b.client,
         A_INSTANCE,
         "a",
-        request(&http, &code, "cloud"),
+        request(http, &code, "cloud"),
     )
     .await;
     assert!(matches!(refused, Err(AddError::Invalid(ref m)) if m.contains("https only")));
@@ -297,21 +394,77 @@ async fn a_plain_http_address_is_refused_before_the_code_is_spent() {
     .expect("the refused attempt never spent the code");
 }
 
-#[tokio::test]
-async fn the_client_never_speaks_plain_http() {
+/// Serve `router` over plain http on a free loopback port.
+async fn serve_http(router: axum::Router) -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(listener, router).await.ok() });
+    port
+}
+
+#[tokio::test]
+async fn the_client_speaks_plain_http_only_to_loopback() {
     let router = axum::Router::new().route(
         GATEWAY_HEALTH_PATH,
         get(|| async { Json(json!({"role": "gateway"})) }),
     );
-    tokio::spawn(async move { axum::serve(listener, router).await.ok() });
-
+    let port = serve_http(router).await;
     let client = PeerConnection::new().unwrap();
-    assert!(client
+    let body = client
         .health(&format!("http://127.0.0.1:{port}"))
         .await
-        .is_err());
+        .expect("plain http reaches a loopback gateway");
+    assert_eq!(body["role"], "gateway");
+
+    // Refused before any connection: the scheme alone decides.
+    let error = client
+        .health("http://lucidos.example.com")
+        .await
+        .unwrap_err();
+    assert!(error.contains("scheme"), "{error}");
+}
+
+/// A dev gateway serves its own certificate, which no public root signs.
+#[tokio::test]
+async fn a_loopback_gateway_answers_under_its_own_certificate() {
+    let cert = localhost_cert();
+    let router = axum::Router::new().route(
+        GATEWAY_HEALTH_PATH,
+        get(|| async { Json(json!({"role": "gateway"})) }),
+    );
+    let port = serve_https(router, &cert).await;
+    let body = PeerConnection::new()
+        .unwrap()
+        .health(&format!("https://localhost:{port}"))
+        .await
+        .expect("loopback skips the certificate check");
+    assert_eq!(body["role"], "gateway");
+}
+
+#[tokio::test]
+async fn a_loopback_gateway_pairs_over_plain_http() {
+    let dir = tempfile::tempdir().unwrap();
+    let b = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+    let port = serve_http(crate::server::gateway_router(b.clone())).await;
+    let address = format!("http://127.0.0.1:{port}");
+    let code = b
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
+    let a_dir = tempfile::tempdir().unwrap();
+    let a = store(&a_dir);
+
+    let row = add(
+        &a,
+        &PeerConnection::new().unwrap(),
+        A_INSTANCE,
+        "a",
+        request(&address, &code, "dmg"),
+    )
+    .await
+    .expect("a loopback peer pairs over http");
+    assert_eq!(row.address, address);
+    assert_eq!(b.paired_gateways().list().len(), 1);
 }
 
 #[tokio::test]
@@ -380,7 +533,11 @@ async fn the_list_never_carries_a_credential() {
     let b = gateway_b().await;
     let dir = tempfile::tempdir().unwrap();
     let a = store(&dir);
-    let code = b.state.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     add(
         &a,
         &b.client,
@@ -421,6 +578,7 @@ impl Drop for ReadOnlyDir<'_> {
 
 fn remote(name: &str) -> RemoteGateway {
     RemoteGateway {
+        gateway_id: None,
         name: name.to_string(),
         address: "https://cloud.example.com".to_string(),
         pairing_id: "pairing".to_string(),
@@ -629,7 +787,10 @@ async fn proxy_headers_reach_health_pair_requests_and_leave_without_changing_ori
     let dir = tempfile::tempdir().unwrap();
     let bdir = tempfile::tempdir().unwrap();
     let bstate = GatewayState::for_tests_with_static_dir(Some(bdir.path().to_path_buf()));
-    let code = bstate.paired_gateways().mint_secret(None).unwrap();
+    let code = bstate
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let seen = std::sync::Arc::new(Mutex::new(Vec::new()));
     let recorded = seen.clone();
     let router = crate::server::gateway_router(bstate.clone()).layer(axum::middleware::from_fn(
@@ -801,7 +962,11 @@ async fn sender_recovers_before_and_after_remote_acceptance() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("remotes.json");
     let a = RemoteGatewayStore::load(path.clone()).unwrap();
-    let code = b.state.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     add(
         &a,
         &b.client,
@@ -887,4 +1052,505 @@ async fn unsupported_rotation_preserves_the_pairing_and_retries_the_same_intent(
     assert!(failed.rotation.error.is_some());
     a.rotate_due(&client).await;
     assert_eq!(a.list()[0], failed);
+}
+
+#[test]
+fn durable_destination_identity_survives_store_reload_and_legacy_rows_stay_readable() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut known = remote("known");
+    known.gateway_id = Some("a".repeat(64));
+    a.add(known.clone()).unwrap();
+    let mut legacy_json = serde_json::to_value(remote("legacy")).unwrap();
+    legacy_json.as_object_mut().unwrap().remove("gateway_id");
+    let legacy: RemoteGateway = serde_json::from_value(legacy_json).unwrap();
+    assert_eq!(legacy.gateway_id, None);
+    a.add(legacy.clone()).unwrap();
+    drop(a);
+    assert_eq!(store(&dir).list(), vec![known, legacy]);
+}
+
+fn mint(b: &GatewayB) -> String {
+    b.state
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn duplicate_destination_uses_conflict_and_preserves_the_unused_code() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&b.address, &mint(&b), "cloud"),
+    )
+    .await
+    .unwrap();
+    let code = mint(&b);
+    let error = add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&format!("{}/", b.address), &code, "alias"),
+    )
+    .await
+    .unwrap_err();
+    let response = error.into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("cloud"));
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
+    // Another initiating gateway can still redeem the unconsumed code.
+    let other_dir = tempfile::tempdir().unwrap();
+    add(
+        &store(&other_dir),
+        &b.client,
+        "other",
+        "other",
+        request(&b.address, &code, "cloud"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_adds_only_redeem_one_grant() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let (one, two) = tokio::join!(
+        add(
+            &a,
+            &b.client,
+            A_INSTANCE,
+            "a",
+            request(&b.address, &mint(&b), "one")
+        ),
+        add(
+            &a,
+            &b.client,
+            A_INSTANCE,
+            "a",
+            request(&b.address, &mint(&b), "two")
+        ),
+    );
+    assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+    assert_eq!(a.list().len(), 1);
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
+}
+
+#[test]
+fn insertion_refuses_the_same_durable_destination_after_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut one = remote("one");
+    one.gateway_id = Some("b".repeat(64));
+    a.add(one.clone()).unwrap();
+    drop(a);
+    let a = store(&dir);
+    one.name = "two".into();
+    one.address = "https://alias.example.com".into();
+    let response = a.add(one).unwrap_err().into_response();
+    assert_eq!(response.status(), axum::http::StatusCode::CONFLICT);
+    assert_eq!(a.list().len(), 1);
+}
+
+/// Real pairing routes with a simulated independent process's public boot id.
+fn router_with_boot(state: GatewayState, boot: &str) -> axum::Router {
+    let boot = boot.to_string();
+    crate::server::gateway_router(state).layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let boot = boot.clone();
+            async move {
+                if req.uri().path() == GATEWAY_HEALTH_PATH {
+                    assert!(!req.headers().contains_key(HEADER_GATEWAY_CREDENTIAL));
+                    Json(json!({"role":"gateway", "instance_id":boot, "gateway_protocol":GATEWAY_PROTOCOL})).into_response()
+                } else {
+                    next.run(req).await
+                }
+            }
+        },
+    ))
+}
+
+fn closed_address() -> String {
+    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    format!("https://localhost:{}", socket.local_addr().unwrap().port())
+}
+
+#[tokio::test]
+async fn aliases_of_the_same_gateway_are_rejected_before_redemption() {
+    let b = gateway_b().await;
+    let cert = localhost_cert();
+    let alias_port = serve_https(crate::server::gateway_router(b.state.clone()), &cert).await;
+    let alias = format!("https://localhost:{alias_port}");
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&b.address, &mint(&b), "cloud"),
+    )
+    .await
+    .unwrap();
+    let code = mint(&b);
+    assert!(
+        matches!(add(&a, &b.client, A_INSTANCE, "a", request(&alias, &code, "alias")).await, Err(AddError::Duplicate(name)) if name == "cloud")
+    );
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
+    let previous = a.remove("cloud").unwrap().unwrap();
+    b.client.leave(&previous).await.unwrap();
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&alias, &code, "repaired"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
+}
+
+#[tokio::test]
+async fn legacy_identity_hydrates_through_saved_proxy_headers_and_distinct_peers_still_pair() {
+    let b = gateway_b().await;
+    let cert = localhost_cert();
+    let saved_port = serve_https(
+        proxy_guard(router_with_boot(b.state.clone(), "old-boot")),
+        &cert,
+    )
+    .await;
+    let saved = format!("https://localhost:{saved_port}");
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut req = request(&saved, &mint(&b), "cloud");
+    req.headers = proxy_headers();
+    add(&a, &b.client, A_INSTANCE, "a", req).await.unwrap();
+    a.write(|data| data.gateways[0].gateway_id = None).unwrap();
+    let c = gateway_b().await;
+    // Different real gateways in one test process need distinct simulated boot ids.
+    let c_port = serve_https(router_with_boot(c.state.clone(), "new-boot"), &cert).await;
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&format!("https://localhost:{c_port}"), &mint(&c), "other"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.list().len(), 2);
+    assert_eq!(
+        a.list()[0].gateway_id.as_deref(),
+        Some(b.state.gateway_id())
+    );
+    assert_eq!(
+        store(&dir).list()[0].gateway_id.as_deref(),
+        Some(b.state.gateway_id())
+    );
+}
+
+#[tokio::test]
+async fn offline_legacy_identity_blocks_an_add_without_consuming_a_code() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut old = remote("offline");
+    old.address = closed_address();
+    a.add(old).unwrap();
+    let code = mint(&b);
+    assert!(
+        matches!(add(&a, &b.client, A_INSTANCE, "a", request(&b.address, &code, "new")).await, Err(AddError::Invalid(message)) if message.contains("reconnect or update") && message.contains("offline"))
+    );
+    assert!(b.state.paired_gateways().list().is_empty());
+    a.remove("offline").unwrap();
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&b.address, &code, "new"),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn saved_durable_identity_catches_a_new_alias_after_restart_and_only_returns_the_new_grant() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&b.address, &mint(&b), "cloud"),
+    )
+    .await
+    .unwrap();
+    let original_grant = b.state.paired_gateways().list()[0].id.clone();
+    // The old origin no longer answers after the destination restarts elsewhere.
+    a.write(|data| data.gateways[0].address = closed_address())
+        .unwrap();
+    drop(a);
+    let a = store(&dir);
+    let cert = localhost_cert();
+    let port = serve_https(router_with_boot(b.state.clone(), "after-restart"), &cert).await;
+    assert!(
+        matches!(add(&a, &b.client, A_INSTANCE, "a", request(&format!("https://localhost:{port}"), &mint(&b), "alias")).await, Err(AddError::Duplicate(name)) if name == "cloud")
+    );
+    assert_eq!(a.list().len(), 1);
+    let grants = b.state.paired_gateways().list();
+    assert_eq!(grants.len(), 1);
+    assert_eq!(grants[0].id, original_grant);
+}
+
+#[tokio::test]
+async fn an_offline_known_destination_does_not_block_a_distinct_modern_peer() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut old = remote("offline");
+    old.address = closed_address();
+    old.gateway_id = Some("different-destination".into());
+    a.add(old).unwrap();
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&b.address, &mint(&b), "new"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.list().len(), 2);
+}
+
+#[tokio::test]
+async fn failed_persistence_returns_the_new_grant() {
+    let b = gateway_b().await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let _locked = ReadOnlyDir::new(dir.path());
+    assert!(matches!(
+        add(
+            &a,
+            &b.client,
+            A_INSTANCE,
+            "a",
+            request(&b.address, &mint(&b), "new")
+        )
+        .await,
+        Err(AddError::Internal(_))
+    ));
+    assert!(a.list().is_empty());
+    assert!(b.state.paired_gateways().list().is_empty());
+}
+
+#[tokio::test]
+async fn failed_compensation_reports_the_unrevoked_grant() {
+    let cert = localhost_cert();
+    let router = axum::Router::new()
+        .route(GATEWAY_HEALTH_PATH, get(|| async { Json(json!({"role":"gateway", "instance_id":"new-boot", "gateway_protocol":GATEWAY_PROTOCOL})) }))
+        .route(&format!("{}{}", crate::gateway_protocol::GATEWAY_API_PREFIX, crate::gateway_protocol::PAIR_PATH), axum::routing::post(|| async { Json(json!({"gateway_id":"same-destination", "pairing_id":"new-grant", "credential":"new-credential", "gateway_protocol":GATEWAY_PROTOCOL})) }))
+        .route(&format!("{}{}", crate::gateway_protocol::GATEWAY_API_PREFIX, crate::gateway_protocol::PAIRING_PATH), axum::routing::delete(|headers: axum::http::HeaderMap| async move {
+            assert_eq!(headers[HEADER_GATEWAY_CREDENTIAL], "new-credential");
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        }));
+    let port = serve_https(router, &cert).await;
+    let client = PeerConnection::trusting(cert.cert.pem().as_bytes());
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut old = remote("cloud");
+    old.address = closed_address();
+    old.gateway_id = Some("same-destination".into());
+    a.add(old).unwrap();
+    let error = add(
+        &a,
+        &client,
+        A_INSTANCE,
+        "a",
+        request(&format!("https://localhost:{port}"), "12345678", "alias"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, AddError::Internal(message) if message.contains("could not be revoked") && message.contains("cloud") && message.contains("Access page"))
+    );
+    assert_eq!(a.list().len(), 1);
+}
+
+/// An older peer with real grants but no durable identity fields on the wire.
+fn legacy_router(state: GatewayState, boot: &str) -> axum::Router {
+    router_with_boot(state, boot).layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            let response = next.run(req).await;
+            let (parts, body) = response.into_parts();
+            let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+            if let Ok(mut body) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if let Some(object) = body.as_object_mut() {
+                    object.remove("gateway_id");
+                }
+                let mut response = Json(body).into_response();
+                *response.status_mut() = parts.status;
+                response
+            } else {
+                axum::response::Response::from_parts(parts, axum::body::Body::from(bytes))
+            }
+        },
+    ))
+}
+
+#[tokio::test]
+async fn fresh_boot_evidence_supports_distinct_older_peers_and_refuses_their_aliases() {
+    let b = gateway_b().await;
+    let c = gateway_b().await;
+    let cert = localhost_cert();
+    let bport = serve_https(legacy_router(b.state.clone(), "older-b"), &cert).await;
+    let cport = serve_https(legacy_router(c.state.clone(), "older-c"), &cert).await;
+    let c_alias = serve_https(legacy_router(c.state.clone(), "older-c"), &cert).await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    for (peer, port, name) in [(&b, bport, "old-b"), (&c, cport, "old-c")] {
+        add(
+            &a,
+            &b.client,
+            A_INSTANCE,
+            "a",
+            request(&format!("https://localhost:{port}"), &mint(peer), name),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(a.list().len(), 2);
+    assert!(a.list().iter().all(|r| r.gateway_id.is_none()));
+    assert!(
+        matches!(add(&a, &b.client, A_INSTANCE, "a", request(&format!("https://localhost:{c_alias}"), &mint(&c), "alias")).await, Err(AddError::Duplicate(name)) if name == "old-c")
+    );
+    assert_eq!(c.state.paired_gateways().list().len(), 1);
+}
+
+#[tokio::test]
+async fn older_candidate_cannot_bypass_an_offline_known_destination_and_returns_its_new_grant() {
+    let b = gateway_b().await;
+    let cert = localhost_cert();
+    let port = serve_https(legacy_router(b.state.clone(), "older-b"), &cert).await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut old = remote("offline");
+    old.address = closed_address();
+    old.gateway_id = Some("known-destination".into());
+    a.add(old).unwrap();
+    assert!(
+        matches!(add(&a, &b.client, A_INSTANCE, "a", request(&format!("https://localhost:{port}"), &mint(&b), "new")).await, Err(AddError::Invalid(message)) if message.contains("offline"))
+    );
+    assert_eq!(a.list().len(), 1);
+    assert!(b.state.paired_gateways().list().is_empty());
+}
+
+#[test]
+fn preexisting_duplicate_destinations_are_preserved_on_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut first = remote("first");
+    first.gateway_id = Some("same-destination".into());
+    let mut second = first.clone();
+    second.name = "second".into();
+    a.write(|data| data.gateways = vec![first.clone(), second.clone()])
+        .unwrap();
+    drop(a);
+    assert_eq!(store(&dir).list(), vec![first, second]);
+}
+
+#[tokio::test]
+async fn hydration_checks_pairing_identity_and_keeps_saved_credentials_off_new_origins() {
+    let cert = localhost_cert();
+    let own_path = format!(
+        "{}{}",
+        crate::gateway_protocol::GATEWAY_API_PREFIX,
+        crate::gateway_protocol::PAIRING_PATH
+    );
+    let saved_router = proxy_guard(axum::Router::new()
+        .route(GATEWAY_HEALTH_PATH, get(|headers: axum::http::HeaderMap| async move {
+            assert!(!headers.contains_key(HEADER_GATEWAY_CREDENTIAL));
+            Json(json!({"role":"gateway", "instance_id":"old", "gateway_protocol":GATEWAY_PROTOCOL}))
+        }))
+        .route(&own_path, get(|headers: axum::http::HeaderMap| async move {
+            assert_eq!(headers[HEADER_GATEWAY_CREDENTIAL], "credential");
+            // This is not the saved grant: its claimed destination must not hydrate it.
+            Json(json!({"pairing_id":"wrong-pairing", "gateway_id":"untrusted-identity"}))
+        })));
+    let port = serve_https(saved_router, &cert).await;
+    let b = gateway_b().await;
+    let new_router = router_with_boot(b.state.clone(), "new").layer(axum::middleware::from_fn(
+        |req: axum::extract::Request, next: axum::middleware::Next| async move {
+            assert!(!req.headers().contains_key(HEADER_GATEWAY_CREDENTIAL));
+            assert!(!req.headers().contains_key("x-proxy-token"));
+            next.run(req).await
+        },
+    ));
+    let newport = serve_https(new_router, &cert).await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = store(&dir);
+    let mut old = remote("old");
+    old.address = format!("https://localhost:{port}");
+    old.headers = proxy_headers();
+    a.add(old).unwrap();
+    add(
+        &a,
+        &b.client,
+        A_INSTANCE,
+        "a",
+        request(&format!("https://localhost:{newport}"), &mint(&b), "new"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(a.list()[0].gateway_id, None);
+    assert_eq!(a.list().len(), 2);
+}
+
+#[tokio::test]
+async fn add_http_handler_names_the_existing_remote_in_a_conflict() {
+    use tower::ServiceExt;
+    let b = gateway_b().await;
+    let cert = localhost_cert();
+    let port = serve_https(router_with_boot(b.state.clone(), "other-process"), &cert).await;
+    let dir = tempfile::tempdir().unwrap();
+    let a = GatewayState::for_tests_with_static_dir(Some(dir.path().to_path_buf()));
+    for (name, expected) in [
+        ("cloud", axum::http::StatusCode::OK),
+        ("alias", axum::http::StatusCode::CONFLICT),
+    ] {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/~/api/v1/remote-gateways")
+            .header(crate::auth::HEADER_LOCAL_TOKEN, "test-local-token")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(json!({"name":name, "address":format!("https://localhost:{port}"), "code":mint(&b)}).to_string())).unwrap();
+        let response = crate::server::gateway_router(a.clone())
+            .oneshot(req)
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(status, expected, "{}", String::from_utf8_lossy(&body));
+        if status == axum::http::StatusCode::CONFLICT {
+            assert!(String::from_utf8_lossy(&body).contains("cloud"));
+        }
+    }
+    assert_eq!(b.state.paired_gateways().list().len(), 1);
 }

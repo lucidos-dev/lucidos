@@ -14,7 +14,8 @@ import { workspaceRouteUrlSegment } from '../../utils/basePath';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { replaceDocument } from '../../utils/documentNavigation';
 import { landingHash, type WorkspaceLanding } from '../../utils/workspaceLanding';
-import { gatewayErrorReason } from './gatewayError';
+import { AWAITING_OWNER, isAwaitingOwner, type AwaitingOwner } from './awaitingOwner';
+import { gatewayErrorBody, gatewayErrorReason } from './gatewayError';
 import type { AppUpdateProgress } from '../../utils/tauri';
 
 const CONTROL = '/~/api/v1/control';
@@ -160,7 +161,7 @@ export async function setAutostart(id: string, enabled: boolean): Promise<void> 
   });
 }
 
-export type WorkspaceOrigin = 'user' | 'demo' | 'eval' | 'e2e' | 'unknown';
+export type WorkspaceOrigin = 'user' | 'demo' | 'eval' | 'e2e' | 'agent' | 'unknown';
 
 export interface CleanupWorkspace {
   id: string;
@@ -371,12 +372,17 @@ export interface ReleaseCheck {
    *  caller reads the unchanged snapshot as "you are up to date". */
   last_error: string | null;
   latest: ReleaseOffer | null;
-  /** The *update address*: the `latest.json` URL checks read instead of the
-   *  published release. `null` when unset. A refused stored value is reported
-   *  here as written, beside `update_address_error`. */
+  /** Resolved channel endpoint; null for Stable. */
   update_address: string | null;
-  /** Why the stored address is refused. While set, every check fails. */
   update_address_error: string | null;
+  /** Absent on gateways predating named update channels. */
+  channel?: string;
+  channels?: { channel: string; available: boolean; reason: string | null }[];
+  custom?: { name: string; url: string }[];
+  channel_version?: string | null;
+  ahead_of_channel?: boolean;
+  channel_error?: string | null;
+  local_channel_dir?: string | null;
 }
 
 /** Build id of the running gateway + whether a newer binary is on disk (the dev
@@ -446,14 +452,16 @@ export async function requestUpdateCheck(force = false): Promise<ReleaseCheck> {
 }
 
 /** Write the machine-global release-check preference and return the result.
- *  The field is optional: a body that names nothing settles on the stored
- *  value. Takes effect on the next tick, with no restart. */
-export async function setReleaseCheckConfig(body: {
+ *  All fields are optional; omitted fields and custom slots are preserved.
+ *  Takes effect on the next tick, with no restart. */
+export interface ReleaseCheckConfig {
   enabled?: boolean;
-  /** A `latest.json` URL, or `''` for the published release. A refused one
-   *  is a 400 whose reason names the rule. */
-  update_address?: string;
-}): Promise<ReleaseCheck> {
+  channel?: string;
+  custom_upsert?: { name: string; url: string };
+  custom_remove?: string;
+}
+
+export async function setReleaseCheckConfig(body: ReleaseCheckConfig): Promise<ReleaseCheck> {
   return controlJson<ReleaseCheck>('/release-check', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
@@ -566,7 +574,7 @@ export async function locateWorkspace(name: string): Promise<WorkspaceLocation |
 
 // ── Network access (machine-global gateway bind) ────────────────────────────
 
-/** The machine-global network bind config from `~/.lucidos/network.toml`.
+/** The machine-global network bind config from the machine-global `network.toml`.
  *  Mirrors the gateway `network_config` handler. `gateway_bind` is `loopback` |
  *  `all` | an IP; `inherit` controls whether engines follow the gateway bind. */
 export interface GatewayNetworkConfig {
@@ -701,10 +709,21 @@ export async function clearRestoreStatus(): Promise<void> {
 // path: the gateway owns `/~/`, and the calls work from the picker and from
 // inside a workspace alike. In legacy no-gateway mode they do not exist, and a
 // caller reads the failure as "no gateway, so nothing is paired".
+//
+// Every device and user call takes `gateway`: `null` for this gateway, or a
+// remote gateway's short name. A remote call goes through this gateway's manage
+// hop, which serves the same paths (ADR 0656).
 
 const AUTH = '/~/api/v1/auth';
+const REMOTE_GATEWAYS = '/~/api/v1/remote-gateways';
 
-/** One device that has paired with this machine's gateway.
+/** Where a device or user call goes: this gateway, or remote gateway `name`
+ *  through the manage hop. */
+function authBase(gateway: string | null): string {
+  return gateway === null ? AUTH : `${REMOTE_GATEWAYS}/${encodeURIComponent(gateway)}/manage`;
+}
+
+/** One device that has paired with a gateway.
  *
  *  `last_seen_at` is absent for a device paired before the gateway recorded it,
  *  and fills in on that device's next request. It moves at most once a day, so
@@ -712,8 +731,8 @@ const AUTH = '/~/api/v1/auth';
 export interface PairedDevice {
   id: string;
   label: string;
-  /** The person holding this device (ADR 0623). */
-  operator_id?: string;
+  /** The user holding this device (ADR 0623). */
+  user_id?: string;
   paired_at: string;
   last_seen_at?: string;
 }
@@ -724,21 +743,23 @@ export interface PairedDevice {
  *  A page served off a direct engine port resolves `/~/` against the engine and
  *  gets a 404, which is not an error to report: there is no pairing surface on
  *  that deployment. Any other status is a real failure and must look like one.
- *  `status` is 0 when the request never got an answer at all. */
+ *  `status` is 0 when the request never got an answer at all. `reasonKind` is
+ *  the typed refusal a gateway names, such as `manage-not-granted`. */
 export class GatewayError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly reasonKind: string | null = null) {
     super(message);
     this.name = 'GatewayError';
   }
 
-  /** Is this "no gateway serves this page", rather than "the gateway broke"? */
+  /** Is this "no gateway serves this page", rather than "the gateway broke"?
+   *  A typed 404, such as an unknown remote gateway, is a gateway answering. */
   get isAbsent(): boolean {
-    return this.status === 404;
+    return this.status === 404 && this.reasonKind === null;
   }
 }
 
-function authJson<T>(path: string, init?: RequestInit): Promise<T> {
-  return gatewayJson<T>(`${AUTH}${path}`, init);
+function authJson<T>(gateway: string | null, path: string, init?: RequestInit): Promise<T> {
+  return gatewayJson<T>(`${authBase(gateway)}${path}`, init);
 }
 
 async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
@@ -748,14 +769,17 @@ async function gatewayJson<T>(url: string, init?: RequestInit): Promise<T> {
   } catch (e) {
     throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
   }
-  // Same `{"error": …}` body every gateway handler answers with, read through
-  // the one helper `controlJson` uses. Only the status has to be kept here.
-  if (!res.ok) throw new GatewayError(await gatewayErrorReason(res), res.status);
+  if (!res.ok) {
+    const { reason, reasonKind } = await gatewayErrorBody(res);
+    throw new GatewayError(reason, res.status, reasonKind);
+  }
   return res.status === 204 ? (undefined as T) : res.json();
 }
 
-export function listPairedDevices(): Promise<PairedDevice[]> {
-  return authJson<PairedDevice[]>('/devices');
+// See "User rename wire aliases" in docs/temporary-measures.md.
+export async function listPairedDevices(gateway: string | null = null): Promise<PairedDevice[]> {
+  const devices = await authJson<(PairedDevice & { operator_id?: string })[]>(gateway, '/devices');
+  return devices.map(({ operator_id, ...device }) => ({ ...device, user_id: device.user_id ?? operator_id }));
 }
 
 /** Forget a paired device, so its credential resolves to nobody.
@@ -763,73 +787,83 @@ export function listPairedDevices(): Promise<PairedDevice[]> {
  *  Revoking the device you are ON is allowed and is sometimes the point (a
  *  phone you no longer hold). The gateway clears the cookie in the same
  *  response, so this browser lands back on the pairing screen. */
-export async function revokePairedDevice(id: string): Promise<void> {
-  await authJson<void>(`/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
+export async function revokePairedDevice(id: string, gateway: string | null = null): Promise<void> {
+  await authJson<void>(gateway, `/devices/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-// Operators (ADR 0623): a person, as the gateway knows them. Identity only:
-// nothing here allows or refuses anything. Every change answers the whole list.
+// Users (ADR 0623): a user, as a gateway knows them. Identity only: nothing
+// here allows or refuses anything. Every change answers the whole list.
 
-export interface GatewayOperator {
+export interface GatewayUser {
   id: string;
   name: string;
   emails: string[];
   device_ids: string[];
 }
 
-/** A device relayed through a gateway pairing, shown as "Sam via A". */
-export interface RelayedOperator {
+/** A device relayed through a gateway pairing. `via` is that gateway's label. */
+export interface RelayedUser {
   device_id: string;
-  operator_id: string;
+  user_id: string;
   name: string;
   via: string;
-  /** The emails the other gateway holds for the person. */
+  /** The emails the other gateway holds for the user. */
   emails: string[];
 }
 
-export interface OperatorsResponse {
-  operators: GatewayOperator[];
-  relayed: RelayedOperator[];
+export interface GatewayUsersResponse {
+  users: GatewayUser[];
+  relayed: RelayedUser[];
 }
 
-function operatorsCall(path: string, method: string, body?: unknown): Promise<OperatorsResponse> {
-  return authJson<OperatorsResponse>(path, {
-    method,
-    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
+async function gatewayUsersCall(
+  gateway: string | null,
+  path: string,
+  method: string,
+  body?: unknown,
+): Promise<GatewayUsersResponse> {
+  const { requestGatewayUsers } = await import('./gatewayUsersCompat');
+  return requestGatewayUsers(gateway, path, method, body, authJson);
 }
 
-const operatorPath = (id: string) => `/operators/${encodeURIComponent(id)}`;
+const gatewayUserPath = (id: string) => `/users/${encodeURIComponent(id)}`;
 
-export function listOperators(): Promise<OperatorsResponse> {
-  return authJson<OperatorsResponse>('/operators');
+export function listGatewayUsers(gateway: string | null = null): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, '/users', 'GET');
 }
 
-export function addOperator(name: string): Promise<OperatorsResponse> {
-  return operatorsCall('/operators', 'POST', { name });
+export function addGatewayUser(gateway: string | null, name: string): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, '/users', 'POST', { name });
 }
 
-export function renameOperator(id: string, name: string): Promise<OperatorsResponse> {
-  return operatorsCall(operatorPath(id), 'PUT', { name });
+export function renameGatewayUser(gateway: string | null, id: string, name: string): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, gatewayUserPath(id), 'PUT', { name });
 }
 
-/** Remove a person, revoking every device they hold. */
-export function removeOperator(id: string): Promise<OperatorsResponse> {
-  return operatorsCall(operatorPath(id), 'DELETE');
+/** Remove a user, revoking every device they hold. */
+export function removeGatewayUser(gateway: string | null, id: string): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, gatewayUserPath(id), 'DELETE');
 }
 
-export function addOperatorEmail(id: string, email: string): Promise<OperatorsResponse> {
-  return operatorsCall(`${operatorPath(id)}/emails`, 'POST', { email });
+export function addGatewayUserEmail(gateway: string | null, id: string, email: string): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, `${gatewayUserPath(id)}/emails`, 'POST', { email });
 }
 
-export function removeOperatorEmail(id: string, email: string): Promise<OperatorsResponse> {
-  return operatorsCall(`${operatorPath(id)}/emails/${encodeURIComponent(email)}`, 'DELETE');
+export function removeGatewayUserEmail(
+  gateway: string | null,
+  id: string,
+  email: string,
+): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, `${gatewayUserPath(id)}/emails/${encodeURIComponent(email)}`, 'DELETE');
 }
 
-export function moveDeviceToOperator(deviceId: string, operatorId: string): Promise<OperatorsResponse> {
-  return operatorsCall(`/devices/${encodeURIComponent(deviceId)}/operator`, 'PUT', {
-    operator_id: operatorId,
+export function moveDeviceToGatewayUser(
+  gateway: string | null,
+  deviceId: string,
+  userId: string,
+): Promise<GatewayUsersResponse> {
+  return gatewayUsersCall(gateway, `/devices/${encodeURIComponent(deviceId)}/user`, 'PUT', {
+    user_id: userId,
   });
 }
 
@@ -848,6 +882,9 @@ export interface PairedGateway {
   label: string;
   paired_at: string;
   last_used_at?: string | null;
+  /** Devices on that gateway may manage this one's users and devices
+   *  (ADR 0656). Off until this gateway turns it on. */
+  may_manage: boolean;
 }
 
 /** A remote gateway this one has paired with. Never carries the credential. */
@@ -869,36 +906,70 @@ export interface RemovedRemoteGateway {
 }
 
 export function mintGatewayPairingCode(): Promise<GatewayPairingCode> {
-  return authJson<GatewayPairingCode>('/gateway-pairing-code', { method: 'POST' });
+  return authJson<GatewayPairingCode>(null, '/gateway-pairing-code', { method: 'POST' });
 }
 
 export function listPairedGateways(): Promise<PairedGateway[]> {
-  return authJson<PairedGateway[]>('/gateways');
+  return authJson<PairedGateway[]>(null, '/gateways');
 }
 
 export async function unpairGateway(id: string): Promise<void> {
-  await authJson<void>(`/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  await authJson<void>(null, `/gateways/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-const REMOTE_GATEWAYS = '/~/api/v1/remote-gateways';
+/** Turn the manage grant for a paired gateway on or off. */
+export function setPairedGatewayMayManage(id: string, mayManage: boolean): Promise<PairedGateway> {
+  return authJson<PairedGateway>(null, `/gateways/${encodeURIComponent(id)}/manage`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ may_manage: mayManage }),
+  });
+}
 
 export function listRemoteGateways(): Promise<RemoteGateway[]> {
   return gatewayJson<RemoteGateway[]>(REMOTE_GATEWAYS);
 }
 
 /** Pair with a remote gateway. The gateway checks it over https first, and
- *  its refusal sentence names what to fix. */
-export function addRemoteGateway(request: {
+ *  its refusal sentence names what to fix. [`AWAITING_OWNER`] means the other
+ *  gateway waits for one of its paired devices to tap Allow. */
+export async function addRemoteGateway(request: {
   headers?: Record<string, string>;
   address: string;
   code: string;
   name: string;
-}): Promise<RemoteGateway> {
-  return gatewayJson<RemoteGateway>(REMOTE_GATEWAYS, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
+}): Promise<RemoteGateway | AwaitingOwner> {
+  let res: Response;
+  try {
+    res = await fetch(REMOTE_GATEWAYS, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    });
+  } catch (e) {
+    throw new GatewayError(e instanceof Error ? e.message : 'could not reach the gateway', 0);
+  }
+  if (isAwaitingOwner(res)) return AWAITING_OWNER;
+  if (!res.ok) throw new GatewayError(await gatewayErrorReason(res), res.status);
+  return res.json() as Promise<RemoteGateway>;
+}
+
+/** A redemption waiting for this paired device's answer. */
+export interface PairingRequest {
+  id: string;
+  kind: 'device' | 'gateway';
+  /** The name the redeemer gave itself. Its own claim, so a hint only. */
+  label: string;
+  expires_in_secs: number;
+}
+
+export function listPairingRequests(): Promise<PairingRequest[]> {
+  return authJson<PairingRequest[]>(null, '/pairing-requests');
+}
+
+/** Allow or decline a waiting pairing. Only a paired device may answer. */
+export async function answerPairingRequest(id: string, answer: 'allow' | 'decline'): Promise<void> {
+  await authJson<void>(null, `/pairing-requests/${encodeURIComponent(id)}/${answer}`, { method: 'POST' });
 }
 
 /** Rotate this pairing's credential, recovering a pending attempt if needed. */

@@ -1,4 +1,5 @@
 import { apiUrl, configure, SdkError } from './_fetch';
+import { media } from './media';
 import { data } from './data';
 import { events } from './events';
 import { triggers } from './triggers';
@@ -33,6 +34,7 @@ export const lucidos = {
   // and refused for a route the engine does not open to apps.
   request,
   data,
+  media,
   events,
   triggers,
   preferences,
@@ -60,7 +62,8 @@ export const lucidos = {
 export { SdkError };
 export type * from './types';
 export type { StorageFailure } from './storage';
-export type { OperatorRef, ThreadPeople, ThreadPeopleList, ThreadPeopleSummary } from './threadPeople';
+export type { UserRef, ThreadUsers, ThreadUsersList, ThreadUsersSummary } from './threadUsers';
+export type { LivenessState, ThreadLiveness } from './threads';
 
 // The engine's answer for which routes an app may reach, and the matcher over
 // it. Runtime values rather than an internal, because the host bridge enforces
@@ -84,3 +87,5 @@ export { CODING_AGENT_TARGETS, NAVIGATE_TARGETS, SETTINGS_VIEW_TARGETS } from '.
 
 export type { ModelPickerValue, ModelPickerFilter, ModelPickerOptions, ModelPickerInstance } from './modelPicker';
 export type { ModelMessage, ModelRequestOptions, ModelRequest } from './modelRequest';
+
+export type { MediaPoster } from './media';

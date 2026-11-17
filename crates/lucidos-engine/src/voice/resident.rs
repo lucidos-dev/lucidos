@@ -46,7 +46,7 @@ pub(super) fn sections_from(stored: Option<&str>) -> Vec<&'static ResidentSectio
         .collect();
     for name in &wanted {
         if !SECTIONS.iter().any(|s| s.id == *name) {
-            log!(
+            log_legacy!(
                 "[Voice] {} names an unknown section '{}'. Ignoring it",
                 prefs::VOICE_RESIDENT_SECTIONS.key(),
                 name
@@ -70,7 +70,7 @@ pub async fn enabled_sections(engine: &LucidosEngine) -> Vec<&'static ResidentSe
     {
         Ok(stored) => sections_from(stored.as_deref()),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Voice] Could not read {}: {}. Opening with no resident block",
                 prefs::VOICE_RESIDENT_SECTIONS.key(),
                 e
@@ -94,7 +94,7 @@ pub async fn build_block(engine: &LucidosEngine, thread_id: uuid::Uuid) -> Strin
         match (section.build)(engine, thread_id).await {
             Ok(body) if body.trim().is_empty() => {}
             Ok(body) => built.push((section.title, body)),
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Voice] Section '{}' failed: {}. Skipping it",
                 section.id,
                 e

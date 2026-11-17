@@ -17,6 +17,83 @@ async fn is_released(turn: &mut InputTurn) -> bool {
 }
 
 #[tokio::test]
+async fn release_wakes_queue_only_when_a_successor_exists() {
+    let order = InputOrder::default();
+    let thread = Uuid::new_v4();
+    drop(order.join(thread));
+    assert!(
+        tokio::time::timeout(SETTLE, order.successor_released.notified())
+            .await
+            .is_err()
+    );
+
+    let first = order.join(thread);
+    let second = order.join(thread);
+    drop(first);
+    tokio::time::timeout(SETTLE, order.successor_released.notified())
+        .await
+        .expect("a waiting successor wakes the queue");
+    drop(second);
+    assert!(
+        tokio::time::timeout(SETTLE, order.successor_released.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_lone_input_with_a_recording_barrier_does_not_wake_the_queue() {
+    let order = InputOrder::default();
+    let thread = Uuid::new_v4();
+    let routing = order.join(thread);
+    let barrier = order.join_recording_barrier(&routing);
+    drop(routing);
+    assert!(
+        tokio::time::timeout(SETTLE, order.successor_released.notified())
+            .await
+            .is_err(),
+        "the input's own recording barrier is not a successor input"
+    );
+    assert_eq!(tails(&order), 1, "the barrier must keep its place");
+    drop(barrier);
+    assert_eq!(tails(&order), 0);
+    assert!(
+        tokio::time::timeout(SETTLE, order.successor_released.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn paired_inputs_still_wake_and_preserve_the_recording_barrier() {
+    let order = InputOrder::default();
+    let thread = Uuid::new_v4();
+    let first = order.join(thread);
+    let first_barrier = order.join_recording_barrier(&first);
+    let mut second = order.join(thread);
+    let second_barrier = order.join_recording_barrier(&second);
+    drop(first);
+    tokio::time::timeout(SETTLE, order.successor_released.notified())
+        .await
+        .expect("a different input is waiting");
+    assert!(second.has_input_ahead(), "recording still blocks routing");
+    drop(first_barrier);
+    tokio::time::timeout(SETTLE, order.successor_released.notified())
+        .await
+        .expect("recording releases the next input");
+    assert!(!second.has_input_ahead());
+    drop(second);
+    assert_eq!(tails(&order), 1);
+    drop(second_barrier);
+    assert_eq!(tails(&order), 0);
+    assert!(
+        tokio::time::timeout(SETTLE, order.successor_released.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn turns_run_in_the_order_they_joined() {
     let order = InputOrder::default();
     let thread = Uuid::new_v4();
@@ -169,6 +246,83 @@ fn a_position_comes_whole_or_not_at_all() {
 mod admission {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    #[tokio::test]
+    async fn transactional_admission_is_visible_only_with_committed_acceptance() {
+        let (pool, db) = setup_test_db().await;
+        let order = InputOrder::default();
+        let (thread, chain, event) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let mut tx = pool.begin().await.unwrap();
+        let admission = order
+            .admit_in_transaction(
+                &mut tx,
+                thread,
+                Some(InputPosition { chain, seq: 2 }),
+                Some(event),
+            )
+            .await
+            .unwrap();
+        assert!(is_admitted(&admission));
+        assert_eq!(chain_rows(&pool, thread).await, 0);
+        tx.commit().await.unwrap();
+        assert_eq!(chain_rows(&pool, thread).await, 1);
+        assert!(matches!(
+            admit(&order, &pool, thread, chain, 1, Uuid::new_v4()).await,
+            InputAdmission::Overtaken
+        ));
+        let InputAdmission::Admitted(mut successor) =
+            admit(&order, &pool, thread, chain, 3, Uuid::new_v4()).await
+        else {
+            panic!("later input must be admitted");
+        };
+        assert!(!is_released(&mut successor).await);
+        drop(admission);
+        assert!(is_released(&mut successor).await);
+        drop(successor);
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn transactional_admission_rolls_back_with_its_acceptance() {
+        let (pool, db) = setup_test_db().await;
+        let order = InputOrder::default();
+        let (thread, chain) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut tx = pool.begin().await.unwrap();
+        let admission = order
+            .admit_in_transaction(
+                &mut tx,
+                thread,
+                Some(InputPosition { chain, seq: 2 }),
+                Some(Uuid::new_v4()),
+            )
+            .await
+            .unwrap();
+        assert!(is_admitted(&admission));
+        assert_eq!(chain_rows(&pool, thread).await, 0);
+        let staged: i64 = sqlx::query_scalar(
+            "SELECT last_seq FROM thread_input_chains WHERE thread_id=$1 AND input_chain=$2",
+        )
+        .bind(thread)
+        .bind(chain)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert_eq!(staged, 2);
+        // A later acceptance write fails: neither the chain tail nor its
+        // runtime place may survive the caller's rollback and drop.
+        assert!(sqlx::query("SELECT 1/0").execute(&mut *tx).await.is_err());
+        tx.rollback().await.unwrap();
+        drop(admission);
+        assert_eq!(chain_rows(&pool, thread).await, 0);
+        let InputAdmission::Admitted(mut retry) =
+            admit(&order, &pool, thread, chain, 1, Uuid::new_v4()).await
+        else {
+            panic!("rolled-back sequence must not overtake the retry");
+        };
+        assert!(is_released(&mut retry).await);
+        drop(retry);
+        teardown_test_db(&db).await;
+    }
 
     async fn admit(
         order: &InputOrder,

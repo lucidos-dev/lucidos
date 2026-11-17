@@ -546,6 +546,7 @@ async fn consuming_leaves_a_proposed_marker_for_the_approval() {
             .await
             .unwrap(),
         Some(ApprovedPlan {
+            plan_only: false,
             plan_path: Some("docs/plans/x.md".into())
         }),
         "the approval hands back the file the CLI marks approved",

@@ -16,6 +16,8 @@ async fn emit_question(bus: &EventBus, thread_id: Uuid) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),

@@ -383,46 +383,50 @@ fn slots<'a>(text: &'a str, before: &str, after: &str) -> Vec<&'a str> {
     found
 }
 
-/// Every way the pins in `pins` drifted from their files, one line each.
-fn drift(pins: Vec<Pin>) -> Vec<String> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let mut drift = Vec::new();
-    for pin in pins {
-        let text = std::fs::read_to_string(root.join(pin.file))
-            .unwrap_or_else(|e| panic!("read {}: {e}", pin.file));
-        let found = slots(&text, &pin.before, &pin.after);
-        let anchor = format!("`{}`…`{}`", pin.before.trim_start(), pin.after);
-        if found.is_empty() {
-            drift.push(format!(
-                "{}: no {anchor} copy found; update this pin",
-                pin.file
-            ));
-        }
-        for slot in found.into_iter().filter(|slot| *slot != pin.value) {
-            drift.push(format!(
-                "{}: {anchor} holds {slot:?}, the Rust constant is {:?}",
-                pin.file, pin.value
-            ));
-        }
-    }
-    drift
-}
-
-#[test]
-fn every_script_copy_holds_its_rust_constant() {
-    let drift = drift(script_pins());
-    assert!(drift.is_empty(), "copies drifted:\n{}", drift.join("\n"));
-}
-
-#[test]
-fn every_knowhow_copy_holds_its_rust_constant() {
-    let drift = drift(knowhow_pins());
-    assert!(drift.is_empty(), "copies drifted:\n{}", drift.join("\n"));
-}
-
 #[test]
 fn a_pin_reads_every_copy_and_rejects_a_drifted_one() {
     let text = "max 64 chars, max 65 chars, max out a budget that runs on for far longer than any slot chars";
     assert_eq!(slots(text, "max ", " chars"), vec!["64", "65"]);
     assert!(slots("no copy here", "max ", " chars").is_empty());
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Every way the pins in `pins` drifted from their files, one line each.
+    fn drift(pins: Vec<Pin>) -> Vec<String> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut drift = Vec::new();
+        for pin in pins {
+            let text = std::fs::read_to_string(root.join(pin.file))
+                .unwrap_or_else(|e| panic!("read {}: {e}", pin.file));
+            let found = slots(&text, &pin.before, &pin.after);
+            let anchor = format!("`{}`…`{}`", pin.before.trim_start(), pin.after);
+            if found.is_empty() {
+                drift.push(format!(
+                    "{}: no {anchor} copy found; update this pin",
+                    pin.file
+                ));
+            }
+            for slot in found.into_iter().filter(|slot| *slot != pin.value) {
+                drift.push(format!(
+                    "{}: {anchor} holds {slot:?}, the Rust constant is {:?}",
+                    pin.file, pin.value
+                ));
+            }
+        }
+        drift
+    }
+
+    #[test]
+    fn every_script_copy_holds_its_rust_constant() {
+        let drift = drift(script_pins());
+        assert!(drift.is_empty(), "copies drifted:\n{}", drift.join("\n"));
+    }
+
+    #[test]
+    fn every_knowhow_copy_holds_its_rust_constant() {
+        let drift = drift(knowhow_pins());
+        assert!(drift.is_empty(), "copies drifted:\n{}", drift.join("\n"));
+    }
 }

@@ -680,3 +680,10 @@ After every forwarded request, the pipeline asks each layer two things: did your
   ./scripts/e2e-wasm.sh -- wasm_signer_layer_runs_binance_hmac_signer  # filter to one test
   ```
 - For a fresh signer template, copy `signers/test-echo/`, the smallest working module. Change the response, build, drop it into `data/auth-modules/`, and call `reload_proxy_modules`.
+
+## Diagnostic evidence
+
+Upstream HTTP 500 responses remain provider failures, not internal Lucidos faults.
+Proxy diagnostic lines mask registered credentials before storage.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

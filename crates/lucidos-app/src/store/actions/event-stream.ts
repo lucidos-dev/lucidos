@@ -1,10 +1,9 @@
 /**
  * The shell's live event-stream transport, held in one place.
  *
- * `thread-sync.ts` owns the connection lifecycle and writes it here.
+ * `thread-stream.ts` owns the connection lifecycle and writes it here.
  * `presence-pong.ts` reads it to submit a pong. A module between them is what
- * keeps the two from importing each other: thread-sync already imports the
- * PresenceCheck handler, so presence-pong cannot import back.
+ * keeps the transport independent of its deferred store handlers.
  */
 
 import type { EventStream, PongAnswer } from '@lucidos/event-stream';
@@ -32,7 +31,7 @@ export function eventFramesReceived(): number {
 
 /** Reopen the live transport now, for a caller holding proof it missed a frame.
  *  Returns which transport it restarted, or null when none is up. The reopen
- *  reports a drop, so `thread-sync` resyncs as after any other drop. */
+ *  reports a drop, so `thread-stream` resyncs as after any other drop. */
 export function restartEventStream(): 'direct' | 'shared' | null {
   if (!current) return null;
   const transport = current.ownsReconnect ? 'shared' : 'direct';

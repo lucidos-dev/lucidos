@@ -88,6 +88,9 @@
 # HOST_LOAD_SATURATED_EXIT.
 # shellcheck source=host_busy_exits.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host_busy_exits.sh"
+# For E2E_DEFAULT_WORKSPACE.
+# shellcheck source=e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 
 # ── measurement seams (overridable in tests) ───────────────────────────────
 # Both readers honor a test override env var FIRST, then read the real host.
@@ -244,11 +247,11 @@ HOST_LOAD_SAMPLER_PID="${HOST_LOAD_SAMPLER_PID:-}"
 # Where the samples land. Under the e2e workspace's .lucidos/ (ephemeral runtime
 # state, mirroring the reaper's pidfile) so a crashed run leaves nothing tracked.
 _host_load_samples_file() {
-    printf '%s' "${HOST_LOAD_SAMPLES_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-load-samples}"
+    printf '%s' "${HOST_LOAD_SAMPLES_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-load-samples}"
 }
 
 _host_load_sampler_pidfile() {
-    printf '%s' "${HOST_LOAD_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-load-sampler.pid}"
+    printf '%s' "${HOST_LOAD_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-load-sampler.pid}"
 }
 
 # _host_load_sampler_loop INTERVAL FILE — append "<epoch> <load1>" every INTERVAL

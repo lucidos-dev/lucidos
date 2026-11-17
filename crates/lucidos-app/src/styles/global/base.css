@@ -35,7 +35,7 @@ html {
 
 :root {
     /* Font stacks */
-    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
     /* NOT the UI font. This is the pre-JS floor, and it is deliberately the
        local system stack: the inline FOUC script in index.html overwrites
        --font-ui on <html> before this sheet is even parsed, so this value only
@@ -178,7 +178,7 @@ html {
        var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
        Mobile redefines this in mobile.css: its header is fixed at the viewport
        top instead, so the anchor there is the measured header height alone. */
-    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px) + var(--app-slowness-banner-height, 0px));
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px) + var(--app-conn-banner-height, 0px) + var(--app-ingress-banner-height, 0px) + var(--app-refusal-banner-height, 0px) + var(--app-slowness-banner-height, 0px) + var(--app-sandbox-banner-height, 0px));
     /* The breathing room a surface HUNG FROM the header leaves below that edge,
        so it reads as coming out of the row it was opened from rather than as
        welded to it. The other half of the anchor above, and it lives beside it
@@ -221,6 +221,10 @@ html {
        says a reachable workspace is slow, which is independent of every bar
        above, so it stands alongside them. */
     --app-slowness-banner-height: 0px;
+    /* The agent sandbox bar's own height, a SIXTH property on the same terms.
+       It says agents cannot start here, or run unsandboxed, which is
+       independent of every bar above. */
+    --app-sandbox-banner-height: 0px;
     /* How much of a state colour an app-shell banner washes over its surface.
        Shared by every bar so they read as one family, and named so the live
        style remote can retune the wash without reaching into four rules. */
@@ -284,9 +288,9 @@ html {
     --scroll-chevron-size: 1.5rem; /* button diameter (width == height) */
     --scroll-chevron-glyph: var(--icon-size-md);
     --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
-    /* The bottom slot stack over the composer's top edge. The follow toggle
-       (.follow-toggle) holds the bottom slot, this inset over the composer. The
-       down chevron stands one slot higher, this gap over the toggle. */
+    /* The bottom slot row over the composer's top edge, this inset over the
+       composer. The down chevron stands at the right edge, and the follow
+       toggle (.follow-toggle) this gap to its left while it shows. */
     --scroll-chevron-inset: 0.75rem;
     --scroll-chevron-stack-gap: 0.5rem;
     /* Height of the transcript's bottom dissolve: the bg-colored gradient band
@@ -648,7 +652,7 @@ html, html[data-theme-mode="dark"] {
     --protected-action: #2176d5;
     --protected-on-action: #ffffff;
     --protected-scrim: rgba(0, 0, 0, 0.5);
-    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
 }
 
 /* iOS PWA dark-mode brand-blue correction (iPhone OLED).
@@ -729,7 +733,7 @@ html[data-theme-mode="light"] {
        border is what outlines the landed turn. 60% reads as a hairline, not a frame. */
     --nav-focus-border-alpha: 60%;
     /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
-    --initiator-coding-agent: #ea7c2a;
+    --initiator-coding-agent: #cb621a;
     --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.08);
     --shadow-md: 0 8px 24px rgba(0, 0, 0, 0.1);
     --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.1);
@@ -779,7 +783,7 @@ html[data-theme-mode="light"] {
     --protected-action: #1a6fd0;
     --protected-on-action: #ffffff;
     --protected-scrim: rgba(0, 0, 0, 0.5);
-    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --protected-font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
 }
 
 button,

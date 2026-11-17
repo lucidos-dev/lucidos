@@ -65,6 +65,7 @@ pub(super) async fn seed_artifact(bus: &EventBus, path: &str, commit: &str, writ
         commit: commit.to_string(),
         source: None,
         writer_thread_id: writer,
+        writer: None, // Legacy event fixture.
     }))
     .await
     .expect("seed artifact");

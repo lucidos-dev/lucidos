@@ -138,6 +138,13 @@ export function openCommandJudgeModelSettings(): void {
   openSettingsSubview('models');
 }
 
+/** Deep-link to Settings → Permissions → Agent sandbox, where the sandbox
+ *  banner sends the owner. */
+export function openAgentSandboxSettings(): void {
+  settingsScrollTarget.value = 'agent-sandbox';
+  openSettingsSubview('permissions');
+}
+
 /** Deep-link to the OpenCode Free switch on the Providers page. It is where
  *  the onboarding surface sends a user with no key, whose one actionable option
  *  is the keyless tier.

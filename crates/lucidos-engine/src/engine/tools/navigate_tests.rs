@@ -96,6 +96,8 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: chat_meta(None),
     })
@@ -105,6 +107,7 @@ async fn answer_from(bus: &EventBus, thread_id: Uuid, from: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id,
             quiet: false,
             answer: AnswerKind::Selected {

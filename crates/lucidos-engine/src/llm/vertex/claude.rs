@@ -13,7 +13,7 @@ use crate::llm::anthropic_wire::{
 use crate::llm::claude_prefill;
 use crate::llm::prefill::{PrefillBody, TurnRoute};
 use crate::llm::provider::{LlmResponse, Message, TokenCallback, ToolDefinition};
-use crate::llm::{ModelNotServed, ModelSelection};
+use crate::llm::{ModelNotServed, ModelSelection, ProviderError};
 
 impl VertexProvider {
     pub(super) async fn chat_claude(
@@ -24,6 +24,7 @@ impl VertexProvider {
         system_prompt: Option<&str>,
         on_token: Option<TokenCallback>,
     ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::Vertex).await?;
         let model = selection.model.unwrap_or(&self.model);
         let reasoning_effort = selection.reasoning_effort;
         // Vertex carries the model in the URL, so strip the [1m] suffix for the
@@ -89,7 +90,18 @@ impl VertexProvider {
 
             let status = resp.status();
             if !status.is_success() {
+                let error_headers = resp.headers().clone();
                 let error_body = resp.text().await.unwrap_or_default();
+                if let Some(cap) = crate::llm::metered::http_spend_cap(
+                    crate::llm::ProviderKind::Vertex,
+                    status.as_u16(),
+                    &error_headers,
+                    &error_body,
+                )
+                .await
+                {
+                    return Err(cap.into());
+                }
 
                 if status.as_u16() == 401 && !retried_auth {
                     if let Some(new_token) =
@@ -98,7 +110,9 @@ impl VertexProvider {
                         access_token = new_token;
                         continue;
                     }
-                    return Err(format!("Claude API error ({}): {}", status, error_body).into());
+                    return Err(
+                        ProviderError::from_http("Vertex", status.as_u16(), &error_body).into(),
+                    );
                 }
 
                 if crate::llm::should_retry_http(status.as_u16(), &error_body, attempt) {
@@ -122,8 +136,11 @@ impl VertexProvider {
                         crate::llm::with_retry_context(advice, attempt),
                     )));
                 }
-                let message = format!("Claude API error ({}): {}", status, error_body);
-                return Err(crate::llm::with_retry_context(message, attempt).into());
+                return Err(
+                    ProviderError::from_http("Vertex", status.as_u16(), &error_body)
+                        .with_attempts(attempt)
+                        .into(),
+                );
             }
 
             // Parse SSE stream — retry on overload errors
@@ -136,11 +153,10 @@ impl VertexProvider {
                     })
                 }
                 Err(e) => {
-                    let err_str = e.to_string();
-                    if crate::llm::retry_after_stream_error(model, &err_str, attempt).await {
+                    if crate::llm::retry_after_stream_error(model, &*e, attempt).await {
                         continue;
                     }
-                    return Err(crate::llm::with_retry_context(e, attempt).into());
+                    return Err(crate::llm::retry_failure(e, attempt));
                 }
             }
         }

@@ -16,7 +16,7 @@ const OPENING_KINDS: [&str; 2] = ["fresh", "handoff"];
 
 /// A SQL predicate over unaliased `events` columns: a `SessionStarted` that
 /// opened a new session of its thread.
-fn session_opened_sql() -> String {
+pub(crate) fn session_opened_sql() -> String {
     let kinds = OPENING_KINDS.map(|k| format!("'{k}'")).join(", ");
     format!("event_type = 'SessionStarted' AND payload->'continuity'->>'kind' IN ({kinds})")
 }

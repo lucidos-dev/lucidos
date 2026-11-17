@@ -187,7 +187,7 @@ describe('a toast is a title that stays over a message that scrolls', () => {
     expect(c.props.onClick).toBeUndefined();
   });
 
-  it('leaves a passive info toast up on a tap, with no keyboard control', () => {
+  it('leaves a passive info toast up on a tap, with no card tap control', () => {
     showToast('Copied', 'info', { key: 'copied' });
     const c = card();
 

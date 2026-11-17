@@ -419,7 +419,7 @@ pub(crate) async fn name_untitled_thread(
     let waits = std::iter::once(std::time::Duration::ZERO).chain(retry_delays.iter().copied());
     for (attempt, wait) in waits.enumerate() {
         if attempt > 0 {
-            log!(
+            log_legacy!(
                 "[Title] retrying {} in {:?} (retry {} of {})",
                 thread_id,
                 wait,
@@ -437,7 +437,7 @@ pub(crate) async fn name_untitled_thread(
             Ok(Some((None,))) => {}
             Ok(_) => return,
             Err(e) => {
-                log!("[Title] Could not read the title of {}: {}", thread_id, e);
+                log_legacy!("[Title] Could not read the title of {}: {}", thread_id, e);
                 return;
             }
         }
@@ -481,7 +481,7 @@ pub(crate) async fn emit_generated_title(
         Ok(false) => {}
         Ok(true) => return TitleAttempt::Settled,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Title] Could not check whether {} is home: {}",
                 thread_id,
                 e
@@ -510,7 +510,7 @@ pub(crate) async fn emit_generated_title(
                 Err(e) if fallback_title.is_some() => format!("failed ({}), using fallback", e),
                 Err(e) => format!("failed: {}", e),
             };
-            log!(
+            log_legacy!(
                 "[Title] {} for {} in {:?} via {}",
                 outcome,
                 thread_id,
@@ -536,7 +536,7 @@ pub(crate) async fn emit_generated_title(
     {
         Ok(_) => TitleAttempt::Settled,
         Err(e) => {
-            log!("[Thread] Failed to emit title: {}", e);
+            log_legacy!("[Thread] Failed to emit title: {}", e);
             TitleAttempt::Failed
         }
     }
@@ -991,39 +991,6 @@ mod tests {
         );
     }
 
-    /// A spawn hands its caller's name onward. It does not write it.
-    ///
-    /// The projection drops a title event for a thread whose row is not there
-    /// yet, and a spawn runs before its thread's first `MessageReceived`. So a
-    /// spawn that names its own thread loses the name, and then earns the
-    /// thread a model-generated one instead.
-    ///
-    /// Read off the source because the slot is positional.
-    /// `process_message_with_steps` takes two dozen arguments, and the bug was
-    /// a bare `None` sitting in the title one. No type can catch that, and the
-    /// crate has no harness that builds an engine to drive the call. The
-    /// end-to-end half is `a_caller_that_names_its_thread_keeps_that_name` in
-    /// the API e2e suite.
-    #[test]
-    fn a_spawn_does_not_name_its_own_thread() {
-        for site in ["engine/chat/spawn.rs", "engine/claude_code/spawn.rs"] {
-            let text = crate::test_support::source_scan::read_production_source(
-                &crate::test_support::source_scan::src_root().join(site),
-            );
-            assert!(
-                !text.contains("ThreadTitleGenerated"),
-                "{site} must leave naming to `process_message_with_steps`, which \
-                 writes the title once the thread's row exists"
-            );
-            assert!(
-                text.contains("caller_title.as_deref()"),
-                "{site} must pass its caller's title to `process_message_with_steps`. \
-                 A `None` in that slot reads as \"nobody named this thread\" and \
-                 spends a title-model call renaming it"
-            );
-        }
-    }
-
     /// A placeholder is a glance, not a name, so it is cut to fit a row.
     #[test]
     fn a_long_prompt_is_cut_down_to_a_placeholder() {
@@ -1393,5 +1360,40 @@ mod tests {
             validate_title("Fix auth handshake bug".to_string()).unwrap(),
             "Fix auth handshake bug"
         );
+    }
+
+    mod guard_tests {
+        /// A spawn hands its caller's name onward. It does not write it.
+        ///
+        /// The projection drops a title event for a thread whose row is not there
+        /// yet, and a spawn runs before its thread's first `MessageReceived`. So a
+        /// spawn that names its own thread loses the name, and then earns the
+        /// thread a model-generated one instead.
+        ///
+        /// Read off the source because the slot is positional.
+        /// `process_message_with_steps` takes two dozen arguments, and the bug was
+        /// a bare `None` sitting in the title one. No type can catch that, and the
+        /// crate has no harness that builds an engine to drive the call. The
+        /// end-to-end half is `a_caller_that_names_its_thread_keeps_that_name` in
+        /// the API e2e suite.
+        #[test]
+        fn a_spawn_does_not_name_its_own_thread() {
+            for site in ["engine/chat/spawn.rs", "engine/claude_code/spawn.rs"] {
+                let text = crate::test_support::source_scan::read_production_source(
+                    &crate::test_support::source_scan::src_root().join(site),
+                );
+                assert!(
+                    !text.contains("ThreadTitleGenerated"),
+                    "{site} must leave naming to `process_message_with_steps`, which \
+                 writes the title once the thread's row exists"
+                );
+                assert!(
+                    text.contains("caller_title.as_deref()"),
+                    "{site} must pass its caller's title to `process_message_with_steps`. \
+                 A `None` in that slot reads as \"nobody named this thread\" and \
+                 spends a title-model call renaming it"
+                );
+            }
+        }
     }
 }

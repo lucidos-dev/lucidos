@@ -227,6 +227,7 @@ const CANCEL_STATE: Partial<Record<CancelCause, string>> = {
   user_action: 'Stopped by apply, discard or archive',
   superseded_by_followup: 'Replaced',
   effort_restart: 'Restarted',
+  refused: 'Not allowed',
 };
 
 interface BoundaryStarter {
@@ -247,6 +248,7 @@ export type BoundaryTurn = 'waiting' | 'working' | 'done' | 'stopped';
 const REASON_PILL: Partial<Record<EngineReason['kind'], string>> = {
   missing_hardening: 'hardening needed',
   missing_plan: 'plan needed',
+  approved_plan_unstarted: 'build the approved plan',
   context_ceiling: 'context ceiling',
   harden_retrigger: 'hardening needed',
   merge_conflict: 'merge conflict',
@@ -445,6 +447,7 @@ const FRESH_SESSION_WHY: Record<FreshSessionReason, string> = {
   'branch-gone': 'The branch was renamed or deleted.',
   'resume-failed': 'The previous session could not be resumed.',
   'no-resumable-session': 'No earlier session was recorded to resume.',
+  'provider-blocked': 'The provider blocked the previous session, so it was not resumed.',
 };
 
 /** The start of a session that did not carry the thread's context over. */

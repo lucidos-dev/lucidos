@@ -22,6 +22,7 @@ export const BRIDGE_PUSH_TYPE = 'lucidos:bridge:push';
 
 /** What the app asks the host to do on its behalf. */
 export type BridgeOp =
+  | 'media.poster'
   | 'fetch'
   | 'sse.open'
   | 'sse.types'

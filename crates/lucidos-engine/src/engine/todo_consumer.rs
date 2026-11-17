@@ -135,7 +135,7 @@ async fn settle_unless_a_turn_owns_the_list(
             // Same rule the settle already applies to its own queries: a probe
             // that could not run settles nothing, because `Abandoned` is
             // terminal and a wrong guess here cannot be walked back.
-            crate::log!(
+            crate::log_legacy!(
                 @Todo,
                 "Could not resolve the turn state for thread {} at an unpark: {} (leaving the list untouched)",
                 thread_id,
@@ -206,7 +206,7 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
         )
         .await
         {}
-        crate::log!(@Todo, "Todo consumer stream ended");
+        crate::log_legacy!(@Todo, "Todo consumer stream ended");
     })
 }
 
@@ -637,7 +637,9 @@ mod tests {
             thread_id,
             event: ThreadEvent::ResponseFailed {
                 error: "upstream 500".to_string(),
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             },
             meta: EventMeta::NONE,
         })

@@ -145,12 +145,12 @@ fn authoring_agent(event: &EventRow) -> Option<AgentParticipant> {
 }
 
 /// The device a person typed this message on: a `MessageReceived` whose
-/// origin is a device, or a `PeopleMessagePosted`, whose actor is one. Every
+/// origin is a device, or a `UserOnlyMessagePosted`, whose actor is one. Every
 /// other sender (a trigger, a parent thread, an API caller) is nobody's.
 pub(crate) fn typed_on_device(event_type: &str, payload: &serde_json::Value) -> Option<String> {
     let key = match event_type {
         "MessageReceived" => "origin",
-        "PeopleMessagePosted" => "actor",
+        "UserOnlyMessagePosted" => "actor",
         _ => return None,
     };
     match serde_json::from_value::<MessageOrigin>(payload.get(key)?.clone()).ok()? {
@@ -557,8 +557,8 @@ pub(crate) fn build_session_messages_with(
     let mut spoken_tail: Option<SpokenTail> = None;
     // Between a message that opened a turn and the turn's terminal event.
     let mut turn_open = false;
-    // People-only messages posted while a turn was open, in order.
-    let mut held_people: Vec<SessionMessage> = Vec::new();
+    // User-only messages posted while a turn was open, in order.
+    let mut held_users: Vec<SessionMessage> = Vec::new();
 
     // `ContextDismissed` records ask the projection to drop the corresponding
     // history entry on every future read. They came from the retired
@@ -704,7 +704,7 @@ pub(crate) fn build_session_messages_with(
 
                 current_request_event_id = Some(event.id.to_string());
                 current_thread_id = get_thread_id(event);
-                messages.append(&mut held_people);
+                messages.append(&mut held_users);
                 turn_open = true;
 
                 messages.push(SessionMessage {
@@ -728,12 +728,12 @@ pub(crate) fn build_session_messages_with(
                     sender_device_id: typed_on_device(&event.event_type, &event.payload),
                 });
             }
-            // A people-only message (ADR 0649). It opened no turn, so it
+            // A user-only message (ADR 0649). It opened no turn, so it
             // leaves the open request and its streamed text alone. One posted
             // during a turn follows that turn's reply, which never saw it.
-            "PeopleMessagePosted" => {
+            "UserOnlyMessagePosted" => {
                 let target = match turn_open {
-                    true => &mut held_people,
+                    true => &mut held_users,
                     false => &mut messages,
                 };
                 target.push(SessionMessage {
@@ -1117,7 +1117,7 @@ pub(crate) fn build_session_messages_with(
                 });
                 last_cc_event_len = 0;
                 last_text_event_len = 0;
-                messages.append(&mut held_people);
+                messages.append(&mut held_users);
                 turn_open = false;
             }
             "ResponseFailed" => {
@@ -1165,7 +1165,7 @@ pub(crate) fn build_session_messages_with(
                     agent: None,
                     sender_device_id: None,
                 });
-                messages.append(&mut held_people);
+                messages.append(&mut held_users);
                 turn_open = false;
             }
             "TriggerStarted" => {
@@ -1188,7 +1188,7 @@ pub(crate) fn build_session_messages_with(
 
                 current_request_event_id = Some(event.id.to_string());
                 current_thread_id = get_thread_id(event);
-                messages.append(&mut held_people);
+                messages.append(&mut held_users);
                 turn_open = true;
 
                 messages.push(SessionMessage {
@@ -1466,7 +1466,7 @@ pub(crate) fn build_session_messages_with(
         Some(last) if last.role == "assistant" && last.completed.is_none() => messages.len() - 1,
         _ => messages.len(),
     };
-    messages.splice(held_at..held_at, held_people);
+    messages.splice(held_at..held_at, held_users);
 
     messages
 }

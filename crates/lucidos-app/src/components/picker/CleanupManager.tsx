@@ -169,7 +169,7 @@ export function CleanupManager({ tick, requestedWorkspace, onRequestHandled, onC
           <p>{data.rows.length} resources · {formatBytes(cleanupTotals(data.rows).knownBytes)} known · {cleanupTotals(data.rows).unknownSizes} unknown sizes</p>
           {data.refreshing && <p>Sizes are being refreshed. Selection becomes available when observation completes.</p>}
           {data.warnings.map(warning => <p role="alert" key={warning}>{warning}</p>)}
-          <div class="pill-bar">{['all', 'eval', 'e2e', 'demo', 'user', 'unknown'].map(value => <button class="action-btn" aria-pressed={origin.value === value} onClick={() => { origin.value = value; }} key={value}>{value}</button>)}</div>
+          <div class="pill-bar">{['all', 'eval', 'e2e', 'demo', 'agent', 'user', 'unknown'].map(value => <button class="action-btn" aria-pressed={origin.value === value} onClick={() => { origin.value = value; }} key={value}>{value}</button>)}</div>
           <ul>{sortCleanupRows(data.rows).filter(row => origin.value === 'all' || (row.workspace?.origin ?? 'unknown') === origin.value).map(row =>
             <ReviewRow key={row.id} row={row} disabled={busy.value || data.refreshing || batch !== null}
               selected={selected.value.includes(row.id)} onSelect={() => {

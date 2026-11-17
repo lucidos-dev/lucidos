@@ -1064,11 +1064,11 @@ const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
 const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
   "event_id": {"type":"string","description":"One event by id: the 'evt-<32 hex>' a tool result ends with, or a bare uuid. A tool call's address returns the pair, call then result. Errors if nothing matches."},
   "event_type": {"type":"string","description":"Omitting it queries all, worth avoiding on a busy workspace."},
-  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Read it back with event_type 'MessageReceived'."},
+  "thread_id": {"type":"string","description":"One thread: 'current' is this one. Read it back with event_type 'MessageReceived'. Leads with its liveness."},
   "since": {"type":"string","description":"After this RFC 3339 timestamp."},
   "until": {"type":"string","description":"Before this RFC 3339 timestamp."},
   "limit": {"type":"integer","description":"1-200, default 50. Raise only to fully enumerate a small type."},
-  "byte_limit": {"type":"integer","description":"Response byte budget (1024-524288, default 131072). On truncation follow the hint and narrow the query before raising it."}
+  "byte_limit": {"type":"integer","description":"Response byte budget (1024-524288, default 131072). On truncation, narrow the query first."}
 }"#;
 const EVENTS_COUNT_LLM_SCHEMA: &str = r#"{
   "event_type": {"type":"string","description":"Omit for a per-type breakdown across all types."},
@@ -2060,6 +2060,29 @@ const THREADS_OPS: &[Operation] = &[
         // `thread_id` and `limit` are already in the union, from `detach_child`
         // and `list`. A schema here would only shadow or repeat them.
         llm_schema: None,
+        llm: None,
+        cli: Some(false),
+        sdk: Some(false),
+    },
+    Operation {
+        action: "submit_draft",
+        summary: "Send a saved draft exactly as saved, only on the owner's say-so. Read it \
+                  with 'drafts' first. (requires: thread_id, expected_revision, expected_epoch)",
+        method: Method::Post,
+        path: "/threads/:thread_id/submit-draft",
+        args: &[],
+        cli_name: "submit-draft",
+        sdk_name: "submitDraft",
+        mutating: true,
+        llm_alias: Some("submit_saved_draft"),
+        // `thread_id` is already in the union, from `detach_child`.
+        llm_schema: Some(
+            r#"{
+              "expected_revision": {"type":"integer","description":"submit_draft: snapshot.draft_revision from 'drafts'."},
+              "expected_epoch": {"type":"integer","description":"submit_draft: snapshot.compose_epoch from 'drafts'."},
+              "retry_key": {"type":"string","description":"submit_draft: a uuid naming this send. Reuse it to retry."}
+            }"#,
+        ),
         llm: None,
         cli: Some(false),
         sdk: Some(false),
@@ -3251,6 +3274,98 @@ const WORKSPACE_PROMPT_FOOTPRINT_DOMAIN: Domain = Domain {
     llm_gate: Gate::Ungated,
 };
 
+// ---------------------------------------------------------------------------
+// permissions: list and revoke what owners' answers granted, and raise a batch
+// for the owner to confirm (ADR 0664). No LLM
+// tool, since its schema would bill every chat turn; the Lucidos Agent reaches
+// the CLI through its shell tool. No app needs it, so no SDK either.
+// ---------------------------------------------------------------------------
+
+const PERMISSIONS_ALL_ARG: Arg = Arg {
+    name: "all",
+    ty: ArgType::Bool,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Query,
+    description: "Include ended permissions: spent, revoked, or ended when their plan landed.",
+};
+const PERMISSION_ID_ARG: Arg = Arg {
+    name: "permission_id",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Path,
+    description: "The permission to revoke, from `list`.",
+};
+const BATCH_ITEMS_ARG: Arg = Arg {
+    name: "items",
+    ty: ArgType::Json,
+    enum_values: &[],
+    required: true,
+    loc: ArgIn::Body,
+    description: "JSON array of items. A pick on an open card in your sub-threads: { \"kind\": \"card_answer\", \"thread_id\": \"…\", \"option\": \"<label>\" }, adding \"tool_use_id\" when the thread has more than one open card. A trigger's grants: { \"kind\": \"trigger_grant\", \"trigger\": \"<id or slug>\", \"side_effects\": [\"email\"], \"coding_agents\": true }. Workspaces' origin, for workspaces not yet classified: { \"kind\": \"workspace_classification\", \"workspaces\": [\"<slug>\"], \"origin\": \"agent|demo|eval|e2e|user\", \"evidence\": \"…\" }.",
+};
+
+const PERMISSIONS_OPS: &[Operation] = &[
+    Operation {
+        action: "list",
+        summary: "Live permissions, newest first: action, breadth, lifetime, holder, and the thread that granted it.",
+        method: Method::Get,
+        path: "/permissions",
+        args: &[PERMISSIONS_ALL_ARG],
+        cli_name: "list",
+        sdk_name: "list",
+        mutating: false,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "revoke",
+        summary: "Revoke one permission, ending it now. Revoking only takes power away.",
+        method: Method::Delete,
+        path: "/permissions/:permission_id",
+        args: &[PERMISSION_ID_ARG],
+        cli_name: "revoke",
+        sdk_name: "revoke",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+    Operation {
+        action: "batch",
+        summary: "Raise a batch on your own thread: one card that runs exact picks on your sub-threads' open cards once the owner confirms it. Each pick is checked again as it runs.",
+        method: Method::Post,
+        path: "/permissions/batches",
+        args: &[BATCH_ITEMS_ARG],
+        cli_name: "batch",
+        sdk_name: "batch",
+        mutating: true,
+        llm_alias: None,
+        llm_schema: None,
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
+];
+
+const PERMISSIONS_DOMAIN: Domain = Domain {
+    name: "permissions",
+    tool_name: "permissions",
+    tool_summary: "Permissions: what the owner's answers to permission requests granted, and batches for the owner to confirm.",
+    llm: false,
+    cli: true,
+    sdk: false,
+    operations: PERMISSIONS_OPS,
+    llm_aliases: &[],
+    llm_gate: Gate::Ungated,
+};
+
 const DOMAINS: &[Domain] = &[
     Domain {
         name: "notifications",
@@ -3282,6 +3397,7 @@ const DOMAINS: &[Domain] = &[
     WEBHOOKS_DOMAIN,
     WIDGETS_DOMAIN,
     WORKSPACE_PROMPT_FOOTPRINT_DOMAIN,
+    PERMISSIONS_DOMAIN,
 ];
 
 /// The full manifest.

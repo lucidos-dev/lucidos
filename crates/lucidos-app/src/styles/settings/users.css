@@ -1,0 +1,44 @@
+/* Let the standard rows own the Settings gutter, as in Accounts. */
+.users-section .list-rows {
+    margin-inline: calc(-1 * var(--space-lg));
+}
+
+/* Keep removal beside the name at every width, with a shrinkable info column. */
+.user-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.user-name {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-bottom: var(--space-xs);
+}
+
+.user-name .title {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.user-emails {
+    align-items: center;
+    gap: var(--space-sm) var(--space-lg);
+}
+
+.user-email {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    max-width: 100%;
+    gap: var(--space-sm);
+}
+
+.user-email-address {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.user-row .list-row-actions {
+    align-self: start;
+}

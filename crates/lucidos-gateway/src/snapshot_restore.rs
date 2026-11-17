@@ -129,12 +129,14 @@ impl GatewayState {
         if database.len() > lucidos_pg_url::PG_MAX_IDENTIFIER_BYTES {
             return Err("snapshot database identity invalid".into());
         }
-        Ok(self
-            .inner
-            .snapshot_home
-            .clone()
-            .join("snapshots")
-            .join(database))
+        let snapshots = match &self.inner.relocated_private {
+            Some(private) => private.join(lucidos_home::private::SNAPSHOTS_DIR),
+            None => lucidos_home::private::entry_in(
+                &self.inner.snapshot_home,
+                lucidos_home::private::SNAPSHOTS_DIR,
+            ),
+        };
+        Ok(snapshots.join(database))
     }
 
     pub(super) fn trash_snapshots(&self, id: &str, trash: &Path) -> Result<(), BoxError> {
@@ -268,14 +270,16 @@ impl GatewayState {
             // Process exit and output are observations, never completion proof.
             // The same offline recovery path also settles pre-mutation failures.
             if self.snapshot_offline(id, restore_id, true).await.is_err() {
-                crate::log!(
+                crate::log_legacy!(
                     "[Gateway] snapshot recovery for '{id}' could not finish; engine blocked"
                 );
             }
         }
         if result.is_err() {
             // Never include child stderr, a URL or a journal's user text.
-            crate::log!("[Gateway] snapshot restore for '{id}' needs journal reconciliation");
+            crate::log_legacy!(
+                "[Gateway] snapshot restore for '{id}' needs journal reconciliation"
+            );
         }
         let status = self.snapshot_restore_status(id);
         let spawn = matches!(status, Ok(Some(ref s)) if matches!(s.phase,
@@ -422,7 +426,7 @@ impl GatewayState {
                         });
                     }
                 }
-                Err(_) => crate::log!(
+                Err(_) => crate::log_legacy!(
                     "[Gateway] snapshot journal for '{}' needs attention; engine blocked",
                     ws.id
                 ),
@@ -524,6 +528,16 @@ mod lifecycle_tests {
         )
         .unwrap();
         id.to_owned()
+    }
+
+    #[test]
+    fn a_relocated_private_dir_holds_the_snapshots() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut state = GatewayState::for_tests_with_static_dir(Some(temp.path().to_owned()));
+        let private = temp.path().join("moved-private");
+        Arc::get_mut(&mut state.inner).unwrap().relocated_private = Some(private.clone());
+        let root = state.snapshot_root("snapshot-demo").unwrap();
+        assert!(root.starts_with(private.join(lucidos_home::private::SNAPSHOTS_DIR)));
     }
 
     #[tokio::test]

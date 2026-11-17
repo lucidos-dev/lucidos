@@ -253,7 +253,7 @@ impl ChangesProjection {
         .await?;
         match row {
             None => {
-                crate::log!("[ChangesProjection] write_applied: no row for {}: missing aggregate ChangeProposed?", id);
+                crate::log_legacy!("[ChangesProjection] write_applied: no row for {}: missing aggregate ChangeProposed?", id);
             }
             Some(Some(thread_id)) => {
                 Self::sync_thread_proposal(
@@ -289,7 +289,7 @@ impl ChangesProjection {
         .await?;
         match row {
             None => {
-                crate::log!("[ChangesProjection] write_status({}) for {}: no row, missing aggregate ChangeProposed?", status, id);
+                crate::log_legacy!("[ChangesProjection] write_status({}) for {}: no row, missing aggregate ChangeProposed?", status, id);
             }
             Some(Some(thread_id)) => {
                 Self::sync_thread_proposal(&mut **tx, thread_id, landing_after(status)).await?
@@ -756,7 +756,7 @@ impl ChangesProjection {
                 recovered += 1;
             }
         }
-        crate::log!(
+        crate::log_legacy!(
             "[ChangesProjection] rebuild_missing_from_events: recovered {}/{} change rows",
             recovered,
             missing_ids.len()
@@ -793,7 +793,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     };
 
     let Some(first) = rows.iter().find(|r| is_aggregate_proposed(r)) else {
-        crate::log!(
+        crate::log_legacy!(
             "[ChangesProjection] rebuild_one: change {} has no aggregate ChangeProposed — skipping",
             change_id
         );

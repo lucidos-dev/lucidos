@@ -1,8 +1,8 @@
 //! The *agent pause* and the route of a typed message on a team gateway
 //! (ADR 0649).
 //!
-//! A message either wakes the thread's agent or stays between people: a
-//! *people-only message*. Mentions decide it, together with the pause, which
+//! A message either wakes the thread's agent or stays between users: a
+//! *user-only message*. Mentions decide it, together with the pause, which
 //! is shared thread state. The pause lives only in events: the last
 //! `AgentPaused` or `AgentResumed` on the thread wins.
 
@@ -26,13 +26,13 @@ pub enum PauseChange {
 pub enum MessageAudience {
     /// The thread's agent, which starts a turn as any message does.
     Agent,
-    /// Only the people in the thread. No turn starts.
-    PeopleOnly,
+    /// Only the users in the thread. No turn starts.
+    UserOnly,
 }
 
 /// What one typed message does on a team gateway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeopleMessageRoute {
+pub struct UserOnlyMessageRoute {
     pub pause_change: Option<PauseChange>,
     pub audience: MessageAudience,
 }
@@ -40,24 +40,24 @@ pub struct PeopleMessageRoute {
 /// The one definition of a typed message's route.
 ///
 /// - The agent mentioned: it wakes, and resumes if paused.
-/// - Only people mentioned: it pauses the agent and stays people-only.
+/// - Only users mentioned: it pauses the agent and stays user-only.
 /// - Nobody mentioned: the pause decides, except that a reply to an open
 ///   question card always reaches the agent, which is blocked on it.
-pub fn people_message_route(
-    people_mentioned: bool,
+pub fn user_only_message_route(
+    users_mentioned: bool,
     agent_mentioned: bool,
     paused: bool,
     question_open: bool,
-) -> PeopleMessageRoute {
-    let (pause_change, audience) = match (agent_mentioned, people_mentioned, paused) {
+) -> UserOnlyMessageRoute {
+    let (pause_change, audience) = match (agent_mentioned, users_mentioned, paused) {
         (true, _, true) => (Some(PauseChange::Resume), MessageAudience::Agent),
         (true, _, false) => (None, MessageAudience::Agent),
-        (false, true, false) => (Some(PauseChange::Pause), MessageAudience::PeopleOnly),
+        (false, true, false) => (Some(PauseChange::Pause), MessageAudience::UserOnly),
         (false, false, true) if question_open => (None, MessageAudience::Agent),
-        (false, _, true) => (None, MessageAudience::PeopleOnly),
+        (false, _, true) => (None, MessageAudience::UserOnly),
         (false, false, false) => (None, MessageAudience::Agent),
     };
-    PeopleMessageRoute {
+    UserOnlyMessageRoute {
         pause_change,
         audience,
     }

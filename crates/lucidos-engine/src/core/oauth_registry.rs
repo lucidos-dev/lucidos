@@ -81,6 +81,11 @@ pub struct OAuthProviderRow {
     /// step from requesting the scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions_hint: Option<String>,
+    /// The scopes a bare Connect requests so the account can report whose it
+    /// is, space separated. Absent means the generic OpenID set, which a
+    /// provider that rejects unknown scopes must override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sign_in_scopes: Option<String>,
 }
 
 /// The parsed file. Its `note` key is prose for a human opening the JSON and is
@@ -99,14 +104,14 @@ struct RegistryFile {
 /// path it accelerates still exists.
 pub fn load_providers(system_knowhow_dir: Option<&Path>) -> Vec<OAuthProviderRow> {
     let Some(dir) = system_knowhow_dir else {
-        log!("[OAuthRegistry] system-knowhow dir unavailable, no known providers");
+        log_legacy!("[OAuthRegistry] system-knowhow dir unavailable, no known providers");
         return Vec::new();
     };
     let path = dir.join(REGISTRY_FILE);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[OAuthRegistry] could not read {}: {}. No known providers.",
                 path.display(),
                 e
@@ -117,7 +122,7 @@ pub fn load_providers(system_knowhow_dir: Option<&Path>) -> Vec<OAuthProviderRow
     match serde_json::from_str::<RegistryFile>(&raw) {
         Ok(file) => file.providers,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[OAuthRegistry] {} is not valid provider JSON: {}. No known providers.",
                 path.display(),
                 e
@@ -145,6 +150,27 @@ pub fn find_provider(
     load_providers(system_knowhow_dir)
         .into_iter()
         .find(|p| p.id.to_lowercase() == wanted)
+}
+
+/// The row whose authorization endpoint sits on `auth_url`'s host.
+///
+/// How a *derived provider* finds its base provider: its credential carries the
+/// base provider's endpoints, whatever name it was saved under. Compared on the
+/// parsed host, never the URL text, so a path or query cannot impersonate a row.
+pub fn row_for_auth_url<'a>(
+    rows: &'a [OAuthProviderRow],
+    auth_url: &str,
+) -> Option<&'a OAuthProviderRow> {
+    let host = reqwest::Url::parse(auth_url.trim())
+        .ok()?
+        .host_str()?
+        .to_lowercase();
+    rows.iter().find(|row| {
+        reqwest::Url::parse(&row.auth_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase))
+            .is_some_and(|row_host| row_host == host)
+    })
 }
 
 #[cfg(test)]

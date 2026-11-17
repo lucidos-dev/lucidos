@@ -99,6 +99,7 @@ async fn boot_withdraws_a_pending_incomplete_change_once() {
         ..EventMeta::NONE
     };
     let propose = |branch: &str, incomplete: bool| ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: Uuid::new_v4().to_string(),
         description: Some("work".into()),
         files: vec!["a.rs".into()],
@@ -213,6 +214,7 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-fastpath".into(),
             branch: branch.into(),
@@ -235,6 +237,7 @@ async fn apply_now_no_live_session_fast_path_preserves_clean_pending_change() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("clean prior turn".into()),
             files: vec!["src/lib.rs".into()],
@@ -316,6 +319,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: no_terminal,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-noterm".into(),
             branch: "claude-code/noterm".into(),
@@ -347,6 +351,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: clean,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-clean".into(),
             branch: "claude-code/clean".into(),
@@ -389,6 +394,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: cc_meta.clone(),
     })
@@ -408,6 +414,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: aborted,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-abort".into(),
             branch: "claude-code/abort".into(),
@@ -450,6 +457,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: canceled,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-cancel".into(),
             branch: "claude-code/cancel".into(),
@@ -492,6 +500,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: failed,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-fail".into(),
             branch: "claude-code/fail".into(),
@@ -513,7 +522,9 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
         thread_id: failed,
         event: ThreadEvent::ResponseFailed {
             error: "test error".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: cc_meta.clone(),
     })
@@ -533,6 +544,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: clean_then_aborted,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-mixed".into(),
             branch: "claude-code/mixed".into(),
@@ -596,6 +608,7 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     bus.emit(BusEvent::Thread {
         thread_id: cross_channel,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-xchan".into(),
             branch: "claude-code/xchan".into(),
@@ -699,7 +712,9 @@ async fn last_turn_end_mirrors_the_idle_gate() {
         (
             Some(ThreadEvent::ResponseFailed {
                 error: "stream interrupted".into(),
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             }),
             Some(TurnEnd::Unfinished),
         ),
@@ -720,6 +735,7 @@ async fn last_turn_end_mirrors_the_idle_gate() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: format!("sid-{thread_id}"),
                 branch: format!("claude-code/{thread_id}"),
@@ -802,6 +818,7 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
             bus.emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::SessionStarted {
+                    sandbox: None,
                     coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                     session_id: format!("sid-{branch}"),
                     branch,
@@ -855,7 +872,9 @@ async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
         failed,
         ThreadEvent::ResponseFailed {
             error: "stream ended".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
     )
     .await;
@@ -1102,6 +1121,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
             bus.emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::SessionStarted {
+                    sandbox: None,
                     coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                     session_id: "cc-session".into(),
                     branch: "claude-code/fix".into(),
@@ -1122,6 +1142,7 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
             bus.emit(BusEvent::Thread {
                 thread_id,
                 event: ThreadEvent::ChangeProposed {
+                    content: Default::default(),
                     change_id: "c-1".into(),
                     description: Some("Fix".into()),
                     files: vec!["src/main.rs".into()],
@@ -1424,6 +1445,7 @@ async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 session_id: String::new(),
                 branch: branch_of(thread_id),
                 repo_id: None,
@@ -1595,6 +1617,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             session_id: "sid-turn-1".into(),
             branch: branch.clone(),
             repo_id: None,
@@ -1616,6 +1639,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("turn 1".into()),
             files: vec!["a.rs".into()],
@@ -1639,6 +1663,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: change_id.to_string(),
             requires_restart: false,
             client_update: false,
@@ -1673,6 +1698,7 @@ async fn an_applied_change_on_the_branch_does_not_cost_a_later_turn_its_resume()
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             session_id: "sid-turn-2".into(),
             branch: branch.clone(),
             repo_id: None,
@@ -1806,6 +1832,7 @@ async fn a_user_switch_auto_resumes_an_app_coding_agent_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: branch.clone(),
@@ -1930,6 +1957,7 @@ async fn the_app_id_lookup_answers_none_for_a_non_app_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: format!("lucidos-claude-code-repo-fix-oauth-urls-{thread_id}"),
@@ -1988,6 +2016,7 @@ async fn a_crash_still_offers_continue_on_an_app_coding_agent_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: format!("lucidos-claude-code-app-habit-tracker-add-streaks-{thread_id}"),
@@ -2048,6 +2077,7 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-app-park".into(),
             branch: format!("lucidos-claude-code-app-habit-tracker-add-streaks-{thread_id}"),
@@ -2075,6 +2105,8 @@ async fn a_parked_question_survives_a_restart_on_an_app_coding_agent_thread() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: cc_meta.clone(),
     })

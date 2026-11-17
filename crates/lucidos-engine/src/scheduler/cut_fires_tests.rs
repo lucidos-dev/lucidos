@@ -290,7 +290,7 @@ fn boot_reports_before_registration_and_catchup() {
         .split("pub async fn start(")
         .nth(1)
         .unwrap()
-        .split("log!(\"[Scheduler] Started\")")
+        .split("log_legacy!(\"[Scheduler] Started\")")
         .next()
         .unwrap();
     let replay = start

@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -7,6 +7,22 @@ use crate::core::preference_catalog::{
 };
 use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
+
+/// Serialize seed changes against draft creation and selection replacement.
+/// Shared holders may edit separate drafts concurrently; a seed change pins
+/// inherited selections while holding the exclusive form of this lock.
+pub(crate) async fn lock_compose_agent_seed(
+    tx: &mut Transaction<'_, Postgres>,
+    exclusive: bool,
+) -> Result<(), sqlx::Error> {
+    let query = if exclusive {
+        "SELECT pg_advisory_xact_lock(hashtext('compose-agent-seed'))"
+    } else {
+        "SELECT pg_advisory_xact_lock_shared(hashtext('compose-agent-seed'))"
+    };
+    sqlx::query(query).execute(&mut **tx).await?;
+    Ok(())
+}
 
 /// Why `url` cannot be the `local_base_url` preference, or `None` when it can.
 ///
@@ -115,17 +131,23 @@ pub struct ResolvedModelSelection {
     pub provider: Option<String>,
 }
 
-/// The event types that stamp a thread's pair: a chat turn's starter, a
-/// trigger fire's starter, and a rung pick between turns. Both pair queries
+/// Pair stamps include starters, next-turn picks and applied turn settings.
+/// Both pair queries
 /// bind this list, so a new stamping type reaches them together.
-const PAIR_STAMPING_EVENT_TYPES: [&str; 3] =
-    ["MessageReceived", "TriggerStarted", "ChatSettingsChanged"];
+const PAIR_STAMPING_EVENT_TYPES: [&str; 4] = [
+    "MessageReceived",
+    "TriggerStarted",
+    "ChatSettingsChanged",
+    "ChatTurnSettingsResolved",
+];
 
 /// One pair stamp, as a paged thread snapshot carries it. An empty field means
 /// the event stamped none, and an empty `model` groups the model-less stamps.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PairStamp {
     pub sequence: i64,
+    pub event_type: String,
+    pub request_event_id: Option<String>,
     pub model: String,
     pub reasoning_effort: String,
     pub provider: String,
@@ -184,7 +206,11 @@ impl PreferenceStore {
     ///
     /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
     /// reachable mutators, and the first of them emits.
-    async fn set_row(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+    async fn set_row<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
+        key: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO preferences (key, value, device_id, updated_at)
@@ -196,7 +222,7 @@ impl PreferenceStore {
         )
         .bind(key)
         .bind(value)
-        .execute(pool)
+        .execute(executor)
         .await?;
 
         Ok(())
@@ -334,13 +360,30 @@ impl PreferenceStore {
 
     /// Delete a global preference row. **Private on purpose**:
     /// [`Self::delete`] is the reachable mutator, and it emits.
-    async fn delete_row(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
+    async fn delete_row<'e>(
+        executor: impl sqlx::Executor<'e, Database = Postgres>,
+        key: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM preferences WHERE key = $1 AND device_id IS NULL")
             .bind(key)
-            .execute(pool)
+            .execute(executor)
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    async fn announce_compose_agent_pins(
+        event_bus: &EventBus,
+        rows: Vec<(Uuid, crate::core::store::ComposeReport)>,
+    ) {
+        for (id, report) in rows {
+            event_bus
+                .emit_or_log(
+                    report.broadcast(id, None),
+                    "[Preferences] pin compose agent",
+                )
+                .await;
+        }
     }
 
     /// Write a global preference and announce it.
@@ -357,7 +400,16 @@ impl PreferenceStore {
         value: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<(), sqlx::Error> {
-        Self::set_row(pool, key, value).await?;
+        if key == prefs::CODING_AGENT_DEFAULT.key() {
+            let mut tx = pool.begin().await?;
+            lock_compose_agent_seed(&mut tx, true).await?;
+            let rows = crate::core::store::pin_legacy_compose_agents(&mut tx).await?;
+            Self::set_row(&mut *tx, key, value).await?;
+            tx.commit().await?;
+            Self::announce_compose_agent_pins(event_bus, rows).await;
+        } else {
+            Self::set_row(pool, key, value).await?;
+        }
         Self::announce(event_bus, key, Some(value.to_string()), actor).await;
         Ok(())
     }
@@ -384,7 +436,17 @@ impl PreferenceStore {
         key: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<bool, sqlx::Error> {
-        let removed = Self::delete_row(pool, key).await?;
+        let removed = if key == prefs::CODING_AGENT_DEFAULT.key() {
+            let mut tx = pool.begin().await?;
+            lock_compose_agent_seed(&mut tx, true).await?;
+            let rows = crate::core::store::pin_legacy_compose_agents(&mut tx).await?;
+            let removed = Self::delete_row(&mut *tx, key).await?;
+            tx.commit().await?;
+            Self::announce_compose_agent_pins(event_bus, rows).await;
+            removed
+        } else {
+            Self::delete_row(pool, key).await?
+        };
         if removed {
             Self::announce(event_bus, key, None, actor).await;
         }
@@ -532,13 +594,13 @@ impl PreferenceStore {
                 };
                 let key = prefs::CHAT_REASONING_EFFORTS.key();
                 if let Err(e) = Self::set(pool, event_bus, key, &value, None).await {
-                    log!("[Preferences] Could not move the legacy chat tier: {}", e);
+                    log_legacy!("[Preferences] Could not move the legacy chat tier: {}", e);
                     return;
                 }
             }
         }
         if let Err(e) = Self::delete(pool, event_bus, LEGACY_CHAT_EFFORT_KEY, None).await {
-            log!("[Preferences] Could not delete the legacy chat tier: {}", e);
+            log_legacy!("[Preferences] Could not delete the legacy chat tier: {}", e);
         }
     }
 
@@ -563,13 +625,13 @@ impl PreferenceStore {
                 continue;
             };
             match Self::set(pool, event_bus, key, replacement, None).await {
-                Ok(()) => log!(
+                Ok(()) => log_legacy!(
                     "[Preferences] {}: {} is retired, replaced by {}",
                     key,
                     stored.trim(),
                     replacement
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Preferences] Could not replace the retired {} in {}: {}",
                     stored.trim(),
                     key,
@@ -591,7 +653,7 @@ impl PreferenceStore {
     /// trigger thread report the account default however the trigger was
     /// pinned, and a human follow-up there would silently switch models.
     ///
-    /// A rung pick between turns (`ChatSettingsChanged`) counts too. So the
+    /// A next-turn rung pick (`ChatSettingsChanged`) counts too. So the
     /// next turn runs on it, whether a person, a child report or a wake starts
     /// it.
     ///
@@ -611,8 +673,28 @@ impl PreferenceStore {
         exclude_event_id: Option<Uuid>,
         model_override: Option<&str>,
     ) -> ResolvedModelSelection {
+        Self::try_last_thread_chat_settings(pool, thread_id, exclude_event_id, model_override)
+            .await
+            .unwrap_or_else(|e| {
+                log_legacy!(
+                    "[Preferences] Failed to read last thread chat settings for {}: {}",
+                    thread_id,
+                    e
+                );
+                ResolvedModelSelection::default()
+            })
+    }
+
+    /// The same per-thread memory read, preserving store failures so acceptance
+    /// can refuse rather than silently substituting account defaults.
+    pub async fn try_last_thread_chat_settings(
+        pool: &PgPool,
+        thread_id: Uuid,
+        exclude_event_id: Option<Uuid>,
+        model_override: Option<&str>,
+    ) -> Result<ResolvedModelSelection, sqlx::Error> {
         // These thread-event payloads are flat (see `ThreadEvent::to_payload`),
-        // so `payload->>'model'` reads the field directly on all three variants.
+        // so `payload->>'model'` reads the field directly on every stamping variant.
         // `aggregate_id` is text; bind the thread id as its string.
         //
         let row = sqlx::query_as::<_, (Option<String>, Option<String>, Option<String>)>(
@@ -622,6 +704,7 @@ impl PreferenceStore {
                 FROM events
                WHERE aggregate_id = $1
                  AND event_type = ANY($4)
+                 AND NOT (event_type = 'MessageReceived' AND payload->>'request_event_id' IS NOT NULL)
                  AND ($2::uuid IS NULL OR id <> $2)
             ),
             remembered AS (
@@ -655,22 +738,13 @@ impl PreferenceStore {
         .bind(model_override)
         .bind(PAIR_STAMPING_EVENT_TYPES)
         .fetch_one(pool)
-        .await;
-        match row {
-            Ok((model, reasoning_effort, provider)) => ResolvedModelSelection {
-                model,
-                reasoning_effort,
-                provider,
-            },
-            Err(e) => {
-                log!(
-                    "[Preferences] Failed to read last thread chat settings for {}: {}",
-                    thread_id,
-                    e
-                );
-                ResolvedModelSelection::default()
-            }
-        }
+        .await?;
+        let (model, reasoning_effort, provider) = row;
+        Ok(ResolvedModelSelection {
+            model,
+            reasoning_effort,
+            provider,
+        })
     }
 
     /// The thread's **pair stamps**: the fewest stamping events that answer
@@ -684,19 +758,23 @@ impl PreferenceStore {
         pool: &PgPool,
         thread_id: Uuid,
     ) -> Result<Vec<PairStamp>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (i64, String, String, String)>(
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String, String, String)>(
             r#"
             WITH stamped AS (
-              SELECT sequence,
+              SELECT sequence, event_type, payload->>'request_event_id' AS request_event_id,
                      COALESCE(payload->>'model', '') AS model,
                      COALESCE(payload->>'reasoning_effort', '') AS effort,
                      COALESCE(payload->>'provider', '') AS provider
                 FROM events
                WHERE aggregate_id = $1
                  AND event_type = ANY($2)
+                 AND NOT (event_type = 'MessageReceived' AND payload->>'request_event_id' IS NOT NULL)
             )
-            SELECT sequence, model, effort, provider FROM (
+            SELECT sequence, event_type, request_event_id, model, effort, provider FROM (
               (SELECT * FROM stamped WHERE model <> '' ORDER BY sequence DESC LIMIT 1)
+              UNION
+              (SELECT * FROM stamped WHERE event_type <> 'ChatSettingsChanged'
+                ORDER BY (event_type = 'ChatTurnSettingsResolved') DESC, sequence DESC LIMIT 1)
               UNION
               (SELECT DISTINCT ON (model) * FROM stamped
                 WHERE effort <> '' ORDER BY model, sequence DESC)
@@ -713,12 +791,18 @@ impl PreferenceStore {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(sequence, model, reasoning_effort, provider)| PairStamp {
-                sequence,
-                model,
-                reasoning_effort,
-                provider,
-            })
+            .map(
+                |(sequence, event_type, request_event_id, model, reasoning_effort, provider)| {
+                    PairStamp {
+                        sequence,
+                        event_type,
+                        request_event_id,
+                        model,
+                        reasoning_effort,
+                        provider,
+                    }
+                },
+            )
             .collect())
     }
 
@@ -743,37 +827,80 @@ impl PreferenceStore {
         exclude_event_id: Option<Uuid>,
         overrides: ResolvedModelSelection,
     ) -> ResolvedModelSelection {
+        Self::resolve_chat_settings(
+            pool,
+            defaults,
+            thread_id,
+            exclude_event_id,
+            overrides,
+            SettingsReads::BestEffort,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            log_read_failure("chat settings", &error);
+            ResolvedModelSelection::default()
+        })
+    }
+
+    /// Resolve the same composer defaults without hiding failed reads or
+    /// malformed stored effort selections. Use this path for durable acceptance.
+    pub async fn try_resolve_chat_overrides_for_thread(
+        pool: &PgPool,
+        defaults: ModelDefaults<'_>,
+        thread_id: Option<Uuid>,
+        exclude_event_id: Option<Uuid>,
+        overrides: ResolvedModelSelection,
+    ) -> Result<ResolvedModelSelection, sqlx::Error> {
+        Self::resolve_chat_settings(
+            pool,
+            defaults,
+            thread_id,
+            exclude_event_id,
+            overrides,
+            SettingsReads::Strict,
+        )
+        .await
+    }
+
+    async fn resolve_chat_settings(
+        pool: &PgPool,
+        defaults: ModelDefaults<'_>,
+        thread_id: Option<Uuid>,
+        exclude_event_id: Option<Uuid>,
+        overrides: ResolvedModelSelection,
+        reads: SettingsReads,
+    ) -> Result<ResolvedModelSelection, sqlx::Error> {
         let ResolvedModelSelection {
             model: model_override,
             reasoning_effort: effort_override,
             provider: provider_override,
         } = overrides;
         if model_override.is_some() && effort_override.is_some() && provider_override.is_some() {
-            return ResolvedModelSelection {
+            return Ok(ResolvedModelSelection {
                 model: model_override,
                 reasoning_effort: effort_override,
                 provider: provider_override,
-            };
+            });
         }
         // Per-thread memory: reuse what this thread last ran with. Only worth a
         // query for a follow-up (a new thread has no prior message).
         let remembered = match thread_id {
-            Some(tid) => {
-                Self::last_thread_chat_settings(
+            Some(tid) => reads.resolve(
+                Self::try_last_thread_chat_settings(
                     pool,
                     tid,
                     exclude_event_id,
                     model_override.as_deref(),
                 )
-                .await
-            }
+                .await,
+            )?,
             None => ResolvedModelSelection::default(),
         };
         let (model, remembered_effort) = match model_override.or(remembered.model) {
             Some(model) => (Some(model), remembered.reasoning_effort),
             // The thread named no model, so it ran on the router's. Its tier
             // stays there, and never carries onto a `chat_model` set since.
-            None => match Self::user_chat_model(pool).await {
+            None => match reads.resolve(prefs::CHAT_MODEL.try_stored(pool).await)? {
                 Some(model) => (Some(model), None),
                 None => (None, remembered.reasoning_effort),
             },
@@ -782,24 +909,57 @@ impl PreferenceStore {
             Some(effort) => Some(effort),
             None => {
                 let running = model.as_deref().unwrap_or(defaults.fallback_model);
-                match Self::user_chat_effort(pool, running).await {
+                let stored = reads.resolve(prefs::CHAT_REASONING_EFFORTS.try_stored(pool).await)?;
+                let effort = match stored {
+                    Some(stored) => reads.resolve(
+                        prefs::parse_model_efforts(&stored)
+                            .map(|pairs| {
+                                pairs
+                                    .into_iter()
+                                    .rev()
+                                    .find(|(model, _)| *model == running)
+                                    .map(|(_, effort)| effort.to_string())
+                            })
+                            .map_err(sqlx::Error::Protocol),
+                    )?,
+                    None => None,
+                };
+                match effort {
                     Some(effort) => Some(effort),
                     None => crate::llm::model_registry::default_effort(defaults.registry, running)
                         .map(str::to_string),
                 }
             }
         };
-        ResolvedModelSelection {
+        Ok(ResolvedModelSelection {
             model,
             reasoning_effort: effort,
             provider: provider_override.or(remembered.provider),
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SettingsReads {
+    Strict,
+    BestEffort,
+}
+
+impl SettingsReads {
+    fn resolve<T: Default>(self, result: Result<T, sqlx::Error>) -> Result<T, sqlx::Error> {
+        match (self, result) {
+            (Self::BestEffort, Err(error)) => {
+                log_read_failure("chat settings", &error);
+                Ok(T::default())
+            }
+            (_, result) => result,
         }
     }
 }
 
 /// Logs a failed read, for a handle read that then falls back to its default.
 fn log_read_failure(key: &str, e: &sqlx::Error) {
-    log!(
+    log_legacy!(
         "[Preferences] Failed to read {}: {}. Using its default",
         key,
         e
@@ -980,6 +1140,182 @@ impl Pref<Optional> {
 mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
+
+    #[tokio::test]
+    async fn remembering_an_agent_pins_legacy_drafts_without_writing_their_content() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let legacy = Uuid::new_v4();
+        let explicit = Uuid::new_v4();
+        let active = Uuid::new_v4();
+        for (id, state, selection) in [
+            (
+                legacy,
+                "composing",
+                serde_json::json!({"model":"draft-model"}),
+            ),
+            (
+                explicit,
+                "composing",
+                serde_json::json!({"codingAgent":"codex"}),
+            ),
+            (active, "active", serde_json::json!({})),
+        ] {
+            sqlx::query("INSERT INTO thread_summaries (thread_id, state, compose_text, compose_selection) VALUES ($1, $2, 'new peer text', $3)")
+                .bind(id).bind(state).bind(selection).execute(&pool).await.unwrap();
+        }
+        PreferenceStore::set(
+            &pool,
+            &bus,
+            prefs::CODING_AGENT_DEFAULT.key(),
+            "codex",
+            None,
+        )
+        .await
+        .unwrap();
+        let (text, selection): (String, serde_json::Value) = sqlx::query_as(
+            "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(legacy)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(text, "new peer text");
+        assert_eq!(
+            selection,
+            serde_json::json!({"model":"draft-model", "codingAgent":"claude-code"})
+        );
+        let agents: Vec<Option<String>> = sqlx::query_scalar("SELECT compose_selection->>'codingAgent' FROM thread_summaries WHERE thread_id = ANY($1) ORDER BY state")
+            .bind(vec![explicit, active]).fetch_all(&pool).await.unwrap();
+        assert_eq!(agents, vec![None, Some("codex".into())]);
+        PreferenceStore::set(
+            &pool,
+            &bus,
+            prefs::CODING_AGENT_DEFAULT.key(),
+            "claude-code",
+            None,
+        )
+        .await
+        .unwrap();
+        let agent: String = sqlx::query_scalar(
+            "SELECT compose_selection->>'codingAgent' FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(explicit)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, "codex");
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_agent_preference_write_rolls_back_legacy_pins() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO thread_summaries (thread_id, state) VALUES ($1, 'composing')")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("ALTER TABLE preferences ADD CONSTRAINT refuse_test_agent CHECK (key <> 'coding_agent_default' OR value <> 'codex')")
+            .execute(&pool).await.unwrap();
+        assert!(PreferenceStore::set(
+            &pool,
+            &bus,
+            prefs::CODING_AGENT_DEFAULT.key(),
+            "codex",
+            None
+        )
+        .await
+        .is_err());
+        let selection: Option<serde_json::Value> = sqlx::query_scalar(
+            "SELECT compose_selection FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(selection, None);
+        assert_eq!(prefs::CODING_AGENT_DEFAULT.read(&pool).await, "claude-code");
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_concurrent_draft_creation_is_pinned_before_the_seed_changes() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let id = Uuid::new_v4();
+        let mut creation = pool.begin().await.unwrap();
+        lock_compose_agent_seed(&mut creation, false).await.unwrap();
+        sqlx::query("INSERT INTO thread_summaries (thread_id, state) VALUES ($1, 'composing')")
+            .bind(id)
+            .execute(&mut *creation)
+            .await
+            .unwrap();
+        let writer_pool = pool.clone();
+        let mut writer = tokio::spawn(async move {
+            PreferenceStore::set(
+                &writer_pool,
+                &bus,
+                prefs::CODING_AGENT_DEFAULT.key(),
+                "codex",
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut writer)
+                .await
+                .is_err()
+        );
+        creation.commit().await.unwrap();
+        writer.await.unwrap().unwrap();
+        let agent: String = sqlx::query_scalar(
+            "SELECT compose_selection->>'codingAgent' FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, "claude-code");
+        assert_eq!(prefs::CODING_AGENT_DEFAULT.read(&pool).await, "codex");
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn resetting_the_agent_preference_preserves_legacy_drafts() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        PreferenceStore::set_row_for_test(&pool, prefs::CODING_AGENT_DEFAULT.key(), "codex")
+            .await
+            .unwrap();
+        let id = Uuid::new_v4();
+        sqlx::query("INSERT INTO thread_summaries (thread_id, state) VALUES ($1, 'composing')")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            PreferenceStore::delete(&pool, &bus, prefs::CODING_AGENT_DEFAULT.key(), None)
+                .await
+                .unwrap()
+        );
+        let agent: String = sqlx::query_scalar(
+            "SELECT compose_selection->>'codingAgent' FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, "codex");
+        assert_eq!(prefs::CODING_AGENT_DEFAULT.read(&pool).await, "claude-code");
+        pool.close().await;
+        teardown_test_db(&db).await;
+    }
 
     /// The real local setups keep working: Ollama and LM Studio on loopback, a
     /// LAN box on an RFC 1918 address, a tailnet box, and a private-use name.
@@ -1896,6 +2232,124 @@ mod tests {
         .await
         .unwrap();
         id
+    }
+
+    #[tokio::test]
+    async fn strict_chat_resolution_matches_composer_and_refuses_failed_reads() {
+        let (pool, db_name) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+        crate::test_support::seed_preference(&pool, prefs::CHAT_MODEL.key(), "model-account")
+            .await
+            .unwrap();
+        crate::test_support::seed_preference(
+            &pool,
+            prefs::CHAT_REASONING_EFFORTS.key(),
+            "model-account=low, model-thread=high",
+        )
+        .await
+        .unwrap();
+        let tid = Uuid::new_v4();
+        insert_message_received(&pool, tid, Some("model-thread"), Some("medium")).await;
+        for thread_id in [None, Some(tid)] {
+            for model in [None, Some("model-account"), Some("model-other")] {
+                let overrides = ResolvedModelSelection {
+                    model: model.map(str::to_string),
+                    ..Default::default()
+                };
+                let defaults = || ModelDefaults {
+                    registry: &registry,
+                    fallback_model: "fallback",
+                };
+                let strict = PreferenceStore::try_resolve_chat_overrides_for_thread(
+                    &pool,
+                    defaults(),
+                    thread_id,
+                    None,
+                    overrides.clone(),
+                )
+                .await
+                .unwrap();
+                let composer = PreferenceStore::resolve_chat_overrides_for_thread(
+                    &pool,
+                    defaults(),
+                    thread_id,
+                    None,
+                    overrides,
+                )
+                .await;
+                assert_eq!(strict, composer);
+                let expected_model = model.unwrap_or(if thread_id.is_some() {
+                    "model-thread"
+                } else {
+                    "model-account"
+                });
+                assert_eq!(strict.model.as_deref(), Some(expected_model));
+                assert_eq!(
+                    strict.reasoning_effort.as_deref(),
+                    match expected_model {
+                        "model-thread" => Some("medium"),
+                        "model-account" => Some("low"),
+                        _ => None,
+                    }
+                );
+            }
+        }
+        crate::test_support::seed_preference(
+            &pool,
+            prefs::CHAT_REASONING_EFFORTS.key(),
+            "model-account=invalid",
+        )
+        .await
+        .unwrap();
+        assert!(PreferenceStore::try_resolve_chat_overrides_for_thread(
+            &pool,
+            ModelDefaults {
+                registry: &registry,
+                fallback_model: "fallback"
+            },
+            None,
+            None,
+            ResolvedModelSelection::default(),
+        )
+        .await
+        .is_err());
+        pool.close().await;
+        assert!(PreferenceStore::try_resolve_chat_overrides_for_thread(
+            &pool,
+            ModelDefaults {
+                registry: &registry,
+                fallback_model: "fallback"
+            },
+            None,
+            None,
+            ResolvedModelSelection::default(),
+        )
+        .await
+        .is_err());
+        teardown_test_db(&db_name).await;
+    }
+
+    #[tokio::test]
+    async fn strict_thread_settings_distinguish_absence_from_read_failure() {
+        let (pool, db_name) = setup_test_db().await;
+        let tid = Uuid::new_v4();
+        let empty = PreferenceStore::try_last_thread_chat_settings(&pool, tid, None, None)
+            .await
+            .unwrap();
+        assert_eq!(empty.model, None);
+        insert_message_received(&pool, tid, Some("model-a"), Some("high")).await;
+        let remembered = PreferenceStore::try_last_thread_chat_settings(&pool, tid, None, None)
+            .await
+            .unwrap();
+        assert_eq!(remembered.model.as_deref(), Some("model-a"));
+        assert_eq!(remembered.reasoning_effort.as_deref(), Some("high"));
+        pool.close().await;
+        assert!(
+            PreferenceStore::try_last_thread_chat_settings(&pool, tid, None, None)
+                .await
+                .is_err()
+        );
+        teardown_test_db(&db_name).await;
     }
 
     #[tokio::test]

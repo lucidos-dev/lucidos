@@ -33,6 +33,41 @@ async fn stored(pool: &PgPool, id: Uuid) -> ComposeReport {
 }
 
 #[tokio::test]
+async fn restoration_journal_survives_writes_and_clears_on_consumption() {
+    let (pool, db) = setup_test_db().await;
+    let id = seed_draft(&pool, "base", serde_json::json!(["shared"])).await;
+    let mut tx = pool.begin().await.unwrap();
+    let report = super::super::threads::restore_compose_slot(
+        &mut tx,
+        id,
+        "queued",
+        &["shared".into(), "queued-image".into()],
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(report.restorations.len(), 1);
+    assert_eq!(report.restorations[0].text, "queued");
+    // Include shared images too: a pending client may have removed its copy.
+    assert_eq!(
+        report.restorations[0].image_hashes,
+        ["shared", "queued-image"]
+    );
+    sqlx::query("UPDATE thread_summaries SET compose_text='replacement' WHERE thread_id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored(&pool, id).await.restorations, report.restorations);
+    let consumed = consume_compose_slot(&pool, id, "replacement", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(consumed.restorations.is_empty());
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
 async fn the_submitted_draft_clears_and_the_epoch_rises() {
     let (pool, db) = setup_test_db().await;
     let id = seed_draft(&pool, "send this\n", serde_json::json!([])).await;
@@ -50,6 +85,32 @@ async fn the_submitted_draft_clears_and_the_epoch_rises() {
         stored(&pool, id).await,
         "the report is the stored row"
     );
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn restoration_journal_limits_survive_intervening_draft_replacements() {
+    let (pool, db) = setup_test_db().await;
+    let id = seed_draft(&pool, "", serde_json::json!([])).await;
+    let text = "x".repeat(MAX_COMPOSE_TEXT_BYTES);
+    let mut tx = pool.begin().await.unwrap();
+    super::super::threads::restore_compose_slot(&mut tx, id, &text, &[])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE thread_summaries SET compose_text='' WHERE thread_id=$1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before = stored(&pool, id).await;
+    let mut tx = pool.begin().await.unwrap();
+    let error = super::super::threads::restore_compose_slot(&mut tx, id, "more", &[])
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("journal exceeds"));
+    tx.rollback().await.unwrap();
+    assert_eq!(stored(&pool, id).await, before);
     teardown_test_db(&db).await;
 }
 
@@ -134,5 +195,48 @@ async fn an_earlier_state_of_the_sent_draft_clears() {
         report.text, "",
         "a stored prefix of the message is the message"
     );
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn consumption_rolls_back_with_failed_acceptance() {
+    let (pool, db) = setup_test_db().await;
+    let hash = "b".repeat(64);
+    let id = seed_draft(&pool, "send together", serde_json::json!([hash])).await;
+    let before = stored(&pool, id).await;
+    let mut tx = pool.begin().await.unwrap();
+    let consumed = consume_compose_slot(&mut *tx, id, "send together", &[hash])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(consumed.text.is_empty());
+    assert!(consumed.image_hashes.is_empty());
+    assert_eq!(consumed.selection, None);
+    assert_eq!(consumed.compose_epoch, before.compose_epoch + 1);
+
+    // An acceptance write fails after consumption. PostgreSQL aborts the
+    // transaction, so the draft must survive, including its picks and token.
+    assert!(sqlx::query("SELECT 1 / 0").execute(&mut *tx).await.is_err());
+    tx.rollback().await.unwrap();
+    assert_eq!(stored(&pool, id).await, before);
+    teardown_test_db(&db).await;
+}
+
+#[tokio::test]
+async fn transactional_consumption_is_visible_only_after_commit() {
+    let (pool, db) = setup_test_db().await;
+    let id = seed_draft(&pool, "send together", serde_json::json!([])).await;
+    let mut tx = pool.begin().await.unwrap();
+    let consumed = consume_compose_slot(&mut *tx, id, "send together", &[])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_ne!(
+        stored(&pool, id).await,
+        consumed,
+        "uncommitted consumption is invisible"
+    );
+    tx.commit().await.unwrap();
+    assert_eq!(stored(&pool, id).await, consumed);
     teardown_test_db(&db).await;
 }

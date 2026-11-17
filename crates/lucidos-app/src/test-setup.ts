@@ -103,16 +103,18 @@ installStorage('localStorage');
 installStorage('sessionStorage');
 // Minimal EventTarget on window — enough for addEventListener/dispatchEvent in tests.
 if (typeof (globalThis as any).addEventListener === 'undefined') {
-  const listeners: Record<string, Function[]> = {};
-  (globalThis as any).addEventListener = (type: string, fn: Function) => {
-    (listeners[type] ??= []).push(fn);
+  const listeners: Record<string, Array<{ fn: Function; once: boolean }>> = {};
+  (globalThis as any).addEventListener = (type: string, fn: Function, options?: boolean | AddEventListenerOptions) => {
+    (listeners[type] ??= []).push({ fn, once: typeof options === 'object' && options.once === true });
   };
   (globalThis as any).removeEventListener = (type: string, fn: Function) => {
-    const fns = listeners[type];
-    if (fns) listeners[type] = fns.filter(f => f !== fn);
+    const entries = listeners[type];
+    if (entries) listeners[type] = entries.filter(e => e.fn !== fn);
   };
   (globalThis as any).dispatchEvent = (event: any) => {
-    for (const fn of listeners[event.type] ?? []) fn(event);
+    const entries = listeners[event.type] ?? [];
+    listeners[event.type] = entries.filter(e => !e.once);
+    for (const { fn } of entries) fn(event);
     return true;
   };
 }

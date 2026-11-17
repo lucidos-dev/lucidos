@@ -205,7 +205,18 @@ impl ScriptHandshakeLayer {
         };
         env_vars.extend(oauth::account_env_vars(oauth_accounts));
 
-        match run_handshake_script(&self.workspace_path, &self.script_rel_path, env_vars).await {
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(&self.pool, &self.workspace_path)
+                .await
+                .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
+        match run_handshake_script(
+            &sandbox,
+            &self.workspace_path,
+            &self.script_rel_path,
+            env_vars,
+        )
+        .await
+        {
             Ok(out) => {
                 let ttl = Duration::from_secs(out.expires_in.max(MIN_HANDSHAKE_TTL_SECS));
                 Ok((out.headers, ttl))

@@ -625,7 +625,7 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 
 /* The agent mark (`ThreadAgentMark`), last on the meta line so every row puts
  * it at the same right edge. Centred on the line, since an icon has no
- * baseline. Every glyph paints in the date's muted colour.
+ * baseline. With brand colours off, glyphs keep the date's muted colour.
  *
  * Its box is as wide as the title line's last action button, and the glyph
  * centres in it, so the mark stands under that button's glyph.
@@ -641,14 +641,14 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 }
 
 /* A thread that ran on several backends stacks one mark per backend, first
- * used on top. When the title's last line leaves the column free,
+ * used on top. When the slot above the lower mark is free of the title,
  * `placeStackedMark` marks the meta line `data-agent-lift` and sets the rise in
- * `--thread-row-agent-lift`. The top mark then leaves the stack and centres on
- * that line, so the row is no taller than a one-backend row. */
+ * `--thread-row-agent-lift`. The top mark keeps the stack gap above the lower
+ * one either way, so every two-mark row shows the same spacing. */
 .thread-row-agents {
     display: inline-flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 0.375rem;
     align-self: flex-end;
 }
 
@@ -670,15 +670,38 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
 .thread-row-agent svg {
     width: var(--icon-size-sm);
     height: var(--icon-size-sm);
+    flex-shrink: 0;
 }
 
-/* Repaints the fill `CodexIcon` sets as a presentation attribute. */
 .thread-row-agent .codex-icon {
     fill: currentColor;
 }
 
-.thread-row-agent[data-glyph="lucidos"] svg {
-    transform: scale(1.55);
+.thread-row-agent[data-glyph="lucidos"] .lucidos-mark {
+    display: none;
+    transform: none;
+}
+
+/* The flat artwork's horizontal bounds centre at 51.48 in its 100-unit
+ * canvas. Centre the painted mark, not the surrounding SVG canvas. */
+.thread-row-agent[data-glyph="lucidos"] .lucidos-mark-icon {
+    transform: scale(1.55) translateX(-1.48%);
+}
+
+:root:not([data-agent-brand-colours="off"]) .thread-row-agent .claude-icon {
+    color: var(--claude-mark);
+}
+
+:root:not([data-agent-brand-colours="off"]) .thread-row-agent .codex-icon {
+    fill: var(--codex-mark);
+}
+
+:root:not([data-agent-brand-colours="off"]) .thread-row-agent .lucidos-mark-icon {
+    display: none;
+}
+
+:root:not([data-agent-brand-colours="off"]) .thread-row-agent[data-glyph="lucidos"] .lucidos-mark {
+    display: block;
 }
 
 .thread-row-agent[data-glyph="trigger"] svg {
@@ -1434,18 +1457,82 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     background: var(--bg-secondary);
 }
 
-/* People in this thread (ADR 0649), under the title on both layouts: a round
- * mark per person, who drives, and this person's own Watch and Take. It shares
- * the title row's left inset. */
-.thread-people-row {
-    display: flex;
+/* Users in this thread (ADR 0649). One icon at the right end of the title row
+ * on both layouts: the driver's round mark and a chevron. It rolls open a panel
+ * under the title, sharing the title row's side insets. */
+.thread-users-button {
+    display: inline-flex;
+    flex: none;
     align-items: center;
+    gap: 0.125rem;
+    align-self: center;
+    margin: 0 0 0 auto;
+    padding: 0.125rem 0.25rem 0.125rem 0.125rem;
+    border: 0;
+    border-radius: var(--radius-round);
+    background: transparent;
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: background-color var(--duration-normal) ease;
+}
+.thread-users-button.open {
+    background: var(--bg-tertiary);
+}
+.thread-users-button:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: var(--focus-ring);
+}
+@media (hover: hover) {
+    .thread-users-button:hover {
+        background: var(--bg-tertiary);
+    }
+}
+.thread-users-chevron {
+    display: inline-flex;
+    transition: transform var(--duration-normal) ease;
+}
+.thread-users-button.open .thread-users-chevron {
+    transform: rotate(180deg);
+}
+.thread-users-glyph {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.5rem;
+    height: 1.5rem;
+}
+.thread-users-glyph svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+.thread-users-panel {
+    display: flex;
+    flex-direction: column;
     gap: 0.375rem;
-    padding: 0.25rem var(--header-padding-x) 0.375rem 1rem;
+    margin: 0.25rem var(--header-padding-x) 0.375rem 1rem;
+    padding: 0.5rem 0.75rem;
+    border-radius: var(--radius-surface);
+    background: var(--bg-secondary);
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
 }
-.thread-people-mark {
+.thread-users-user {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+.thread-users-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.thread-users-role {
+    flex: none;
+    color: var(--text-muted);
+}
+.thread-users-mark {
     display: inline-flex;
     flex: none;
     align-items: center;
@@ -1459,28 +1546,29 @@ html[data-theme-mode="dark"] .thread-row .message-channel-tag.channel-error {
     font-size: var(--font-size-xs);
     font-weight: 600;
 }
-.thread-people-mark-you {
+.thread-users-mark-you {
     color: var(--accent);
 }
-.thread-people-summary {
-    flex: 1;
-    min-width: 0;
-    margin-left: 0.25rem;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.thread-people-actions {
+.thread-users-actions {
     display: flex;
-    flex: none;
+    align-items: center;
     justify-content: flex-end;
     gap: 0.375rem;
+    padding-top: 0.25rem;
 }
-.thread-people-actions .action-btn {
+.thread-users-actions .action-btn {
     font-size: var(--font-size-xs);
     padding: 0.125rem 0.625rem;
 }
-.thread-people-row-failed {
+.thread-users-edit {
+    margin-right: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    font-size: var(--font-size-xs);
+    cursor: pointer;
+}
+.thread-users-panel-failed {
     color: var(--accent-red);
 }
 

@@ -18,7 +18,7 @@ A compose draft is a thread in `threadMap` (`meta.state === 'composing'`). `send
 
 - **Every compose-view dropdown is PER-DRAFT** (scope, coding-agent backend, model and reasoning). The value lives in `composeSelections[id]` as an override, read through `resolve*(threadId)`. Reading a mutable global (`selectedScope`) in a compose surface leaks one draft's pick into every other.
 - **Writes go through `updateComposeSelection(threadId-or-null, …)`**, and scope through `applyDestination`. A bare `setChatModelSelection` from a compose surface is the bug.
-- **No compose pick writes an account preference** (`chat_model`, `chat_reasoning_efforts`, `coding_agent_default`), because each is the fallback of every override-less draft. A backend pick is the one exception (ADR 0247).
+- **Model and reasoning picks never write account preferences.** Coding-agent chip picks remember `coding_agent_default` through `selectComposeCodingAgent` (ADR 0006). The server preserves existing drafts atomically. New drafts copy the seed. Provider picks follow ADR 0247.
 - **An existing draft resolves scope as `override.scope ?? {kind:'lucidos'}`.** `selectedScope` only seeds a NEW draft, in `ensureFocusedComposeThread`. Picks made before a draft exists use `pendingComposeSelection`.
 - **Selections are server-synced** (ADR 0437). At promotion, `sendCompose` binds them onto the send and clears them.
 

@@ -11,6 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::llm::model_registry::ProviderKind;
+use crate::llm::provider_error::ProviderError;
 
 /// How long a not-found answer keeps a model out of reach. After it, the next
 /// call tries the model again, so enabling it in the provider's console takes
@@ -152,15 +153,17 @@ fn names_unknown_model(status: u16, body: &str) -> bool {
 
 /// The error for a failed answer from the direct Anthropic API or an
 /// OpenAI-compatible backend: [`ModelNotServed`] when it names an unknown
-/// model, else `message` as is.
+/// model, else the [`ProviderError`] the answer reads as.
 pub(crate) fn failure(
+    provider: &str,
     status: u16,
     body: &str,
-    message: String,
+    attempts: u32,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    match names_unknown_model(status, body) {
-        true => Box::new(ModelNotServed::new(message)),
-        false => message.into(),
+    let error = ProviderError::from_http(provider, status, body).with_attempts(attempts);
+    match !error.tools_unsupported() && names_unknown_model(status, body) {
+        true => Box::new(ModelNotServed::new(error.to_string())),
+        false => Box::new(error),
     }
 }
 

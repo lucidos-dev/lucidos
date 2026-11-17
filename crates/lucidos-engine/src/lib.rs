@@ -7,6 +7,8 @@
 //! - LLM integration with tool calling
 //! - Python runtime execution
 
+#![deny(clippy::print_stdout, clippy::print_stderr)]
+
 /// The Providers page as copy names it: the one definition for engine strings.
 /// A macro, not a `const`, so `concat!` can take it in `const` strings and
 /// `match` arms. The frontend's twin is `PROVIDERS_SETTINGS_PATH`.
@@ -16,25 +18,71 @@ macro_rules! providers_settings {
     };
 }
 
-/// Timestamped log with auto-derived module label.
-/// - `log!("message")` → auto module from `module_path!()`
-/// - `log!(@Push, "message")` → explicit label override
+/// Typed logging preserves host output and stores classified diagnostic values.
 #[macro_export]
 macro_rules! log {
     (@$label:ident, $($arg:tt)*) => {
-        println!("{} [pid:{}] [{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            std::process::id(),
-            stringify!($label),
-            format_args!($($arg)*))
+        $crate::typed_log_line(stringify!($label), ::lucidos_diagnostic_log::line!($($arg)*))
     };
     ($($arg:tt)*) => {
-        println!("{} [pid:{}] [{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            std::process::id(),
-            $crate::module_label(module_path!()),
-            format_args!($($arg)*))
+        $crate::typed_log_line($crate::module_label(module_path!()), ::lucidos_diagnostic_log::line!($($arg)*))
     };
+}
+
+pub fn typed_log_line(label: &'static str, line: lucidos_diagnostic_log::Line) {
+    log_output::host(
+        label,
+        &line.render(lucidos_diagnostic_log::Destination::Owner),
+    );
+    lucidos_diagnostic_log::record(label, line);
+}
+
+// All host printing is confined to this logging module.
+#[allow(clippy::print_stdout)]
+mod log_output {
+    pub fn host(label: &str, msg: &str) {
+        println!(
+            "{} [pid:{}] [{label}] {msg}",
+            super::log_stamp(),
+            std::process::id()
+        );
+    }
+}
+
+/// Legacy log with auto-derived module label, printed to stdout and
+/// handed to the diagnostic log.
+/// - `log_legacy!("message")` → auto module from `module_path!()`
+/// - `log_legacy!(@Push, "message")` → explicit label override
+#[macro_export]
+macro_rules! log_legacy {
+    (@$label:ident, $($arg:tt)*) => {
+        $crate::log_line(stringify!($label), format!($($arg)*))
+    };
+    ($($arg:tt)*) => {
+        $crate::log_line($crate::module_label(module_path!()), format!($($arg)*))
+    };
+}
+
+/// The body of [`log_legacy!`]: one stdout line, then the same message to the
+/// diagnostic log, which never blocks.
+pub fn log_line(label: &'static str, msg: String) {
+    log_output::host(label, &msg);
+    diagnostic_log::record(label, msg);
+}
+
+/// The current local time, formatted to start a log line.
+pub fn log_stamp() -> impl std::fmt::Display {
+    chrono::Local::now().format(lucidos_gateway_constants::LOG_STAMP_FORMAT)
+}
+
+#[cfg(test)]
+mod log_stamp_tests {
+    #[test]
+    fn a_log_stamp_is_rfc_3339_with_a_date_and_an_offset() {
+        let stamp = super::log_stamp().to_string();
+        let parsed = chrono::DateTime::parse_from_rfc3339(&stamp).expect(&stamp);
+        assert_eq!(parsed.to_rfc3339(), stamp);
+    }
 }
 
 pub fn module_label(path: &str) -> &str {
@@ -77,9 +125,15 @@ pub mod boot_report;
 pub mod capability_manifest;
 pub mod codegen;
 pub mod core;
+pub mod diagnostic_bundles;
+pub mod diagnostic_log;
 pub mod engine;
+pub mod engine_runtime;
 pub mod gateway_auth;
-pub mod gateway_operators;
+pub mod gateway_users;
+#[cfg(test)]
+mod guard_tests;
+pub mod internal_faults;
 pub mod landing_gateway;
 pub mod llm;
 pub mod mcp;
@@ -259,7 +313,7 @@ pub(crate) mod test_util {
         match outcome {
             SharedEmbedder::Ready(provider) => Some(provider),
             SharedEmbedder::FetchUnavailable(msg) => {
-                eprintln!(
+                crate::log_legacy!(
                     "[real-embedder-tests] SKIP: MultilingualE5Small model unavailable \
                      (huggingface.co fetch failed): {msg}"
                 );

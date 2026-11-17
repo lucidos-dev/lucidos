@@ -204,7 +204,7 @@ impl WakeDuty {
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[TurnEnd] Parent of {} unreadable: {}", thread_id, e);
+            crate::log_legacy!("[TurnEnd] Parent of {} unreadable: {}", thread_id, e);
             None
         });
         match row {
@@ -278,7 +278,7 @@ impl OwedReport {
             .fetch_optional(pool)
             .await
             .unwrap_or_else(|e| {
-                crate::log!("[TurnEnd] Owed report of {} unreadable: {}", thread_id, e);
+                crate::log_legacy!("[TurnEnd] Owed report of {} unreadable: {}", thread_id, e);
                 None
             })
             .map(
@@ -340,7 +340,7 @@ impl ParentView {
             .fetch_optional(pool)
             .await
             .unwrap_or_else(|e| {
-                crate::log!("[TurnEnd] Parent {} unreadable: {}", parent_id, e);
+                crate::log_legacy!("[TurnEnd] Parent {} unreadable: {}", parent_id, e);
                 None
             });
         row.map(|(latest_reply, siblings_running)| Self {
@@ -487,7 +487,7 @@ pub(crate) async fn decide_with(
     {
         Ok(judgment) => read_wake_answer(&judgment.answers),
         Err(e) => {
-            crate::log!("[TurnEnd] Wake decision failed, so the parent wakes: {}", e);
+            crate::log_legacy!("[TurnEnd] Wake decision failed, so the parent wakes: {}", e);
             WakeDecision::Requested
         }
     }
@@ -540,7 +540,7 @@ impl crate::engine::LucidosEngine {
         match record_wake_decision(&self.event_bus, thread_id, decision, None).await {
             Ok(()) => Some(decision),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[TurnEnd] Recording the wake decision for thread {} failed, so it wakes: {}",
                     thread_id,
                     e
@@ -564,10 +564,10 @@ impl crate::engine::LucidosEngine {
                 wake_decision_chat_judge(call.provider(), call.reasoning().map(str::to_string))
             });
         let system_one = self
-            .turn_end_system_one(JudgmentSite::WakeDecision, call.attempt_timeout())
+            .judgment_system_one(JudgmentSite::WakeDecision, call.attempt_timeout())
             .await;
         let Some(provider) = wake_judge(system_one, chat) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[TurnEnd] No measured wake-decision model is reachable for thread {}, so the \
                  parent wakes",
                 thread_id

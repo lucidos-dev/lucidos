@@ -1,7 +1,8 @@
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+import { PREF_CHAT_MODEL } from '@lucidos/preference-catalog';
+
 
 /** Default chat model when no preference is set. */
-export const DEFAULT_CHAT_MODEL: string = PREFERENCE_CATALOG.chat_model.fallback;
+export const DEFAULT_CHAT_MODEL: string = PREF_CHAT_MODEL.fallback;
 
 /** Fallback chat model options shown before the DB-backed registry (`/models`)
  *  loads, and used by tests + label lookups. The live picker reads the loaded

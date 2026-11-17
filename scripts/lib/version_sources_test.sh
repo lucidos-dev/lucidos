@@ -21,6 +21,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_present "$SCRIPT_DIR/../.." scripts/release.sh
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_DIR" || exit 1
 
@@ -106,8 +109,8 @@ echo "test: no unmanaged release-version literal anywhere else in the tree"
 # not exist. The first cut of this suite used them and the scan tests PRINTED
 # THEIR HEADING AND SILENTLY DID NOTHING, which is precisely the fail-open
 # behaviour a guard must never have. A temp file + `wc -l` works everywhere.
-HITS_FILE="$(mktemp -t version-sources-hits)"
-STALE_FILE="$(mktemp -t version-sources-stale)"
+HITS_FILE="$(mktemp "${TMPDIR:-/tmp}/version-sources-hits.XXXXXX")"
+STALE_FILE="$(mktemp "${TMPDIR:-/tmp}/version-sources-stale.XXXXXX")"
 trap 'rm -f "$HITS_FILE" "$HITS_FILE".all "$HITS_FILE".raw "$STALE_FILE"' EXIT
 
 # `git grep` exits 1 on "no matches" — the CLEAN case — so its status is

@@ -21,24 +21,29 @@ mod keep_alive_status;
 mod mcp;
 mod memory;
 mod meta;
+mod plan;
+mod provider_error;
 mod question;
 mod session;
 mod todo;
 mod triage;
+mod turn_end_facts;
 
 pub use actor::{
     ActorMode, AgentParticipant, EngineReason, EventWaitOutcome, MessageOrigin, PluginSetupCause,
-    PluginSetupOccasion, ThreadDirection, CACHE_KEEP_ALIVE_REASON_KIND,
+    PluginSetupOccasion, SpawnVerdict, ThreadDirection, CACHE_KEEP_ALIVE_REASON_KIND,
+    EVENT_WAIT_REASON_KIND,
 };
 pub use agent_exit::{CodingAgentExit, CodingAgentExitStage};
 pub use apply_now::ApplyNowOutcome;
 pub use capture::CaptureFormat;
 pub use cause::{
-    AbortCause, AgentPauseCause, CancelCause, EventWaitCancelCause, UnproposedReason, UnqueueReason,
+    AbortCause, AgentPauseCause, AutomationUnpauseCause, CancelCause, EventWaitCancelCause,
+    UnproposedReason, UnqueueReason,
 };
 pub use channel::{EventChannel, FireRetry, RetryOf, RetrySkipReason, TriggerInvocation};
 pub use dashboard::{ArrangedTile, Dashboard, LegacyArrangedTile};
-pub use event::{RecoveredCompose, ThreadEvent};
+pub use event::{AgentDraft, RecoveredCompose, ThreadEvent};
 pub use event_impl::{
     not_an_engine_turn_idle_sql, CEILING_REENTRY_IDLE_REASON, KEEP_ALIVE_ENDING_EVENT_TYPES,
     KEEP_ALIVE_IDLE_REASON,
@@ -51,8 +56,12 @@ pub use keep_alive_status::{
 pub use mcp::McpEnablementSource;
 pub use memory::RecalledMemory;
 pub use meta::EventMeta;
+pub use plan::{ChangeContent, PlanKind, PlanScope};
+pub use provider_error::{ProviderError, ProviderErrorCode};
 pub(crate) use question::with_image_note;
-pub use question::{AnswerKind, OwnerApproval, QuestionOption, WidgetEmbed};
+pub use question::{
+    AnswerKind, OwnerApproval, QuestionOption, UnattestedAct, UnattestedRequest, WidgetEmbed,
+};
 pub use session::{
     ChildCompletionStatus, FreshSessionReason, HandoffCause, HandoffConsent, HandoffOpening,
     IntegratedBranch, SessionContinuity, SessionEndReason, SessionStart, SubThreadPendingChange,
@@ -60,6 +69,7 @@ pub use session::{
 };
 pub use todo::{TodoItem, TodoStatus};
 pub use triage::TriageProposalEntry;
+pub use turn_end_facts::{TurnEndFacts, TurnEndStatus};
 
 pub(crate) use emit::{
     emit_continuation_requested_or_log, emit_response_aborted, emit_response_canceled,

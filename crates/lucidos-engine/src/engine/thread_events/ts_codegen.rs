@@ -34,13 +34,29 @@ use crate::codegen::REGENERATE;
 /// A payload field naming a new supporting type therefore fails the generator,
 /// with that type's name in the message.
 const TYPE_SOURCES: &[(&str, &str)] = &[
+    ("ChangeContent", "engine/thread_events/plan.rs"),
+    ("PlanScope", "engine/thread_events/plan.rs"),
+    ("PlanKind", "engine/thread_events/plan.rs"),
+    ("BillingAttribution", "runtime/billing_provider.rs"),
+    ("BillingProvider", "runtime/billing_provider.rs"),
+    ("BillingMode", "runtime/billing_provider.rs"),
+    ("BillingEvidenceSource", "runtime/billing_provider.rs"),
+    ("UnresolvedBillingReason", "runtime/billing_provider.rs"),
+    ("ComposeReport", "core/store/threads/compose.rs"),
+    ("ComposeRestoration", "core/store/threads/compose.rs"),
+    ("SpendCapNotice", "llm/spend_cap.rs"),
     ("RecoveredCompose", "engine/thread_events/event.rs"),
+    ("AgentDraft", "engine/thread_events/event.rs"),
     ("ActorMode", "engine/thread_events/actor.rs"),
     ("AgentParticipant", "engine/thread_events/actor.rs"),
     ("CodingAgentExit", "engine/thread_events/agent_exit.rs"),
     ("CodingAgentExitStage", "engine/thread_events/agent_exit.rs"),
+    ("ProviderError", "engine/thread_events/provider_error.rs"),
+    ("TurnEndFacts", "engine/thread_events/turn_end_facts.rs"),
+    ("TurnEndStatus", "engine/thread_events/turn_end_facts.rs"),
     ("EngineReason", "engine/thread_events/actor.rs"),
     ("MessageOrigin", "engine/thread_events/actor.rs"),
+    ("SpawnVerdict", "engine/thread_events/actor.rs"),
     ("PluginSetupOccasion", "engine/thread_events/actor.rs"),
     ("PluginSetupCause", "engine/thread_events/actor.rs"),
     ("EventWaitOutcome", "engine/thread_events/actor.rs"),
@@ -64,6 +80,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("AgentPauseCause", "engine/thread_events/cause.rs"),
     ("CancelCause", "engine/thread_events/cause.rs"),
     ("EventWaitCancelCause", "engine/thread_events/cause.rs"),
+    ("AutomationUnpauseCause", "engine/thread_events/cause.rs"),
     ("UnproposedReason", "engine/thread_events/cause.rs"),
     ("UnqueueReason", "engine/thread_events/cause.rs"),
     ("FormRequestOutcome", "engine/thread_events/form_request.rs"),
@@ -82,7 +99,27 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("QuestionOption", "engine/thread_events/question.rs"),
     ("WidgetEmbed", "engine/thread_events/question.rs"),
     ("OwnerApproval", "engine/thread_events/question.rs"),
-    ("ThreadReachVerb", "api/thread_reach.rs"),
+    ("UnattestedAct", "engine/thread_events/question.rs"),
+    ("UnattestedRequest", "engine/thread_events/question.rs"),
+    ("Action", "engine/permission/action.rs"),
+    ("Lifetime", "engine/permission/mod.rs"),
+    ("Holder", "engine/permission/mod.rs"),
+    ("PermissionChoice", "engine/permission/mod.rs"),
+    ("GrantBreadth", "engine/permission/mod.rs"),
+    ("PreparedCard", "engine/permission/mod.rs"),
+    ("PreparedOption", "engine/permission/mod.rs"),
+    ("PermissionRequest", "engine/permission/mod.rs"),
+    ("GrantLines", "engine/permission/tool_grants.rs"),
+    ("GrantFile", "core/grants/mod.rs"),
+    ("PickedBy", "engine/permission/mod.rs"),
+    ("Batch", "engine/permission/batch.rs"),
+    ("BatchItem", "engine/permission/batch.rs"),
+    ("BatchItemOutcome", "engine/permission/batch.rs"),
+    ("ClassifiedOrigin", "engine/permission/batch.rs"),
+    ("LegacyLane", "engine/permission/legacy.rs"),
+    ("LegacyPick", "engine/permission/legacy.rs"),
+    ("PlanBinding", "engine/git_ops/plan_approval.rs"),
+    ("SideEffectCategory", "engine/command_guard.rs"),
     ("TodoItem", "engine/thread_events/todo.rs"),
     ("TodoStatus", "engine/thread_events/todo.rs"),
     ("TriageProposalEntry", "engine/thread_events/triage.rs"),
@@ -103,6 +140,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ("CeilingSource", "engine/context_ceiling.rs"),
     ("CeilingCrossing", "engine/context_ceiling.rs"),
     ("AutoCompactArm", "engine/auto_compact_trial.rs"),
+    ("SandboxMode", "runtime/agent_sandbox.rs"),
     ("CheckpointProgress", "engine/handoff_estimate.rs"),
     ("IntelligenceRung", "runtime/intelligence_ladder.rs"),
     ("ApiUsage", "llm/api_usage.rs"),
@@ -120,6 +158,7 @@ const TYPE_SOURCES: &[(&str, &str)] = &[
     ),
     ("AllowScope", "engine/claude_code/mod.rs"),
     ("GrantOffer", "engine/claude_code/mod.rs"),
+    ("OfferWithheld", "engine/claude_code/mod.rs"),
     ("EventSubscription", "core/event_subscription/mod.rs"),
     ("CodingAgent", "runtime/agent_runtime.rs"),
 ];
@@ -316,6 +355,8 @@ const FIELD_TYPE_OVERRIDES: &[(&str, &str, &str)] = &[
     // before the Phase 4 reasons still carries a retired string, which no
     // serde alias rewrites on the way out.
     ("SessionEnded", "reason", "SessionEndReason | string"),
+    // An unknown reset is serialized as null, rather than omitted.
+    ("SpendCapNotice", "resets_at", "string | null"),
 ];
 
 /// Longest doc paragraph carried into the generated file.
@@ -373,6 +414,11 @@ enum TypeDef {
         variants: Vec<Variant>,
         doc: Doc,
     },
+    /// An externally tagged enum: unit strings or objects keyed by variant.
+    ExternalUnion {
+        variants: Vec<(Variant, bool)>,
+        doc: Doc,
+    },
     /// A struct. Becomes an interface.
     Interface { fields: Vec<Field>, doc: Doc },
 }
@@ -396,6 +442,8 @@ struct SerdeAttrs {
     rename: Option<String>,
     rename_all: Option<String>,
     tag: Option<String>,
+    content: Option<String>,
+    untagged: bool,
     has_default: bool,
     skip_serializing_if: bool,
     skip: bool,
@@ -427,6 +475,8 @@ fn serde_attrs(attrs: &[syn::Attribute]) -> SerdeAttrs {
                 "rename" => out.rename = value(),
                 "rename_all" => out.rename_all = value(),
                 "tag" => out.tag = value(),
+                "content" => out.content = value(),
+                "untagged" => out.untagged = true,
                 "default" => {
                     out.has_default = true;
                     value();
@@ -533,7 +583,7 @@ fn ts_type(ty: &syn::Type) -> Result<String, String> {
             .ok_or_else(|| format!("`{name}` needs a type argument at position {i}"))
     };
     match name.as_str() {
-        "Option" => ts_type(arg(0)?),
+        "Option" | "Box" => ts_type(arg(0)?),
         "Vec" => Ok(format!("{}[]", ts_type(arg(0)?)?)),
         "HashMap" | "BTreeMap" => Ok(format!("Record<string, {}>", ts_type(arg(1)?)?)),
         "String" | "str" => Ok("string".into()),
@@ -542,7 +592,7 @@ fn ts_type(ty: &syn::Type) -> Result<String, String> {
         | "f64" => Ok("number".into()),
         // Each serializes to a string, so the frontend reads them as one.
         "Uuid" | "DateTime" | "ContextCeiling" => Ok("string".into()),
-        "Value" => Ok("unknown".into()),
+        "Value" | "JsonValue" => Ok("unknown".into()),
         other if is_registered(other) => Ok(other.to_string()),
         other => Err(format!(
             "`{other}` reaches the wire but is not in TYPE_SOURCES. Register it with the \
@@ -619,6 +669,18 @@ fn parse_fields(
 
 fn parse_enum(item: &syn::ItemEnum) -> Result<TypeDef, String> {
     let container = serde_attrs(&item.attrs);
+    if container.untagged
+        || container.content.is_some()
+        || item.variants.iter().any(|v| {
+            let attrs = serde_attrs(&v.attrs);
+            !attrs.skip && attrs.untagged
+        })
+    {
+        return Err(format!(
+            "`{}` uses an unsupported enum representation",
+            item.ident
+        ));
+    }
     let rename_all = container.rename_all.as_deref();
     let doc = doc_of(&item.attrs);
     let name = item.ident.to_string();
@@ -630,6 +692,9 @@ fn parse_enum(item: &syn::ItemEnum) -> Result<TypeDef, String> {
         let mut values = Vec::new();
         for v in &item.variants {
             let attrs = serde_attrs(&v.attrs);
+            if attrs.skip {
+                continue;
+            }
             values.push(match &attrs.rename {
                 Some(r) => r.clone(),
                 None => apply_rename_all(&v.ident.to_string(), rename_all)?,
@@ -637,23 +702,35 @@ fn parse_enum(item: &syn::ItemEnum) -> Result<TypeDef, String> {
         }
         return Ok(TypeDef::StringUnion { values, doc });
     }
-    let tag = container.tag.ok_or_else(|| {
-        format!("`{name}` carries data but is not internally tagged; the frontend cannot narrow it")
-    })?;
     let mut variants = Vec::new();
+    let mut external = Vec::new();
     for v in &item.variants {
         let attrs = serde_attrs(&v.attrs);
+        if attrs.skip {
+            continue;
+        }
         let wire = match &attrs.rename {
             Some(r) => r.clone(),
             None => apply_rename_all(&v.ident.to_string(), rename_all)?,
         };
-        variants.push(Variant {
+        let variant = Variant {
             fields: parse_fields(&format!("{name}::{wire}"), &v.fields, rename_all)?,
             name: wire,
             doc: doc_of(&v.attrs),
-        });
+        };
+        if container.tag.is_some() {
+            variants.push(variant);
+        } else {
+            external.push((variant, matches!(v.fields, syn::Fields::Unit)));
+        }
     }
-    Ok(TypeDef::TaggedUnion { tag, variants, doc })
+    Ok(match container.tag {
+        Some(tag) => TypeDef::TaggedUnion { tag, variants, doc },
+        None => TypeDef::ExternalUnion {
+            variants: external,
+            doc,
+        },
+    })
 }
 
 pub(crate) fn enum_variant_names(repo_root: &Path, name: &str) -> BTreeSet<String> {
@@ -858,6 +935,23 @@ fn emit_supporting(out: &mut String, name: &str, def: &TypeDef) {
                     emit_field(out, f, "      ");
                 }
                 out.push_str("    }\n");
+            }
+            close_union(out);
+        }
+        TypeDef::ExternalUnion { variants, doc } => {
+            emit_doc(out, doc, "");
+            out.push_str(&format!("export type {name} =\n"));
+            for (v, unit) in variants {
+                emit_doc(out, &v.doc, "  ");
+                if *unit {
+                    out.push_str(&format!("  | '{}'\n", v.name));
+                } else {
+                    out.push_str(&format!("  | {{\n      '{}': {{\n", v.name));
+                    for f in &v.fields {
+                        emit_field(out, f, "        ");
+                    }
+                    out.push_str("      };\n    }\n");
+                }
             }
             close_union(out);
         }

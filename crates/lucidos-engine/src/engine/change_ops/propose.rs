@@ -57,7 +57,7 @@ async fn withhold_work(
         Ok(Some(open)) => OpenChangeAfterHold::StillCarries(open.id),
         Ok(None) => OpenChangeAfterHold::None,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Changes] get_open_by_branch({}): {}; leaving any open change in place",
                 input.branch_name,
                 e
@@ -139,7 +139,7 @@ pub(crate) async fn branch_moved_since_last_idle(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!("[Changes] last idle head for {}: {}", thread_id, e);
+        log_legacy!("[Changes] last idle head for {}: {}", thread_id, e);
         None
     })
     .flatten();
@@ -212,7 +212,7 @@ pub(crate) async fn withhold_unready(
     else {
         return Ok(HoldOutcome::Clear);
     };
-    log!(
+    log_legacy!(
         "[Changes] Not proposing branch {} for thread {}: the proposal hold keeps it ({:?})",
         input.branch_name,
         input.thread_id,
@@ -467,6 +467,7 @@ impl LucidosEngine {
                     crate::engine::event_bus::BusEvent::Thread {
                         thread_id,
                         event: crate::engine::thread_events::ThreadEvent::ChangeProposed {
+                            content: crate::engine::thread_events::ChangeContent::from_files(files),
                             change_id: change_id.to_string(),
                             description: Some(description.to_string()),
                             files: files.to_vec(),
@@ -503,7 +504,7 @@ impl LucidosEngine {
         match self.changes().get_open_by_branch(branch_name).await {
             Ok(row) => row.is_some(),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] get_open_by_branch({}): {}; treating it as having no open change",
                     branch_name,
                     e
@@ -540,7 +541,7 @@ impl LucidosEngine {
         let existing = match self.changes().get_pending_by_branch(branch_name).await {
             Ok(row) => row,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] reconcile: get_pending_by_branch({}): {} — leaving the row alone",
                     branch_name,
                     e
@@ -551,7 +552,7 @@ impl LucidosEngine {
         let diff =
             crate::engine::git_ops::branch_changed_files_checked(repo_root, branch_name).await;
         if let (Some(row), Err(e)) = (existing.as_ref(), diff.as_ref()) {
-            log!(
+            log_legacy!(
                 "[Changes] reconcile: {} — leaving change {} at {} file(s)",
                 e,
                 row.id,
@@ -581,7 +582,7 @@ impl LucidosEngine {
             crate::engine::git_ops::describe_branch_changes(repo_root, &log_range, &fallback, None)
                 .await;
 
-        log!(
+        log_legacy!(
             "[Changes] Branch {} has no diff left — change {} reconciled to 0 files (was {})",
             branch_name,
             existing.id,
@@ -605,7 +606,7 @@ impl LucidosEngine {
             })
             .await
         {
-            log!(
+            log_legacy!(
                 "[Changes] Failed to reconcile emptied change {}: {}",
                 existing.id,
                 e
@@ -646,14 +647,16 @@ impl LucidosEngine {
         thread_id: Uuid,
         actor: Option<MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if let Some(session) = CodingAgentChangeOps::live_session_info(self, thread_id).await {
-            return self
-                .nudge_held_proposal_in_session(
-                    thread_id,
-                    ProposalHold::HardeningMissing,
-                    &session.msg_tx,
-                )
-                .await;
+        if !crate::engine::thread_stop::thread_is_stopped(self.pool(), thread_id).await {
+            if let Some(session) = CodingAgentChangeOps::live_session_info(self, thread_id).await {
+                return self
+                    .nudge_held_proposal_in_session(
+                        thread_id,
+                        ProposalHold::HardeningMissing,
+                        &session.msg_tx,
+                    )
+                    .await;
+            }
         }
         let requested = crate::engine::thread_events::emit_continuation_requested_or_log(
             &self.event_bus,
@@ -712,7 +715,7 @@ impl LucidosEngine {
             })
             .await
             .unwrap_or_else(|e| {
-                log!(
+                log_legacy!(
                     "[Changes] PromptInjected (held proposal) emit failed: {}",
                     e
                 );

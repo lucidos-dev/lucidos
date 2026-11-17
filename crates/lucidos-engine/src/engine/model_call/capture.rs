@@ -58,6 +58,8 @@ pub(crate) struct CallDetail {
     pub(crate) served_model: Option<String>,
     /// The backend the router sent the call to.
     pub(crate) provider: Option<String>,
+    /// The reporting CLI process owns telemetry for this call.
+    pub(crate) telemetry_owned_by_cli: bool,
     /// Time to the first content delta, from the start `duration_ms` counts from.
     pub(crate) ttft_ms: Option<u64>,
     /// The provider's id for the response that answered.
@@ -75,8 +77,9 @@ impl CallDetail {
             provider: cost
                 .reported
                 .provider()
-                .or(cost.provider)
-                .map(|kind| kind.as_str().to_string()),
+                .or(cost.provider.map(|kind| kind.as_str()))
+                .map(str::to_string),
+            telemetry_owned_by_cli: false,
             ttft_ms: cost.ttft_ms,
             request_id: cost.request_id.map(str::to_string),
             stable_prefix_fingerprint: match cost.reported {
@@ -128,6 +131,7 @@ pub(crate) fn auxiliary_capture_detailed(
         stable_prefix_fingerprint,
         ttft_ms: detail.ttft_ms,
         request_id: detail.request_id,
+        telemetry_owned_by_cli: detail.telemetry_owned_by_cli,
         session: None,
     }
 }
@@ -291,7 +295,7 @@ impl AuxCapture {
                     match crate::engine::home_thread::ensure_home_thread(&bus, bus.pool()).await {
                         Ok(id) => id,
                         Err(e) => {
-                            crate::log!("[AuxCapture] No home thread to record on: {}", e);
+                            crate::log_legacy!("[AuxCapture] No home thread to record on: {}", e);
                             return;
                         }
                     }
@@ -309,7 +313,7 @@ impl AuxCapture {
             .await;
         });
         if let Err(e) = task.await {
-            crate::log!("[AuxCapture] The capture task failed: {}", e);
+            crate::log_legacy!("[AuxCapture] The capture task failed: {}", e);
         }
     }
 
@@ -347,6 +351,19 @@ impl AuxCapture {
 
 #[async_trait::async_trait]
 impl CostSink for AuxCapture {
+    fn spend_cap_policy(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::llm::spend_cap::SpendCapPolicy>,
+        bool,
+    )> {
+        match &self.sink {
+            Sink::Bus(bus) => Some((std::sync::Arc::new(bus.clone()), false)),
+            #[cfg(test)]
+            Sink::Discard => None,
+        }
+    }
+
     /// One row per call, before its caller reads the answer.
     async fn record(&self, cost: CallCost<'_>) {
         let detail = CallDetail::of(&cost);
@@ -357,7 +374,7 @@ impl CostSink for AuxCapture {
                 input_tokens,
                 output_tokens,
             } => usage_from_image(input_tokens, output_tokens),
-            Reported::Usage(usage) => usage,
+            Reported::Search(result) => result.usage,
         };
         self.emit(auxiliary_capture_detailed(
             self.purpose,

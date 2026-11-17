@@ -1,3 +1,5 @@
+import { releaseCheck } from '../store/store';
+import { withUpdateChannel } from './updateChannel';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { formatBuildId } from './buildId';
 
@@ -25,6 +27,6 @@ import { formatBuildId } from './buildId';
  *  (`utils/lucidosVersion.ts`), which reads the same on every platform. */
 export function clientVersionLabel(): string {
   const packaged = typeof window !== 'undefined' ? window.__LUCIDOS_APP_VERSION__ : undefined;
-  if (packaged) return packaged;
-  return formatBuildId(CLIENT_BUILD_ID);
+  if (packaged) return withUpdateChannel(packaged, releaseCheck.value?.channel);
+  return withUpdateChannel(formatBuildId(CLIENT_BUILD_ID), releaseCheck.value?.channel);
 }

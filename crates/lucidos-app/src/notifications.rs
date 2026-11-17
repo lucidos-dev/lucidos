@@ -432,10 +432,10 @@ mod imp {
     /// No-op in dev (see [`setup`]). Those two fields compose the request
     /// identifier ([`super::notification_identifier`]), which keys the
     /// pending-link map and scopes replace-by-id (the web-push `tag` equivalent)
-    /// to the raising workspace.
-    pub fn show(title: &str, body: &str, link: serde_json::Value) {
+    /// to the raising workspace. Returns true only after OS acceptance.
+    pub fn show(title: &str, body: &str, link: serde_json::Value) -> Result<bool, String> {
         if tauri::is_dev() {
-            return;
+            return Ok(false);
         }
         let identifier = super::link_identifier(&link);
 
@@ -456,8 +456,21 @@ mod imp {
             &content,
             None,
         );
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let completion = RcBlock::new(move |error: *mut NSError| {
+            let result = if error.is_null() {
+                Ok(true)
+            } else {
+                // UN owns the error for the duration of this callback.
+                Err(unsafe { (&*error).localizedDescription().to_string() })
+            };
+            let _ = sender.send(result);
+        });
         UNUserNotificationCenter::currentNotificationCenter()
-            .addNotificationRequest_withCompletionHandler(&request, None);
+            .addNotificationRequest_withCompletionHandler(&request, Some(&completion));
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .map_err(|error| format!("Native notification acceptance timed out: {error}"))?
     }
 
     /// Remove already-delivered native banner(s) — the cross-device dismiss
@@ -642,13 +655,14 @@ pub use imp::{
 };
 
 /// Non-macOS desktop has no native notification path (the engine still
-/// web-pushes browser / PWA clients); these are no-ops so call sites stay
-/// platform-agnostic.
+/// web-pushes browser / PWA clients); setup remains a no-op.
 #[cfg(not(target_os = "macos"))]
 pub fn setup(_app: &tauri::AppHandle) {}
 
 #[cfg(not(target_os = "macos"))]
-pub fn show(_title: &str, _body: &str, _link: serde_json::Value) {}
+pub fn show(_title: &str, _body: &str, _link: serde_json::Value) -> Result<bool, String> {
+    Err("Native notifications are unavailable on this platform".into())
+}
 
 /// No native banner removal off macOS (no native notification path here); a
 /// no-op so the Tauri command stays platform-agnostic.

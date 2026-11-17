@@ -10,9 +10,10 @@
 
 use super::*;
 
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::event_bus::SystemEvent;
+use crate::engine::trigger_group_writes::emit_and_apply_group_event;
 use crate::engine::trigger_group_writes::{CreateTriggerGroupError, RenameTriggerGroupError};
-use crate::triggers::TriggerGroup;
+use crate::triggers::{TriggerGroup, TriggerGroupProjection};
 
 #[derive(Serialize)]
 pub struct TriggerGroupInfo {
@@ -84,29 +85,22 @@ struct DeleteBlockedResponse {
 /// Both reorder endpoints run this, so the emit and the apply cannot drift.
 async fn emit_and_apply_reorder(
     bus: &crate::engine::event_bus::EventBus,
-    groups: &std::sync::Arc<std::sync::RwLock<std::collections::HashMap<String, TriggerGroup>>>,
+    groups: &std::sync::Arc<std::sync::RwLock<TriggerGroupProjection>>,
     group_id: &str,
     order: i32,
     actor: Option<crate::engine::thread_events::MessageOrigin>,
 ) -> Result<(), String> {
     let payload = serde_json::json!({ "group_id": group_id, "order": order });
-    if let Err(e) = bus
-        .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
-            group_id: group_id.to_string(),
-            payload: payload.clone(),
-            actor,
-        }))
-        .await
-    {
-        return Err(e.to_string());
-    }
-    crate::scheduler::handle_trigger_group_event(
-        "TriggerGroupReordered",
-        group_id,
-        &payload,
+    emit_and_apply_group_event(
         groups,
-    );
-    Ok(())
+        bus,
+        SystemEvent::TriggerGroupReordered {
+            group_id: group_id.to_string(),
+            payload,
+            actor,
+        },
+    )
+    .await
 }
 
 fn to_info(group: &TriggerGroup, member_count: usize) -> TriggerGroupInfo {
@@ -190,7 +184,7 @@ pub(super) async fn create_trigger_group(
             })),
         ),
         Err(CreateTriggerGroupError::EmitFailed(msg)) => {
-            log!(
+            log_legacy!(
                 "[TriggerGroups] Failed to emit TriggerGroupCreated: {}",
                 msg
             );
@@ -245,7 +239,7 @@ pub(super) async fn update_trigger_group(
                 );
             }
             Err(RenameTriggerGroupError::EmitFailed(msg)) => {
-                log!(
+                log_legacy!(
                     "[TriggerGroups] Failed to emit TriggerGroupRenamed: {}",
                     msg
                 );
@@ -281,7 +275,7 @@ pub(super) async fn update_trigger_group(
         )
         .await
         {
-            log!(
+            log_legacy!(
                 "[TriggerGroups] Failed to emit TriggerGroupReordered: {}",
                 e
             );
@@ -346,17 +340,18 @@ pub(super) async fn delete_trigger_group(
 
     let payload = serde_json::json!({ "group_id": group_id });
     let actor = super::actor::user_actor(&headers, None);
-    if let Err(e) = state
-        .engine
-        .event_bus
-        .emit(BusEvent::System(SystemEvent::TriggerGroupDeleted {
+    if let Err(e) = emit_and_apply_group_event(
+        &state.engine.trigger_groups,
+        &state.engine.event_bus,
+        SystemEvent::TriggerGroupDeleted {
             group_id: group_id.clone(),
             payload,
             actor,
-        }))
-        .await
+        },
+    )
+    .await
     {
-        log!("[TriggerGroups] Failed to emit TriggerGroupDeleted: {}", e);
+        log_legacy!("[TriggerGroups] Failed to emit TriggerGroupDeleted: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to emit delete: {}", e) })),
@@ -412,7 +407,7 @@ pub(super) async fn reorder_trigger_groups(
         )
         .await
         {
-            log!(
+            log_legacy!(
                 "[TriggerGroups] Failed to emit TriggerGroupReordered for {}: {}",
                 group_id,
                 e
@@ -449,17 +444,17 @@ mod tests {
     use super::*;
     use crate::engine::event_bus::EventBus;
     use crate::test_support::{setup_test_db, teardown_test_db};
-    use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
 
-    fn registry(order: i32) -> Arc<RwLock<HashMap<String, TriggerGroup>>> {
-        let group = TriggerGroup {
-            id: "group-1".to_string(),
-            name: "Morning".to_string(),
-            order,
+    fn registry(order: i32) -> Arc<RwLock<TriggerGroupProjection>> {
+        let mut projection = TriggerGroupProjection::default();
+        projection.apply(&crate::triggers::TriggerGroupEventRow {
+            seq: 0,
+            event_type: "TriggerGroupCreated".into(),
+            payload: serde_json::json!({"group_id":"group-1","name":"Morning","order":order}),
             created: chrono::Utc::now(),
-        };
-        Arc::new(RwLock::new(HashMap::from([(group.id.clone(), group)])))
+        });
+        Arc::new(RwLock::new(projection))
     }
 
     /// Read-your-writes. The single-group `PUT` used to emit and stop there. A

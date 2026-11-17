@@ -1,7 +1,7 @@
 /**
  * The follow toggle's glyph paints 0.667 of its viewBox on both axes.
  *
- * It floats in a circle under the down chevron. The composer row's 0.750 read
+ * It floats in a circle beside the down chevron. The composer row's 0.750 read
  * too heavy beside that chevron, so the user picked 0.667 from rendered sizes.
  *
  * **0.667 is the GEOMETRIC extent, stroke excluded.** A check that includes

@@ -64,11 +64,11 @@ fn resolve_served_dir_inner(static_dir: PathBuf, workspace_path: &Path, packaged
     match std::fs::remove_dir_all(&parent) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => crate::log!("[Frontend] failed to clear {}: {e}", parent.display()),
+        Err(e) => crate::log_legacy!("[Frontend] failed to clear {}: {e}", parent.display()),
     }
     match pin_generation_inner(&static_dir, workspace_path, 0) {
         Ok(snapshot) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Frontend] Serving pinned dist snapshot at {}",
                 snapshot.display()
             );
@@ -77,7 +77,7 @@ fn resolve_served_dir_inner(static_dir: PathBuf, workspace_path: &Path, packaged
         Err(e) => {
             // Fail-safe: degrade to serving the live dir (today's behavior),
             // never a 404. The invariant is best-effort in this rare case.
-            crate::log!(
+            crate::log_legacy!(
                 "[Frontend] dist snapshot failed ({e}); serving live dir {}",
                 static_dir.display()
             );
@@ -116,7 +116,7 @@ fn pin_generation_inner(
 pub(crate) fn remove_snapshot_dir(dir: &Path) {
     if let Err(e) = std::fs::remove_dir_all(dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            crate::log!(
+            crate::log_legacy!(
                 "[Frontend] failed to remove old snapshot {}: {e}",
                 dir.display()
             );

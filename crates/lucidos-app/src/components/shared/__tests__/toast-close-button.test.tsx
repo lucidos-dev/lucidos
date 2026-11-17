@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import { ToastList } from '../Toast';
 import { toasts, showToast, engineRestarting, activeProgressDialog } from '../../../store/store';
@@ -26,7 +26,7 @@ beforeEach(() => {
   engineRestarting.value = false;
 });
 
-describe('Toast close button: shown on a toast that stays or has a target', () => {
+describe('Toast close button: timed toasts always have a close control', () => {
   it('omits .toast-close when dismissable: false', () => {
     showToast('Downloading embedding model', 'info', { key: 'model-download', spinning: true, dismissable: false });
     expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
@@ -45,15 +45,39 @@ describe('Toast close button: shown on a toast that stays or has a target', () =
     expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
-  it('omits .toast-close on a plain info toast, which leaves on its own', () => {
+  it('renders .toast-close on a plain success toast, which leaves on its own', () => {
     showToast('Trigger saved', 'success');
-    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
 
-  it('omits .toast-close on a keyed toast its caller put on a timer', () => {
+  it('renders .toast-close on a keyed toast its caller put on a timer', () => {
     showToast('Build finished', 'success', { key: 'build-done', autoDismissMs: 8000 });
-    expect(findByClass(ToastList(), 'toast-close').length).toBe(0);
+    expect(findByClass(ToastList(), 'toast-close').length).toBe(1);
   });
+
+  for (const type of ['success', 'info', 'warning', 'error'] as const) {
+    for (const key of [undefined, 'timed-toast']) {
+      for (const dismissable of [undefined, false]) {
+        it(`closes timed ${type} immediately and cancels its timer (key=${key}, dismissable=${dismissable})`, () => {
+          vi.useFakeTimers();
+          try {
+            const timerCount = vi.getTimerCount();
+            showToast('Operation finished', type, { key, autoDismissMs: 8000, dismissable });
+            expect(vi.getTimerCount()).toBe(timerCount + 1);
+            const buttons = findByClass(ToastList(), 'toast-close');
+            expect(buttons).toHaveLength(1);
+            const props = buttons[0].props as unknown as { 'aria-label': string; onClick: () => void };
+            expect(props['aria-label']).toBe('Dismiss');
+            props.onClick();
+            expect(toasts.value).toEqual([]);
+            expect(vi.getTimerCount()).toBe(timerCount);
+          } finally {
+            vi.useRealTimers();
+          }
+        });
+      }
+    }
+  }
 
   it('renders .toast-close on a timed toast with a button, so Escape has a way out', () => {
     showToast('Build finished', 'success', {

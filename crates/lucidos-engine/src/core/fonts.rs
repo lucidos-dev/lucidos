@@ -28,6 +28,9 @@ pub const FOLLOW_THEME: &str = "theme";
 /// is vendored, so it renders offline (ADR 0077).
 pub const FALLBACK_FONT: &str = "fira-code";
 
+/// Native monospace families, in platform fallback order.
+pub const NATIVE_MONO_STACK: &str = "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace";
+
 /// What a font is fit for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -414,8 +417,7 @@ pub const FONT_CATALOG: &[FontSpec] = &[
     FontSpec {
         id: "fira-code",
         label: "Fira Code",
-        // The full system-mono chain, because this is the fallback and must
-        // paint well before the web font decodes (ADR 0077).
+        // Keep the selected font readable before its web font decodes (ADR 0077).
         stack: "'Fira Code', ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'JetBrains Mono', Monaco, Consolas, monospace",
         kind: FontKind::Both,
         source: FontSource::Vendored {
@@ -434,7 +436,7 @@ pub const FONT_CATALOG: &[FontSpec] = &[
     FontSpec {
         id: "monospace",
         label: "Monospace",
-        stack: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
+        stack: NATIVE_MONO_STACK,
         kind: FontKind::Both,
         source: FontSource::Device,
         license: "none",

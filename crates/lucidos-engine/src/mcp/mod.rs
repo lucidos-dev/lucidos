@@ -604,7 +604,7 @@ impl McpManager {
             if running.get(&id).is_some_and(RunningServer::has_exited) {
                 running.remove(&id);
                 evicted = true;
-                log!(
+                log_legacy!(
                     "[MCP] Server '{}' exited on its own, dropping it from the registry",
                     id
                 );
@@ -876,7 +876,11 @@ impl McpManager {
         let env = crate::core::mcp_servers::launch_env(&self.pool, server).await?;
         // MCP servers are invoked as part of LLM tool calls today, so default to Agent.
         // If engine-internal MCP usage is added, that call site should pass ActorMode::Engine.
+        let sandbox =
+            crate::runtime::agent_sandbox::Sandbox::resolve(&self.pool, &self.workspace_root)
+                .await?;
         let client = McpClient::connect(
+            &sandbox,
             &server.id,
             &server.command,
             &server.args,
@@ -890,7 +894,7 @@ impl McpManager {
         if let Err(e) = McpServerStore::set_tools(&self.pool, &server.id, &tools).await {
             // The server IS up, so this is not a start failure. It only means
             // the page will keep quoting the previous manifest.
-            log!(
+            log_legacy!(
                 "[MCP] Failed to cache the tool manifest for '{}': {}",
                 server.id,
                 e
@@ -1318,7 +1322,7 @@ impl McpManager {
         drop(running);
 
         if !dropped.is_empty() {
-            log!(
+            log_legacy!(
                 "[MCP] Tools past the {}-char MCP tool ceiling, not offering them: {}",
                 char_ceiling,
                 describe_dropped(&dropped)
@@ -1397,7 +1401,7 @@ impl McpManager {
         let servers = match self.list_servers().await {
             Ok(servers) => servers,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[MCP] Failed to list servers for the turn's server lines: {}",
                     e
                 );
@@ -1444,7 +1448,7 @@ impl McpManager {
         {
             Ok(ids) => ids.unwrap_or_default().into_iter().collect(),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[MCP] Failed to read the enabled servers of thread {}: {}",
                     thread_id,
                     e
@@ -1491,7 +1495,7 @@ impl McpManager {
                 )
                 .await
             {
-                log!(
+                log_legacy!(
                     "[MCP] Thread {} did not inherit '{}' from its parent {}: {}",
                     child,
                     server_id,
@@ -1571,7 +1575,7 @@ fn offered_by_server(
             .into_iter()
             .filter_map(|offer| {
                 if offer.wire_name.is_none() {
-                    log!(
+                    log_legacy!(
                         "[MCP] Tool '{}' on server '{}' has no name that fits the tool-name limit, not offering it",
                         offer.tool.name,
                         server_id
@@ -4069,9 +4073,16 @@ done
     #[tokio::test]
     async fn dropping_a_client_stops_the_processes_its_server_started() {
         let stub = StubServer::new(&[]).spawns_a_grandchild();
-        let client = McpClient::connect("stub", &stub.command, &[], &stub.env, ActorMode::Agent)
-            .await
-            .unwrap();
+        let client = McpClient::connect(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "stub",
+            &stub.command,
+            &[],
+            &stub.env,
+            ActorMode::Agent,
+        )
+        .await
+        .unwrap();
 
         drop(client);
 

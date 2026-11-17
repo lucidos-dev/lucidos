@@ -17,6 +17,7 @@ use tokio::io::AsyncReadExt;
 
 use super::agent_run_marker::AGENT_RUN_ENV;
 use super::agent_runtime::SpawnArgs;
+use super::agent_sandbox::SandboxedCommand;
 use super::lucidos_cli::path_with_prefixes;
 
 /// Stamp the agent-independent Lucidos env contract onto `cmd`.
@@ -35,12 +36,13 @@ use super::lucidos_cli::path_with_prefixes;
 ///   metadata consumed by `lucidos spawn-thread` and `cc-stop-reminder`.
 /// - The agent run marker (`LUCIDOS_AGENT_RUN`) from `args.agent_run`, whose
 ///   `finish` reaps what outlives the agent (`agent_run_marker`).
-/// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` (sccache when
-///   on PATH and the agent is unsandboxed, explicitly empty otherwise), the
-///   agents' own sccache daemon, and a Lucidos source tree's compile mode.
-/// - `PATH` prefixed with the `lucidos` CLI dir when one was found, AND the
-///   bundled Postgres bin dir (`LUCIDOS_PG_BIN_DIR`) when set. A packaged
-///   build's `psql` lives there, not on the service manager's minimal PATH.
+/// - The compile env from `agent_compile_env`: `RUSTC_WRAPPER` and the
+///   agents' sccache daemon for the agent's sandbox shape, plus a Lucidos
+///   source tree's compile mode.
+/// - `PATH` prefixed, in order, with the `lucidos` CLI dir when one was found,
+///   the `ps` shim dir under a macOS sandbox, and `LUCIDOS_PG_BIN_DIR` when set.
+///   A packaged build's `psql` lives there, not on the service manager's
+///   minimal PATH.
 ///   Mirrors `workspace_script_env_vars` (chat bash/python tools).
 pub(super) fn apply_lucidos_env(
     cmd: &mut tokio::process::Command,
@@ -56,6 +58,10 @@ pub(super) fn apply_lucidos_env(
         cmd,
         args.user_env_vars,
         crate::core::InheritedSecrets::Keep,
+    );
+    cmd.env(
+        lucidos_build_slot::ENV_CLASS,
+        args.build_slot_class.as_str(),
     );
     cmd.env("LUCIDOS_WORKSPACE", args.workspace_path);
     for (key, value) in crate::api::actor::host_protection_env_vars() {
@@ -101,6 +107,7 @@ pub(super) fn apply_lucidos_env(
     }
     let prefixes = agent_path_prefixes(
         cli_dir,
+        args.sandbox.ps_shim_dir(args.workspace_path, cli_dir),
         std::env::var_os("LUCIDOS_PG_BIN_DIR").map(std::path::PathBuf::from),
     );
     if !prefixes.is_empty() {
@@ -109,7 +116,7 @@ pub(super) fn apply_lucidos_env(
                 cmd.env("PATH", p);
             }
             Err(e) => {
-                crate::log!("[{}] failed to join PATH for agent child: {}", log_label, e);
+                crate::log_legacy!("[{}] failed to join PATH for agent child: {}", log_label, e);
             }
         }
     }
@@ -154,19 +161,22 @@ pub(crate) fn session_secret_values(
 
 /// The dirs to prepend to an agent child's PATH: the `lucidos` CLI dir first
 /// (so `lucidos …` resolves — its position is load-bearing for the workspace
-/// symlink contract), then the bundled Postgres bin dir when the packaged env
+/// symlink contract), then the `ps` shim dir of a macOS sandbox, then the
+/// bundled Postgres bin dir when the packaged env
 /// provides one that exists, so `psql "$LUCIDOS_DATABASE_URL"` resolves. It
 /// mirrors `workspace_script_env_vars` for chat bash/python tools. In dev
 /// `LUCIDOS_PG_BIN_DIR` is unset ⇒ no PG entry, unchanged behavior. Split from
 /// `apply_lucidos_env` so the decision is unit-testable without process env.
 fn agent_path_prefixes(
     cli_dir: Option<&Path>,
+    ps_shim_dir: Option<std::path::PathBuf>,
     pg_bin_dir: Option<std::path::PathBuf>,
 ) -> Vec<std::path::PathBuf> {
     let mut prefixes: Vec<std::path::PathBuf> = Vec::new();
     if let Some(cli_dir) = cli_dir {
         prefixes.push(cli_dir.to_path_buf());
     }
+    prefixes.extend(ps_shim_dir);
     if let Some(pg_bin) = pg_bin_dir {
         if pg_bin.is_dir() {
             prefixes.push(pg_bin);
@@ -258,22 +268,23 @@ const MAX_NICE: i32 = 19;
 /// engine, so the engine keeps answering clients while agents build (ADR 0341).
 ///
 /// Agent sessions, side questions, model probes and background tasks spawn
-/// through here. The engine's own Apply rebuild must not: the user waits on it
-/// (ADR 0304).
+/// through here. Each runs agent-steered code, so it takes only a
+/// [`SandboxedCommand`] (ADR 0645). The engine's own Apply rebuild must not
+/// come here: the user waits on it (ADR 0304).
 ///
 /// The renice runs in the parent after spawn, because a `pre_exec` hook would
 /// cost the `posix_spawn` path. It names the group, not the pid: Linux nice is
 /// per thread, and the group reaches every thread and process present. A
 /// failed renice is logged and the child returned, never a failed spawn.
 pub(crate) fn spawn_below_engine(
-    cmd: &mut tokio::process::Command,
+    cmd: &mut SandboxedCommand,
 ) -> std::io::Result<tokio::process::Child> {
     isolate_in_process_group(cmd);
     let child = cmd.spawn()?;
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         if let Err(e) = lower_group_below_engine(pid) {
-            crate::log!("[SpawnEnv] Could not lower priority of process group {pid}: {e}");
+            crate::log_legacy!("[SpawnEnv] Could not lower priority of process group {pid}: {e}");
         }
     }
     Ok(child)
@@ -325,7 +336,7 @@ fn process_group_target(pid: u32) -> Option<i32> {
 #[cfg(unix)]
 pub(super) fn signal_child_process_group(pid: u32, signal: i32) {
     let Some(target) = process_group_target(pid) else {
-        crate::log!("[SpawnEnv] Refusing to signal process group for pid {pid}");
+        crate::log_legacy!("[SpawnEnv] Refusing to signal process group for pid {pid}");
         return;
     };
     // SAFETY: `kill(2)` with a negative pid targets the process group and a
@@ -590,33 +601,51 @@ pub(super) fn sccache_on_path(path_var: Option<&std::ffi::OsStr>) -> bool {
     find_on_path(std::ffi::OsStr::new(&exe), path_var).is_some()
 }
 
-/// Port of the agents' own sccache daemon. The default daemon on 4226 is left
-/// to the Apply rebuild and to terminals (ADR 0343).
-const AGENT_SCCACHE_PORT: &str = "4227";
-
-/// Size cap of the agents' cache. At sccache's default 10 GiB the cache turns
+/// Size cap of each agents' cache. At sccache's default 10 GiB the cache turns
 /// over in under 12 hours, so a dependency built yesterday is built again today.
 /// The daemon reads this when it starts.
 const AGENT_SCCACHE_CACHE_SIZE: &str = "50G";
 
-/// Directory under [`crate::paths::user_cache_root`] holding the agents' cache.
-/// Two daemons never share one disk cache: sccache does not lock it.
-const AGENT_SCCACHE_DIR_NAME: &str = "sccache-agents";
+/// An agents' sccache daemon: its port, and its directory under
+/// [`crate::paths::user_cache_root`]. Two daemons never share one disk cache:
+/// sccache does not lock it. The default daemon on 4226 is left to the Apply
+/// rebuild and to terminals (ADR 0343).
+struct SccacheDaemon {
+    port: &'static str,
+    dir_name: &'static str,
+}
 
-/// Whether the OS confines an agent's processes, decided by its backend at spawn.
+/// The daemon of unsandboxed agents.
+const UNSANDBOXED_AGENTS_SCCACHE: SccacheDaemon = SccacheDaemon {
+    port: "4227",
+    dir_name: "sccache-agents",
+};
+
+/// The daemon of agents in the shared sandbox. It starts inside that sandbox,
+/// so it runs every client's `rustc` under the policy the client has.
+const SANDBOXED_AGENTS_SCCACHE: SccacheDaemon = SccacheDaemon {
+    port: "4228",
+    dir_name: "sccache-agents-sandboxed",
+};
+
+/// How the OS confines an agent's processes, as its compile cache sees it.
+/// Read from [`super::agent_sandbox::Sandbox::compile_cache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentSandbox {
     Unsandboxed,
-    /// The agent runs under an OS sandbox (Codex's `workspace-write` seatbelt).
-    OsSandboxed,
+    /// The policy every sandboxed agent shares.
+    Shared,
+    /// Writes confined to the agent's own roots (Codex on the exec protocol).
+    WritesConfined,
 }
 
 /// The compile env a coding agent's builds get. The agent spawn and an agent's
 /// background task both take it, so a build behaves the same in both.
 ///
-/// A sandboxed agent compiles without sccache. The daemon auto-starts from the
-/// first client and inherits that client's sandbox, so a sandboxed daemon
-/// refuses every other worktree's writes (ADR 0567).
+/// The daemon auto-starts from the first client and inherits that client's
+/// sandbox, so each sandbox shape gets its own daemon (ADR 0567). An agent
+/// whose writes are confined compiles without sccache: its daemon would refuse
+/// every other worktree's writes.
 ///
 /// With `sccache` on PATH, builds go to the agents' own daemon. That daemon
 /// inherits the priority of the agent that starts it, so agent `rustc` runs
@@ -628,13 +657,18 @@ pub(crate) fn agent_compile_env_from(
     path_var: Option<&std::ffi::OsStr>,
     cache_root: Option<&Path>,
 ) -> Vec<(&'static str, String)> {
-    if sandbox == AgentSandbox::OsSandboxed || !sccache_on_path(path_var) {
+    let daemon = match sandbox {
+        AgentSandbox::WritesConfined => None,
+        AgentSandbox::Shared => Some(SANDBOXED_AGENTS_SCCACHE),
+        AgentSandbox::Unsandboxed => Some(UNSANDBOXED_AGENTS_SCCACHE),
+    };
+    let Some(daemon) = daemon.filter(|_| sccache_on_path(path_var)) else {
         return vec![("RUSTC_WRAPPER", String::new())];
-    }
+    };
     let mut env = vec![("RUSTC_WRAPPER", "sccache".to_string())];
     if let Some(root) = cache_root {
-        let dir = root.join(AGENT_SCCACHE_DIR_NAME);
-        env.push(("SCCACHE_SERVER_PORT", AGENT_SCCACHE_PORT.to_string()));
+        let dir = root.join(daemon.dir_name);
+        env.push(("SCCACHE_SERVER_PORT", daemon.port.to_string()));
         env.push(("SCCACHE_DIR", dir.to_string_lossy().into_owned()));
         env.push(("SCCACHE_CACHE_SIZE", AGENT_SCCACHE_CACHE_SIZE.to_string()));
     }
@@ -825,6 +859,7 @@ mod tests {
             spawning_event_id: None,
             repo_name: None,
             interactive: false,
+            build_slot_class: lucidos_build_slot::SlotClass::Ordinary,
             user_env_vars: &[],
             account_pin: None,
             binary_override: None,
@@ -833,7 +868,56 @@ mod tests {
             auto_compact: None,
             keep_alive: false,
             agent_run: AgentRun::unrecorded(),
+            sandbox: crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
         }
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn coding_agent_environment_handles_stay_reachable_in_the_sandbox() {
+            crate::test_support::install_agent_database_url();
+            let workspace = tempfile::tempdir().unwrap();
+            let args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+            let mut cmd = tokio::process::Command::new("true");
+            apply_lucidos_env(&mut cmd, &args, None, AgentSandbox::Shared, "SpawnEnvTest");
+            let env = cmd.as_std().get_envs().filter_map(|(key, value)| {
+                value.map(|value| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+            });
+            crate::runtime::agent_sandbox::env_guard_tests::assert_spawn_env_reachable(
+                workspace.path(),
+                env,
+            );
+        }
+    }
+
+    #[test]
+    fn engine_build_class_overrides_workspace_values() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let mut args = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+        let user_env = vec![(lucidos_build_slot::ENV_CLASS.into(), "priority".into())];
+        args.user_env_vars = &user_env;
+        args.build_slot_class = lucidos_build_slot::SlotClass::Background;
+        let mut cmd = tokio::process::Command::new("true");
+        apply_lucidos_env(
+            &mut cmd,
+            &args,
+            None,
+            AgentSandbox::Unsandboxed,
+            "SpawnEnvTest",
+        );
+        let class = cmd
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == lucidos_build_slot::ENV_CLASS)
+            .and_then(|(_, value)| value);
+        assert_eq!(class, Some(std::ffi::OsStr::new("background")));
     }
 
     /// Codex's env is exactly this shared contract, so the auto-compact trial
@@ -989,7 +1073,7 @@ mod tests {
         // is independent of the CLI dir's presence.
         let pg = tempfile::TempDir::new().expect("tempdir");
         assert_eq!(
-            agent_path_prefixes(None, Some(pg.path().to_path_buf())),
+            agent_path_prefixes(None, None, Some(pg.path().to_path_buf())),
             vec![pg.path().to_path_buf()]
         );
     }
@@ -1044,21 +1128,47 @@ mod tests {
         );
     }
 
-    /// The incident: a daemon a sandboxed session started inherited its
+    /// The incident: a daemon a write-confined session started inherited its
     /// seatbelt, and every other worktree's `rustc` then got EPERM writing its
-    /// own `target/`. Sandboxed `rustc` runs as the session's own child.
+    /// own `target/`. Confined `rustc` runs as the session's own child.
     #[test]
-    fn a_sandboxed_agent_never_reaches_the_shared_daemon() {
+    fn a_write_confined_agent_reaches_no_daemon() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let path_var = path_with_fake_sccache(tmp.path());
         assert_eq!(
             agent_compile_env_from(
-                AgentSandbox::OsSandboxed,
+                AgentSandbox::WritesConfined,
                 Some(&path_var),
                 Some(Path::new("/tmp/cache/lucidos"))
             ),
             vec![("RUSTC_WRAPPER", String::new())],
         );
+    }
+
+    /// A daemon runs every client's `rustc` under its starter's sandbox. So a
+    /// sandboxed agent never reaches the unsandboxed agents' daemon, whose
+    /// proc macros would run outside the sandbox.
+    #[test]
+    fn a_sandboxed_agent_compiles_through_the_sandboxed_daemon() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path_var = path_with_fake_sccache(tmp.path());
+        let env = agent_compile_env_from(
+            AgentSandbox::Shared,
+            Some(&path_var),
+            Some(Path::new("/tmp/cache/lucidos")),
+        );
+        let unsandboxed = agent_compile_env_from(
+            AgentSandbox::Unsandboxed,
+            Some(&path_var),
+            Some(Path::new("/tmp/cache/lucidos")),
+        );
+        for key in ["SCCACHE_SERVER_PORT", "SCCACHE_DIR"] {
+            let value = |env: &Vec<(&'static str, String)>| {
+                env.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
+            };
+            assert!(value(&env).is_some(), "{key}: {env:?}");
+            assert_ne!(value(&env), value(&unsandboxed), "{key}");
+        }
     }
 
     /// The daemon an agent starts inherits the agent's lower priority. Only
@@ -1111,7 +1221,7 @@ mod tests {
         // Dev: LUCIDOS_PG_BIN_DIR unset → only the CLI dir, unchanged behavior.
         let cli = std::path::Path::new("/opt/lucidos/bin");
         assert_eq!(
-            agent_path_prefixes(Some(cli), None),
+            agent_path_prefixes(Some(cli), None, None),
             vec![cli.to_path_buf()]
         );
     }
@@ -1123,16 +1233,78 @@ mod tests {
         let cli = std::path::Path::new("/opt/lucidos/bin");
         let pg = tempfile::TempDir::new().expect("tempdir");
         assert_eq!(
-            agent_path_prefixes(Some(cli), Some(pg.path().to_path_buf())),
+            agent_path_prefixes(Some(cli), None, Some(pg.path().to_path_buf())),
             vec![cli.to_path_buf(), pg.path().to_path_buf()]
         );
+    }
+
+    #[test]
+    fn agent_path_prefixes_puts_the_ps_shim_between_the_cli_and_postgres() {
+        let cli = std::path::Path::new("/opt/lucidos/bin");
+        let shim = std::path::PathBuf::from("/w/.lucidos/sandbox-bin");
+        let pg = tempfile::TempDir::new().expect("tempdir");
+        assert_eq!(
+            agent_path_prefixes(Some(cli), Some(shim.clone()), Some(pg.path().to_path_buf())),
+            vec![cli.to_path_buf(), shim, pg.path().to_path_buf()]
+        );
+    }
+
+    fn path_of(cmd: &tokio::process::Command) -> Option<std::ffi::OsString> {
+        cmd.as_std()
+            .get_envs()
+            .find(|(key, _)| *key == "PATH")
+            .and_then(|(_, value)| value.map(std::ffi::OsString::from))
+    }
+
+    /// Linux, and the owner's opt-out, run the system `ps`: their PATH is the
+    /// one they had before the shim existed.
+    #[test]
+    fn an_unsandboxed_agent_or_a_linux_one_gets_no_ps_shim_on_its_path() {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let cli = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(
+            cli.path().join(super::super::lucidos_cli::LUCIDOS_BIN_NAME),
+            "",
+        )
+        .expect("fake cli");
+        let mut unsandboxed = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+        let mut inherited = spawn_args_for(uuid::Uuid::new_v4(), workspace.path());
+        unsandboxed.sandbox = crate::runtime::agent_sandbox::Sandbox::unsandboxed();
+        inherited.sandbox = crate::runtime::agent_sandbox::Sandbox::inherited();
+
+        let mut opted_out = tokio::process::Command::new("true");
+        apply_lucidos_env(
+            &mut opted_out,
+            &unsandboxed,
+            Some(cli.path()),
+            AgentSandbox::Unsandboxed,
+            "SpawnEnvTest",
+        );
+        let mut active = tokio::process::Command::new("true");
+        apply_lucidos_env(
+            &mut active,
+            &inherited,
+            Some(cli.path()),
+            AgentSandbox::Shared,
+            "SpawnEnvTest",
+        );
+
+        let shim = workspace
+            .path()
+            .join(crate::runtime::agent_sandbox::PS_SHIM_SUBPATH);
+        let on_path = |cmd: &tokio::process::Command| {
+            path_of(cmd).is_some_and(|path| std::env::split_paths(&path).any(|dir| dir == shim))
+        };
+        assert!(!on_path(&opted_out));
+        assert_eq!(on_path(&active), cfg!(target_os = "macos"));
+        assert!(shim.join("ps").is_file() == cfg!(target_os = "macos"));
     }
 
     #[test]
     fn agent_path_prefixes_ignores_missing_pg_bin_dir() {
         // A set-but-absent dir (mis-staged runtime) must not poison PATH.
         let missing = std::path::PathBuf::from("/nonexistent/postgres/bin");
-        assert!(agent_path_prefixes(None, Some(missing)).is_empty());
+        assert!(agent_path_prefixes(None, None, Some(missing)).is_empty());
     }
 
     // ── Process-group isolation ────────────────────────────────────────────
@@ -1188,6 +1360,12 @@ mod tests {
 
     // ── Running below the engine (ADR 0341) ────────────────────────────────
 
+    fn test_command(program: &str) -> SandboxedCommand {
+        crate::runtime::agent_sandbox::Sandbox::unsandboxed()
+            .command(program)
+            .expect("unsandboxed command")
+    }
+
     #[cfg(unix)]
     fn nice_of(pid: u32) -> i32 {
         // SAFETY: getpriority takes no pointers and only reads process state.
@@ -1202,7 +1380,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_child_spawned_below_the_engine_leads_its_group_at_lower_priority() {
-        let mut cmd = tokio::process::Command::new("sleep");
+        let mut cmd = test_command("sleep");
         cmd.arg("60").kill_on_drop(true);
         let mut child = spawn_below_engine(&mut cmd).expect("spawn");
         let pid = child.id().expect("child has a pid");
@@ -1225,7 +1403,7 @@ mod tests {
     async fn a_grandchild_runs_below_the_engine_too() {
         use tokio::io::AsyncWriteExt;
 
-        let mut cmd = tokio::process::Command::new("sh");
+        let mut cmd = test_command("sh");
         cmd.args(["-c", "read _; sleep 60 & echo $!; wait"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1262,7 +1440,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_binary_still_fails_the_spawn() {
-        let mut cmd = tokio::process::Command::new("/nonexistent/lucidos-test-binary");
+        let mut cmd = test_command("/nonexistent/lucidos-test-binary");
         assert!(spawn_below_engine(&mut cmd).is_err());
     }
 
@@ -1358,7 +1536,7 @@ mod tests {
         isolate_in_process_group(&mut cmd);
         cmd.kill_on_drop(true);
         let Ok(mut child) = cmd.spawn() else {
-            crate::log!(
+            crate::log_legacy!(
                 "[SpawnEnv] SKIP graceful_kill_force_kills_a_sigterm_ignoring_group: perl unavailable"
             );
             return;

@@ -77,8 +77,27 @@ describe('a saved registration continues the connection it was blocking', () => 
 
     // The same provider and the same scopes: a continuation that dropped the
     // purpose would connect a bare sign-in and send the user back to Backup.
-    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', 'files.content.write');
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', 'files.content.write', false);
     expect(openUrlOutsideApp).toHaveBeenCalledWith('https://dropbox.test/authorize?x=1');
+  });
+
+  it('keeps the sign-in request through the registration form', async () => {
+    reauthorizeOAuth.mockResolvedValueOnce(needsCredentials());
+    await grantOAuthScope('dropbox', '', true);
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', '', true);
+
+    reauthorizeOAuth.mockResolvedValueOnce(AUTHORIZES);
+    await submitRequestedCredential(
+      { service: 'dropbox' },
+      'dropbox',
+      ['https://api.dropboxapi.test'],
+      'oauth_client',
+      '{"client_id":"abc"}',
+    );
+
+    // The engine adds the provider's sign-in scopes only when asked, so a
+    // continuation that dropped the flag would connect with no scopes at all.
+    expect(reauthorizeOAuth).toHaveBeenLastCalledWith('dropbox', '', true);
   });
 
   it('does not fire twice for one press', async () => {

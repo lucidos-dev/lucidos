@@ -136,6 +136,37 @@ pub const RUNTIME_CREATED_TABLES: &[(&str, &str)] = &[(
 /// table.
 pub const TABLES: &[TableRule] = &[
     TableRule {
+        table: "diagnostic_bundles",
+        owners: &["engine/event_bus/diagnostic_bundles.rs"],
+        announcement: Announcement::Announced {
+            events: &["DiagnosticBundleReceived"],
+            exempt: &[ExemptWriter {
+                function: "expire_diagnostic_bundles",
+                why: "Previously announced inbox arrivals expire after the fixed 90-day retention window; immutable receipt events remain for deduplication.",
+            }],
+        },
+    },
+    TableRule {
+        table: "internal_fault_receipts",
+        owners: &["engine/event_bus/internal_faults.rs"],
+        announcement: Announcement::Silent { reason: "Inbox retry identities are observations consumed alongside the deduplicated InternalFaultRecorded event, not user decisions." },
+    },
+    TableRule {
+        table: "user_only_message_notices",
+        owners: &["api/chat.rs", "api/user_only_messages.rs", "api/threads/delete.rs", "engine/thread_users.rs", "engine/user_only_message_delivery.rs"],
+        announcement: Announcement::Silent { reason: "Delivery bookkeeping; recorded messages and notifications announce visible effects." },
+    },
+    TableRule {
+        table: "user_only_message_dispatches",
+        owners: &["engine/thread_users.rs", "scheduler/push.rs"],
+        announcement: Announcement::Silent { reason: "Internal completion receipt for an announced notification." },
+    },
+    TableRule {
+        table: "user_only_message_push_receipts",
+        owners: &["scheduler/push.rs"],
+        announcement: Announcement::Silent { reason: "Internal transport receipts prevent replaying completed targets." },
+    },
+    TableRule {
         table: "snapshot_restore_boundary",
         owners: &["core/snapshot/boundary.rs"],
         announcement: Announcement::Silent {
@@ -205,6 +236,16 @@ pub const TABLES: &[TableRule] = &[
             of: "the change-lifecycle thread events, written through by \
                  event_bus_projection_thread in the same transaction as the \
                  thread_summaries update",
+        },
+    },
+    TableRule {
+        table: "permissions",
+        owners: &["api/threads/delete.rs", "engine/permission/projection.rs"],
+        announcement: Announcement::Projection {
+            of: "PermissionGranted, PermissionSpent, PermissionRestored, PermissionRevoked, ChangeApplied \
+                 and PermissionGrantsChanged, written through by the thread and \
+                 system projections in the event transaction. ThreadsDeleted \
+                 covers deletion of the family's thread grants",
         },
     },
     TableRule {
@@ -525,7 +566,11 @@ pub const TABLES: &[TableRule] = &[
     },
     TableRule {
         table: "planned_branches",
-        owners: &["api/threads/delete.rs", "engine/git_ops/plan_marker.rs"],
+        owners: &[
+            "api/threads/delete.rs",
+            "engine/git_ops/plan_marker.rs",
+            "engine/plan_lifecycle.rs",
+        ],
         announcement: Announcement::Silent {
             reason: "The per-branch plan marker the edit gate and Apply read. \
                      Build-gate bookkeeping, same shape as hardened_branches.",
@@ -636,6 +681,13 @@ pub const TABLES: &[TableRule] = &[
                      each page admitted to each thread. No client reads it. \
                      The input it admits is announced by its own \
                      MessageReceived or UserQuestionAnswered.",
+        },
+    },
+    TableRule {
+        table: "draft_submissions",
+        owners: &["engine/event_bus_projection_system.rs"],
+        announcement: Announcement::Projection {
+            of: "DraftSubmissionAccepted, atomically with compose consumption and queue membership",
         },
     },
     TableRule {

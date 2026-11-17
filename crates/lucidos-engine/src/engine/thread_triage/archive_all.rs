@@ -184,6 +184,37 @@ pub(crate) fn still_safe(rows: &[TriageRow], confirmed: &[Uuid]) -> (Vec<Uuid>, 
     (safe, kept)
 }
 
+/// Completed-only selection adds a finish requirement to the common safety
+/// authority. Sub-thread blockers remain authoritative; ancestors do not block.
+pub(crate) fn refuse_completed(row: Option<&TriageRow>) -> Option<String> {
+    refuse_fresh(TriageAction::Archive, row).or_else(|| {
+        row.filter(|r| {
+            r.facts.status != crate::engine::thread_lifecycle::ThreadStatus::Idle
+                || !r.facts.has_output
+        })
+        .map(|_| "it has not finished with output".to_string())
+    })
+}
+
+/// Scoped counts refer to individual threads, never overlapping cascades.
+pub(crate) fn completed_preflight(rows: &[TriageRow]) -> ArchiveAllPreflight {
+    let safe: Vec<_> = rows
+        .iter()
+        .filter(|r| refuse_completed(Some(r)).is_none())
+        .map(|r| SafeThread {
+            thread_id: r.facts.thread_id,
+            title: r.title.clone(),
+        })
+        .collect();
+    let safe_thread_count = safe.len();
+    ArchiveAllPreflight {
+        safe,
+        safe_thread_count,
+        kept: BTreeMap::new(),
+        kept_thread_count: rows.len() - safe_thread_count,
+    }
+}
+
 #[cfg(test)]
 #[path = "archive_all_tests.rs"]
 mod tests;

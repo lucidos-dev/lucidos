@@ -47,6 +47,7 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "sid-test".into(),
             branch: "claude-code/test".into(),
@@ -81,6 +82,8 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: cc_meta(),
     })
@@ -89,6 +92,7 @@ async fn seed_question_canceled_after_agent_died(bus: &EventBus, thread_id: Uuid
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: tool_use_id.into(),
             quiet: false,
             answer: AnswerKind::Canceled,

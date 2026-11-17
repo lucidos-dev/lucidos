@@ -93,9 +93,19 @@ pub enum SideEffectCategory {
 }
 
 impl SideEffectCategory {
+    /// Every category a trigger's side-effect grant can allow. A new category
+    /// stays ungrantable until it is listed here.
+    pub const GRANTABLE: [SideEffectCategory; 5] = [
+        Self::Email,
+        Self::ExternalApi,
+        Self::CloudCli,
+        Self::OutOfWorkspaceDestruction,
+        Self::Other,
+    ];
+
     /// Whether a trigger's side-effect grant can allow this category.
     pub fn is_grantable(&self) -> bool {
-        !matches!(self, Self::SecretRead)
+        Self::GRANTABLE.contains(self)
     }
 
     /// Noun phrase for LLM-facing refusal / card text — reads as "may perform
@@ -298,14 +308,34 @@ pub(crate) const GUARD_SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", 
 /// handed the same shape. Returns the original command when it is not a
 /// recognized shell wrapper.
 pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
-    let trimmed = command.trim_start();
-    let toks: Vec<&str> = trimmed.split_whitespace().collect();
-    let Some(shell_at) = shell_token_index(&toks) else {
+    let Some(at) = shell_script_operand_at(command) else {
         return Cow::Borrowed(command);
     };
+    // One quote layer is stripped so the common `zsh -lc 'curl ...'` form
+    // classifies as a clean `curl ...`.
+    let (script, tail) = split_shell_script_operand(command[at..].trim_end());
+    // `sh -c <script> [$0 args]` makes the tail positional parameters, which is
+    // why cutting at the close quote is right. The tail is only OURS to discard
+    // when it really is plain words. A control operator there belongs to the
+    // OUTER shell and runs, so returning the script alone would hide it from
+    // every scan. Fall back to the whole command, which the segment split
+    // covers end to end. Strictly more scanning, never less.
+    if tail_runs_more_commands(tail) {
+        return Cow::Borrowed(command);
+    }
+    script
+}
+
+/// The byte offset in `command` where a shell wrapper's script operand starts,
+/// just past its `-c`-style flag and the blanks after it. `None` when
+/// `command` is no recognised shell wrapper.
+fn shell_script_operand_at(command: &str) -> Option<usize> {
+    let lead = command.len() - command.trim_start().len();
+    let trimmed = &command[lead..];
+    let toks: Vec<&str> = trimmed.split_whitespace().collect();
+    let shell_at = shell_token_index(&toks)?;
     // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
-    // flag; everything after it is the script. One quote layer is stripped so the
-    // common `zsh -lc 'curl ...'` form classifies as a clean `curl ...`.
+    // flag; everything after it is the script.
     let bytes = trimmed.as_bytes();
     let mut i = 0;
     let mut tok_index = 0usize;
@@ -329,21 +359,11 @@ pub(crate) fn unwrap_shell_command(command: &str) -> Cow<'_, str> {
             continue;
         }
         if is_shell_c_flag(&trimmed[start..i]) {
-            let (script, tail) = split_shell_script_operand(trimmed[i..].trim());
-            // `sh -c <script> [$0 args]` makes the tail positional
-            // parameters, which is why cutting at the close quote is right. The
-            // tail is only OURS to discard when it really is plain words. A
-            // control operator there belongs to the OUTER shell and runs, so
-            // returning the script alone would hide it from every scan. Fall
-            // back to the whole command, which the segment split covers end to
-            // end. Strictly more scanning, never less.
-            if tail_runs_more_commands(tail) {
-                return Cow::Borrowed(command);
-            }
-            return script;
+            let rest = &trimmed[i..];
+            return Some(lead + i + rest.len() - rest.trim_start().len());
         }
     }
-    Cow::Borrowed(command)
+    None
 }
 
 /// True when `arch`'s arguments name a command for it to exec, rather than only
@@ -626,27 +646,139 @@ fn tail_runs_more_commands(tail: &str) -> bool {
         || has_command_substitution(tail)
 }
 
-/// Secret and snapshot paths under the Lucidos home. Matched as a suffix, so `~`, `$HOME`,
-/// `${HOME}` and an absolute home all match.
-static SECRET_PATHS: LazyLock<[String; 4]> = LazyLock::new(|| {
-    let home = lucidos_home::HOME_DIR_NAME;
-    [
-        format!(
-            "{home}/{}",
-            crate::core::secret_store::key_store::KEY_DIR_NAME
-        ),
-        format!("{home}/{}", lucidos_local_token::SHARED_PG_PASSWORD_FILE),
-        format!("{home}/snapshots"),
-        format!("{home}/{}", lucidos_local_token::LOCAL_TOKEN_FILE),
-    ]
-});
+/// The private subtree under the Lucidos home, then every name an older
+/// release kept directly in the home. Matched as a suffix, so `~`, `$HOME`,
+/// `${HOME}` and an absolute home all match. A moved subtree
+/// (`LUCIDOS_PRIVATE_DIR`) holds the secrets in place of the default one.
+/// It is listed by its own path. Under the user's home it is also listed in
+/// the three home forms.
+static SECRET_PATHS: LazyLock<Vec<String>> =
+    LazyLock::new(|| secret_paths(lucidos_home::private::relocated(), home_dir().as_deref()));
 
-/// Whether `text` names a secret path. Quotes and backslashes are dropped and
-/// `/./` and `//` collapse first, so `"$HOME/.lucidos"/secret-keys` matches.
-///
-/// A static rule is a stopgap: string building or `base64` gets around it.
-/// The real boundary is an OS sandbox (docs/temporary-measures.md).
-pub fn mentions_secret_path(text: &str) -> bool {
+fn secret_paths(relocated: Option<PathBuf>, user_home: Option<&Path>) -> Vec<String> {
+    let home = lucidos_home::HOME_DIR_NAME;
+    std::iter::once(lucidos_home::private::DIR_NAME.to_string())
+        .chain(lucidos_home::private::legacy_entries())
+        .map(|name| format!("{home}/{name}"))
+        .chain(
+            relocated
+                .into_iter()
+                .flat_map(|dir| moved_secret_paths(&dir, user_home)),
+        )
+        .collect()
+}
+
+pub const SECRET_READ_STEER: &str = "No grant covers Lucidos's private files, and the agent sandbox blocks them when it is on. For this workspace's engine log, use `lucidos diagnostic-log query`. Do not retry with another spelling.";
+
+/// Secret paths for the policy and mode of the process executing a call.
+#[derive(Debug, Clone)]
+pub struct SecretPaths {
+    hidden: Vec<String>,
+    open: Vec<String>,
+}
+
+impl SecretPaths {
+    pub fn for_policy(
+        policy: &lucidos_agent_sandbox::Policy,
+        mode: Option<crate::runtime::agent_sandbox::SandboxMode>,
+    ) -> Self {
+        let policy = policy.resolved();
+        let home = home_dir();
+        let mut hidden = SECRET_PATHS.clone();
+        hidden.extend(
+            policy
+                .hidden
+                .iter()
+                .flat_map(|p| moved_secret_paths(p, home.as_deref())),
+        );
+        let mut open = Vec::new();
+        if mode == Some(crate::runtime::agent_sandbox::SandboxMode::Enforced) {
+            for root in &policy.open_within_hidden {
+                open.extend(moved_secret_paths(root, home.as_deref()));
+                // Retain the suffix spellings of the legacy entries too.
+                let root = root.to_string_lossy();
+                for suffix in SECRET_PATHS.iter() {
+                    if let Some(at) = root.find(suffix.as_str()) {
+                        open.push(root[at..].to_string());
+                    }
+                }
+            }
+        }
+        Self { hidden, open }
+    }
+
+    pub fn for_sandbox(sandbox: &crate::runtime::agent_sandbox::Sandbox, workspace: &Path) -> Self {
+        Self::for_policy(
+            &sandbox.policy_for_execution(workspace),
+            Some(sandbox.mode()),
+        )
+    }
+
+    /// Quotes and backslashes are dropped, and `/./` and `//` collapse.
+    /// The OS sandbox remains the boundary against constructed paths and links.
+    pub fn mentions(&self, text: &str) -> bool {
+        mentions_paths(&self.hidden, &self.open, text)
+    }
+
+    pub fn command(&self, command: &str) -> bool {
+        self.shell_at(command, 0)
+    }
+
+    pub fn python(&self, code: &str) -> bool {
+        self.mentions(code) || self.mentions(&unwrap_shell_command(code))
+    }
+
+    pub fn tool(&self, tool_name: &str, text: &str) -> bool {
+        if matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND) {
+            self.command(text)
+        } else {
+            self.python(text)
+        }
+    }
+
+    fn shell_at(&self, command: &str, depth: usize) -> bool {
+        if depth < MAX_SHELL_LAYERS {
+            if let Some((outer, script)) = literal_wrapper_script(command) {
+                return self.mentions(&outer) || self.shell_at(&script, depth + 1);
+            }
+        }
+        let unwrapped = unwrap_shell_command(command);
+        self.mentions(&secret_scan_text(command))
+            || (unwrapped != command && self.mentions(&unwrapped))
+    }
+
+    pub fn conservative() -> Self {
+        Self::for_policy(
+            &crate::runtime::agent_sandbox::policy_for(Path::new("/")),
+            None,
+        )
+    }
+}
+
+/// Every spelling of the moved subtree. Each is rebuilt from its components,
+/// so a trailing `/`, `//` or `/./` in the variable cannot hide it.
+fn moved_secret_paths(dir: &Path, user_home: Option<&Path>) -> Vec<String> {
+    let dir: PathBuf = dir.components().collect();
+    let mut paths = vec![dir.to_string_lossy().into_owned()];
+    let under_home = user_home
+        .and_then(|home| {
+            dir.strip_prefix(home.components().collect::<PathBuf>())
+                .ok()
+        })
+        .filter(|rest| !rest.as_os_str().is_empty());
+    if let Some(rest) = under_home {
+        let rest = rest.to_string_lossy();
+        paths.extend(["~", "$HOME", "${HOME}"].map(|home| format!("{home}/{rest}")));
+    }
+    paths
+}
+
+#[cfg(test)]
+fn mentions_any_path(secrets: &[String], text: &str) -> bool {
+    mentions_paths(secrets, &[], text)
+}
+
+fn mentions_paths(secrets: &[String], open: &[String], text: &str) -> bool {
     let mut path: String = text
         .chars()
         .filter(|c| !matches!(c, '\'' | '"' | '\\'))
@@ -660,20 +792,151 @@ pub fn mentions_secret_path(text: &str) -> bool {
     }
     // A match must end the path name: `secret-keys-notes` is another file.
     let ends_name = |c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-    SECRET_PATHS.iter().any(|secret| {
+    secrets.iter().any(|secret| {
         path.match_indices(secret.as_str()).any(|(at, _)| {
             path[at + secret.len()..]
                 .chars()
                 .next()
                 .is_none_or(ends_name)
+                && !open.iter().any(|root| {
+                    path.match_indices(root.as_str()).any(|(start, _)| {
+                        let end = start + root.len();
+                        // Reopen only this enclosing match, never a nested private root.
+                        // With quotes removed, only `/` or the end proves that
+                        // the open root is a complete directory name.
+                        if start > at
+                            || end < at + secret.len()
+                            || path[end..].chars().next().is_some_and(|c| c != '/')
+                        {
+                            return false;
+                        }
+                        let tail = path[end..]
+                            .split([';', '|', '&', ')', '('])
+                            .next()
+                            .unwrap_or("");
+                        !tail
+                            .split(|c: char| c == '/' || c.is_whitespace())
+                            .any(|part| part == "..")
+                    })
+                })
         })
     })
 }
 
-/// Whether a bash command or Python code reads a secret path, read both as
-/// written and as the inner script of a shell wrapper.
+/// Whether a bash command reads a secret path, read both as written and as the
+/// inner script of a shell wrapper.
+///
+/// A literal heredoc body that nothing in the command can run is document
+/// text, so it is not scanned ([`secret_scan_text`]). Everything else is.
 pub fn command_reads_secret(command: &str) -> bool {
-    mentions_secret_path(command) || mentions_secret_path(&unwrap_shell_command(command))
+    SecretPaths::conservative().command(command)
+}
+
+/// Whether Python code names a secret path anywhere in its text.
+#[cfg(test)]
+pub fn python_reads_secret(code: &str) -> bool {
+    SecretPaths::conservative().python(code)
+}
+
+/// Read `text` according to the tool executing it.
+#[cfg(test)]
+pub fn tool_text_reads_secret(tool_name: &str, text: &str) -> bool {
+    SecretPaths::conservative().tool(tool_name, text)
+}
+
+/// A shell wrapper's decoded script and the rest of the command, when the
+/// outer shell expands nothing in the script operand.
+///
+/// The operand must open with `'` and hold only single-quoted runs and
+/// backslash escapes. That covers Codex's `'…'\''…'` rendering of argv. A
+/// double-quoted or ANSI-C run returns `None`: the outer shell expands
+/// `$(…)` inside it before the inner shell runs. So do an unterminated run,
+/// an escaped newline and a tail that runs more commands.
+fn literal_wrapper_script(command: &str) -> Option<(String, String)> {
+    let at = shell_script_operand_at(command)?;
+    let b = command.as_bytes();
+    if b.get(at) != Some(&b'\'') {
+        return None;
+    }
+    let mut script = String::new();
+    let mut i = at;
+    while i < b.len() && !ends_shell_word(b[i]) {
+        match b[i] {
+            b'\'' => {
+                let close = i + 1 + command[i + 1..].find('\'')?;
+                script.push_str(&command[i + 1..close]);
+                i = close + 1;
+            }
+            b'\\' if matches!(b.get(i + 1), Some(c) if *c != b'\n') => {
+                i += 1 + push_char_at(&mut script, command, i + 1);
+            }
+            _ => return None,
+        }
+    }
+    let tail = &command[i..];
+    if tail_runs_more_commands(tail) {
+        return None;
+    }
+    Some((format!("{} {tail}", &command[..at]), script))
+}
+
+/// The text the secret scan reads: `command` without its literal heredoc
+/// bodies when nothing in it can run them, else `command` whole.
+///
+/// The bodies drop only when every body is placed and terminated
+/// ([`blank_literal_heredoc_bodies`]), no substitution remains, and every
+/// segment only writes data ([`writes_data_only`]). The opener line, redirect
+/// targets, here-strings and arguments stay in the text.
+fn secret_scan_text(command: &str) -> Cow<'_, str> {
+    let Some(blanked) =
+        blank_literal_heredoc_bodies(command, |_| false).filter(|b| !b.unterminated)
+    else {
+        return Cow::Borrowed(command);
+    };
+    if has_command_substitution(&blanked.text)
+        || !command_segments(&blanked.text).all(|s| writes_data_only(&s))
+    {
+        return Cow::Borrowed(command);
+    }
+    Cow::Owned(blanked.text)
+}
+
+/// Heads that only copy, print or count their input, and never run it.
+const DATA_SINK_HEADS: [&str; 10] = [
+    "cat", "tee", "printf", "echo", "mkdir", "ls", "wc", "head", "tail", "true",
+];
+
+/// The `lucidos` verbs that store a file's text and never run it.
+const LUCIDOS_DATA_SINK_VERBS: [[&str; 2]; 3] = [
+    ["successor", "start"],
+    ["successor", "offer"],
+    ["data", "write"],
+];
+
+/// True when `segment` is empty, only assignments, or headed by a data sink.
+/// The head is compared as written, so a path-qualified, quoted or escaped
+/// head is no sink. So is a code-injecting assignment before it.
+///
+/// A parenthesis fails it: `cat () ( bash )` makes a later `cat` run its body.
+fn writes_data_only(segment: &str) -> bool {
+    if segment.contains(['(', ')']) {
+        return false;
+    }
+    let toks: Vec<&str> = segment.split_whitespace().collect();
+    let mut at = 0;
+    while at < toks.len() && is_assignment_word(toks[at]) {
+        if is_code_injecting_assignment(toks[at]) {
+            return false;
+        }
+        at += assignment_token_span(&toks[at..]);
+    }
+    match &toks[at..] {
+        [] => true,
+        ["lucidos", verb @ ..] => LUCIDOS_DATA_SINK_VERBS
+            .iter()
+            .any(|sink| verb.starts_with(sink)),
+        [head, ..] => DATA_SINK_HEADS.contains(head),
+    }
 }
 
 /// The static, deterministic classification pass.
@@ -702,7 +965,23 @@ pub fn static_classify_trusting(
     site: CommandSite<'_>,
     trusted: &TrustedHeads,
 ) -> StaticVerdict {
-    site.with_disk(|disk| static_classify_at(tool_name, input, site.root(), disk, trusted))
+    static_classify_with_paths(
+        tool_name,
+        input,
+        site,
+        trusted,
+        &SecretPaths::conservative(),
+    )
+}
+
+pub fn static_classify_with_paths(
+    tool_name: &str,
+    input: &Value,
+    site: CommandSite<'_>,
+    trusted: &TrustedHeads,
+    paths: &SecretPaths,
+) -> StaticVerdict {
+    site.with_disk(|disk| static_classify_at(tool_name, input, site.root(), disk, trusted, paths))
 }
 
 fn static_classify_at(
@@ -711,6 +990,7 @@ fn static_classify_at(
     root: Option<&Path>,
     disk: Option<OnDisk<'_>>,
     trusted: &TrustedHeads,
+    paths: &SecretPaths,
 ) -> StaticVerdict {
     let Some(raw) = command_text(tool_name, input) else {
         return StaticVerdict::Settled(RiskLane::Safe);
@@ -720,10 +1000,11 @@ fn static_classify_at(
     // this, a wrapped command reads as head `bash`, skips the catastrophic
     // hard-block, and with the judge off falls through to Safe.
     let unwrapped = unwrap_shell_command(raw);
-    if catastrophic_reason_at(&unwrapped, 0, root).is_some() {
+    let is_python = matches!(tool_name, tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND);
+    if catastrophic_reason_with_language(&unwrapped, 0, root, is_python).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
-    if command_reads_secret(raw) {
+    if paths.tool(tool_name, raw) {
         return StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
     }
     let is_bash = matches!(tool_name, tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
@@ -1964,6 +2245,7 @@ static LUCIDOS_WORKSPACE_LOCAL_SUBCOMMANDS: &[(&str, &[&str])] = &[
     ("data", &["path", "write"]),
     ("model-prices", &[]),
     ("events", &["query", "count"]),
+    ("diagnostic-log", &["query"]),
     ("knowhow", &["list", "read"]),
 ];
 
@@ -3867,6 +4149,15 @@ pub(crate) fn catastrophic_reason_for_command_at(
 
 /// [`catastrophic_reason`], carrying the substitution-recursion depth.
 fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Option<&'static str> {
+    catastrophic_reason_with_language(command, depth, cwd, false)
+}
+
+fn catastrophic_reason_with_language(
+    command: &str,
+    depth: usize,
+    cwd: Option<&Path>,
+    is_python: bool,
+) -> Option<&'static str> {
     if is_fork_bomb(command) {
         return Some("a fork bomb (a recursive self-spawning process that exhausts the machine)");
     }
@@ -3886,11 +4177,21 @@ fn catastrophic_reason_at(command: &str, depth: usize, cwd: Option<&Path>) -> Op
         if let Some(reason) = catastrophic_rm_or_chmod(&inner) {
             return Some(reason);
         }
-        if let Some(reason) = workspace_floor::reason(&inner, cwd) {
+        if let Some(reason) = workspace_floor::filesystem_reason(&inner, cwd) {
             return Some(reason);
         }
     }
-    if let Some(reason) = workspace_floor::reason(command, cwd) {
+    // The workspace floor places quoted data and heredoc bodies itself. A
+    // fragment from the quote-blind segment split loses that execution context.
+    let workspace_reason = if depth == 0 && is_python {
+        workspace_floor::python_reason(command)
+            .or_else(|| workspace_floor::filesystem_reason(command, cwd))
+    } else if depth == 0 {
+        workspace_floor::reason(command, cwd)
+    } else {
+        workspace_floor::filesystem_reason(command, cwd)
+    };
+    if let Some(reason) = workspace_reason {
         return Some(reason);
     }
     // A substitution runs its body, and every scan above reads the OUTER head,
@@ -4529,6 +4830,8 @@ struct BlankedHeredocs {
     text: String,
     /// A blanked body may run as code the proof did not read.
     unproven: bool,
+    /// A body ran to the end of input with no terminator line.
+    unterminated: bool,
 }
 
 /// `command` without the body and terminator line of each heredoc whose
@@ -4539,7 +4842,9 @@ struct BlankedHeredocs {
 /// `proven` accepts that body, the opener line, body and terminator read as
 /// `true`. Every other blanked body is unproven.
 ///
-/// For the fast path only. The danger scans read the whole command, since the
+/// The fast path and the secret scan ([`secret_scan_text`]) read its output.
+/// A body placed differently from the shell is therefore a guard bypass, not
+/// a fast-path miss. The other danger scans read the whole command, since the
 /// head may run the body as code. An opener inside quotes or a comment is text.
 /// An unquoted body expands, so it stays, and the walk skips it unread.
 ///
@@ -4555,6 +4860,7 @@ fn blank_literal_heredoc_bodies(
     let mut out = String::with_capacity(command.len());
     let mut copied = 0;
     let mut unproven = false;
+    let mut unterminated = false;
     let mut pending: Vec<Heredoc> = Vec::new();
     let mut quotes = QuoteState::default();
     let mut i = 0;
@@ -4587,6 +4893,7 @@ fn blank_literal_heredoc_bodies(
                 let mut at = i + 1;
                 for heredoc in pending.drain(..) {
                     let (body_end, end) = heredoc_body_end(command, at, &heredoc)?;
+                    unterminated |= body_end == command.len();
                     if heredoc.literal {
                         if runs_python && proven(&command[at..body_end]) {
                             out.push_str(&command[copied..line_start]);
@@ -4607,6 +4914,7 @@ fn blank_literal_heredoc_bodies(
     (copied > 0).then(|| BlankedHeredocs {
         text: out + &command[copied..],
         unproven,
+        unterminated,
     })
 }
 
@@ -4759,7 +5067,8 @@ fn heredoc_opener(command: &str, at: usize) -> Option<(Heredoc, usize)> {
             end = next;
             continue;
         }
-        if b[end].is_ascii_whitespace() || b";|&<>()".contains(&b[end]) {
+        // Only the shell's own blanks end the word: a `\r` is part of it.
+        if b" \t\n;|&<>()".contains(&b[end]) {
             break;
         }
         end += char_len_at(command, end);
@@ -5693,6 +6002,7 @@ fn wrapper_preamble_redirects(command: &str) -> bool {
 ///
 /// The head list reads [`grant_command`], so a grant for `python3` covers
 /// `cd <root> && python3 x.py`. Every other check reads the command as written.
+#[cfg(test)]
 pub fn grant_covers_command(
     label: &str,
     command: &str,
@@ -5700,8 +6010,25 @@ pub fn grant_covers_command(
     trusted: &TrustedHeads,
     allowed: impl Fn(&str) -> bool,
 ) -> bool {
-    if command_reads_secret(command)
-        || catastrophic_reason_for_command_at(command, site.root()).is_some()
+    grant_covers_command_with_paths(
+        label,
+        command,
+        site,
+        trusted,
+        &SecretPaths::conservative(),
+        allowed,
+    )
+}
+
+pub fn grant_covers_command_with_paths(
+    label: &str,
+    command: &str,
+    site: CommandSite<'_>,
+    trusted: &TrustedHeads,
+    paths: &SecretPaths,
+    allowed: impl Fn(&str) -> bool,
+) -> bool {
+    if paths.command(command) || catastrophic_reason_for_command_at(command, site.root()).is_some()
     {
         return false;
     }
@@ -6540,6 +6867,37 @@ mod tests {
     const TEXT_ONLY: CommandSite<'static> = CommandSite::TextOnly { root: None };
 
     #[test]
+    fn workspace_operations_inside_data_are_not_catastrophic_for_any_tool() {
+        for command in [
+            "python3 - <<'PY'\nimport os,shutil\nprint(os.environ.get('LUCIDOS_PG_BIN_DIR'))\nprint(shutil.which('pg_ctl'))\nPY",
+            "cat > fixture.rs <<'EOF'\npg_ctl -D /tmp/lucidos_example stop\nEOF",
+            "python3 - <<'PY'\nfrom pathlib import Path\nPath('handoff.md').write_text('Use LUCIDOS_PG_BIN_DIR and pg_ctl')\nPY",
+            "cat <<'EOF'\n$(dropdb lucidos_example)\nEOF",
+        ] {
+            assert_eq!(catastrophic_reason_for_command(command), None, "{command}");
+            for tool in [tn::RUN_BASH, tn::RUN_BASH_BACKGROUND] {
+                assert_ne!(static_classify(tool, &json!({"command": command, "code": command}), TEXT_ONLY),
+                    StaticVerdict::Settled(RiskLane::Catastrophic), "{tool}: {command}");
+            }
+        }
+        for tool in [tn::RUN_PYTHON, tn::RUN_PYTHON_BACKGROUND] {
+            for (catastrophic, code) in [
+                (false, "from pathlib import Path\nPath('handoff.md').write_text('Use LUCIDOS_PG_BIN_DIR and pg_ctl')"),
+                (false, "description = 'dropdb lucidos_example'\nprint(description)"),
+                (true, "db = 'lucidos_example'\nimport subprocess\nsubprocess.run(['dropdb', db])"),
+                (true, "'''script'''\nimport subprocess\nsubprocess.run(['dropdb', 'lucidos_example'])"),
+            ] {
+                assert_eq!(
+                    static_classify(tool, &json!({"code": code}), TEXT_ONLY)
+                        == StaticVerdict::Settled(RiskLane::Catastrophic),
+                    catastrophic,
+                    "{tool}: {code}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cleanup_floor_blocks_every_tool_and_broad_grant_without_running_commands() {
         let temp = tempfile::tempdir().unwrap();
         let ws = temp.path().join("workspace");
@@ -6562,7 +6920,15 @@ mod tests {
                 tn::RUN_PYTHON,
                 tn::RUN_PYTHON_BACKGROUND,
             ] {
-                let input = json!({"command": command, "code": command});
+                let code = if command.starts_with("import ") {
+                    command.clone()
+                } else {
+                    format!(
+                        "import subprocess; subprocess.run({}, shell=True)",
+                        serde_json::to_string(&command).unwrap()
+                    )
+                };
+                let input = json!({"command": command, "code": code});
                 assert_eq!(
                     static_classify(tool, &input, CommandSite::Workspace(temp.path())),
                     StaticVerdict::Settled(RiskLane::Catastrophic),
@@ -8866,10 +9232,37 @@ print(subprocess.run('lucidos data write config/model-prices.json --from .lucido
             "lucidos model-prices | jq .override",
             "lucidos events query --type TaskDone --limit 5",
             "lucidos events count",
+            "lucidos diagnostic-log query",
+            "lucidos diagnostic-log query --since 30m --contains '[Voice]' --pid 77210",
+            "lucidos diagnostic-log query --json | jq .returned",
             "lucidos knowhow list",
             "lucidos knowhow read best-practices",
         ] {
             assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    #[test]
+    fn a_retargeted_or_unlisted_diagnostic_log_call_does_not_settle() {
+        for cmd in [
+            "lucidos diagnostic-log",
+            "lucidos diagnostic-log tail",
+            "sudo lucidos diagnostic-log query",
+            "env LUCIDOS_API_BASE_URL=http://x lucidos diagnostic-log query",
+            "export LUCIDOS_API_PORT=1; lucidos diagnostic-log query",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        for cmd in [
+            "LUCIDOS_API_BASE_URL=http://x lucidos diagnostic-log query",
+            "LUCIDOS_WORKSPACE=/tmp lucidos diagnostic-log query",
+            "LUCIDOS_API_PORT=1 lucidos diagnostic-log query",
+        ] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::NeedsJudge(ref ji) if ji.fast_path_refused),
+                "{cmd} must be a refusal, got {:?}",
+                bash(cmd)
+            );
         }
     }
 
@@ -9959,6 +10352,79 @@ subprocess.run('ls\x3b id', shell=True)",
         }
     }
 
+    #[test]
+    fn executing_policy_opens_workspace_logs_only_when_enforced() {
+        use crate::runtime::agent_sandbox::{policy_from, PolicyInputs, SandboxMode};
+        let home = Path::new("/home/user/.lucidos");
+        let policy = policy_from(&PolicyInputs {
+            lucidos_home: Some(home.into()),
+            data_dirs: vec![home.join("gateway"), PathBuf::from("/srv/second-install")],
+            workspaces: vec![],
+        });
+        for mode in [
+            Some(SandboxMode::Enforced),
+            Some(SandboxMode::Inherited),
+            Some(SandboxMode::OwnerOptedOut),
+            Some(SandboxMode::PermittedOutside),
+            None,
+        ] {
+            let paths = SecretPaths::for_policy(&policy, mode);
+            let enforced = mode == Some(SandboxMode::Enforced);
+            for path in ["/home/user/.lucidos/gateway/workspaces/tour-film-demo/.lucidos/diagnostic-log/diagnostic-log.jsonl", "/srv/second-install/workspaces/demo/log", "/srv/second-install//workspaces/./demo/log"] {
+                assert_eq!(paths.mentions(path), !enforced, "{mode:?}: {path}");
+            }
+            for path in [
+                "/srv/second-install/config/key",
+                "/srv/second-install/workspaces:archive/key",
+                "/srv/second-install/workspacesé/key",
+                "/srv/second-install/workspaces*/key",
+                "cat '/srv/second-install/workspaces archive/key'",
+                "/srv/second-install/workspaces/demo/../../config/key",
+                "/srv/second-install/workspaces/demo/.. -n",
+                "cat '/srv/second-install/workspaces/a b/../../config/key'",
+                "/home/user/.lucidos/local-token",
+                "/home/user/.lucidos/paired-devices.json",
+                ".lucidos/private/local-token",
+                "~/.lucidos/gateway/gateway.log",
+                "/home/user/.lucidos/gateway/workspaces/demo/.lucidos/private/local-token",
+            ] {
+                assert!(paths.mentions(path), "{mode:?}: {path}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classifier_adds_resolved_roots_and_every_home_form() {
+        use crate::runtime::agent_sandbox::SandboxMode;
+        let scratch = tempfile::tempdir().unwrap();
+        let real = scratch.path().join("real");
+        std::fs::create_dir_all(real.join("workspaces/demo")).unwrap();
+        let alias = scratch.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let home = home_dir().unwrap();
+        let gateway = home.join(".lucidos/gateway");
+        let policy = lucidos_agent_sandbox::Policy {
+            hidden: vec![alias.clone(), gateway.clone()],
+            open_within_hidden: vec![alias.join("workspaces"), gateway.join("workspaces")],
+            ..Default::default()
+        };
+        for mode in [Some(SandboxMode::Enforced), None] {
+            let paths = SecretPaths::for_policy(&policy, mode);
+            for root in policy.resolved().hidden {
+                assert!(paths.mentions(&format!("{}/config/key", root.display())));
+                assert_eq!(
+                    paths.mentions(&format!("{}/workspaces/demo/log", root.display())),
+                    mode.is_none()
+                );
+            }
+            for prefix in ["~", "$HOME", "${HOME}", ""] {
+                let path = format!("{prefix}/.lucidos/gateway/workspaces/demo/log");
+                assert_eq!(paths.mentions(&path), mode.is_none(), "{path}");
+            }
+        }
+    }
+
     const SECRET_READS: [&str; 13] = [
         "cat ~/.lucidos/snapshots/demo/snap_test/db.dump",
         "ls ${HOME}/.lucidos//./snapshots",
@@ -9987,6 +10453,168 @@ subprocess.run('ls\x3b id', shell=True)",
         ] {
             assert_eq!(python(code), want, "{code}");
         }
+    }
+
+    /// Reads of the gateway data dir an agent really ran while debugging, plus
+    /// each home form. The log sits beside keys and pairing state, so it stays
+    /// a secret read that no grant covers.
+    const GATEWAY_LOG_READS: [&str; 10] = [
+        r#"ls -t ~/.lucidos/gateway | head; f=$(ls -t ~/.lucidos/gateway/*.log ~/.lucidos/gateway/*/*.log 2>/dev/null | head -3); echo "$f""#,
+        r#"L=~/.lucidos/gateway/gateway.log; ls -la $L; grep -a "\[Voice\]" $L | grep -aE "2026-11-11[T ]20:(2[3-9])" | cut -c1-260 | head -60"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "\[Voice\]" $L | tail -3 | cut -c1-300; echo; grep -a "\[Voice\]" $L | grep -a "floor" | tail -20 | cut -c1-260"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(2[3-9])" | grep -av timing_log | grep -aiE "voice|call|live" | cut -c1-280 | head -70"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | head -400 | grep -aiE "commit|version|build|sha|started" | head -8 | cut -c1-250; echo ---; grep -a "\[pid:" $L | tail -1 | cut -c1-120"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(28|17|18)" | grep -av -E "timing_log|responses|Memory|AgentLoop|scroll" | grep -aiE "voice|call|live|chat" | cut -c1-260 | head -30"#,
+        r#"L=~/.lucidos/gateway/gateway.log; grep -a "pid:77210" $L | grep -aE "^21:(25:(19|2[0-9]|3[0-9])|28:(1[3-9]|2[0-2]))" | cut -c1-240 | head -40"#,
+        "tail -n 50 $HOME/.lucidos/gateway/gateway.log",
+        "grep Voice ${HOME}/.lucidos/gateway/gateway.log",
+        "tail /Users/me/.lucidos/gateway/gateway.log",
+    ];
+
+    #[test]
+    fn a_gateway_log_read_is_a_secret_read_no_grant_covers() {
+        let want = StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead);
+        let all = |_: &str| true;
+        for cmd in GATEWAY_LOG_READS {
+            assert_eq!(bash(cmd), want, "{cmd}");
+            for tool in ["Bash", "command_execution"] {
+                assert!(
+                    !grant_covers_command(tool, cmd, TEXT_ONLY, &TrustedHeads::NONE, all),
+                    "{tool}: {cmd}"
+                );
+            }
+        }
+    }
+
+    /// A handoff narrative line that names a secret path as document text.
+    const NARRATIVE: &str = "- Do NOT read `~/.lucidos/gateway/gateway.log` or other raw logs.\n";
+
+    /// The second evidence command: a literal narrative, then a verb reading
+    /// it as a file.
+    fn handoff_command() -> String {
+        format!(
+            "cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF\n\
+             lucidos successor start --narrative /tmp/h.md --at phase-commit --progress 1/7"
+        )
+    }
+
+    /// `script` as Codex renders argv: one `-c` operand of joined single-quoted
+    /// runs, each `'` written as `'\''`.
+    fn codex_wrapped(script: &str) -> String {
+        format!("/bin/zsh -lc '{}'", script.replace('\'', r"'\''"))
+    }
+
+    #[test]
+    fn a_literal_heredoc_body_nothing_runs_is_not_a_secret_read() {
+        for cmd in [
+            format!(
+                "N=\"${{TMPDIR:-/tmp}}/h.md\"; cat > \"$N\" <<'EOF'\n{NARRATIVE}EOF\n\
+                 lucidos successor start --narrative \"$N\" --at phase-commit --progress 1/7"
+            ),
+            handoff_command(),
+            format!("cat > /tmp/h.md <<\"EOF\"\n{NARRATIVE}EOF"),
+            format!("cat > /tmp/h.md <<\\EOF\n{NARRATIVE}EOF"),
+            format!("cat > /tmp/h.md <<-'EOF'\n\t{NARRATIVE}\tEOF"),
+            format!(
+                "cat > /tmp/h.md <<'EOF'\r\n{}EOF\r\n",
+                NARRATIVE.replace('\n', "\r\n")
+            ),
+            format!("mkdir -p /tmp/h && cat > /tmp/h/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("tee /tmp/h.md >/dev/null <<'EOF'\n{NARRATIVE}EOF"),
+            format!("lucidos data write artifacts/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            codex_wrapped(&handoff_command()),
+        ] {
+            assert!(!command_reads_secret(&cmd), "{cmd}");
+            assert_ne!(
+                bash(&cmd),
+                StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead),
+                "{cmd}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heredoc_that_reads_or_runs_a_secret_path_stays_a_secret_read() {
+        let read = "cat ~/.lucidos/secret-keys/db\n";
+        let script = format!("cat > /tmp/x.sh <<'EOF'\n{read}EOF\n");
+        let all = |_: &str| true;
+        for cmd in [
+            // A real read, an input redirect, a here-string, a secret target.
+            "cat ~/.lucidos/gateway/gateway.log".to_string(),
+            "grep x $HOME/.lucidos/secret-keys/db".into(),
+            "cat < ~/.lucidos/secret-keys/db".into(),
+            "while read l; do :; done < ~/.lucidos/gateway/gateway.log".into(),
+            "cat <<< ~/.lucidos/secret-keys/db".into(),
+            "cat > ~/.lucidos/secret-keys/db <<'EOF'\nx\nEOF".into(),
+            format!("cat > /tmp/h.md <<'EOF' ~/.lucidos/secret-keys/db\n{NARRATIVE}EOF"),
+            // An unquoted body expands, so its text is scanned.
+            "cat > /tmp/h.md <<EOF\n$(cat ~/.lucidos/secret-keys/db)\nEOF".into(),
+            "cat > /tmp/h.md <<EOF\n`cat ~/.lucidos/secret-keys/db`\nEOF".into(),
+            format!("cat > /tmp/h.md <<EOF\n{NARRATIVE}EOF"),
+            // A head that runs the body.
+            format!("bash <<'EOF'\n{read}EOF"),
+            format!("sh -s <<'EOF'\n{read}EOF"),
+            "python3 - <<'EOF'\nprint(open('/Users/me/.lucidos/secret-keys/db').read())\nEOF"
+                .into(),
+            format!(". /dev/stdin <<'EOF'\n{read}EOF"),
+            format!("cat <<'EOF' | sh\n{read}EOF"),
+            format!("env cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("/bin/cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("BASH_ENV=/tmp/x cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            // A sink name redefined as a function that runs its input.
+            format!("cat () ( bash )\ncat <<'EOF'\n{read}EOF"),
+            format!("cat () {{ bash; }}\ncat <<'EOF'\n{read}EOF"),
+            // A CRLF opener: the shell's delimiter keeps its `\r`.
+            format!("cat > /tmp/h.md <<'EOF'\r\nnotes\r\nEOF\r\n{read}EOF"),
+            // A body written as a script, then run in the same command.
+            format!("{script}bash /tmp/x.sh"),
+            format!("{script}chmod +x /tmp/x.sh && /tmp/x.sh"),
+            format!("cat > /tmp/x.md <<'EOF'\n{read}EOF\nsource /tmp/x.md"),
+            codex_wrapped(&format!("{script}bash /tmp/x.sh")),
+            // A substitution beside the body.
+            format!("cat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF\necho $(date)"),
+            // A nested shell, and a wrapper the outer shell expands.
+            "bash -c 'cat ~/.lucidos/secret-keys/db'".into(),
+            "bash -c \"cat > f <<'EOF'\n$(cat ~/.lucidos/secret-keys/db)\nEOF\"".into(),
+            format!(
+                "/bin/zsh -lc \"{}\"",
+                handoff_command().replace('"', "\\\"")
+            ),
+            // A wrapper tail the script reads.
+            "bash -c 'cat \"$1\"' _ ~/.lucidos/secret-keys/db".into(),
+            // Shapes the body walk cannot place.
+            format!("cat > /tmp/h.md <<'EOF'\n{NARRATIVE}"),
+            format!("echo ${{x:-<<}}\ncat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+            format!("# note\ncat > /tmp/h.md <<'EOF'\n{NARRATIVE}EOF"),
+        ] {
+            assert!(command_reads_secret(&cmd), "{cmd}");
+            assert_eq!(
+                bash(&cmd),
+                StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead),
+                "{cmd}"
+            );
+            for tool in ["Bash", "command_execution"] {
+                assert!(
+                    !grant_covers_command(tool, &cmd, TEXT_ONLY, &TrustedHeads::NONE, all),
+                    "{tool}: {cmd}"
+                );
+            }
+        }
+    }
+
+    /// Python's `<<` is a shift, so a `cat` object with `__lshift__` runs the
+    /// lines a shell would read as a heredoc body.
+    #[test]
+    fn python_shaped_like_a_heredoc_stays_a_secret_read() {
+        let code = "cat = type('', (), {'__lshift__': lambda s, o: s})()\n\
+                    cat <<'EOF'\n\
+                    print(open('/Users/me/.lucidos/secret-keys/db').read())\n\
+                    EOF";
+        assert!(python_reads_secret(code));
+        assert_eq!(
+            python(code),
+            StaticVerdict::SettledIrreversible(SideEffectCategory::SecretRead)
+        );
     }
 
     #[test]
@@ -11242,6 +11870,65 @@ subprocess.run('ls\x3b id', shell=True)",
             &TrustedHeads::NONE,
             |p: &str| { p == "Bash(cat:*)" || p == "Bash" }
         ));
+    }
+}
+
+#[cfg(test)]
+mod relocated_secret_tests {
+    use super::*;
+
+    const USER_HOME: &str = "/home/user";
+
+    fn guards(moved: &str, text: &str) -> bool {
+        let secrets = secret_paths(Some(PathBuf::from(moved)), Some(Path::new(USER_HOME)));
+        mentions_any_path(&secrets, text)
+    }
+
+    #[test]
+    fn a_moved_private_subtree_is_a_secret_path() {
+        let read = "cat /tmp/e2e-root/private/secret-keys/k";
+        assert!(!mentions_any_path(
+            &secret_paths(None, Some(Path::new(USER_HOME))),
+            read
+        ));
+        assert!(guards("/tmp/e2e-root/private", read));
+        assert!(!guards(
+            "/tmp/e2e-root/private",
+            "cat /tmp/e2e-root/private-notes"
+        ));
+    }
+
+    #[test]
+    fn a_moved_subtree_under_the_home_matches_every_home_form() {
+        let moved = "/home/user/.lucidos/e2e-root/private";
+        for read in [
+            "cat /home/user/.lucidos/e2e-root/private/local-token",
+            "cat ~/.lucidos/e2e-root/private/local-token",
+            "cat \"$HOME/.lucidos/e2e-root/private\"/local-token",
+            "cat ${HOME}/.lucidos/e2e-root/private/local-token",
+        ] {
+            assert!(guards(moved, read), "{read}");
+        }
+    }
+
+    #[test]
+    fn a_shallow_moved_subtree_does_not_match_every_private_dir() {
+        assert!(guards("/home/user/private", "cat ~/private/local-token"));
+        assert!(!guards(
+            "/home/user/private",
+            "cat /srv/project/private/notes"
+        ));
+    }
+
+    #[test]
+    fn a_trailing_slash_or_doubled_slash_cannot_hide_the_moved_subtree() {
+        for moved in ["/tmp/e2e-root/private/", "/tmp//e2e-root/./private"] {
+            assert!(
+                guards(moved, "cat /tmp/e2e-root/private/secret-keys/k"),
+                "{moved}"
+            );
+            assert!(guards(moved, "tar czf - /tmp/e2e-root/private"), "{moved}");
+        }
     }
 }
 

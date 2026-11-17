@@ -104,7 +104,7 @@ pub(crate) async fn lookup_latest_worktree_head_sha(
             None => IdleAnchor::Absent,
         },
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to look up latest worktree_head_sha for {}: {}",
                 thread_id,
                 e
@@ -133,7 +133,7 @@ pub(crate) async fn lookup_latest_worktree_path(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to look up latest worktree_path for {}: {}",
             thread_id,
             e
@@ -179,7 +179,7 @@ pub(crate) async fn lookup_prior_change_flags(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to read the prior branch work for {}: {}",
             thread_id,
             e
@@ -199,7 +199,7 @@ pub(crate) async fn lookup_prior_change_flags(
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to read prior requires_restart for {}: {}",
                 thread_id,
                 e
@@ -237,7 +237,7 @@ pub(crate) async fn resolve_worktree_path(
     branch_hint: Option<&str>,
 ) -> PathBuf {
     if let Some(path) = lookup_latest_worktree_path(pool, thread_id).await {
-        log!(
+        log_legacy!(
             "[AgentSession] Resolved worktree path from CodingAgentIdled event for thread {}: {}",
             thread_id,
             path.display()
@@ -248,7 +248,7 @@ pub(crate) async fn resolve_worktree_path(
     if let Some(branch) = branch_hint {
         match find_worktree_for_branch(repo_root, branch).await {
             WorktreeLookup::Found(path) => {
-                log!(
+                log_legacy!(
                     "[AgentSession] Resolved worktree path via git worktree list for thread {} branch {}: {}",
                     thread_id,
                     branch,
@@ -260,7 +260,7 @@ pub(crate) async fn resolve_worktree_path(
             // Same fallback as NotFound, and the log is what tells them apart.
             // Step 3 below only computes a path, and the caller checks it on
             // disk before using it, so nothing destructive rides on this.
-            WorktreeLookup::Unknown => log!(
+            WorktreeLookup::Unknown => log_legacy!(
                 "[AgentSession] git worktree list gave no answer for thread {} branch {}; falling back to the deterministic path",
                 thread_id,
                 branch
@@ -269,7 +269,7 @@ pub(crate) async fn resolve_worktree_path(
     }
 
     let path = deterministic_worktree_path(workspace_path, thread_id);
-    log!(
+    log_legacy!(
         "[AgentSession] Generated new deterministic worktree path for thread {}: {}",
         thread_id,
         path.display()
@@ -304,21 +304,22 @@ pub(crate) async fn resume_sid_for_account(
 /// that was mis-pinned onto another account by a toggle flip still resumes the
 /// session belonging to its original account rather than the globally-newest one.
 ///
-/// `handoff_pending` wins over all of it: a *successor session* never resumes,
-/// and runs on the thread's own branch.
+/// `start_fresh` wins over all of it: a *successor session* never resumes, and
+/// neither does a session after a *provider block*. Both run on the thread's
+/// own branch.
 pub(super) async fn resolve_resume_context(
     pool: &sqlx::PgPool,
     changes: &crate::core::changes_projection::ChangesProjection,
     thread_id: uuid::Uuid,
     caller_session_id: Option<String>,
     pinned_config_dir: Option<&str>,
-    handoff_pending: bool,
+    start_fresh: bool,
 ) -> (Option<String>, Option<String>) {
     let open_branch = changes
         .open_for_thread(thread_id)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[AgentSession] resume: open_for_thread({}): {}; \
                  skipping the open-branch resume path",
                 thread_id,
@@ -329,14 +330,14 @@ pub(super) async fn resolve_resume_context(
         .pop()
         .map(|c| c.branch_name);
 
-    // A *successor session* starts fresh on the thread's own branch.
-    if handoff_pending {
+    // A fresh session runs on the thread's own branch.
+    if start_fresh {
         let branch = match open_branch {
             Some(branch) => Some(branch),
             None => lookup_session_branch_for_thread(pool, thread_id).await,
         };
-        log!(
-            "[AgentSession] Thread {} handed off: a fresh session on branch {:?}",
+        log_legacy!(
+            "[AgentSession] Thread {} starts a fresh session on branch {:?}",
             thread_id,
             branch
         );
@@ -348,7 +349,7 @@ pub(super) async fn resolve_resume_context(
             Some(sid) => Some(sid),
             None => resume_sid_for_account(pool, thread_id, pinned_config_dir).await,
         };
-        log!(
+        log_legacy!(
             "[AgentSession] Resuming on open-change branch {} for thread {} (sid={:?})",
             branch,
             thread_id,
@@ -373,7 +374,7 @@ pub(super) async fn resolve_resume_context(
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to look up last lifecycle event for resume: {}",
                 e
             );
@@ -398,6 +399,126 @@ pub(super) async fn resolve_resume_context(
     (None, None)
 }
 
+/// Which session a run starts, for the handoff and resume decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunKind {
+    /// A first message, a follow-up or a Continue: the thread's own next session.
+    Ordinary,
+    /// A lane thread resolving its open batch. Its sessions are the thread's
+    /// own, so a pending handoff starts its successor session.
+    Lane,
+    /// A conflict-resolution or orphan-recovery session. It is not the
+    /// thread's next session, so it never consumes a pending handoff.
+    Resolution,
+}
+
+/// What a run resumes, and the handoff or provider block its session starts
+/// from.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct RunResume {
+    pub pending_handoff: Option<crate::engine::successor::PendingHandoff>,
+    /// The policy that blocked an ordinary run's newest session
+    /// ([`blocking_policy`]). A pending handoff already starts fresh.
+    pub blocking_policy: Option<&'static str>,
+    pub session_id: Option<String>,
+    /// The branch an ordinary run's worktree resumes on.
+    pub branch: Option<String>,
+}
+
+impl RunResume {
+    /// Whether the run's `SessionStarted` records its continuity whatever
+    /// its spawn did. A resumed spawn always records it.
+    pub(super) fn records_continuity(&self, kind: RunKind) -> bool {
+        kind == RunKind::Ordinary || self.pending_handoff.is_some()
+    }
+}
+
+/// Resolve what a run of `kind` resumes. The thread's own next session reads
+/// the pending handoff under the handoff lock. A withdraw then either lands
+/// first or sees this run's claim and refuses.
+pub(super) async fn resolve_run_resume(
+    pool: &sqlx::PgPool,
+    changes: &crate::core::changes_projection::ChangesProjection,
+    thread_id: uuid::Uuid,
+    kind: RunKind,
+    caller_session_id: Option<String>,
+    pinned_config_dir: Option<&str>,
+) -> Result<RunResume, sqlx::Error> {
+    let pending_handoff = if kind == RunKind::Resolution {
+        None
+    } else {
+        let claim = crate::engine::successor::lock_handoff(pool, thread_id).await?;
+        let pending = crate::engine::successor::pending_handoff(pool, thread_id).await?;
+        claim.commit().await?;
+        pending
+    };
+    let blocking_policy = if kind == RunKind::Ordinary && pending_handoff.is_none() {
+        blocking_policy(pool, thread_id).await
+    } else {
+        None
+    };
+    let (session_id, branch) = match kind {
+        RunKind::Ordinary => {
+            resolve_resume_context(
+                pool,
+                changes,
+                thread_id,
+                caller_session_id,
+                pinned_config_dir,
+                pending_handoff.is_some() || blocking_policy.is_some(),
+            )
+            .await
+        }
+        // A lane thread's successor session starts fresh in the lane's own
+        // worktree. Without a handoff it keeps its context.
+        RunKind::Lane if pending_handoff.is_some() => (None, None),
+        RunKind::Lane | RunKind::Resolution => (caller_session_id, None),
+    };
+    Ok(RunResume {
+        pending_handoff,
+        blocking_policy,
+        session_id,
+        branch,
+    })
+}
+
+/// The reason OpenAI's safety systems blocked the thread's newest session, when
+/// the newest provider error since that session started was a policy block.
+/// A later failure with no provider error, such as a spawn that failed before
+/// its session began, leaves the block in place. The session that carried the
+/// block is never resumed: it would replay the history that tripped it. A newer
+/// `SessionStarted` clears the block, since its own id is the one to resume. A
+/// failed read answers `None`, which resumes as before.
+pub(crate) async fn blocking_policy(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> Option<&'static str> {
+    let provider_error = sqlx::query_scalar::<_, Option<serde_json::Value>>(
+        "SELECT payload->'provider_error' FROM events \
+         WHERE thread_id = $1 AND event_type = 'ResponseFailed' \
+           AND jsonb_typeof(payload->'provider_error') = 'object' \
+           AND sequence > COALESCE(( \
+                 SELECT MAX(sequence) FROM events \
+                 WHERE thread_id = $1 AND event_type = 'SessionStarted'), 0) \
+         ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log_legacy!(
+            "[AgentSession] Failed to look up a provider block for {}: {}",
+            thread_id,
+            e
+        );
+        None
+    })
+    .flatten()?;
+    serde_json::from_value::<crate::engine::thread_events::ProviderError>(provider_error)
+        .ok()?
+        .policy_name()
+}
+
 /// The branch the thread's latest session ran on. `None` when no session
 /// recorded one, or the lookup failed.
 pub(crate) async fn lookup_session_branch_for_thread(
@@ -414,7 +535,7 @@ pub(crate) async fn lookup_session_branch_for_thread(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to look up session branch for {}: {}",
             thread_id,
             e
@@ -444,7 +565,7 @@ pub(crate) async fn lookup_latest_session_repo_and_branch(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to look up session repo+branch for {}: {}",
             thread_id,
             e
@@ -490,7 +611,7 @@ pub(crate) async fn latest_originating_event_id(
         .fetch_optional(pool)
         .await
         .map_err(|e| {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to look up latest originating event id for {}: {}",
                 thread_id,
                 e
@@ -530,20 +651,38 @@ pub(crate) async fn lookup_latest_cc_session_id(
     pool: &sqlx::PgPool,
     thread_id: uuid::Uuid,
 ) -> Option<String> {
+    lookup_latest_session_id_where(pool, thread_id, None).await
+}
+
+pub(crate) async fn lookup_latest_session_id_for_agent(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    agent: crate::runtime::CodingAgent,
+) -> Option<String> {
+    lookup_latest_session_id_where(pool, thread_id, Some(agent)).await
+}
+
+async fn lookup_latest_session_id_where(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    agent: Option<crate::runtime::CodingAgent>,
+) -> Option<String> {
     sqlx::query_scalar::<_, Option<String>>(&format!(
         "SELECT payload->>'cc_session_id' FROM events \
          WHERE thread_id = $1 \
            AND event_type IN ('CodingAgentIdled', 'CodingAgentSettingsChanged') \
            AND payload->>'cc_session_id' IS NOT NULL \
            AND payload->>'cc_session_id' <> '' \
+           AND ($2::text IS NULL OR COALESCE(payload->>'coding_agent', payload->>'agent', 'claude-code') = $2) \
            AND {AFTER_LAST_STALE_RESUME_SQL} \
          ORDER BY sequence DESC LIMIT 1"
     ))
     .bind(thread_id)
+    .bind(agent.map(crate::runtime::CodingAgent::as_str))
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to look up latest cc_session_id for {}: {}",
             thread_id,
             e
@@ -601,7 +740,7 @@ pub(crate) async fn api_error_auto_resumes_spent(
     {
         Ok(n) => n,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Failed to count api-error auto-resumes for {}: {}. Treating the budget as spent.",
                 thread_id,
                 e
@@ -724,7 +863,7 @@ pub(crate) async fn lookup_latest_cc_session_id_for_config_dir(
     .fetch_optional(pool)
     .await
     .map_err(|e| {
-        log!(
+        log_legacy!(
             "[AgentSession] Failed to look up cc_session_id under {} for {}: {}",
             config_dir,
             thread_id,
@@ -752,7 +891,7 @@ pub(crate) async fn change_description_fallback(
         {
             Ok(t) => t,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[AgentSession] Failed to fetch thread title for change description: {}",
                     e
                 );

@@ -55,7 +55,9 @@ jobs:
       macos: ${{ steps.plan.outputs.macos }}
       has_linux: ${{ steps.plan.outputs.has_linux }}
       has_macos: ${{ steps.plan.outputs.has_macos }}
-      has_engine: ${{ steps.plan.outputs.has_engine }}
+      suites: ${{ steps.plan.outputs.suites }}
+      has_suites: ${{ steps.plan.outputs.has_suites }}
+      has_confinement: ${{ steps.plan.outputs.has_confinement }}
       linux_engine_run: ${{ steps.find-linux.outputs.linux_engine_run }}
       linux_engine_artifact: ${{ steps.find-linux.outputs.linux_engine_artifact }}
       macos_engine_run: ${{ steps.find-macos.outputs.macos_engine_run }}
@@ -203,7 +205,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.linux) }}
-    name: ${{ matrix.id }}
+    # The e2e prefix tells a waiting main check its tests started (e2e_github.sh).
+    name: e2e ${{ matrix.id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
@@ -269,8 +272,8 @@ jobs:
           overwrite: true
           path: |
             crates/lucidos-app/test-results
-            ~/workspaces/e2e-test/.lucidos/engine.log
-            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
+            ~/.lucidos/e2e-root/workspaces/e2e-test/.lucidos/engine.log
+            ~/.lucidos/e2e-root/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
           retention-days: 1
           if-no-files-found: ignore
 
@@ -283,7 +286,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.macos) }}
-    name: ${{ matrix.id }}
+    # The e2e prefix tells a waiting main check its tests started (e2e_github.sh).
+    name: e2e ${{ matrix.id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
@@ -342,16 +346,83 @@ jobs:
           overwrite: true
           path: |
             crates/lucidos-app/test-results
-            ~/workspaces/e2e-test/.lucidos/engine.log
-            ~/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
+            ~/.lucidos/e2e-root/workspaces/e2e-test/.lucidos/engine.log
+            ~/.lucidos/e2e-root/workspaces/e2e-test/.lucidos/e2e-gateway/gateway.log
           retention-days: 1
           if-no-files-found: ignore
 
-  # The engine suite, against a disposable pgvector Postgres in Docker. Only
-  # the main check asks for it (scripts/main-check.sh).
-  engine:
+  # The engine, crates and script suites, each on Linux and macOS: the crates
+  # hold macOS-only code and tests, and the scripts must hold under bash 3.2
+  # and BSD tools. Only the main check asks for them (scripts/main-check.sh).
+  # Linux's engine suite uses a pgvector Postgres in Docker, macOS's a native one.
+  suites:
     needs: plan
-    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_engine == 'true'
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_suites == 'true'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.suites) }}
+    name: ${{ matrix.id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: '20'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          prefix-key: v0-rust-e2e
+          shared-key: ${{ runner.os == 'macOS' && 'macos' || 'linux' }}
+          save-if: false
+      - name: Block parcel.pyke.io (the ONNX Runtime mirror must be enough, ADR 0595)
+        shell: bash
+        run: ./scripts/block-ort-upstream.sh
+
+      - name: Prepare the runner
+        run: |
+          git config --global user.name "Lucidos e2e"
+          git config --global user.email "lucidos-e2e@users.noreply.github.com"
+      - name: Install ripgrep and a PostgreSQL client of the server's version (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq ripgrep >/dev/null
+          # The runner's own pg_dump is older than the pg18 test server.
+          # shellcheck source=scripts/lib/workspace_constants.sh
+          source scripts/lib/workspace_constants.sh
+          sudo apt-get install -y -qq postgresql-common >/dev/null
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
+          sudo apt-get install -y -qq "postgresql-client-${PG_IMAGE##*pg}" >/dev/null
+          echo "/usr/lib/postgresql/${PG_IMAGE##*pg}/bin" >> "$GITHUB_PATH"
+      - name: Install ripgrep (macOS)
+        if: runner.os == 'macOS'
+        run: command -v rg >/dev/null || brew install ripgrep
+      # What seed-cache saved on main. A miss downloads and compiles as before.
+      - id: keys
+        if: runner.os == 'macOS' && matrix.suite == 'engine'
+        run: ./scripts/e2e-github-shard.sh cache-keys
+      - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        if: runner.os == 'macOS' && matrix.suite == 'engine'
+        with:
+          path: ${{ runner.temp }}/pg/${{ steps.keys.outputs.postgres_dir }}
+          key: e2e-macos-15-${{ steps.keys.outputs.postgres }}
+      - name: Start Postgres with pgvector (macOS runners have no Docker)
+        if: runner.os == 'macOS' && matrix.suite == 'engine'
+        run: ./scripts/e2e-github-shard.sh native-postgres "$RUNNER_TEMP/pg"
+      - name: Run ${{ matrix.id }}
+        run: ./scripts/e2e-github-shard.sh run "${{ matrix.id }}" "${{ matrix.suite }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        if: always()
+        with:
+          name: e2e-out-${{ matrix.id }}
+          overwrite: true
+          path: e2e-out/${{ matrix.id }}
+          retention-days: 1
+
+  # Confinement builds its own test binaries and needs no e2e engine.
+  confinement:
+    needs: plan
+    if: github.repository == 'lucidos-dev/lucidos' && needs.plan.outputs.has_confinement == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 100
     steps:
@@ -381,14 +452,14 @@ jobs:
           sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null
           sudo apt-get install -y -qq "postgresql-client-${PG_IMAGE##*pg}" >/dev/null
           echo "/usr/lib/postgresql/${PG_IMAGE##*pg}/bin" >> "$GITHUB_PATH"
-      - name: Run the engine suite
-        run: ./scripts/e2e-github-shard.sh run engine engine
+      - name: Run the confinement tests
+        run: ./scripts/e2e-github-shard.sh run confinement confinement
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         if: always()
         with:
-          name: e2e-out-engine
+          name: e2e-out-confinement
           overwrite: true
-          path: e2e-out/engine
+          path: e2e-out/confinement
           retention-days: 1
 
   # The only jobs that save a cache. Mirror main moves at each release, and
@@ -474,6 +545,6 @@ jobs:
       - name: Compile the API and WASM suites' test binaries
         if: matrix.key == 'linux'
         run: cargo test --locked -p lucidos-e2e --no-run
+      # The suites job runs the engine suite on both platforms.
       - name: Compile the engine suite's test binary
-        if: matrix.key == 'linux'
         run: cargo test --locked -p lucidos-engine --lib --no-run

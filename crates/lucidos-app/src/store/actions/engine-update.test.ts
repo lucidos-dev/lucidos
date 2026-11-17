@@ -308,7 +308,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(engineVersionReady.value).toBe(false);
   });
 
-  it('keeps the Rebuild escape hatch when a finished rebuild left the version still pending', async () => {
+  it('keeps the build action when a finished rebuild left the version still pending', async () => {
     // Same wedge, but source IS behind: silence would hide a real pending
     // version AND its manual escape, so the pending branch admits 'ready'
     // (only 'building' suppresses it). INV-5b.
@@ -320,40 +320,43 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     }));
     await checkEngineVersion();
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.action?.label).toBe('Rebuild');
+    expect(toast?.action?.label).toBe('Build new version');
     expect(engineVersionReady.value).toBe(false);
   });
 
-  it('surfaces a pending-version toast with a Rebuild action when source is behind but no fresh binary exists', async () => {
+  it('surfaces a pending-version toast with a build action when source is behind but no fresh binary exists', async () => {
     // The wedge: engine source is behind HEAD (a new version exists) but the
     // on-disk binary hasn't advanced (rebuild failed / not run). The Switch isn't
-    // ready, so instead of silence the user gets an actionable "Rebuild".
+    // ready, so instead of silence the user gets an actionable "Build new version".
     mockStatus.mockResolvedValue(status({ source_behind_head: true, update_available: false, build_state: 'idle' }));
     await checkEngineVersion();
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.action?.label).toBe('Rebuild');
+    expect(toast?.action?.label).toBe('Build new version');
     // Not a Switch — there's no built binary to switch onto yet.
     expect(toast?.action?.label).not.toBe('Switch');
     expect(engineVersionReady.value).toBe(false);
   });
 
-  it('pending-version Rebuild action triggers a background rebuild', async () => {
+  it('pending-version build action joins and never switches automatically', async () => {
     mockStatus.mockResolvedValue(status({ source_behind_head: true, build_state: 'idle' }));
     await checkEngineVersion();
     toasts.value.find((t) => t.key === 'engine-new-version')?.action?.onClick();
-    expect(mockRebuild).toHaveBeenCalled();
+    expect(mockRebuild).toHaveBeenCalledWith('join');
+    expect(confirmAndRestartEngine).not.toHaveBeenCalled();
+    toasts.value.find((t) => t.key === 'engine-new-version')?.action?.onClick();
+    expect(mockRebuild).toHaveBeenLastCalledWith('join');
   });
 
-  it('does NOT nag a Rebuild toast when a ready binary exists but its Switch was dismissed (source still behind)', async () => {
+  it('does NOT nag a build toast when a ready binary exists but its Switch was dismissed (source still behind)', async () => {
     // After a successful rebuild both update_available (disk≠running) AND
     // source_behind_head (running commit still behind HEAD) are true. Dismissing
-    // the Switch must not re-surface as a "Rebuild" pending toast — a switchable
+    // the Switch must not re-surface as a pending build toast: a switchable
     // binary already exists; that's the ready branch's per-build dismissal, not here.
     mockWasDismissed.mockImplementation((id) => id === 'disk999');
     mockStatus.mockResolvedValue(status({ source_behind_head: true, update_available: true, build_state: 'ready', disk_build_id: 'disk999' }));
     await checkEngineVersion();
     expect(engineVersionReady.value).toBe(true); // badge persists (a binary IS ready)
-    expect(hasSwitchToast()).toBe(false); // neither the Switch toast (dismissed) nor a Rebuild nag
+    expect(hasSwitchToast()).toBe(false); // neither the Switch toast (dismissed) nor a build nag
   });
 
   it('does not surface the pending toast while the self-heal rebuild is building (spinner covers it)', async () => {
@@ -363,11 +366,11 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(engineBuilding.value).toBe(true);
   });
 
-  it('shows the building spinner (not a Rebuild toast) when a co-located peer is building the shared binary', async () => {
+  it('shows the building spinner (not a pending build toast) when a co-located peer is building the shared binary', async () => {
     // Multi-workspace: this workspace lost the shared build lock so its own
     // rebuild SkippedLocked → build_state fell back to 'idle', but a peer's build
     // IS in flight and will advance the shared binary. Show the spinner, withhold
-    // the misleading manual "Rebuild".
+    // the misleading "Build new version".
     mockStatus.mockResolvedValue(status({
       source_behind_head: true,
       update_available: false,
@@ -380,7 +383,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(engineVersionReady.value).toBe(false);
   });
 
-  it('still shows the Rebuild toast (no spinner) when genuinely stuck — nothing is building', async () => {
+  it('still shows the pending build toast (no spinner) when nothing is building', async () => {
     // The complement of the peer-building case: source behind, no fresh binary,
     // and NO build in flight (shared lock free) → genuinely stuck, so the manual
     // Rebuild escape hatch must still appear and the spinner must stay off.
@@ -392,7 +395,7 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     }));
     await checkEngineVersion();
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.action?.label).toBe('Rebuild');
+    expect(toast?.action?.label).toBe('Build new version');
     expect(engineBuilding.value).toBe(false);
   });
 
@@ -544,7 +547,7 @@ describe('checkEngineVersion: the pending version is dismissable, and the badge 
     mockStatus.mockResolvedValue(status(PENDING));
     await checkEngineVersion();
     const toast = toasts.value.find((t) => t.key === 'engine-new-version');
-    expect(toast?.action?.label).toBe('Rebuild');
+    expect(toast?.action?.label).toBe('Build new version');
     expect(toast?.secondaryAction?.label).toBe('Later');
   });
 

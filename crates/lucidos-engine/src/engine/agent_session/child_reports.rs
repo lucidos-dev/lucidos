@@ -139,7 +139,7 @@ pub(crate) fn begin_take(
             }
         }
         if let Err(unsettled) = settled_tx.send(WithdrawnReports { request, reports }) {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildReports] session ended before it settled a take of {:?}",
                 unsettled
                     .0
@@ -174,6 +174,7 @@ pub(crate) async fn settle_take(
     let mut moved = Vec::new();
     for report in reports {
         let resent = AgentInput {
+            defer_on_steer_failure: false,
             text: report.sent.clone(),
             images: Vec::new(),
             uuid: Uuid::new_v4(),
@@ -184,7 +185,7 @@ pub(crate) async fn settle_take(
         inputs.child_report_taken(report.card_id);
         inputs.forwarded_child_report(report.card_id, &resent, None, report.text);
         if agent_input_tx.send(resent).is_err() {
-            crate::log!(
+            crate::log_legacy!(
                 "[ChildReports] report {} could not go back to the agent: its process ended",
                 report.card_id
             );
@@ -240,7 +241,7 @@ impl LucidosEngine {
             Ok(Ok(taken)) => taken,
             Ok(Err(_loop_ended)) => Vec::new(),
             Err(_) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[ChildReports] take for thread {} not answered within {}s",
                     thread_id,
                     TAKE_TIMEOUT.as_secs()

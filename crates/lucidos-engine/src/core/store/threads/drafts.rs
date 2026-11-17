@@ -2,8 +2,9 @@
 //! thread holds and how to link it.
 //!
 //! The draft is what the user typed into the composer and has not sent. It
-//! lives on the thread's projection row (`compose_*` columns), and the compose
-//! PUT is its only writer. Everything here only reads it. A draft has no
+//! lives on the thread's projection row (`compose_*` columns). The compose PUT
+//! writes it, and a seeded `ThreadStarted` fills it once: a recovery, or an
+//! agent's draft (ADR 0665). Everything here only reads it. A draft has no
 //! address of its own, so a reader links to its owning thread.
 
 use super::*;
@@ -68,6 +69,8 @@ pub struct DraftSummary {
     pub section: String,
     pub status: ThreadStatus,
     pub parent_thread_id: Option<String>,
+    /// The thread whose agent created this draft. `None` for the owner's own.
+    pub drafted_by: Option<String>,
     pub preview: String,
     /// The whole draft's length in characters.
     pub length: usize,
@@ -78,7 +81,20 @@ pub struct DraftSummary {
     /// The whole draft, carried only when one thread's draft was asked for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Exact compose report for a single-draft read. Its revision and fields
+    /// come from one SELECT; list reads carry previews only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<DraftSnapshot>,
     pub link: String,
+}
+
+/// A single-draft read's compose report, with the *draft revision* an agent
+/// names to send it (ADR 0651).
+#[derive(Debug, Clone, Serialize)]
+pub struct DraftSnapshot {
+    pub draft_revision: i64,
+    #[serde(flatten)]
+    pub report: ComposeReport,
 }
 
 #[derive(sqlx::FromRow)]
@@ -91,9 +107,16 @@ struct DraftRow {
     archive_state: String,
     status: String,
     parent_thread_id: Option<String>,
+    drafted_by_thread_id: Option<String>,
     compose_text: String,
     compose_images: serde_json::Value,
     compose_updated_at: Option<chrono::DateTime<chrono::Utc>>,
+    summary_version: i64,
+    draft_revision: i64,
+    compose_epoch: i64,
+    compose_restorations: serde_json::Value,
+    compose_mode: Option<String>,
+    compose_selection: Option<serde_json::Value>,
 }
 
 impl DraftRow {
@@ -115,10 +138,23 @@ impl DraftRow {
             section: self.archive_state,
             status: ThreadStatus::parse(&self.status),
             parent_thread_id: self.parent_thread_id,
+            drafted_by: self.drafted_by_thread_id,
             preview: text_preview(&self.compose_text),
             length: char_length(&self.compose_text),
             image_count: self.compose_images.as_array().map_or(0, Vec::len),
             last_edited: self.compose_updated_at,
+            snapshot: with_text.then(|| DraftSnapshot {
+                draft_revision: self.draft_revision,
+                report: ComposeReport::from((
+                    self.summary_version,
+                    self.compose_epoch,
+                    self.compose_text.clone(),
+                    self.compose_images,
+                    self.compose_mode,
+                    self.compose_selection,
+                    self.compose_restorations,
+                )),
+            }),
             text: with_text.then_some(self.compose_text),
         })
     }
@@ -158,7 +194,9 @@ impl EventStore {
             "SELECT t.thread_id::text AS thread_id, t.title, t.first_message, t.source, \
                     t.state, t.archive_state, t.status, \
                     t.parent_thread_id::text AS parent_thread_id, \
-                    t.compose_text, t.compose_images, t.compose_updated_at \
+                    t.drafted_by_thread_id::text AS drafted_by_thread_id, \
+                    t.compose_text, t.compose_images, t.compose_updated_at, \
+                    t.summary_version, t.draft_revision, t.compose_epoch, t.compose_mode, t.compose_selection, t.compose_restorations \
              FROM thread_summaries t \
              WHERE {HAS_DRAFT_SQL} AND ($1::uuid IS NULL OR t.thread_id = $1) \
              ORDER BY t.compose_updated_at DESC NULLS LAST, t.last_activity DESC \

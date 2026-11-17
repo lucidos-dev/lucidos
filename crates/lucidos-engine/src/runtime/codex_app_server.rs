@@ -1,9 +1,10 @@
 //! Persistent-process Codex driver speaking the `codex app-server` JSON-RPC
 //! protocol (ADR 0005). One `codex app-server` child per session; each
-//! accepted `AgentInput` becomes one `turn/start` against the same thread.
+//! input starts or steers a turn against the same thread.
 //!
 //! What this buys over the per-turn exec driver (`codex.rs`):
-//! - **Permission cards** — `approvalPolicy: on-request` raises
+//! - **Permission cards** — `approvalPolicy` (`untrusted` inside the Lucidos
+//!   sandbox, else `on-request`) raises
 //!   `item/commandExecution/requestApproval` / `item/fileChange/requestApproval`
 //!   server requests, forwarded to the engine over
 //!   `RunningAgent::permission_rx` and answered from the PermissionCard.
@@ -20,7 +21,7 @@
 //! - `Init` once, from the `thread/start` / `thread/resume` response (the
 //!   Codex thread id is the engine's resume handle — same id space the exec
 //!   driver resumes, so a thread survives a protocol flip).
-//! - One `Result` per accepted input — synthesized on child death without a
+//! - One `Result` per turn (including its steered inputs), synthesized on child death without a
 //!   turn terminal.
 //! - `Exited` exactly once, when the driver winds down.
 
@@ -31,8 +32,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::agent_runtime::{
     AgentEvent, AgentExitFacts, AgentInput, AgentPermissionRequest, ControlRequest,
-    SessionContextDue, WithdrawRequest,
+    InputWithdrawal, SessionContextDue, WithdrawRequest,
 };
+use super::billing_provider::{CodexEndpointConfig, CodexProviderEndpoints};
 use super::claude_code::{format_exit_status, EXIT_AFTER_STDOUT_EOF_GRACE};
 use super::codex::{
     answer_withdraw, lucidos_mcp_server_config_json, write_image_files, CodexConfig,
@@ -41,6 +43,7 @@ use super::codex_app_server_parse::{
     parse_app_server_line, parse_approval_request, AppServerLine, AppServerTracker,
 };
 use super::spawn_env::StderrTail;
+use crate::engine::thread_events::{TurnEndFacts, TurnEndStatus};
 
 /// How long the handshake (initialize → thread established) may take before
 /// the driver gives up and synthesizes a failure. Generous — a cold codex
@@ -52,10 +55,27 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingRequest {
     Initialize,
+    SteerProbe,
+    TurnSteer,
     Thread,
+    BillingConfig(u64),
+    BillingAccount(u64),
+    BillingProviders(u64),
     /// Carries the [`AgentInput::uuid`] of the input the turn starts with.
     TurnStart(uuid::Uuid),
     TurnInterrupt,
+}
+
+/// One bounded read of the account and endpoint configuration before a turn.
+/// A new generation ignores replies left over from a timed-out earlier read.
+#[derive(Default)]
+struct BillingRead {
+    generation: u64,
+    ready: bool,
+    deadline: Option<tokio::time::Instant>,
+    account: Option<super::billing_provider::BillingAttribution>,
+    endpoints: Option<CodexEndpointConfig>,
+    providers: Option<CodexProviderEndpoints>,
 }
 
 enum DriverAction {
@@ -130,7 +150,7 @@ fn build_thread_request(
             ),
         );
     }
-    let config_obj = serde_json::json!({
+    let mut config_obj = serde_json::json!({
         "sandbox_workspace_write": sandbox_ww,
         "mcp_servers": { "lucidos": lucidos_mcp_server_config_json(&config.env) },
         // Reasoning summaries + CLAUDE.md project-doc fallback — see the
@@ -140,16 +160,25 @@ fn build_thread_request(
         "project_doc_fallback_filenames": super::codex::CODEX_PROJECT_DOC_FALLBACKS,
         "project_doc_max_bytes": super::codex::CODEX_PROJECT_DOC_MAX_BYTES,
     });
+    if !config.login_shell {
+        config_obj["allow_login_shell"] = false.into();
+    }
 
     let mut params = serde_json::Map::new();
     params.insert(
         "cwd".to_string(),
         config.worktree_path.to_string_lossy().into_owned().into(),
     );
-    params.insert("sandbox".to_string(), "workspace-write".into());
-    // The point of this driver: sandbox-escaping commands raise a card
-    // instead of failing silently (the exec escape hatch keeps `never`).
-    params.insert("approvalPolicy".to_string(), "on-request".into());
+    params.insert(
+        "sandbox".to_string(),
+        super::codex::codex_sandbox_mode(config).into(),
+    );
+    // The point of this driver: commands and writes raise a card instead of
+    // failing silently (the exec escape hatch keeps `never`).
+    params.insert(
+        "approvalPolicy".to_string(),
+        super::codex::codex_approval_policy(config).into(),
+    );
     params.insert("config".to_string(), config_obj);
     if let Some(sp) = config.system_prompt.as_deref().filter(|s| !s.is_empty()) {
         params.insert("developerInstructions".to_string(), sp.into());
@@ -171,7 +200,7 @@ fn build_thread_request(
 }
 
 /// Build `turn/start` params for one accepted input. Pure for tests.
-fn build_turn_start_params(
+pub(super) fn build_turn_start_params(
     thread_id: &str,
     text: &str,
     image_paths: &[std::path::PathBuf],
@@ -206,7 +235,7 @@ fn build_turn_start_params(
 fn spawn_app_server_child(
     config: &CodexConfig,
 ) -> std::io::Result<(tokio::process::Child, Vec<String>)> {
-    let mut cmd = tokio::process::Command::new(&config.codex_bin);
+    let mut cmd = config.sandbox.command(&config.codex_bin)?;
     cmd.arg("app-server")
         .current_dir(&config.worktree_path)
         .stdin(std::process::Stdio::piped())
@@ -237,11 +266,13 @@ pub(super) async fn app_server_driver_task(
     let (mut child, secrets) = match spawn_app_server_child(&config) {
         Ok(spawned) => spawned,
         Err(e) => {
-            log!("[CodexAppServer] failed to spawn codex app-server: {}", e);
+            log_legacy!("[CodexAppServer] failed to spawn codex app-server: {}", e);
             let _ = events_tx.send(AgentEvent::Result {
                 text: String::new(),
                 duration_ms: 0,
                 error: Some(format!("Failed to start Codex: {e}")),
+                provider_error: None,
+                turn_end: Some(TurnEndFacts::of_status(TurnEndStatus::Failed)),
             });
             let _ = events_tx.send(AgentEvent::Exited {
                 exit: AgentExitFacts::default(),
@@ -296,9 +327,20 @@ pub(super) async fn app_server_driver_task(
     let mut next_id: u64 = 1;
     let mut pending: HashMap<u64, PendingRequest> = HashMap::new();
     let mut queue: VecDeque<AgentInput> = VecDeque::new();
+    let mut can_steer = false;
+    let mut probe_deadline = None;
+    let mut probe_done = false;
+    let mut pending_init = None;
+    let mut steer_input: Option<AgentInput> = None;
+    let mut withdrawn_steer = None;
+    let mut steer_deadline = None;
+    let mut steer_blocked_for_turn = false;
+    let mut deferred_terminal = None;
     // True once the thread response has established the session (the id itself
     // lives on `tracker.session_id`). Turns can start only once this is true.
     let mut thread_ready = false;
+    let mut billing = BillingRead::default();
+    let mut billing_model_provider: Option<String> = None;
     // One-shot guard for the thread/resume → thread/start fallback below.
     let mut tried_fresh_thread_fallback = false;
     // A fresh thread owes its first turn the session context. The fallback
@@ -345,8 +387,10 @@ pub(super) async fn app_server_driver_task(
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(e)) => log!("[CodexAppServer] stdin write failed — child gone? {}", e),
-                Err(_) => log!(
+                Ok(Err(e)) => {
+                    log_legacy!("[CodexAppServer] stdin write failed — child gone? {}", e)
+                }
+                Err(_) => log_legacy!(
                     "[CodexAppServer] stdin write timed out — child wedged with a full pipe?"
                 ),
             }
@@ -372,9 +416,129 @@ pub(super) async fn app_server_driver_task(
     }
 
     'session: while !shutdown {
-        // Start the next queued turn whenever the thread is ready and idle.
-        if thread_ready && !turn_in_flight {
+        // A withdrawn queued turn cannot leave an auth snapshot ready for a
+        // different input that might arrive much later.
+        if !turn_in_flight && queue.is_empty() {
+            billing.ready = false;
+            billing.deadline = None;
+        }
+        if billing.deadline.is_some() {
+            if let (Some(account), Some(endpoints), Some(providers)) =
+                (&billing.account, billing.endpoints, billing.providers)
+            {
+                let attribution = account
+                    .clone()
+                    .codex_endpoint_checked(endpoints.is_default(providers));
+                let _ = events_tx.send(AgentEvent::BillingObserved { attribution });
+                billing.deadline = None;
+                billing.ready = true;
+            }
+        }
+        if thread_ready
+            && !turn_in_flight
+            && !queue.is_empty()
+            && !billing.ready
+            && billing.deadline.is_none()
+        {
+            pending.retain(|_, request| {
+                !matches!(
+                    request,
+                    PendingRequest::BillingConfig(_)
+                        | PendingRequest::BillingAccount(_)
+                        | PendingRequest::BillingProviders(_)
+                )
+            });
+            billing.generation += 1;
+            billing.account = None;
+            billing.endpoints = None;
+            billing.providers = None;
+            billing.deadline =
+                Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            let id = next_id;
+            next_id += 1;
+            pending.insert(id, PendingRequest::BillingConfig(billing.generation));
+            send_frame!(request_line(
+                id,
+                "config/read",
+                serde_json::json!({"includeLayers": false})
+            ));
+            let id = next_id;
+            next_id += 1;
+            pending.insert(id, PendingRequest::BillingAccount(billing.generation));
+            send_frame!(request_line(
+                id,
+                "account/read",
+                serde_json::json!({"refreshToken": false})
+            ));
+            let id = next_id;
+            next_id += 1;
+            pending.insert(id, PendingRequest::BillingProviders(billing.generation));
+            send_frame!(request_line(
+                id,
+                "modelProvider/list",
+                serde_json::json!({})
+            ));
+        }
+        if probe_done {
+            if let Some(mut init) = pending_init.take() {
+                if let AgentEvent::Init {
+                    can_steer: capability,
+                    ..
+                } = &mut init
+                {
+                    *capability = can_steer;
+                }
+                if events_tx.send(init).is_err() {
+                    break 'session;
+                }
+            }
+        }
+        if steer_input.is_none() {
+            if let Some(params) = deferred_terminal.take() {
+                for event in tracker.map_notification(
+                    "turn/completed",
+                    &params,
+                    turn_start.elapsed().as_millis() as u64,
+                ) {
+                    if events_tx.send(event).is_err() {
+                        shutdown = true;
+                    }
+                }
+                turn_image_guards.clear();
+                if shutdown {
+                    break 'session;
+                }
+            }
+        }
+        // Serialize steers to preserve arrival order, including rejected inputs.
+        if can_steer && turn_in_flight && !steer_blocked_for_turn && steer_input.is_none() {
+            if let (Some(turn_id), Some(input)) = (tracker.current_turn_id.clone(), queue.front()) {
+                let (paths, guards) = write_image_files(&input.images);
+                let mut params = build_turn_start_params(
+                    tracker.session_id.as_deref().unwrap_or_default(),
+                    &input.text,
+                    &paths,
+                    None,
+                    None,
+                );
+                params
+                    .as_object_mut()
+                    .expect("turn params object")
+                    .retain(|key, _| key == "threadId" || key == "input");
+                params["expectedTurnId"] = turn_id.into();
+                turn_image_guards.extend(guards);
+                let id = next_id;
+                next_id += 1;
+                pending.insert(id, PendingRequest::TurnSteer);
+                steer_input = queue.pop_front();
+                steer_deadline = Some(tokio::time::Instant::now() + HANDSHAKE_TIMEOUT);
+                send_frame!(request_line(id, "turn/steer", params));
+            }
+        }
+        // A terminal arriving before its steer reply waits for the receipt.
+        if thread_ready && probe_done && !turn_in_flight && steer_input.is_none() && billing.ready {
             if let Some(input) = queue.pop_front() {
+                billing.ready = false;
                 let input = session_context.led(input);
                 let thread_id = tracker.session_id.clone().unwrap_or_default();
                 // The same validated effort goes to the turn and to the `Usage`.
@@ -384,6 +548,7 @@ pub(super) async fn app_server_driver_task(
                 )
                 .map(String::from);
                 tracker.begin_turn(turn_effort.clone());
+                steer_blocked_for_turn = false;
                 turn_start = std::time::Instant::now();
                 let (image_paths, guards) = write_image_files(&input.images);
                 turn_image_guards = guards;
@@ -404,32 +569,83 @@ pub(super) async fn app_server_driver_task(
             }
         }
 
+        let billing_deadline = billing.deadline;
         tokio::select! {
+            _ = async move {
+                match billing_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            }, if billing_deadline.is_some() => {
+                billing.deadline = None;
+                billing.ready = true;
+                let _ = events_tx.send(AgentEvent::BillingObserved {
+                    attribution: super::billing_provider::BillingAttribution::default(),
+                });
+            }
             maybe_line = lines_rx.recv() => {
                 let Some(line) = maybe_line else {
                     // Reader task hit stdout EOF — child gone (or wound down
                     // after child.wait fired; everything buffered has been
                     // processed by this arm already).
-                    log!("[CodexAppServer] stdout EOF — child gone");
+                    log_legacy!("[CodexAppServer] stdout EOF — child gone");
                     stdout_closed = true;
                     break 'session;
                 };
                 match parse_app_server_line(&line) {
                             AppServerLine::Response { id, result, error } => {
                                 let Some(kind) = pending.remove(&id) else {
-                                    log!("[CodexAppServer] response for unknown request id {}", id);
+                                    log_legacy!("[CodexAppServer] response for unknown request id {}", id);
                                     continue;
                                 };
                                 match (kind, error) {
+                                    (PendingRequest::BillingConfig(generation), error) => {
+                                        if generation == billing.generation && billing.deadline.is_some() {
+                                            billing.endpoints = Some(if error.is_none() {
+                                                CodexEndpointConfig::read(&result)
+                                            } else {
+                                                CodexEndpointConfig::Unknown
+                                            });
+                                        }
+                                    }
+                                    (PendingRequest::BillingProviders(generation), error) => {
+                                        if generation == billing.generation && billing.deadline.is_some() {
+                                            billing.providers = Some(if error.is_none() {
+                                                CodexProviderEndpoints::read(&result)
+                                            } else {
+                                                CodexProviderEndpoints::Unavailable
+                                            });
+                                        }
+                                    }
+                                    (PendingRequest::BillingAccount(generation), error) => {
+                                        if generation == billing.generation && billing.deadline.is_some() {
+                                            billing.account = Some(if error.is_none() {
+                                                super::billing_provider::BillingAttribution::codex_account(
+                                                    billing_model_provider.as_deref(), &result,
+                                                )
+                                            } else {
+                                                super::billing_provider::BillingAttribution::default()
+                                            });
+                                        }
+                                    }
                                     (PendingRequest::Initialize, None) => {
                                         // Log the negotiated handshake so a codex
                                         // upgrade that breaks the (experimental)
                                         // contract is diagnosable from logs.
-                                        log!(
+                                        log_legacy!(
                                             "[CodexAppServer] initialized: {}",
                                             result.get("userAgent").and_then(|v| v.as_str()).unwrap_or("?")
                                         );
                                         send_frame!(notification_line("initialized"));
+                                        let probe_id = next_id;
+                                        next_id += 1;
+                                        pending.insert(probe_id, PendingRequest::SteerProbe);
+                                        probe_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+                                        // Never probe a real thread: this cannot modify a live turn.
+                                        send_frame!(request_line(probe_id, "turn/steer", serde_json::json!({
+                                            "threadId": uuid::Uuid::new_v4().to_string(),
+                                            "expectedTurnId": uuid::Uuid::new_v4().to_string(), "input": []
+                                        })));
                                         let id = next_id;
                                         next_id += 1;
                                         pending.insert(id, PendingRequest::Thread);
@@ -447,7 +663,7 @@ pub(super) async fn app_server_driver_task(
                                             .unwrap_or_default()
                                             .to_string();
                                         if thread_id.is_empty() {
-                                            log!("[CodexAppServer] thread response carried no id — failing session");
+                                            log_legacy!("[CodexAppServer] thread response carried no id — failing session");
                                             fail_session(&events_tx, &mut tracker, &mut input_rx, &mut queue, turn_in_flight,
                                                 "codex app-server returned no thread id".to_string(),
                                                 turn_start.elapsed().as_millis() as u64);
@@ -457,11 +673,13 @@ pub(super) async fn app_server_driver_task(
                                             .get("model")
                                             .and_then(|v| v.as_str())
                                             .map(str::to_string);
+                                        tracker.note_resume_response(&result);
                                         for ev in tracker.note_thread_started(thread_id, response_model) {
-                                            if events_tx.send(ev).is_err() {
-                                                break 'session;
-                                            }
+                                            pending_init = Some(ev);
                                         }
+                                        billing_model_provider = result.get("modelProvider")
+                                            .or_else(|| result.get("thread").and_then(|t| t.get("modelProvider")))
+                                            .and_then(|v| v.as_str()).map(String::from);
                                         thread_ready = true;
                                     }
                                     (PendingRequest::TurnStart(input), None) => {
@@ -493,6 +711,51 @@ pub(super) async fn app_server_driver_task(
                                             }
                                         }
                                     }
+                                    (PendingRequest::SteerProbe, error) => {
+                                        if !probe_done {
+                                            // A handler-specific refusal proves the method exists.
+                                            // Unknown methods (including old -32600 unknown-variant
+                                            // replies) and inconclusive failures keep legacy routing.
+                                            can_steer = error.as_deref().is_some_and(|message| message.to_ascii_lowercase().starts_with("thread not found"));
+                                            probe_done = true;
+                                            probe_deadline = None;
+                                        }
+                                    }
+                                    (PendingRequest::TurnSteer, error) => {
+                                        steer_deadline = None;
+                                        if let Some(input) = steer_input.take() {
+                                            if let Some(error) = error {
+                                                log_legacy!("[CodexAppServer] turn/steer rejected: {}", error);
+                                                let interrupting = turn_in_flight && !input.defer_on_steer_failure;
+                                                if withdrawn_steer.take() == Some(input.uuid) {
+                                                    let _ = events_tx.send(AgentEvent::InputRejected { input: input.uuid });
+                                                } else {
+                                                    queue.push_front(input);
+                                                }
+                                                steer_blocked_for_turn = true;
+                                                let lower = error.to_ascii_lowercase();
+                                                let mismatch = (lower.contains("expected") && lower.contains("turn")) || lower.contains("no active turn");
+                                                if !mismatch {
+                                                    // Any other refusal falls back conservatively for
+                                                    // this process; never loop on a rejected steer.
+                                                    can_steer = false;
+                                                    let _ = events_tx.send(AgentEvent::SteerFallback { can_steer, interrupting });
+                                                    if interrupting {
+                                                        if let Some(turn_id) = tracker.current_turn_id.as_deref() {
+                                                            let id = next_id;
+                                                            next_id += 1;
+                                                            pending.insert(id, PendingRequest::TurnInterrupt);
+                                                            send_frame!(request_line(id, "turn/interrupt", serde_json::json!({"threadId": tracker.session_id, "turnId": turn_id})));
+                                                            tracker.note_interrupt_requested();
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                tracker.note_steer_accepted();
+                                                let _ = events_tx.send(AgentEvent::InputRead { input: input.uuid });
+                                            }
+                                        }
+                                    }
                                     (PendingRequest::TurnInterrupt, None) => {}
                                     (PendingRequest::Thread, Some(msg))
                                         if resume_session_id.is_some()
@@ -514,7 +777,7 @@ pub(super) async fn app_server_driver_task(
                                             None,
                                             config.session_context.as_ref(),
                                         );
-                                        log!(
+                                        log_legacy!(
                                             "[CodexAppServer] thread/resume failed ({}) — falling back to a fresh thread",
                                             msg
                                         );
@@ -526,14 +789,14 @@ pub(super) async fn app_server_driver_task(
                                     }
                                     (PendingRequest::Initialize, Some(msg))
                                     | (PendingRequest::Thread, Some(msg)) => {
-                                        log!("[CodexAppServer] handshake failed: {}", msg);
+                                        log_legacy!("[CodexAppServer] handshake failed: {}", msg);
                                         fail_session(&events_tx, &mut tracker, &mut input_rx, &mut queue, turn_in_flight,
                                             format!("Codex app-server handshake failed: {msg}"),
                                             turn_start.elapsed().as_millis() as u64);
                                         break 'session;
                                     }
                                     (PendingRequest::TurnStart(input), Some(msg)) => {
-                                        log!("[CodexAppServer] turn/start rejected: {}", msg);
+                                        log_legacy!("[CodexAppServer] turn/start rejected: {}", msg);
                                         // The block stays owed to the next turn.
                                         turn_input = None;
                                         // Named before the `Result`, so the idle
@@ -546,6 +809,8 @@ pub(super) async fn app_server_driver_task(
                                             text: String::new(),
                                             duration_ms: turn_start.elapsed().as_millis() as u64,
                                             error: Some(format!("Codex rejected the turn: {msg}")),
+                                            provider_error: None,
+                                            turn_end: Some(tracker.turn_end_facts(TurnEndStatus::Failed)),
                                         });
                                         turn_in_flight = false;
                                         turn_image_guards.clear();
@@ -553,17 +818,26 @@ pub(super) async fn app_server_driver_task(
                                     (PendingRequest::TurnInterrupt, Some(msg)) => {
                                         // Turn may have completed before the
                                         // interrupt landed — benign race.
-                                        log!("[CodexAppServer] turn/interrupt rejected: {}", msg);
+                                        log_legacy!("[CodexAppServer] turn/interrupt rejected: {}", msg);
                                     }
                                 }
                             }
                             AppServerLine::Notification { method, params } => {
+                                if method == "turn/completed" && tracker.owns(&method, &params) && steer_input.is_some() {
+                                    turn_in_flight = false;
+                                    deferred_terminal = Some(params);
+                                    continue;
+                                }
                                 let events = tracker.map_notification(
                                     &method,
                                     &params,
                                     turn_start.elapsed().as_millis() as u64,
                                 );
                                 for ev in events {
+                                    if matches!(ev, AgentEvent::Init { .. }) {
+                                        pending_init = Some(ev);
+                                        continue;
+                                    }
                                     if events_tx.send(ev).is_err() {
                                         shutdown = true;
                                         break;
@@ -572,7 +846,7 @@ pub(super) async fn app_server_driver_task(
                                 if shutdown {
                                     break 'session;
                                 }
-                                if method == "turn/completed" {
+                                if method == "turn/completed" && tracker.owns(&method, &params) {
                                     turn_in_flight = false;
                                     turn_image_guards.clear();
                                 }
@@ -613,14 +887,8 @@ pub(super) async fn app_server_driver_task(
             }
             input = input_rx.recv() => {
                 match input {
-                    // Queue — the pre-select block above starts it as soon as
-                    // the thread is ready and no turn is in flight. No
-                    // mid-turn injection (parity with the exec driver; every
-                    // accepted input gets its own turn and its own Result). A
-                    // user follow-up that should redirect a live turn is handled
-                    // engine-side: the fast-path fires `turn/interrupt` first
-                    // (ADR 0005 addendum), so by the time the queued input is
-                    // dequeued the interrupted turn has ended.
+                    // The pre-select block steers the live turn when supported,
+                    // or starts a new turn at its boundary.
                     Some(i) => queue.push_back(i),
                     None => {
                         shutdown = true;
@@ -629,17 +897,25 @@ pub(super) async fn app_server_driver_task(
                 }
             }
             Some(withdraw) = withdraw_rx.recv() => {
-                answer_withdraw(&mut queue, &mut input_rx, withdraw);
+                if steer_input.as_ref().is_some_and(|input| input.uuid == withdraw.input_uuid && input.defer_on_steer_failure) {
+                    // Already in the RPC: it may have joined the active turn.
+                    // If refused later, it must not become a new turn after Stop.
+                    withdrawn_steer = Some(withdraw.input_uuid);
+                    let _ = withdraw.reply.send(InputWithdrawal::AlreadyRead);
+                } else {
+                    answer_withdraw(&mut queue, &mut input_rx, withdraw);
+                }
             }
             req = control_rx.recv() => {
                 match req {
                     Some(ControlRequest::Interrupt) => {
                         match (turn_in_flight, tracker.current_turn_id.clone(), tracker.session_id.clone()) {
                             (true, Some(turn_id), Some(thread_id)) => {
-                                log!("[CodexAppServer] interrupt — sending turn/interrupt for turn {}", turn_id);
+                                log_legacy!("[CodexAppServer] interrupt — sending turn/interrupt for turn {}", turn_id);
                                 let id = next_id;
                                 next_id += 1;
                                 pending.insert(id, PendingRequest::TurnInterrupt);
+                                tracker.note_interrupt_requested();
                                 let line = request_line(id, "turn/interrupt", serde_json::json!({
                                     "threadId": thread_id,
                                     "turnId": turn_id,
@@ -653,7 +929,7 @@ pub(super) async fn app_server_driver_task(
                                 // our token and the hard-kill path below runs.
                             }
                             (true, None, _) => {
-                                log!("[CodexAppServer] interrupt requested but no turn id known yet — engine escalation will hard-stop");
+                                log_legacy!("[CodexAppServer] interrupt requested but no turn id known yet — engine escalation will hard-stop");
                             }
                             _ => {} // idle — nothing to interrupt
                         }
@@ -665,7 +941,7 @@ pub(super) async fn app_server_driver_task(
                 }
             }
             _ = cancel.cancelled() => {
-                log!("[CodexAppServer] cancellation signalled — killing codex app-server");
+                log_legacy!("[CodexAppServer] cancellation signalled — killing codex app-server");
                 shutdown = true;
                 break 'session;
             }
@@ -678,7 +954,7 @@ pub(super) async fn app_server_driver_task(
                 // buffered in lines_rx and flow through the normal arm;
                 // wind down when the reader hits EOF or the bounded drain
                 // deadline below passes.
-                log!(
+                log_legacy!(
                     "[CodexAppServer] app-server child died (status={}) — draining remaining stdout",
                     format_exit_status(&wait_result),
                 );
@@ -698,8 +974,40 @@ pub(super) async fn app_server_driver_task(
                 // waiting for an EOF that isn't coming.
                 break 'session;
             }
+            _ = async {
+                match probe_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                probe_done = true;
+                probe_deadline = None;
+                log_legacy!("[CodexAppServer] steer probe timed out; retaining interrupt-and-redirect");
+            }
+            _ = async {
+                match steer_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                if steer_input.as_ref().is_some_and(|input| input.defer_on_steer_failure) {
+                    // An unknown receipt cannot authorize interrupting or resending.
+                    // Retire the input and let the turn end settle the handoff debt.
+                    if let Some(input) = steer_input.take() {
+                        let _ = events_tx.send(AgentEvent::InputRejected { input: input.uuid });
+                    }
+                    pending.retain(|_, request| !matches!(request, PendingRequest::TurnSteer));
+                    steer_deadline = None;
+                    can_steer = false;
+                    let _ = events_tx.send(AgentEvent::SteerFallback { can_steer, interrupting: false });
+                    continue 'session;
+                }
+                fail_session(&events_tx, &mut tracker, &mut input_rx, &mut queue, true,
+                    "Codex did not acknowledge the follow-up steer".to_string(), turn_start.elapsed().as_millis() as u64);
+                break 'session;
+            }
             _ = tokio::time::sleep_until(handshake_deadline), if !thread_ready => {
-                log!("[CodexAppServer] handshake timed out after {:?}", HANDSHAKE_TIMEOUT);
+                log_legacy!("[CodexAppServer] handshake timed out after {:?}", HANDSHAKE_TIMEOUT);
                 fail_session(&events_tx, &mut tracker, &mut input_rx, &mut queue, turn_in_flight,
                     "Codex app-server did not complete its handshake".to_string(),
                     turn_start.elapsed().as_millis() as u64);
@@ -763,10 +1071,10 @@ pub(super) async fn app_server_driver_task(
 
     let stderr_text = stderr.finish().await;
     if !stderr_text.is_empty() {
-        log!("[CodexAppServer] codex stderr: {}", stderr_text);
+        log_legacy!("[CodexAppServer] codex stderr: {}", stderr_text);
     }
     if !child_reaped {
-        log!(
+        log_legacy!(
             "[CodexAppServer] app-server child exited (pid={} status={})",
             child_pid
                 .map(|p| p.to_string())
@@ -779,7 +1087,7 @@ pub(super) async fn app_server_driver_task(
     // leaves the engine waiting on a Result — synthesize the failure. The
     // deliberate-shutdown paths (cancel token, closed channels) skip this:
     // the engine isn't waiting (idle termination / engine shutdown).
-    if turn_in_flight && !tracker.turn_terminal_seen && !shutdown {
+    if (turn_in_flight || deferred_terminal.is_some()) && !tracker.turn_terminal_seen && !shutdown {
         for ev in tracker.close_open_tools() {
             let _ = events_tx.send(ev);
         }
@@ -797,6 +1105,8 @@ pub(super) async fn app_server_driver_task(
             text: tracker.turn_text(),
             duration_ms: turn_start.elapsed().as_millis() as u64,
             error: Some(reason),
+            provider_error: tracker.last_provider_error.clone(),
+            turn_end: Some(tracker.turn_end_facts(TurnEndStatus::Synthesized)),
         });
     }
 
@@ -844,6 +1154,8 @@ fn fail_session(
         text: tracker.turn_text(),
         duration_ms,
         error: Some(reason),
+        provider_error: None,
+        turn_end: Some(tracker.turn_end_facts(TurnEndStatus::Synthesized)),
     });
 }
 
@@ -863,7 +1175,7 @@ fn handle_server_request(
     tracker: &mut AppServerTracker,
 ) {
     let Some(mut approval) = parse_approval_request(method, params) else {
-        log!("[CodexAppServer] unsupported server request: {}", method);
+        log_legacy!("[CodexAppServer] unsupported server request: {}", method);
         let _ = driver_action_tx.send(DriverAction::SendLine(error_response_line(
             &id,
             -32601,

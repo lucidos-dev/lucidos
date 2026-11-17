@@ -700,6 +700,8 @@ async fn lookup_question_channel_returns_chat_for_chat_emitter() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -1274,6 +1276,7 @@ async fn coding_agent_idled_orphans_only_active_lookup() {
                     worktree_path: None,
                     worktree_head_sha: None,
                     bg_bash_pending: false,
+                    turn_end: None,
                 },
                 meta: cc_meta(),
             })
@@ -1495,6 +1498,8 @@ async fn chat_text_streamed_orphans_active_lookup_on_chat_thread() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Chat),
@@ -1963,28 +1968,6 @@ fn the_walk_shows_the_message_just_before_the_first_card() {
 
 // ---- Option widgets (ADR 0415) ----
 
-/// A workspace with the shipped sound player plus one non-reusable widget
-/// made in `origin`.
-fn widgets_workspace(origin: Uuid) -> (tempfile::TempDir, crate::core::AppManager) {
-    let ws = tempfile::tempdir().unwrap();
-    let mine = ws.path().join("data/apps/fare-grid");
-    std::fs::create_dir_all(&mine).unwrap();
-    std::fs::write(
-        mine.join("manifest.json"),
-        serde_json::json!({"name": "Fare grid", "kind": "widget", "origin_thread_id": origin})
-            .to_string(),
-    )
-    .unwrap();
-    let app = ws.path().join("data/apps/notes");
-    std::fs::create_dir_all(&app).unwrap();
-    std::fs::write(app.join("manifest.json"), r#"{"name": "Notes"}"#).unwrap();
-    let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system-widgets");
-    let manager = crate::core::AppManager::new(ws.path())
-        .unwrap()
-        .with_system_widgets(Some(shipped));
-    (ws, manager)
-}
-
 fn one_option(description: &str) -> Vec<crate::engine::agent_session::ParsedQuestion> {
     crate::engine::agent_session::parse_ask_user_question_inputs(&serde_json::json!({
         "questions": [{
@@ -2009,49 +1992,6 @@ fn an_option_embed_lifts_into_its_widget_and_leaves_the_text() {
         "artifacts/voices/marin.mp3"
     );
     assert!(parsed[0].options[1].widget.is_none());
-}
-
-#[test]
-fn a_good_option_widget_passes_the_check() {
-    let thread = Uuid::new_v4();
-    let (_ws, apps) = widgets_workspace(thread);
-    let parsed = one_option(r#"![Marin](app:lucidos-sound-player?params={"clip": "a.mp3"})"#);
-    check_option_widgets(&apps, &parsed, thread).expect("a good widget passes");
-    let own = one_option("![](app:fare-grid)");
-    check_option_widgets(&apps, &own, thread).expect("the thread's own widget passes");
-}
-
-/// Each bad embed refuses the batch, and the reason names the option.
-#[test]
-fn a_bad_option_widget_refuses_the_card() {
-    let thread = Uuid::new_v4();
-    let (_ws, apps) = widgets_workspace(Uuid::new_v4());
-    let cases = [
-        ("![x](app:no-such-widget)", "No widget"),
-        ("![x](app:notes)", "is an app"),
-        ("![x](app:fare-grid)", "belongs to another thread"),
-        ("![x](app:lucidos-sound-player)", "needs the param 'clip'"),
-        (
-            r#"![x](app:lucidos-sound-player?params={"clip":"a","speed":2})"#,
-            "no param 'speed'",
-        ),
-        ("![x](app:lucidos-sound-player?params=[1])", "broken"),
-        (
-            r#"![a](app:lucidos-sound-player?params={"clip":"a"}) ![b](app:lucidos-sound-player?params={"clip":"b"})"#,
-            "2 widget embeds",
-        ),
-    ];
-    for (description, why) in cases {
-        let err = check_option_widgets(&apps, &one_option(description), thread)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Option 'Marin'"), "{description}: {err}");
-        assert!(err.contains(why), "{description}: {err}");
-    }
-    let big = "x".repeat(crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES);
-    let over = format!(r#"![x](app:lucidos-sound-player?params={{"clip":"{big}"}})"#);
-    let err = check_option_widgets(&apps, &one_option(&over), thread).unwrap_err();
-    assert!(err.to_string().contains("cap"), "{err}");
 }
 
 /// The check runs before the first card is asked, so a refusal writes no
@@ -2181,4 +2121,73 @@ async fn a_failed_pending_question_lookup_is_an_error_not_no_card() {
             .is_err()
     );
     teardown_test_db(&db_name).await;
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// A workspace with the shipped sound player plus one non-reusable widget
+    /// made in `origin`.
+    fn widgets_workspace(origin: Uuid) -> (tempfile::TempDir, crate::core::AppManager) {
+        let ws = tempfile::tempdir().unwrap();
+        let mine = ws.path().join("data/apps/fare-grid");
+        std::fs::create_dir_all(&mine).unwrap();
+        std::fs::write(
+            mine.join("manifest.json"),
+            serde_json::json!({"name": "Fare grid", "kind": "widget", "origin_thread_id": origin})
+                .to_string(),
+        )
+        .unwrap();
+        let app = ws.path().join("data/apps/notes");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(app.join("manifest.json"), r#"{"name": "Notes"}"#).unwrap();
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system-widgets");
+        let manager = crate::core::AppManager::new(ws.path())
+            .unwrap()
+            .with_system_widgets(Some(shipped));
+        (ws, manager)
+    }
+
+    #[test]
+    fn a_good_option_widget_passes_the_check() {
+        let thread = Uuid::new_v4();
+        let (_ws, apps) = widgets_workspace(thread);
+        let parsed = one_option(r#"![Marin](app:lucidos-sound-player?params={"clip": "a.mp3"})"#);
+        check_option_widgets(&apps, &parsed, thread).expect("a good widget passes");
+        let own = one_option("![](app:fare-grid)");
+        check_option_widgets(&apps, &own, thread).expect("the thread's own widget passes");
+    }
+
+    /// Each bad embed refuses the batch, and the reason names the option.
+    #[test]
+    fn a_bad_option_widget_refuses_the_card() {
+        let thread = Uuid::new_v4();
+        let (_ws, apps) = widgets_workspace(Uuid::new_v4());
+        let cases = [
+            ("![x](app:no-such-widget)", "No widget"),
+            ("![x](app:notes)", "is an app"),
+            ("![x](app:fare-grid)", "belongs to another thread"),
+            ("![x](app:lucidos-sound-player)", "needs the param 'clip'"),
+            (
+                r#"![x](app:lucidos-sound-player?params={"clip":"a","speed":2})"#,
+                "no param 'speed'",
+            ),
+            ("![x](app:lucidos-sound-player?params=[1])", "broken"),
+            (
+                r#"![a](app:lucidos-sound-player?params={"clip":"a"}) ![b](app:lucidos-sound-player?params={"clip":"b"})"#,
+                "2 widget embeds",
+            ),
+        ];
+        for (description, why) in cases {
+            let err = check_option_widgets(&apps, &one_option(description), thread)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("Option 'Marin'"), "{description}: {err}");
+            assert!(err.contains(why), "{description}: {err}");
+        }
+        let big = "x".repeat(crate::engine::widgets::WIDGET_PARAMS_MAX_BYTES);
+        let over = format!(r#"![x](app:lucidos-sound-player?params={{"clip":"{big}"}})"#);
+        let err = check_option_widgets(&apps, &one_option(&over), thread).unwrap_err();
+        assert!(err.to_string().contains("cap"), "{err}");
+    }
 }

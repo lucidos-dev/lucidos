@@ -95,7 +95,7 @@ impl LucidosEngine {
                 let image_desc = match event_store.get_thread_first_message(&tid_str).await {
                     Ok(found) => found.and_then(|(_, desc, _)| desc),
                     Err(e) => {
-                        log!(
+                        log_legacy!(
                             "[Thread] First-message read failed for the title of {}: {}",
                             tid_str,
                             e

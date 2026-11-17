@@ -97,6 +97,21 @@ impl ResolvingBatch {
     }
 }
 
+/// Clean arrivals the lane keeps off `main` while the resolving batch
+/// re-hardens after a catch-up, so no landing moves `main` under it again
+/// (ADR 0694). Each held arrival also waits in the queue, in arrival order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArrivalHold {
+    pub(crate) batch_id: Uuid,
+    arrivals: Vec<Uuid>,
+}
+
+impl ArrivalHold {
+    pub(crate) fn arrivals(&self) -> &[Uuid] {
+        &self.arrivals
+    }
+}
+
 /// The queue, at most one resolving batch, and the open Apply All presses.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Lane {
@@ -105,6 +120,8 @@ pub(crate) struct Lane {
     /// Presses still handing changes over. While one is open the lane opens
     /// no batch, so a press's conflicts resolve together (ADR 0480).
     presses: BTreeSet<Uuid>,
+    /// Only ever for the resolving batch.
+    arrival_hold: Option<ArrivalHold>,
 }
 
 impl Lane {
@@ -199,6 +216,52 @@ impl Lane {
         }
     }
 
+    pub(crate) fn arrival_hold(&self) -> Option<&ArrivalHold> {
+        self.arrival_hold.as_ref()
+    }
+
+    /// Start holding clean arrivals for the resolving batch `batch_id`. True
+    /// when this started a hold: one already open keeps its arrivals.
+    pub(crate) fn hold_arrivals(&mut self, batch_id: Uuid) -> bool {
+        if self.arrival_hold.is_some() || self.resolving_batch(batch_id).is_none() {
+            return false;
+        }
+        self.arrival_hold = Some(ArrivalHold {
+            batch_id,
+            arrivals: Vec::new(),
+        });
+        true
+    }
+
+    /// Queue an arrival under the open hold, skipping its pass. Without a
+    /// hold it only waits.
+    pub(crate) fn hold(&mut self, member: LaneMember) {
+        let change_id = member.change_id;
+        if self.place(change_id) != Place::Absent {
+            return;
+        }
+        self.waiting.push(member);
+        if let Some(hold) = self.arrival_hold.as_mut() {
+            hold.arrivals.push(change_id);
+        }
+    }
+
+    /// Whether `change_id` waits under the open hold.
+    pub(crate) fn is_held(&self, change_id: Uuid) -> bool {
+        self.arrival_hold
+            .as_ref()
+            .is_some_and(|h| h.arrivals.contains(&change_id))
+    }
+
+    /// End the hold for `batch_id`, and hand back its arrivals still waiting,
+    /// in arrival order. `None` when no hold for that batch is open.
+    pub(crate) fn release_arrivals(&mut self, batch_id: Uuid) -> Option<Vec<Uuid>> {
+        if self.arrival_hold.as_ref()?.batch_id != batch_id {
+            return None;
+        }
+        self.arrival_hold.take().map(|h| h.arrivals)
+    }
+
     /// Every waiting member, for the next clean pass. Empty while the queue
     /// is held: it starts the pass once the batch ends or the press is in.
     pub(crate) fn take_pass(&mut self) -> Vec<LaneMember> {
@@ -250,6 +313,9 @@ impl Lane {
     pub(crate) fn unqueue(&mut self, change_id: Uuid) -> bool {
         let before = self.waiting.len();
         self.waiting.retain(|m| m.change_id != change_id);
+        if let Some(hold) = self.arrival_hold.as_mut() {
+            hold.arrivals.retain(|&id| id != change_id);
+        }
         self.waiting.len() != before
     }
 
@@ -269,10 +335,12 @@ impl Lane {
     }
 
     /// Close the batch `batch_id`, landed or failed, and hand it back. The
-    /// queue behind it starts the next pass. A failed batch's members are
-    /// not queued again: only an Apply press does that.
+    /// queue behind it starts the next pass, held arrivals included, in
+    /// arrival order. A failed batch's members are not queued again: only an
+    /// Apply press does that.
     pub(crate) fn end_batch(&mut self, batch_id: Uuid) -> Option<ResolvingBatch> {
         if self.resolving_batch(batch_id).is_some() {
+            self.release_arrivals(batch_id);
             self.resolving.take()
         } else {
             None
@@ -281,6 +349,9 @@ impl Lane {
 
     pub(super) fn retain_waiting(&mut self, keep: impl Fn(Uuid) -> bool) {
         self.waiting.retain(|m| keep(m.change_id));
+        if let Some(hold) = self.arrival_hold.as_mut() {
+            hold.arrivals.retain(|&id| keep(id));
+        }
     }
 }
 
@@ -590,6 +661,82 @@ mod tests {
         let outside = lane.held_of(&[member(3).change_id, member(4).change_id]);
         assert_eq!(outside.batch, None, "no batch member, no batch to cancel");
         assert_eq!(outside.members(), vec![member(3).change_id]);
+    }
+
+    /// A hold opens only for the resolving batch, and only once.
+    #[test]
+    fn a_hold_opens_once_and_only_for_the_resolving_batch() {
+        assert!(!Lane::default().hold_arrivals(BATCH), "no batch, no hold");
+        let mut lane = lane_with_batch(vec![member(1)]);
+        assert!(!lane.hold_arrivals(Uuid::new_v4()), "another batch");
+        assert!(lane.hold_arrivals(BATCH));
+        lane.hold(member(2));
+        assert!(
+            !lane.hold_arrivals(BATCH),
+            "the open hold keeps its arrivals"
+        );
+        assert_eq!(lane.arrival_hold().unwrap().arrivals(), &[id(2)]);
+    }
+
+    /// I11: held arrivals wait in arrival order, among what else waits, and
+    /// the batch's end hands the whole queue to the next pass in that order.
+    #[test]
+    fn held_arrivals_pass_in_arrival_order_after_the_batch() {
+        let mut lane = lane_with_batch(vec![member(1)]);
+        lane.wait(member(2));
+        lane.hold_arrivals(BATCH);
+        lane.hold(member(3));
+        lane.hold(member(4));
+        assert!(lane.is_held(id(3)) && !lane.is_held(id(2)));
+        assert!(
+            lane.take_pass().is_empty(),
+            "nothing passes during the hold"
+        );
+        lane.end_batch(BATCH).expect("the open batch");
+        assert!(
+            lane.arrival_hold().is_none(),
+            "the batch's end ends the hold"
+        );
+        assert_eq!(lane.take_pass(), vec![member(2), member(3), member(4)]);
+    }
+
+    /// The cap releases only the held arrivals, in order. What waited behind
+    /// the batch before the hold keeps waiting for it.
+    #[test]
+    fn a_release_names_the_held_arrivals_still_waiting() {
+        let mut lane = lane_with_batch(vec![member(1)]);
+        lane.wait(member(2));
+        lane.hold_arrivals(BATCH);
+        for n in [3, 4, 5] {
+            lane.hold(member(n));
+        }
+        lane.unqueue(id(4));
+        assert_eq!(lane.release_arrivals(Uuid::new_v4()), None);
+        let released = lane.release_arrivals(BATCH).expect("the open hold");
+        assert_eq!(released, vec![id(3), id(5)]);
+        let ids: HashSet<Uuid> = released.into_iter().collect();
+        assert_eq!(lane.take_members(&ids), vec![member(3), member(5)]);
+        assert_eq!(lane.waiting(), &[member(2)]);
+        assert_eq!(lane.release_arrivals(BATCH), None, "released once");
+    }
+
+    /// A change already in the lane is not held a second time.
+    #[test]
+    fn a_held_change_keeps_its_place_and_snapshot() {
+        let mut lane = lane_with_batch(vec![member(1)]);
+        lane.hold_arrivals(BATCH);
+        lane.hold(member(1));
+        lane.hold(member(2));
+        lane.hold(LaneMember {
+            snapshot_sha: "moved".into(),
+            ..member(2)
+        });
+        assert_eq!(lane.waiting(), &[member(2)]);
+        assert_eq!(lane.arrival_hold().unwrap().arrivals(), &[id(2)]);
+    }
+
+    fn id(n: u8) -> Uuid {
+        member(n).change_id
     }
 
     #[test]

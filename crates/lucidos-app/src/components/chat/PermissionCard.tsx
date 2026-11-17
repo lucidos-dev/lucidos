@@ -10,14 +10,9 @@ import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermi
 import { changeKindName, type AllowScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
 import { CHOICE_CARD_ROLE, handAnsweredCardFocusToPrompt, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
-import { pendingDecisions, usePickMark, type PickMark } from '../../store/pendingDecisions';
+import { pendingDecisions } from '../../store/pendingDecisions';
+import { usePickMark, type PickMark } from '../../hooks/usePickMark';
 import { followConfirmedCard, followResolvedPermission } from './scrollState';
-import {
-  BENIGN_PREFIX_WORDS,
-  GRANTS_NOTHING_HEADS,
-  GUARD_SHELLS,
-  MAX_SHELL_LAYERS,
-} from '@lucidos/engine-constants';
 import type { GrantOffer } from '../../generated/thread-event-wire';
 import { parseMcpToolName } from '../../utils/mcpToolName';
 
@@ -251,12 +246,6 @@ function toolText(toolName: string): string {
   return mcp ? `The ${mcp.tool} tool from ${mcp.server}` : `The ${toolName} tool`;
 }
 
-/** Whether an engine tool list names `tool`. Each list is typed as its literal
- *  members, so `includes` needs the wider type. */
-function listed(list: readonly string[], tool: string): boolean {
-  return list.includes(tool);
-}
-
 /** Claude Code's `Bash` and Codex's `command_execution`: the two command tools
  *  a permission card is raised for. */
 function isCommandTool(toolName: string): boolean {
@@ -275,7 +264,7 @@ export function sessionLabel(pattern: string): string {
   return arg.split('/').filter(Boolean).pop() || arg;
 }
 
-export type PermissionChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
+export type PermissionCardChoice = 'deny' | 'allow' | 'session' | 'narrow' | 'broad';
 
 /** Which button a resolved card marks as picked, or `null` when nobody pressed
  *  one. A card the engine settled was not pressed: it expired, a restart
@@ -286,7 +275,7 @@ export function resolvedChoice(resolved: {
   allowed: boolean;
   persist_scope?: AllowScope;
   reason?: string;
-}): PermissionChoice | null {
+}): PermissionCardChoice | null {
   if (engineResolutionNote(resolved)) return null;
   if (!resolved.allowed) return 'deny';
   return resolved.persist_scope ?? 'allow';
@@ -299,21 +288,25 @@ const USER_DENIAL_REASON = 'User denied';
 /** The engine's resolution reasons, by their opening words, in plain words.
  *  The engine's own text is written for the agent, which reads it too, so the
  *  card translates rather than the engine rewording. Mirrors the `*_REASON`
- *  constants in `cc_permission.rs`, `command_permission.rs`,
- *  `mcp_permission.rs` and the orphan sweep in `agent_recovery/has_diff.rs`. */
+ *  constants in `cc_permission.rs`, `command_permission.rs` and
+ *  `mcp_permission.rs`. Every lane's restart sweep writes
+ *  `RESTART_CLOSED_REASON`. */
 export const PLAIN_RESOLUTION_NOTES: [string, string][] = [
   ['Interrupted by an engine restart', 'Closed when Lucidos restarted. Nobody denied it.'],
   ['Superseded by a new message', 'Closed because you sent a new message instead.'],
   ['Canceled by user', 'Closed because you stopped the reply.'],
   ['Coding agent session ended before answering', 'Closed because the agent finished its turn before anyone answered.'],
-  ['Coding agent terminated before answering', 'Closed because the agent stopped before anyone answered.'],
   ['Auto-allowed: file write inside', 'Allowed by Lucidos: the agent was writing a file in its own working copy.'],
   ['Auto-allowed: the command guard', 'Allowed by Lucidos: its command check judged this safe to run.'],
 ];
 
-/** Reasons only the retired unattended lane wrote (ADR 0641). Older cards in a
- *  thread's history still carry them, so the card keeps translating them. */
+/** Reasons the engine no longer writes. Older cards in a thread's history
+ *  still carry them, so the card keeps translating them. The restart sweeps
+ *  wrote the first two before they shared the restart reason. The rest come
+ *  from the retired unattended lane (ADR 0641). */
 export const LEGACY_RESOLUTION_NOTES: [string, string][] = [
+  ['Coding agent terminated before answering', 'Closed when Lucidos restarted. Nobody denied it.'],
+  ['Chat turn ended before answering', 'Closed when Lucidos restarted. Nobody denied it.'],
   ['Auto-allowed: benign in-workspace operation', 'Allowed by Lucidos: a harmless step in a trigger run with nobody to ask.'],
   ['Auto-allowed: covered by the trigger', 'Allowed by Lucidos: the trigger was given permission for this kind of action.'],
   ['Auto-denied: catastrophic operation', 'Refused by Lucidos: this is never allowed in a run with nobody to ask.'],
@@ -357,7 +350,7 @@ export function permissionButtonState({
 }
 
 type ButtonSpec = {
-  choice: PermissionChoice;
+  choice: PermissionCardChoice;
   btnClass: string;
   label: ComponentChildren;
   ariaLabel: string;
@@ -375,13 +368,13 @@ type ButtonSpec = {
  *  an `allow` spec, which is what makes one constant enough for all three.
  *  Changing this value changes what a reflex Enter does to a permission
  *  request, so it is pinned by `permission-card.test.tsx`. */
-export const DEFAULT_PERMISSION_CHOICE: PermissionChoice = 'allow';
+export const DEFAULT_PERMISSION_CHOICE: PermissionCardChoice = 'allow';
 
 /** Render one permission button with answered/terminated state styling. Shared
  *  by all three cards: coding-agent, command-guard and MCP. */
 function renderPermissionButton(
   spec: ButtonSpec,
-  state: { selected: PermissionChoice | null; answered: boolean; mark: PickMark; terminated: boolean },
+  state: { selected: PermissionCardChoice | null; answered: boolean; mark: PickMark; terminated: boolean },
 ) {
   const isPicked = state.selected === spec.choice;
   const { disabled, stateClass } = permissionButtonState({
@@ -446,7 +439,7 @@ function PermissionBodyShell({
   requestId: string;
   question: ComponentChildren;
   buttons: ButtonSpec[];
-  selected: PermissionChoice | null;
+  selected: PermissionCardChoice | null;
   answered: boolean;
   mark: PickMark;
   terminated: boolean;
@@ -553,40 +546,13 @@ function usePermissionDecide(
   return { effective: resolved ?? pending, mark, decide };
 }
 
-/** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
- *  the initiator panel which provides the chrome. `pending` is an optimistic
- *  override; SSE swaps in `resolved` once the paired
- *  `CodingAgentPermissionResolved` event arrives. */
-export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
-  const { effective, mark, decide } = usePermissionDecide(
-    event.request_id,
-    resolved,
-    terminated,
-    resolveCodingAgentPermission,
-    () => toolText(event.tool_name),
-  );
-
-  // The engine decides which grants a card offers (ADR 0571).
-  const { broad, narrow, session } = event.grant_offer ?? {};
-
-  const selected = effective ? resolvedChoice(effective) : null;
-  const answered = effective !== undefined;
-
-  const buttons: ButtonSpec[] = [
-    {
-      choice: 'deny',
-      btnClass: 'action-btn action-btn-danger',
-      label: 'Deny',
-      ariaLabel: 'Deny this permission request',
-      onClick: () => void decide(false),
-    },
-    {
-      choice: 'allow',
-      btnClass: 'action-btn action-btn-confirm',
-      label: 'Allow once',
-      ariaLabel: 'Allow this permission request once',
-      onClick: () => void decide(true),
-    },
+/** The grant buttons for exactly the scopes the offer names (ADR 0571). */
+function grantButtons(
+  { session, narrow, broad }: GrantOffer,
+  broadAriaLabel: (broad: string) => string,
+  decide: (allowed: boolean, scope?: AllowScope) => Promise<void>,
+): ButtonSpec[] {
+  return [
     ...(session ? [{
       choice: 'session' as const,
       btnClass: 'action-btn action-btn-secondary',
@@ -605,9 +571,52 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       choice: 'broad' as const,
       btnClass: 'action-btn action-btn-secondary',
       label: 'Always allow',
-      ariaLabel: `Always allow ${broad}`,
+      ariaLabel: broadAriaLabel(broad),
       onClick: () => void decide(true, 'broad'),
     }] : []),
+  ];
+}
+
+/** Why a card offers no grant at all, when the engine withheld every one. */
+export function withheldNote(offer: GrantOffer): string | null {
+  return offer.withheld === 'secret-read'
+    ? "This reads Lucidos's private files. No grant can cover that, so it can only be allowed once."
+    : null;
+}
+
+/** Body of a `CodingAgentPermissionRequest` divider exchange — rendered inside
+ *  the initiator panel which provides the chrome. `pending` is an optimistic
+ *  override; SSE swaps in `resolved` once the paired
+ *  `CodingAgentPermissionResolved` event arrives. */
+export function PermissionBody({ event, resolved, terminated }: PermissionBodyProps) {
+  const { effective, mark, decide } = usePermissionDecide(
+    event.request_id,
+    resolved,
+    terminated,
+    resolveCodingAgentPermission,
+    () => toolText(event.tool_name),
+  );
+
+  const offer = event.grant_offer ?? {};
+  const selected = effective ? resolvedChoice(effective) : null;
+  const answered = effective !== undefined;
+
+  const buttons: ButtonSpec[] = [
+    {
+      choice: 'deny',
+      btnClass: 'action-btn action-btn-danger',
+      label: 'Deny',
+      ariaLabel: 'Deny this permission request',
+      onClick: () => void decide(false),
+    },
+    {
+      choice: 'allow',
+      btnClass: 'action-btn action-btn-confirm',
+      label: 'Allow once',
+      ariaLabel: 'Allow this permission request once',
+      onClick: () => void decide(true),
+    },
+    ...grantButtons(offer, (broad) => `Always allow ${broad}`, decide),
   ];
 
   return (
@@ -619,7 +628,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
       answered={answered}
       mark={mark}
       terminated={!!terminated}
-      note={engineResolutionNote(resolved)}
+      note={engineResolutionNote(resolved) ?? withheldNote(offer)}
       settingsLink={
         !isCommandTool(event.tool_name) ? null
           : currentCodingAgentAutoAnswer() ? 'judge-model'
@@ -643,6 +652,9 @@ interface CommandPermissionEvent {
   summary: string;
   /** The head the engine stores for a bash grant. Absent on an older card. */
   grant_head?: string;
+  /** The grant each "Always allow"-style button stores. Absent on a card from
+   *  before the engine stamped it, which then offers none. */
+  grant_offer?: GrantOffer;
 }
 
 interface CommandPermissionBodyProps {
@@ -652,182 +664,6 @@ interface CommandPermissionBodyProps {
 }
 
 const BASH_TOOLS: ReadonlySet<string> = new Set(['run_bash', 'run_bash_background']);
-
-/** Basename of a head token, with grouping, `$'…'` and quote characters
- *  stripped. Mirror of the engine's `normalized_head`. */
-function normalizedHead(head: string): string {
-  const unquoted = head
-    .replace(/^[({\\]+/, '')
-    .replace(/^\$(?=["'])/, '')
-    .replace(/^["']+|["']+$/g, '');
-  return unquoted.split('/').pop() || unquoted;
-}
-
-/** A single-dash cluster of ASCII letters containing `c`. Mirror of the
- *  engine's `is_shell_c_flag`. */
-function isShellCFlag(tok: string): boolean {
-  if (tok.length < 2 || !tok.startsWith('-') || tok.startsWith('--')) return false;
-  const letters = tok.slice(1);
-  return letters.includes('c') && /^[A-Za-z]+$/.test(letters);
-}
-
-/** Whether the tail after a `-c` script operand can run something of its own.
- *  Mirror of the engine's `tail_runs_more_commands` plus
- *  `has_command_substitution`. */
-function tailRunsMoreCommands(tail: string): boolean {
-  return /[;|&\n><]/.test(tail) || tail.includes('$(') || tail.includes('`')
-    || tail.includes('<(') || tail.includes('>(');
-}
-
-/** Unwrap one shell `-c` wrapper so the head comes from the inner script.
- *
- *  Mirror of the engine's `unwrap_shell_command`, and it has to stay one. The
- *  engine derives the pattern it STORES from the unwrapped text. A card reading
- *  the raw text therefore names a different grant from the one the click
- *  persists. Codex sends every command pre-wrapped, so that is the ordinary
- *  path rather than an edge case.
- *
- *  Returns the original command whenever the wrapper is not a plain one, which
- *  is the same conservative direction the engine takes. */
-function unwrapShellCommand(command: string): string {
-  const trimmed = command.trimStart();
-  const first = trimmed.split(/\s+/).filter(Boolean)[0];
-  if (!first || !listed(GUARD_SHELLS, normalizedHead(first))) return command;
-
-  // Walk EVERY whitespace-delimited token for the `-c` cluster, as the engine
-  // does. Testing only the first dash token gave up on `bash -o pipefail -c
-  // '…'`, so the card read `bash` while the click stored the inner head.
-  const token = /\S+/g;
-  let m: RegExpExecArray | null;
-  while ((m = token.exec(trimmed)) !== null) {
-    if (!isShellCFlag(m[0])) continue;
-    const operand = trimmed.slice(m.index + m[0].length).trim();
-    // The script is ONE word. Anything after it sets `$0` and the positional
-    // parameters. A control operator there belongs to the OUTER shell and
-    // unwrapping would hide it, so fall back to the whole command.
-    const [script, tail] = splitShellScriptOperand(operand);
-    if (tailRunsMoreCommands(tail)) return command;
-    return script;
-  }
-  return command;
-}
-
-/** Characters that end an UNQUOTED shell word. */
-const ENDS_SHELL_WORD = /[\s;|&<>()]/;
-
-/** Take the `-c` script operand as POSIX builds it, and the tail after it.
- *
- *  A word JOINS adjacent quoted and unquoted runs, so the first close quote is
- *  not where it ends. `'rm -rf '\''/'\'''` is one word reading `rm -rf '/'`,
- *  which is exactly the idiom Codex emits. One quoting layer is decoded, since
- *  `-c` makes the inner shell re-parse the operand.
- *
- *  An operand not starting with a quote is returned whole, tail included, the
- *  same conservative direction the engine takes. */
-function splitShellScriptOperand(s: string): [string, string] {
-  if (s === '' || (s[0] !== "'" && s[0] !== '"')) return [s, ''];
-  let word = '';
-  let i = 0;
-  while (i < s.length) {
-    const c = s[i];
-    if (c === "'") {
-      const end = s.indexOf("'", i + 1);
-      const stop = end === -1 ? s.length : end;
-      word += s.slice(i + 1, stop);
-      i = Math.min(stop + 1, s.length);
-    } else if (c === '"') {
-      i++;
-      while (i < s.length && s[i] !== '"') {
-        if (s[i] === '\\' && i + 1 < s.length && '"\\$`'.includes(s[i + 1])) {
-          word += s[i + 1];
-          i += 2;
-          continue;
-        }
-        word += s[i];
-        i++;
-      }
-      i = Math.min(i + 1, s.length);
-    } else if (c === '\\') {
-      i++;
-      if (i < s.length) {
-        word += s[i];
-        i++;
-      }
-    } else if (opensSubstitution(s, i) || ENDS_SHELL_WORD.test(c)) {
-      // A substitution glued to the word ends it HERE, so the opener lands in
-      // the tail where `tailRunsMoreCommands` sees it. Otherwise the `$` joins
-      // the script and the tail starts at `(`, which nothing recognises.
-      break;
-    } else {
-      word += c;
-      i++;
-    }
-  }
-  return [word, s.slice(i)];
-}
-
-/** True when a substitution opener starts at `i`: `$(`, `<(`, `>(`, or a
- *  backtick. Mirror of the engine's `opens_substitution`. */
-function opensSubstitution(s: string, i: number): boolean {
-  return s[i] === '`' || ('$<>'.includes(s[i]) && s[i + 1] === '(');
-}
-
-/** If `tok` is an I/O redirection operator, whether its target is the NEXT
- *  token rather than glued onto this one. `null` when it is not a redirect.
- *  Mirror of the engine's `redirect_token_needs_target`: bash allows a
- *  redirect BEFORE the command, and reading it as the command word labels the
- *  card with a grant the engine never stores. */
-function redirectTokenNeedsTarget(tok: string): boolean | null {
-  const rest = tok.replace(/^[0-9&]+/, '');
-  const op = /^(>>|>|<)/.exec(rest);
-  if (!op) return null;
-  return rest.length === op[1].length;
-}
-
-/** Every shell `-c` layer unwrapped, up to the engine's `MAX_SHELL_LAYERS`.
- *  Mirror of the innermost entry of the engine's `shell_layers`. */
-function innermostShellScript(command: string): string {
-  let current = command;
-  for (let layer = 0; layer < MAX_SHELL_LAYERS; layer++) {
-    const inner = unwrapShellCommand(current);
-    if (inner === current) break;
-    current = inner;
-  }
-  return current;
-}
-
-/** The command head a card names when its event carries no `grant_head`. It
- *  mirrors the engine's `first_command_token`: unwrap every shell layer, skip privilege
- *  prefixes and `VAR=value` assignments, take the basename. `null` for an empty
- *  command, or a head that runs its arguments (`GRANTS_NOTHING_HEADS`), since
- *  the engine stores no grant for one. Pinned by
- *  `__tests__/permission-card-command-head.test.ts`. */
-export function commandHead(command: string): string | null {
-  const toks = innermostShellScript(command).trim().split(/\s+/).filter(Boolean);
-  let i = 0;
-  while (i < toks.length) {
-    if (listed(BENIGN_PREFIX_WORDS, toks[i])
-      || (!toks[i].startsWith('-') && toks[i].includes('='))) {
-      i++;
-      continue;
-    }
-    const needsTarget = redirectTokenNeedsTarget(toks[i]);
-    if (needsTarget === null) break;
-    i += needsTarget ? 2 : 1;
-  }
-  const head = toks[i];
-  if (!head || listed(GRANTS_NOTHING_HEADS, normalizedHead(head))) return null;
-  const base = head.split('/').filter(Boolean).pop();
-  return base || null;
-}
-
-/** The head a bash command card's narrow and session buttons name. The engine
- *  sends it as `grant_head`, since only it knows the workspace root a leading
- *  `cd` may drop. An older card falls back to `commandHead`. */
-export function commandGrantHead(event: CommandPermissionEvent): string | null {
-  if (!BASH_TOOLS.has(event.tool_name)) return null;
-  return event.grant_head ?? commandHead(event.command);
-}
 
 /** Body of a `CommandPermissionRequested` divider exchange. */
 export function CommandPermissionBody({ event, resolved, terminated }: CommandPermissionBodyProps) {
@@ -842,11 +678,10 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
   const selected = effective ? resolvedChoice(effective) : null;
   const answered = effective !== undefined;
 
-  const isBash = BASH_TOOLS.has(event.tool_name);
-  const head = commandGrantHead(event);
-  // Bash gets a narrow `Bash(<head>:*)` sub-scope; Python is coarse (no narrow).
-  const narrow = isBash && head ? `Bash(${head}:*)` : null;
-  const sessionLabelText = isBash ? (head ? `${head} …` : null) : 'Python';
+  const offer = event.grant_offer ?? {};
+  const broadAriaLabel = () => (BASH_TOOLS.has(event.tool_name)
+    ? 'Always allow any shell command'
+    : 'Always allow any Python');
 
   const buttons: ButtonSpec[] = [
     {
@@ -863,29 +698,7 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       ariaLabel: 'Allow this command once',
       onClick: () => void decide(true),
     },
-    // A command with no readable head derives no session pattern, so the
-    // button would claim a grant the engine never records.
-    ...(sessionLabelText ? [{
-      choice: 'session' as const,
-      btnClass: 'action-btn action-btn-secondary',
-      label: 'Allow for this thread',
-      ariaLabel: `Allow ${sessionLabelText} for the rest of this thread`,
-      onClick: () => void decide(true, 'session'),
-    }] : []),
-    ...(narrow ? [{
-      choice: 'narrow' as const,
-      btnClass: 'action-btn action-btn-secondary',
-      label: grantLabel(narrow),
-      ariaLabel: grantText(narrow),
-      onClick: () => void decide(true, 'narrow'),
-    }] : []),
-    {
-      choice: 'broad',
-      btnClass: 'action-btn action-btn-secondary',
-      label: 'Always allow',
-      ariaLabel: isBash ? 'Always allow any shell command' : 'Always allow any Python',
-      onClick: () => void decide(true, 'broad'),
-    },
+    ...grantButtons(offer, broadAriaLabel, decide),
   ];
 
   return (
@@ -897,7 +710,8 @@ export function CommandPermissionBody({ event, resolved, terminated }: CommandPe
       answered={answered}
       mark={mark}
       terminated={!!terminated}
-      note={engineResolutionNote(resolved)}
+      note={engineResolutionNote(resolved) ?? withheldNote(offer)
+        ?? (event.grant_offer ? null : 'This card comes from an older Lucidos, so it can only allow once.')}
     />
   );
 }

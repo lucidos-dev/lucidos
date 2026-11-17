@@ -219,7 +219,7 @@ impl ApplyEstimateCache {
         state.refreshing = false;
         match computed {
             Ok(value) => state.computed = Some((value, Instant::now())),
-            Err(e) => log!("[ApplyEstimate] refreshing phase estimates failed: {}", e),
+            Err(e) => log_legacy!("[ApplyEstimate] refreshing phase estimates failed: {}", e),
         }
     }
 }

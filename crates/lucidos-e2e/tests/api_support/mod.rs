@@ -323,13 +323,19 @@ pub fn apis_json_lock() -> &'static tokio::sync::Mutex<()> {
     &LOCK
 }
 
+/// `$E2E_WORKSPACE`, which the e2e scripts always export. The fallback
+/// mirrors `E2E_DEFAULT_WORKSPACE` in `scripts/lib/e2e_root.sh`.
 pub fn workspace_path() -> PathBuf {
     if let Ok(ws) = std::env::var("E2E_WORKSPACE") {
-        PathBuf::from(ws)
-    } else {
-        let home = std::env::var("HOME").expect("HOME not set");
-        PathBuf::from(home).join("workspaces/e2e-test")
+        return PathBuf::from(ws);
     }
+    let root = std::env::var("LUCIDOS_E2E_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").expect("HOME not set");
+            PathBuf::from(home).join(".lucidos/e2e-root")
+        });
+    root.join("workspaces/e2e-test")
 }
 
 /// The E2E workspace's database URL.
@@ -460,9 +466,70 @@ pub async fn register_device(device_id: &str) {
 /// event only fires on the genuine first insert.
 pub const E2E_DEVICE_ID: &str = "e2e-api-client";
 
-/// An HTTP client that speaks for the user, the way the browser does: every
-/// request carries `x-lucidos-device-id` for a device that is registered in
-/// this workspace.
+/// The stamp key the harness piped into the engine it started, and the
+/// workspace its stamps name (`scripts/lib/e2e_stamp.sh`). `None` for an
+/// engine the harness did not start: every device is then unattested.
+fn harness_stamp_key() -> Option<(lucidos_gateway_stamp::StampKey, String)> {
+    let text = fs::read_to_string(workspace_path().join(".lucidos/e2e-stamp-key")).ok()?;
+    let mut lines = text.lines();
+    let key = lucidos_gateway_stamp::StampKey::read_handover(lines.next()?.as_bytes())?;
+    Some((key, lines.next()?.to_string()))
+}
+
+/// The gateway stamp a gateway would forward with `device_id`, signed now.
+/// It verifies for `lucidos_gateway_stamp::WINDOW_SECS`.
+pub fn device_stamp(device_id: &str) -> Option<String> {
+    let (key, workspace_id) = harness_stamp_key()?;
+    Some(key.sign_now(lucidos_gateway_stamp::Claim::Device {
+        workspace_id: &workspace_id,
+        device_id,
+    }))
+}
+
+/// `builder` speaking as `device_id`, with the stamp a gateway would forward.
+/// A per-request header replaces the client's default of the same name.
+pub fn as_stamped_device(
+    builder: reqwest::RequestBuilder,
+    device_id: &str,
+) -> reqwest::RequestBuilder {
+    let builder = builder.header("x-lucidos-device-id", device_id);
+    match device_stamp(device_id) {
+        Some(stamp) => builder.header(lucidos_gateway_stamp::HEADER_GATEWAY_STAMP, stamp),
+        None => builder,
+    }
+}
+
+/// Headers naming the suite's device, stamped when `stamped` and the harness
+/// holds a key.
+fn device_headers(stamped: bool) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-lucidos-device-id",
+        reqwest::header::HeaderValue::from_static(E2E_DEVICE_ID),
+    );
+    if let Some(stamp) = device_stamp(E2E_DEVICE_ID).filter(|_| stamped) {
+        headers.insert(
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+            reqwest::header::HeaderValue::from_str(&stamp).expect("a header-safe stamp"),
+        );
+    }
+    headers
+}
+
+fn device_client(stamped: bool) -> reqwest::Client {
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .default_headers(device_headers(stamped))
+        .build()
+        .expect("Failed to build device-attributed HTTP client")
+}
+
+/// An HTTP client that speaks for the user, the way the browser does through
+/// the gateway: every request carries `x-lucidos-device-id` for a device that
+/// is registered in this workspace, and the stamp that proves it.
+///
+/// **The stamp expires** after `lucidos_gateway_stamp::WINDOW_SECS`. A step
+/// that runs later than that in a long test builds a fresh client.
 ///
 /// Use this for anything posting `mode: "human"`. The engine refuses a human
 /// claim it has no evidence for (`api::chat::human_mode_is_attributed`), and
@@ -482,16 +549,14 @@ pub const E2E_DEVICE_ID: &str = "e2e-api-client";
 /// optimising here.
 pub async fn user_client() -> reqwest::Client {
     register_device(E2E_DEVICE_ID).await;
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert(
-        "x-lucidos-device-id",
-        reqwest::header::HeaderValue::from_static(E2E_DEVICE_ID),
-    );
-    reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .default_headers(headers)
-        .build()
-        .expect("Failed to build device-attributed HTTP client")
+    device_client(true)
+}
+
+/// [`user_client`] with no stamp: the registered device id alone, which any
+/// local process can type. The engine reads it as an unattested caller.
+pub async fn unattested_user_client() -> reqwest::Client {
+    register_device(E2E_DEVICE_ID).await;
+    device_client(false)
 }
 
 /// An HTTP client that speaks as a process on this machine, the way `lucidos`

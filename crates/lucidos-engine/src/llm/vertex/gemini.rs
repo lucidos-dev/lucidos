@@ -52,7 +52,9 @@ impl VertexProvider {
             .await?;
 
         if !status.is_success() {
-            return Err(format!("Gemini search API error ({}): {}", status, body).into());
+            return Err(
+                crate::llm::ProviderError::from_http("Gemini", status.as_u16(), &body).into(),
+            );
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
@@ -123,19 +125,21 @@ impl VertexProvider {
             .await?;
 
         if !status.is_success() {
-            log!("[Vertex] Gemini API error ({}): {}", status, body);
+            log_legacy!("[Vertex] Gemini API error ({}): {}", status, body);
             if let Some(advice) =
                 super::explain_publisher_model_404(status.as_u16(), &body, model, &url)
             {
                 return Err(Box::new(ModelNotServed::new(advice)));
             }
-            return Err(format!("Gemini API error ({}): {}", status, body).into());
+            return Err(
+                crate::llm::ProviderError::from_http("Gemini", status.as_u16(), &body).into(),
+            );
         }
 
         let response = match parse_gemini_reply(&body) {
             Ok(response) => response,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Vertex] Failed to parse Gemini response: {}\nBody: {}",
                     e,
                     body

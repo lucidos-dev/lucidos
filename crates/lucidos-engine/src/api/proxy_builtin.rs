@@ -295,7 +295,7 @@ pub(crate) async fn builtin_proxy_state(
         },
         Err((StatusCode::NOT_FOUND, _)) => BuiltinProxyState::NotConfigured,
         Err((status, msg)) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Proxy] Cannot tell whether builtin '{}' is configured ({}): {}",
                 proxy.name,
                 status,

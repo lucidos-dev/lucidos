@@ -1259,92 +1259,6 @@ fn each_update_cause_seeds_its_own_wording() {
     }
 }
 
-/// Cross-layer pin: the engine writes both seeds, and two other layers have to
-/// recognise them. The system prompt's route is what makes the agent call
-/// `load_knowhow` at all, and the knowhow's frontmatter `description` is the
-/// retrieval path behind it. Reword any one of the three alone and the thread
-/// still starts, still looks right, and quietly gets a generic answer.
-///
-/// Reading the real sources is what makes this a check on the set rather than
-/// three assertions that the same string equals itself. Same shape as
-/// `setup_interview_route_matches_the_frontend_seeded_prompt`.
-#[test]
-fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
-    use crate::engine::chat::process::PLUGIN_SETUP_RULE;
-
-    let seed = |occasion| match build_setup_thread_request(
-        uuid::Uuid::new_v4(),
-        &super_slides(),
-        occasion,
-        None,
-    ) {
-        crate::engine::thread_queue::ThreadQueueRequest::SubThread { prompt, .. } => {
-            prompt.to_lowercase()
-        }
-        other => panic!("setup thread must be a SubThread, got: {other:?}"),
-    };
-
-    let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-    let knowhow_path = repo.join("system-knowhow/plugin-setup.md");
-    let knowhow = std::fs::read_to_string(&knowhow_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", knowhow_path.display()))
-        .to_lowercase();
-    let description = knowhow
-        .split("\n---")
-        .next()
-        .expect("split always yields at least one element")
-        .to_string();
-    let route = PLUGIN_SETUP_RULE.to_lowercase();
-
-    // The verb every seed keeps, plus the word that tells the two occasions
-    // apart. A route or description carrying only "installed" leaves the update
-    // seed on retrieval alone.
-    for word in ["set up", "install", "update"] {
-        assert!(
-            route.contains(word),
-            "the system-prompt route drops {word:?}, so a setup seed may not \
-             reach the knowhow:\n{PLUGIN_SETUP_RULE}"
-        );
-        assert!(
-            description.contains(word),
-            "system-knowhow/plugin-setup.md's description drops {word:?}, so \
-             retrieval may not reach it:\n{description}"
-        );
-    }
-
-    let occasions = [
-        PluginSetupOccasion::FreshInstall,
-        update_from(Some("0.5.1"), PluginSetupCause::InstructionsChanged),
-        update_from(None, PluginSetupCause::InstructionsChanged),
-        update_from(Some("0.5.1"), revision_raised()),
-        update_from(None, revision_raised()),
-        update_from(Some("0.5.1"), both_causes()),
-        update_from(None, both_causes()),
-    ];
-    for occasion in occasions {
-        let again = matches!(occasion, PluginSetupOccasion::Update { .. });
-        let prompt = seed(occasion);
-        assert!(
-            !again || prompt.contains("again"),
-            "an update seed drops the word the knowhow keys on: {prompt:?}"
-        );
-        assert!(
-            prompt.contains("set up"),
-            "the seed drops the verb every route keys on: {prompt:?}"
-        );
-    }
-    assert!(
-        seed(PluginSetupOccasion::FreshInstall).contains("newly installed"),
-        "the fresh-install seed must keep the phrase the route names"
-    );
-
-    assert!(
-        route.contains("`system-knowhow/plugin-setup`")
-            || route.contains("'system-knowhow/plugin-setup'"),
-        "the route must name the knowhow id it loads:\n{PLUGIN_SETUP_RULE}"
-    );
-}
-
 #[test]
 fn an_update_from_a_versionless_record_still_seeds_a_re_run() {
     // A legacy `PluginInstalled` row can name no version at all, which is why
@@ -1951,4 +1865,94 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
                 .contains(&"knowhow/git-track.md".to_string()),
         "fixture must span apps/ and knowhow/ to prove a single multi-dir commit"
     );
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Cross-layer pin: the engine writes both seeds, and two other layers have to
+    /// recognise them. The system prompt's route is what makes the agent call
+    /// `load_knowhow` at all, and the knowhow's frontmatter `description` is the
+    /// retrieval path behind it. Reword any one of the three alone and the thread
+    /// still starts, still looks right, and quietly gets a generic answer.
+    ///
+    /// Reading the real sources is what makes this a check on the set rather than
+    /// three assertions that the same string equals itself. Same shape as
+    /// `setup_interview_route_matches_the_frontend_seeded_prompt`.
+    #[test]
+    fn both_setup_seeds_route_to_the_plugin_setup_knowhow() {
+        use crate::engine::chat::process::PLUGIN_SETUP_RULE;
+
+        let seed = |occasion| match build_setup_thread_request(
+            uuid::Uuid::new_v4(),
+            &super_slides(),
+            occasion,
+            None,
+        ) {
+            crate::engine::thread_queue::ThreadQueueRequest::SubThread { prompt, .. } => {
+                prompt.to_lowercase()
+            }
+            other => panic!("setup thread must be a SubThread, got: {other:?}"),
+        };
+
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let knowhow_path = repo.join("system-knowhow/plugin-setup.md");
+        let knowhow = std::fs::read_to_string(&knowhow_path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", knowhow_path.display()))
+            .to_lowercase();
+        let description = knowhow
+            .split("\n---")
+            .next()
+            .expect("split always yields at least one element")
+            .to_string();
+        let route = PLUGIN_SETUP_RULE.to_lowercase();
+
+        // The verb every seed keeps, plus the word that tells the two occasions
+        // apart. A route or description carrying only "installed" leaves the update
+        // seed on retrieval alone.
+        for word in ["set up", "install", "update"] {
+            assert!(
+                route.contains(word),
+                "the system-prompt route drops {word:?}, so a setup seed may not \
+             reach the knowhow:\n{PLUGIN_SETUP_RULE}"
+            );
+            assert!(
+                description.contains(word),
+                "system-knowhow/plugin-setup.md's description drops {word:?}, so \
+             retrieval may not reach it:\n{description}"
+            );
+        }
+
+        let occasions = [
+            PluginSetupOccasion::FreshInstall,
+            update_from(Some("0.5.1"), PluginSetupCause::InstructionsChanged),
+            update_from(None, PluginSetupCause::InstructionsChanged),
+            update_from(Some("0.5.1"), revision_raised()),
+            update_from(None, revision_raised()),
+            update_from(Some("0.5.1"), both_causes()),
+            update_from(None, both_causes()),
+        ];
+        for occasion in occasions {
+            let again = matches!(occasion, PluginSetupOccasion::Update { .. });
+            let prompt = seed(occasion);
+            assert!(
+                !again || prompt.contains("again"),
+                "an update seed drops the word the knowhow keys on: {prompt:?}"
+            );
+            assert!(
+                prompt.contains("set up"),
+                "the seed drops the verb every route keys on: {prompt:?}"
+            );
+        }
+        assert!(
+            seed(PluginSetupOccasion::FreshInstall).contains("newly installed"),
+            "the fresh-install seed must keep the phrase the route names"
+        );
+
+        assert!(
+            route.contains("`system-knowhow/plugin-setup`")
+                || route.contains("'system-knowhow/plugin-setup'"),
+            "the route must name the knowhow id it loads:\n{PLUGIN_SETUP_RULE}"
+        );
+    }
 }

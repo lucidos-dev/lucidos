@@ -82,7 +82,7 @@ pub(crate) fn listed_widget(
         Ok(app) => Ok(Some(app)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
-            log!("[Widgets] Skipping {app_id}: {e}");
+            log_legacy!("[Widgets] Skipping {app_id}: {e}");
             Ok(None)
         }
         Err(e) => Err(format!("reading widget '{app_id}': {e}").into()),

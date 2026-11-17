@@ -766,7 +766,8 @@ mod tests {
         // cannot: it filters by status and channel and never by topic.
         // `detach_child` stops waiting for a child (ADR 0278). `archive` closes
         // the caller or one of its children (ADR 0310). `drafts` and
-        // `held_messages` say what a thread holds that nothing has sent.
+        // `held_messages` say what a thread holds that nothing has sent, and
+        // `submit_draft` sends a saved draft on the owner's authority (ADR 0651).
         // `cache_keep_alive` is the per-thread keep-alive switch (ADR 0554).
         // `context_ceiling` sets a thread's context ceiling (ADR 0629).
         // `triage` and `apply_triage` are thread triage (ADR 0349).
@@ -776,6 +777,7 @@ mod tests {
                 "list",
                 "count",
                 "drafts",
+                "submit_draft",
                 "held_messages",
                 "search",
                 "detach_child",
@@ -797,8 +799,8 @@ mod tests {
         assert!(domain_for_tool("run_coding_agent").is_none());
     }
 
-    /// What a thread holds unsent is READ-ONLY to every agent surface: the
-    /// two actions that read it are GETs, flagged non-mutating.
+    /// The two actions that read what a thread holds unsent are GETs, flagged
+    /// non-mutating. The one that sends a saved draft is a mutating POST.
     #[test]
     fn the_unsent_reads_are_read_only() {
         let threads = domains().iter().find(|d| d.name == "threads").unwrap();
@@ -814,6 +816,17 @@ mod tests {
         assert_eq!(
             threads.legacy_tool_for_action("drafts"),
             Some("list_drafts")
+        );
+        let submit = threads
+            .operations
+            .iter()
+            .find(|o| o.action == "submit_draft")
+            .expect("the threads domain sends a saved draft");
+        assert!(submit.mutating && matches!(submit.method, Method::Post));
+        assert_eq!(submit.path, "/threads/:thread_id/submit-draft");
+        assert_eq!(
+            threads.legacy_tool_for_action("submit_draft"),
+            Some("submit_saved_draft")
         );
     }
 

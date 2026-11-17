@@ -52,14 +52,21 @@ setup_postgres
 build_or_find_engine
 # build_or_find_engine builds the window once this checkout has one, so only
 # the first launch builds it here.
-DEV_WINDOW_LAUNCH_DIR="$(launch_bin_dir)"
+DEV_WINDOW_LAUNCH_DIR="$(launch_bin_dir)" || exit 1
 if [ ! -f "$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")" ]; then
     build_dev_window "$DEV_WINDOW_LAUNCH_DIR"
 fi
+# The plist comes from the same tree a build reads, so a launch and a build
+# write the same bundle.
+select_launch_source
+write_dev_window_bundle "$DEV_WINDOW_LAUNCH_DIR" \
+    || echo "WARNING: could not refresh the dev window's Info.plist" >&2
 # Resolved, because stop_dev_windows matches a window by the exact path it was
 # started from, and a later launch must name it the same way.
 DEV_WINDOW_LAUNCH_DIR="$(cd "$DEV_WINDOW_LAUNCH_DIR" && pwd -P)"
 DEV_WINDOW_BIN="$(dev_window_bin "$DEV_WINDOW_LAUNCH_DIR")"
+DEV_WINDOW_RECORDS_DIR="$(dev_window_records_dir "$PROJECT_DIR" "${LUCIDOS_NO_GATEWAY:-}")"
+mkdir -p "$DEV_WINDOW_RECORDS_DIR"
 # Before the stack starts, so /api/v1/sdk.js is ready immediately.
 generate_build_outputs
 kill_stale_processes
@@ -100,4 +107,4 @@ echo "Launching Tauri desktop app at $WINDOW_URL ..."
 # run_dev_window relaunches the newer published binary once its engine has
 # switched.
 cd "$FRONTEND_DIR"
-run_dev_window "$DEV_WINDOW_BIN" "$WINDOW_URL"
+run_dev_window "$DEV_WINDOW_BIN" "$WINDOW_URL" "$DEV_WINDOW_RECORDS_DIR"

@@ -60,16 +60,20 @@ pub enum JudgmentSite {
     /// The turn end's *expected wake decision*: when a waiting thread wakes
     /// next. A missing answer records no estimate.
     ExpectedWakeDecision,
+    /// Which option of an open *permission request* the owner's words choose
+    /// (ADR 0664). Every doubt grants nothing.
+    PermissionAnswer,
 }
 
 impl JudgmentSite {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::CommandGuard,
         Self::QueryClassification,
         Self::MemoryFind,
         Self::ReadDecision,
         Self::WakeDecision,
         Self::ExpectedWakeDecision,
+        Self::PermissionAnswer,
     ];
 
     pub const fn preference_key(self) -> &'static Pref<Optional> {
@@ -80,6 +84,7 @@ impl JudgmentSite {
             Self::ReadDecision => &prefs::JUDGMENT_READ_DECISION,
             Self::WakeDecision => &prefs::JUDGMENT_WAKE_DECISION,
             Self::ExpectedWakeDecision => &prefs::JUDGMENT_EXPECTED_WAKE_DECISION,
+            Self::PermissionAnswer => &prefs::JUDGMENT_PERMISSION_ANSWER,
         }
     }
 
@@ -92,6 +97,7 @@ impl JudgmentSite {
             Self::ReadDecision => &prefs::MODEL_READ_DECISION,
             Self::WakeDecision => &prefs::MODEL_WAKE_DECISION,
             Self::ExpectedWakeDecision => &prefs::MODEL_EXPECTED_WAKE_DECISION,
+            Self::PermissionAnswer => &prefs::MODEL_PERMISSION_ANSWER,
         }
     }
 
@@ -104,6 +110,7 @@ impl JudgmentSite {
             Self::WakeDecision => Some(WAKE_DECISION_DEFAULT),
             Self::ReadDecision
             | Self::ExpectedWakeDecision
+            | Self::PermissionAnswer
             | Self::CommandGuard
             | Self::QueryClassification
             | Self::MemoryFind => None,
@@ -119,6 +126,7 @@ impl JudgmentSite {
             Self::ReadDecision => "read decision",
             Self::WakeDecision => "wake decision",
             Self::ExpectedWakeDecision => "expected wake decision",
+            Self::PermissionAnswer => "permission answer",
         }
     }
 
@@ -130,6 +138,7 @@ impl JudgmentSite {
         static READ_DECISION: AtomicBool = AtomicBool::new(false);
         static WAKE_DECISION: AtomicBool = AtomicBool::new(false);
         static EXPECTED_WAKE_DECISION: AtomicBool = AtomicBool::new(false);
+        static PERMISSION_ANSWER: AtomicBool = AtomicBool::new(false);
         match self {
             Self::CommandGuard => &COMMAND_GUARD,
             Self::QueryClassification => &QUERY_CLASSIFICATION,
@@ -137,6 +146,7 @@ impl JudgmentSite {
             Self::ReadDecision => &READ_DECISION,
             Self::WakeDecision => &WAKE_DECISION,
             Self::ExpectedWakeDecision => &EXPECTED_WAKE_DECISION,
+            Self::PermissionAnswer => &PERMISSION_ANSWER,
         }
     }
 }
@@ -156,7 +166,7 @@ async fn provider_switch(pool: &PgPool, endpoint: SystemOneEndpoint) -> Option<b
     match endpoint.switch_key().try_read(pool).await {
         Ok(on) => Some(on),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Judgment] Could not read {}: {}",
                 endpoint.switch_key().key(),
                 e
@@ -195,7 +205,7 @@ pub async fn system_one_or_default_for(
     let preference = match site.preference_key().try_stored(pool).await {
         Ok(value) => value.filter(|v| !v.trim().is_empty()),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Judgment] Could not read {}: {}. Running the {} on its chat model",
                 site.preference_key().key(),
                 e,
@@ -251,7 +261,7 @@ async fn chat_model_unpinned(pool: &PgPool, site: JudgmentSite) -> bool {
     match site.chat_model_key().try_stored(pool).await {
         Ok(stored) => stored.is_none_or(|model| model.trim().is_empty()),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Judgment] Could not read {}: {}. Running the {} on its chat model",
                 site.chat_model_key().key(),
                 e,
@@ -316,7 +326,7 @@ pub async fn jev_for_agent(
         .provider(pool, timeout)
         .await
         .map_err(|e| {
-            log!("[Judgment] Jev for the judge tool: {}", e);
+            log_legacy!("[Judgment] Jev for the judge tool: {}", e);
             "the TypeSafe client could not be built, see the engine log"
         })
 }
@@ -327,7 +337,7 @@ pub async fn jev_for_agent(
 /// call would bury the log in the one message worth reading.
 fn warn_once(site: JudgmentSite, message: String) {
     if !site.warned().swap(true, Ordering::Relaxed) {
-        log!("{}", message);
+        log_legacy!("{}", message);
     }
 }
 

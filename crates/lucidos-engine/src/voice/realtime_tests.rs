@@ -748,12 +748,12 @@ fn a_frame_the_seam_has_no_word_for_maps_to_nothing() {
 async fn a_real_session_accepts_the_opening_payload() {
     crate::net_config::install_crypto_provider();
     let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
-        println!("skipped: OPENAI_API_KEY is not set");
+        crate::log_legacy!("skipped: OPENAI_API_KEY is not set");
         return;
     };
     let model = std::env::var("LUCIDOS_VOICE_TALKER_MODEL")
         .unwrap_or_else(|_| "gpt-realtime-2.1".to_string());
-    println!("opening a session on {}", model);
+    crate::log_legacy!("opening a session on {}", model);
 
     // The default transcriber with a language pinned, so the run also asks
     // whether the provider takes that model's `languages` array.
@@ -773,7 +773,7 @@ async fn a_real_session_accepts_the_opening_payload() {
             Ok(Some(VoiceEvent::Failed { message })) => {
                 panic!("the opening payload was refused: {}", message)
             }
-            Ok(Some(other)) => println!("received {:?}", other),
+            Ok(Some(other)) => crate::log_legacy!("received {:?}", other),
             Ok(None) => panic!("the provider closed the socket"),
             Err(_) => break,
         }

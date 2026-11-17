@@ -25,17 +25,18 @@ Draft content is per-draft (`composeDrafts[id]`). So are the dropdowns: target a
 
 ### Persistence
 
-No compose interaction writes an account preference. The selection is stored in `thread_summaries.compose_selection`, beside the draft's text, images and mode. The debounced compose PUT (`pushNow` in `compose.ts`) writes it. The `ThreadComposeChanged` SSE event carries a `selection` field. A reload or a peer frame rehydrates it through `store/composeSync.ts` (ADR 0437). So a stored draft keeps its picks across a refresh and across devices.
+Compose selections are stored in `thread_summaries.compose_selection`, beside the draft's text, images and mode. The debounced compose PUT (`pushNow` in `compose.ts`) writes it. The `ThreadComposeChanged` SSE event carries a `selection` field. A reload or a peer frame rehydrates it through `store/composeSync.ts` (ADR 0437). So a stored draft keeps its picks across a refresh and across devices.
 
-- `chat_model`, `chat_reasoning_efforts` and `coding_agent_default` are account defaults and the live fallback of every override-less draft. A compose pick that wrote one would leak to every existing draft.
-- A backend pick is the one deliberate exception. It writes the draft's `provider` override and the model row's preferred provider (`rememberProvider`, ADR 0247). The override keeps the draft on its backend. A draft that picked nothing follows the row.
+- `chat_model` and `chat_reasoning_efforts` remain account defaults. Compose model and reasoning picks never write them.
+- Coding-agent chip picks use `selectComposeCodingAgent` to remember `coding_agent_default` (ADR 0006). The server atomically pins inherited agent choices when updating the preference, without rewriting draft content. Local preference refreshes preserve inherited choices without scheduling compose writes. New drafts copy the remembered agent into their own selection.
+- A provider pick also remembers its preference. It writes the draft's `provider` override and the model row's preferred provider (`rememberProvider`, ADR 0247). The override keeps the draft on its backend. A draft that picked nothing follows the row.
 - A scope pick writes `selectedScope`. It is the seed for the next new draft and no account preference. It is leak-safe because no existing draft reads it.
 
 ### The pending slot
 
 A draft is created on the first keystroke. So the fresh compose view often has no focused draft while the user picks a destination, agent or model. Those picks go to `pendingComposeSelection`. A `null` or `undefined` thread id makes `getComposeSelectionOverride`, `patchComposeSelection` and `clearComposeSelection` use that slot. Every `resolve*` follows.
 
-`ensureFocusedComposeThread` moves the pending picks onto the new draft. It also seeds `scope` from `selectedScope`: `seedComposeSelection({ scope: selectedScope.value, ...pending })`. The seed is required because a real draft no longer falls back to `selectedScope`. A pending scope pick wins over the seed. The first keystroke's PUT persists the seed.
+`ensureFocusedComposeThread` moves the pending picks onto the new draft. It also copies `scope` from `selectedScope` and `codingAgent` from `selectedCodingAgent` before overlaying pending picks. The seed is required because a real draft no longer falls back to `selectedScope`. A pending scope pick wins over the seed. The first keystroke's PUT persists the seed.
 
 ### Surfaces
 

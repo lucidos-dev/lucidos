@@ -531,27 +531,35 @@ async fn sort_ladder_writes_the_sorted_override_and_clears_one_equal_to_shipped(
     teardown_test_db(&db_name).await;
 }
 
-/// The chat ladder is the only switch for what the picker lists, so no code
-/// reads the `models.enabled` column it replaced. The column itself stays
-/// until a later migration drops it.
-#[test]
-fn nothing_reads_the_enabled_column_of_models() {
-    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let statement = regex::Regex::new(r"\b(?:FROM|UPDATE|INTO|JOIN)\s+models\b").unwrap();
-    let enabled = regex::Regex::new(r"\benabled\b").unwrap();
-    let mut offenders = Vec::new();
-    let mut dirs = vec![crates];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            if path.is_dir() {
-                if name != "target" && name != "node_modules" {
-                    dirs.push(path);
-                }
-                continue;
-            }
-            if path.extension().is_none_or(|e| e != "rs") || name == "chat_ladder_tests.rs" {
+mod guard_tests {
+    /// The chat ladder is the only switch for what the picker lists, so no code
+    /// reads the `models.enabled` column it replaced. The column itself stays
+    /// until a later migration drops it.
+    #[test]
+    fn nothing_reads_the_enabled_column_of_models() {
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let statement = regex::Regex::new(r"\b(?:FROM|UPDATE|INTO|JOIN)\s+models\b").unwrap();
+        let enabled = regex::Regex::new(r"\benabled\b").unwrap();
+        let mut offenders = Vec::new();
+        // Browser runs create and remove nested worktrees under test-results.
+        // The index names the source population without traversing that runtime data.
+        let sources = std::process::Command::new("git")
+            .args(["ls-files", "-z", "--", "*.rs"])
+            .current_dir(&crates)
+            .output()
+            .expect("list tracked Rust sources");
+        assert!(
+            sources.status.success(),
+            "{}",
+            String::from_utf8_lossy(&sources.stderr)
+        );
+        let paths = std::str::from_utf8(&sources.stdout).unwrap();
+        for relative in paths.split('\0').filter(|path| !path.is_empty()) {
+            let path = crates.join(relative);
+            if path
+                .file_name()
+                .is_some_and(|name| name == "chat_ladder_tests.rs")
+            {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -565,6 +573,6 @@ fn nothing_reads_the_enabled_column_of_models() {
                 }
             }
         }
+        assert!(offenders.is_empty(), "{offenders:#?}");
     }
-    assert!(offenders.is_empty(), "{offenders:#?}");
 }

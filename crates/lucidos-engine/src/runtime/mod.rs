@@ -1,5 +1,7 @@
 pub(crate) mod agent_run_marker;
 pub mod agent_runtime;
+pub mod agent_sandbox;
+pub mod billing_provider;
 pub mod browser;
 mod browser_consent;
 pub mod cc_model_discovery;
@@ -10,6 +12,7 @@ pub mod codex;
 mod codex_app_server;
 mod codex_app_server_parse;
 mod codex_parse;
+pub(crate) mod codex_side_question;
 pub(crate) mod compile_mode;
 pub mod intelligence_ladder;
 pub mod lucidos_cli;
@@ -390,6 +393,24 @@ pub struct AgentBinaryStatus {
     pub version: Option<String>,
 }
 
+/// Installed coding agents, using the same binary-path preferences as spawning.
+pub async fn installed_coding_agents(pool: &sqlx::PgPool) -> Vec<CodingAgent> {
+    let claude = crate::core::prefs::CODING_AGENT_CLAUDE_PATH
+        .read(pool)
+        .await;
+    let codex = crate::core::prefs::CODING_AGENT_CODEX_PATH.read(pool).await;
+    [CodingAgent::ClaudeCode, CodingAgent::Codex]
+        .into_iter()
+        .filter(|agent| {
+            let path = match agent {
+                CodingAgent::ClaudeCode => claude.as_deref(),
+                CodingAgent::Codex => codex.as_deref(),
+            };
+            detect_agent_binary(*agent, path).valid
+        })
+        .collect()
+}
+
 /// Compute the effective CLI binary resolution for `agent`, mirroring exactly
 /// what a spawn would do: a set override wins (validated the same way the
 /// spawn validates it), else the probe list, else a bare-name PATH walk.
@@ -560,7 +581,7 @@ pub(crate) async fn probe_agent_version(
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            crate::log!("[AgentBinary] {label}: `{shown} --version` failed to run: {e}");
+            crate::log_legacy!("[AgentBinary] {label}: `{shown} --version` failed to run: {e}");
             return None;
         }
     };
@@ -582,19 +603,23 @@ pub(crate) async fn probe_agent_version(
     let (stdout, stderr, waited) = match collected {
         Ok(collected) => collected,
         Err(_) => {
-            crate::log!("[AgentBinary] {label}: `{shown} --version` timed out after {timeout:?}");
+            crate::log_legacy!(
+                "[AgentBinary] {label}: `{shown} --version` timed out after {timeout:?}"
+            );
             return None;
         }
     };
     let status = match waited {
         Ok(status) => status,
         Err(e) => {
-            crate::log!("[AgentBinary] {label}: waiting for `{shown} --version` failed: {e}");
+            crate::log_legacy!(
+                "[AgentBinary] {label}: waiting for `{shown} --version` failed: {e}"
+            );
             return None;
         }
     };
     if !status.success() {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentBinary] {label}: `{shown} --version` exited {status}: {}",
             log_excerpt(&stderr, VERSION_PROBE_LOG_EXCERPT)
         );
@@ -602,7 +627,7 @@ pub(crate) async fn probe_agent_version(
     }
     let parsed = parse_agent_version(&stdout);
     if parsed.is_none() {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentBinary] {label}: `{shown} --version` printed no recognizable version: '{}'",
             log_excerpt(&stdout, VERSION_PROBE_LOG_EXCERPT)
         );
@@ -635,7 +660,7 @@ async fn read_capped(
     };
     let mut kept = Vec::new();
     if let Err(e) = (&mut pipe).take(limit).read_to_end(&mut kept).await {
-        crate::log!("[AgentBinary] {context} read failed: {e}");
+        crate::log_legacy!("[AgentBinary] {context} read failed: {e}");
         return String::from_utf8_lossy(&kept).into_owned();
     }
     let mut sink = [0u8; 4096];
@@ -644,7 +669,7 @@ async fn read_capped(
             Ok(0) => break,
             Ok(_) => continue,
             Err(e) => {
-                crate::log!("[AgentBinary] {context} drain failed: {e}");
+                crate::log_legacy!("[AgentBinary] {context} drain failed: {e}");
                 break;
             }
         }
@@ -1260,7 +1285,7 @@ mod tests {
     }
 
     /// The incident list with the overlay-only ids Claude Code can still list,
-    /// as it did before Fable and Opus 5 left the offered set.
+    /// as it did before Fable 5, Fable 5.1 and Opus 5 left the offered set.
     fn picker_listing_withdrawn_models() -> Vec<claude_code::CcMenuOption> {
         let mut rows = incident_picker();
         let template = rows[0].clone();
@@ -1279,9 +1304,9 @@ mod tests {
     /// answered with the incident list, and it lists a withdrawn model.
     fn both_list_states() -> [std::sync::Arc<[claude_code::CcMenuOption]>; 3] {
         [
-            claude_code::offered_cc_model_options(None),
-            claude_code::offered_cc_model_options(Some(&incident_picker())),
-            claude_code::offered_cc_model_options(Some(&picker_listing_withdrawn_models())),
+            claude_code::offered_cc_model_options(None, &[]),
+            claude_code::offered_cc_model_options(Some(&incident_picker()), &[]),
+            claude_code::offered_cc_model_options(Some(&picker_listing_withdrawn_models()), &[]),
         ]
     }
 
@@ -1294,6 +1319,7 @@ mod tests {
                 "claude-opus-5-5",
                 "claude-opus-5-5[1m]",
                 "claude-sonnet-5-5",
+                "claude-fable-5-2",
             ] {
                 assert_eq!(
                     validate_model_against(CodingAgent::ClaudeCode, Some(id), &options),
@@ -1339,7 +1365,7 @@ mod tests {
     /// `resolvedModel` it reported stay the ones shown.
     #[test]
     fn a_discovered_row_wins_over_a_curated_row_with_its_value() {
-        let options = claude_code::offered_cc_model_options(Some(&incident_picker()));
+        let options = claude_code::offered_cc_model_options(Some(&incident_picker()), &[]);
         let rows: Vec<_> = options
             .iter()
             .filter(|o| o.value == "claude-sonnet-5-5")

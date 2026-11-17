@@ -44,7 +44,7 @@ type ThreadOpts = {
     lastUserAction?: string;
     liveEventWaitCount?: number;
     activeChildrenCount?: number;
-    waitingChildrenCount?: number;
+    awaitedChildrenCount?: number;
     parentThreadId?: string;
     isStoppedChild?: boolean;
     readRequested?: boolean;
@@ -65,8 +65,9 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         messageCount: 1,
         section: opts.section ?? 'inbox',
         activeChildrenCount: opts.activeChildrenCount ?? 0,
-        waitingChildrenCount: opts.waitingChildrenCount ?? 0,
-        totalChildrenCount: (opts.activeChildrenCount ?? 0) + (opts.waitingChildrenCount ?? 0),
+        // A running child is a `wake` child unless a test says otherwise.
+        awaitedChildrenCount: opts.awaitedChildrenCount ?? opts.activeChildrenCount ?? 0,
+        totalChildrenCount: Math.max(opts.activeChildrenCount ?? 0, opts.awaitedChildrenCount ?? 0),
         blockingDescendantCount: 0,
         attentionDescendantCount: 0,
         codingAgentChangeState: opts.codingAgentChangeState ?? { kind: 'none' },
@@ -291,7 +292,7 @@ describe('inFlightThreads', () => {
     });
 
     it('includes a parent waiting on a sub-thread asleep on its own event wait', () => {
-        const parent = makeThread('a', { waitingChildrenCount: 1 });
+        const parent = makeThread('a', { awaitedChildrenCount: 1 });
         expect(rootIds(inFlightThreads(asMap([parent])))).toEqual(['a']);
     });
 
@@ -545,7 +546,7 @@ describe('an unread thread whose work runs on', () => {
     const unreadWaiting = () => [
         makeThread('parent', { readRequested: true, activeChildrenCount: 1 }),
         makeThread('parked', { readRequested: true, liveEventWaitCount: 1 }),
-        makeThread('child-parked', { readRequested: true, waitingChildrenCount: 1 }),
+        makeThread('child-parked', { readRequested: true, awaitedChildrenCount: 1 }),
     ];
 
     it('lists in Review and In flight both', () => {
@@ -576,7 +577,7 @@ describe('In flight never claims a thread Blocked holds, nor a change Review hol
             makeThread('parent-proposed', { activeChildrenCount: 1, codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
             makeThread('question', { status: 'waiting_for_user_answer', liveEventWaitCount: 1 }),
             makeThread('failed', { status: 'failed', activeChildrenCount: 1 }),
-            makeThread('stopped', { isStoppedChild: true, waitingChildrenCount: 1 }),
+            makeThread('stopped', { isStoppedChild: true, awaitedChildrenCount: 1 }),
             makeThread('proposed', { codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
             makeThread('paused', { status: 'paused', liveEventWaitCount: 1 }),
         ];

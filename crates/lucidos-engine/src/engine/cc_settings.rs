@@ -50,7 +50,7 @@ fn widened_directories(workspace_root: &Path) -> Vec<PathBuf> {
         Some(dir)
             if crate::runtime::codex::grants_more_than_the_data_tree(&dir, workspace_root) =>
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} resolves to {}, which contains the workspace. Refusing to \
                  grant it: Claude Code will keep asking before it reaches the workspace's \
                  data/ tree.",
@@ -61,7 +61,7 @@ fn widened_directories(workspace_root: &Path) -> Vec<PathBuf> {
         }
         Some(dir) => vec![dir],
         None => {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
                  before it reaches the workspace's data/ tree.",
                 data_dir.display()
@@ -103,7 +103,7 @@ fn os_tmp_directories_with(tmpdir: Option<std::ffi::OsString>) -> Vec<PathBuf> {
     let mut granted: Vec<PathBuf> = Vec::new();
     for literal in std::iter::once(PathBuf::from(OS_TMP_DIR)).chain(tmpdir) {
         let Ok(resolved) = std::fs::canonicalize(&literal) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[CcSettings] {} is not a reachable directory. Claude Code will keep asking \
                  before it writes a throwaway file there.",
                 literal.display()
@@ -191,6 +191,7 @@ pub(crate) fn build_cc_settings_json(additional_directories: &[PathBuf]) -> Stri
     });
     grant_directories(&mut settings, additional_directories);
     hide_unused_skills(&mut settings);
+    turn_off_own_sandbox(&mut settings);
     settings.to_string()
 }
 
@@ -214,6 +215,14 @@ fn hide_unused_skills(settings: &mut serde_json::Value) {
         .map(|skill| (skill.to_string(), serde_json::json!("off")))
         .collect::<serde_json::Map<_, _>>()
         .into();
+}
+
+/// Turn Claude Code's own sandbox off, whatever the user's settings say. Its
+/// seatbelt cannot nest inside Lucidos's (ADR 0645), so every sandboxed Bash
+/// call would fail. Both files carry it, since CC names its sandbox in the
+/// prompt, and a side question must share its session's prefix.
+fn turn_off_own_sandbox(settings: &mut serde_json::Value) {
+    settings["sandbox"] = serde_json::json!({ "enabled": false });
 }
 
 /// Add the `permissions.additionalDirectories` grant, or nothing for an empty
@@ -262,7 +271,7 @@ pub(crate) async fn write_cc_settings(
         build_cc_settings_json(&granted_directories(workspace_root)),
     )
     .await?;
-    crate::log!("[CcSettings] wrote {}", path.display());
+    crate::log_legacy!("[CcSettings] wrote {}", path.display());
     Ok(())
 }
 
@@ -296,6 +305,7 @@ pub(crate) fn build_cc_side_question_settings_json(additional_directories: &[Pat
     });
     grant_directories(&mut settings, additional_directories);
     hide_unused_skills(&mut settings);
+    turn_off_own_sandbox(&mut settings);
     settings.to_string()
 }
 
@@ -347,6 +357,17 @@ mod tests {
 
     /// The skill listing is part of the prompt prefix, so the side-question copy
     /// must hide exactly what the session hides, and nothing beyond the four.
+    #[test]
+    fn both_files_turn_off_claude_codes_own_sandbox() {
+        for body in [
+            build_cc_settings_json(&[]),
+            build_cc_side_question_settings_json(&[]),
+        ] {
+            let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(parsed["sandbox"]["enabled"], false, "{body}");
+        }
+    }
+
     #[test]
     fn skill_overrides_hide_only_the_unused_skills_in_both_files() {
         for json in [

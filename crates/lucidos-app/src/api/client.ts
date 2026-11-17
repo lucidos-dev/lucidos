@@ -21,7 +21,7 @@ export * from './client/settings';
 export * from './client/themes';
 export * from './client/models';
 export * from './client/mcp';
-export * from './client/people';
+export * from './client/users';
 export * from './client/pluginMarketplaces';
 export * from './client/readerDevices';
 export * from './client/releaseNotices';

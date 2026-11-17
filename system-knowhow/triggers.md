@@ -503,8 +503,8 @@ Set `actor` on an intent trigger to say whose action a fire carries: the person 
 
 How a fire uses it:
 
-- **The fire records the email, never a person.** It goes on the fire's origin: on `TriggerStarted`, and on the answer when a keyed fire answers a question. The thread credits the *operator* who holds that email, and moving an email to another operator moves the credit.
-- **An email no operator holds credits nobody.** The thread still runs. It just names the trigger alone.
+- **The fire records the email, never a user.** It goes on the fire's origin: on `TriggerStarted`, and on the answer when a keyed fire answers a question. The thread credits the *user* who holds that email, and moving an email to another user moves the credit.
+- **An email no user holds credits nobody.** The thread still runs. It just names the trigger alone.
 - **No email, no credit.** A path that resolves to nothing, or to a value that is not one email, records none. The email is trimmed and lowercased.
 - **It is attribution, never authority.** The fire runs with the workspace's credentials either way. Use the trigger's `condition` to decide whose actions may fire it.
 
@@ -803,6 +803,8 @@ A `gh` read such as `gh run view` or `gh pr checks` is not a cloud-CLI side effe
 
 So when a trigger's intent needs an irreversible side-effect ("email me the digest every morning"), **tell the user** to tick the matching one. Here that is *Send email or messages*. With command safety on, the run otherwise fails the first time it tries to send; with it off, none of this applies.
 
+**Or raise a batch, when the user asks you to grant.** One `trigger_grant` item per trigger, through `lucidos permissions batch` (`lucidos-cli.md` § "`lucidos permissions batch`"), can widen several triggers at once. The card names each trigger, its *definition digest*, what it runs and the grants. Only the user's **Run all** grants, and an item whose trigger changed meanwhile is skipped. A secret read is never grantable, so such an item is refused.
+
 **A coding-agent thread the trigger starts does not read this grant.** It needs the trigger's coding-agent grant (below) to start at all. It then takes the same permission gates as every coding-agent session: the workspace's "Always allow" lines, then a card that waits for a human. See `coding-agent-events.md` § "Every session uses the workspace's grants".
 
 ### Coding-agent grant
@@ -815,7 +817,9 @@ A trigger whose fire continues another trigger's thread (a shared continue key) 
 
 **An agent's edit to the work clears both grants.** The user granted the trigger as it was. So when an agent or an app frame changes a granted trigger's `run`, `on` or `mcp_servers`, the edit lands. Both the coding-agent grant and the side-effect grant drop, and the reply says so. **Tell the user plainly** that the grants are gone, and ask them to tick them again if they trust the new version. A rename, a pause or the user's own edit keeps them.
 
-**Only the user grants it.** The user ticks *Allow coding agents* in the trigger's settings. The `triggers` LLM tool cannot set it. The HTTP API, CLI and SDK refuse `true` from an agent or an app frame when the trigger lacks it, and accept `false` from anyone. A plugin's `trigger.toml` never sets it. So when a trigger's intent needs a coding agent, **tell the user** to tick it, and say what steers the trigger: its coding agents hold every grant the user gave coding agents.
+**Only the user grants it.** The user ticks *Allow coding agents* in the trigger's settings. The `triggers` LLM tool cannot set it. The HTTP API, CLI and SDK refuse `true` from an agent or an app frame when the trigger lacks it, and accept `false` from anyone. A plugin's `trigger.toml` never sets it, and a batch's `trigger_grant` item asks the user as above. So when a trigger's intent needs a coding agent, **tell the user** to tick it, and say what steers the trigger: its coding agents hold every grant the user gave coding agents.
+
+**An *unattested caller* waits for the user.** That is a caller proving nothing, such as a script holding only the machine-local token. Its grant, or its edit to a granted trigger's work, clears nothing. It waits for the user's **Allow once** on a card naming the trigger.
 
 ### Context ceiling
 

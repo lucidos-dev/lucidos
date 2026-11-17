@@ -12,9 +12,9 @@
 //! Both inputs are prefix fields of the *thread-bound origin token*, under its
 //! MAC (`api::actor`), so neither is a claim a caller can edit. The turn-start
 //! set is `agent_recovery::THREAD_START_EVENTS_SQL`, shared with the recovery
-//! gates: "the owner opened this turn" must mean one thing. An *owner approval*
-//! (`api::owner_approval`) reads the same current turn, through
-//! [`opens_current_turn_sql`].
+//! gates: "the owner opened this turn" must mean one thing. A once
+//! *permission* (`engine::permission`) ends with the same current turn,
+//! through [`opens_current_turn_sql`].
 //!
 //! **Nothing here can be self-granted.** An agent creates triggers freely, and
 //! an unchecked fire would promote its own thread to the owner's authority in
@@ -79,7 +79,7 @@ enum TurnStart {
 }
 
 /// SQL predicate over one `events` row: does it open the turn the standing
-/// instruction and an *owner approval* are weighed against?
+/// instruction and a once *permission* are weighed against?
 ///
 /// It is the recovery gates' turn-start set, minus any resume the owner did
 /// not click. So a resume reads as the turn it continues (ADR 0282), and the
@@ -91,7 +91,7 @@ enum TurnStart {
 /// `actor` is the `EventMeta` slot, for a start event that records its
 /// initiator there instead. Both hold a `MessageOrigin`, so `kind` means the
 /// same in either.
-pub(super) fn opens_current_turn_sql() -> String {
+pub(crate) fn opens_current_turn_sql() -> String {
     format!(
         "event_type IN ({starts}) \
          AND NOT (event_type IN ('ContinuationStarted', 'OrphanRecoveryStarted') \
@@ -104,10 +104,43 @@ pub(super) fn opens_current_turn_sql() -> String {
 /// Read the thread's newest turn-start event. `None` when the thread has never
 /// started a turn, or the read failed.
 async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> {
+    try_newest_turn_start(pool, thread_id)
+        .await
+        .unwrap_or_else(|e| {
+            crate::log_legacy!("[StandingInstruction] Could not read the turn start of thread {}: {}; treating it as carrying none", thread_id, e);
+            None
+        })
+        .map(|(_, start)| start)
+}
+
+/// The event carrying the thread's standing instruction, if one holds. The
+/// acceptance transaction rereads it under the caller append lock, so a
+/// different turn cannot replace the instruction mid-send.
+pub(crate) async fn standing_instruction_event(
+    conn: &mut sqlx::PgConnection,
+    thread_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let Some((event_id, start)) = try_newest_turn_start(&mut *conn, thread_id).await? else {
+        return Ok(None);
+    };
+    let held = match start {
+        TurnStart::OwnerOpened => true,
+        TurnStart::TriggerFire { trigger_id } => {
+            try_owner_authorized_trigger(&mut *conn, &trigger_id).await?
+        }
+        TurnStart::SomebodyElse => false,
+    };
+    Ok(held.then_some(event_id))
+}
+
+async fn try_newest_turn_start<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    thread_id: Uuid,
+) -> Result<Option<(Uuid, TurnStart)>, sqlx::Error> {
     // `task_id` is `TriggerStarted`'s legacy spelling of `trigger_id`, aliased
     // on the enum and therefore still live in old rows.
     let sql = format!(
-        "SELECT event_type, \
+        "SELECT id, event_type, \
                 COALESCE(payload->'origin', payload->'actor')->>'kind' = 'device', \
                 COALESCE(payload->>'trigger_id', payload->>'task_id') \
          FROM events \
@@ -115,31 +148,30 @@ async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> 
          ORDER BY sequence DESC LIMIT 1",
         opens = opens_current_turn_sql(),
     );
-    let row: Option<(String, Option<bool>, Option<String>)> = sqlx::query_as(&sql)
+    let row: Option<(Uuid, String, Option<bool>, Option<String>)> = sqlx::query_as(&sql)
         .bind(thread_id.to_string())
-        .fetch_optional(pool)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!(
-                "[StandingInstruction] Could not read the turn start of thread {}: {}; \
-                 treating it as carrying none",
-                thread_id,
-                e
-            );
-            None
-        });
-    let (event_type, by_device, trigger_id) = row?;
+        .fetch_optional(executor)
+        .await?;
+    let Some((event_id, event_type, by_device, trigger_id)) = row else {
+        return Ok(None);
+    };
     if event_type == "TriggerStarted" {
         // A fire with no trigger id names nothing to check, so it is nobody's.
-        return Some(match trigger_id {
-            Some(trigger_id) => TurnStart::TriggerFire { trigger_id },
-            None => TurnStart::SomebodyElse,
-        });
+        return Ok(Some((
+            event_id,
+            match trigger_id {
+                Some(trigger_id) => TurnStart::TriggerFire { trigger_id },
+                None => TurnStart::SomebodyElse,
+            },
+        )));
     }
-    Some(match by_device {
-        Some(true) => TurnStart::OwnerOpened,
-        _ => TurnStart::SomebodyElse,
-    })
+    Ok(Some((
+        event_id,
+        match by_device {
+            Some(true) => TurnStart::OwnerOpened,
+            _ => TurnStart::SomebodyElse,
+        },
+    )))
 }
 
 /// Did the workspace owner authorize this trigger, so that a firing of it is
@@ -158,6 +190,19 @@ async fn newest_turn_start(pool: &PgPool, thread_id: Uuid) -> Option<TurnStart> 
 /// fail-closed direction, and it costs a legacy trigger only its reach OUTSIDE
 /// its own subtree, which clause 3 never needed.
 async fn owner_authorized_trigger(pool: &PgPool, trigger_id: &str) -> bool {
+    match try_owner_authorized_trigger(pool, trigger_id).await {
+        Ok(held) => held,
+        Err(e) => {
+            crate::log_legacy!("[StandingInstruction] Could not read who authored trigger {}: {}; treating its fire as carrying none", trigger_id, e);
+            false
+        }
+    }
+}
+
+async fn try_owner_authorized_trigger<'e>(
+    executor: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    trigger_id: &str,
+) -> Result<bool, sqlx::Error> {
     let authored = sqlx::query_scalar::<_, Option<bool>>(
         "SELECT payload->'actor'->>'kind' = 'device' \
          FROM events \
@@ -166,20 +211,9 @@ async fn owner_authorized_trigger(pool: &PgPool, trigger_id: &str) -> bool {
          ORDER BY sequence DESC LIMIT 1",
     )
     .bind(trigger_id)
-    .fetch_optional(pool)
-    .await;
-    match authored {
-        Ok(row) => row.flatten().unwrap_or(false),
-        Err(e) => {
-            crate::log!(
-                "[StandingInstruction] Could not read who authored trigger {}: {}; \
-                 treating its fire as carrying none",
-                trigger_id,
-                e
-            );
-            false
-        }
-    }
+    .fetch_optional(executor)
+    .await?;
+    Ok(authored.flatten().unwrap_or(false))
 }
 
 #[cfg(test)]

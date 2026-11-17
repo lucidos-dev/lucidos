@@ -13,16 +13,16 @@
 //! The request carries platform, arch and version. It also carries the caller's
 //! IP, as any HTTP request does, and `PRIVACY.md` says so.
 //!
-//! An *update address* in the same file replaces the origin with a plain
-//! `latest.json` URL, for testing a release candidate before it is published.
-//! That request carries no query parameters. A refused address fails closed:
-//! no request goes out and the snapshot reports why.
+//! The selected update channel resolves to a feed (ADR 0715). Stable keeps the
+//! ADR 0108 request. Other channels read platform feeds without query parameters.
+//! A refused channel or unreadable feed reports an error and offers nothing.
 
 use futures::StreamExt;
-use lucidos_update_address::UpdateAddress;
+use lucidos_update_channel::{is_upgrade, Channel, UpdateAddress};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
@@ -54,146 +54,29 @@ fn user_agent(version: &str) -> String {
 
 /// Cap on the response body. The contract answers one small JSON object, so
 /// anything larger is a wrong origin rather than a big answer.
-const MAX_BODY_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // The preference file
 // ---------------------------------------------------------------------------
 
-/// The machine-global `~/.lucidos/updates.toml`, parsed with safe defaults.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UpdatesToml {
-    /// `[release_check] enabled`. Default true.
-    pub enabled: bool,
-    /// `[release_check] update_address`, exactly as stored. Empty means the
-    /// default. Kept raw, so a hand-edited bad value is reported, not dropped.
-    pub update_address: String,
-}
+pub use crate::update_channels::{
+    parse_updates_toml, render_updates_toml, CustomSlot, UpdatesToml,
+};
 
-impl Default for UpdatesToml {
-    fn default() -> Self {
-        UpdatesToml {
-            enabled: true,
-            update_address: String::new(),
-        }
-    }
-}
-
-impl UpdatesToml {
-    /// The stored address under the shared rule. `Ok(None)` is the default.
-    pub fn address(&self) -> Result<Option<UpdateAddress>, String> {
-        UpdateAddress::parse(&self.update_address)
-    }
-}
-
-#[derive(Deserialize, Default)]
-struct RawUpdatesToml {
-    release_check: Option<RawReleaseCheck>,
-}
-
-/// No `deny_unknown_fields`, deliberately. A file written before ADR 0139 still
-/// carries `notice_acknowledged`, and it must parse with its `enabled` honoured
-/// rather than fall back to the defaults.
-#[derive(Deserialize)]
-struct RawReleaseCheck {
-    #[serde(default = "default_true")]
-    enabled: bool,
-    /// Any TOML value, so a non-string reaches the address rule and is refused
-    /// there, rather than failing the whole file back to the defaults.
-    #[serde(default)]
-    update_address: Option<toml::Value>,
-}
-
-fn raw_address(value: Option<toml::Value>) -> String {
-    match value {
-        None => String::new(),
-        Some(toml::Value::String(s)) => s,
-        Some(other) => other.to_string(),
-    }
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// `~/.lucidos/updates.toml`. `None` only when `HOME` is unset.
 pub fn updates_toml_path() -> Option<PathBuf> {
     Some(lucidos_home::path()?.join("updates.toml"))
 }
 
-/// Read and parse the preference at `path`. Any failure yields the defaults.
 pub fn read_updates_toml(path: Option<&Path>) -> UpdatesToml {
-    match path.and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(contents) => parse_updates_toml(&contents),
+    match path.map(std::fs::read_to_string) {
         None => UpdatesToml::default(),
-    }
-}
-
-/// Pure parse. Malformed input warns and yields the defaults, exactly as
-/// `net_config::parse_network_toml` does for the bind file.
-pub fn parse_updates_toml(contents: &str) -> UpdatesToml {
-    match toml::from_str::<RawUpdatesToml>(contents) {
-        Ok(raw) => match raw.release_check {
-            Some(rc) => UpdatesToml {
-                enabled: rc.enabled,
-                update_address: raw_address(rc.update_address),
-            },
-            None => UpdatesToml::default(),
+        Some(Ok(contents)) => parse_updates_toml(&contents),
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => UpdatesToml::default(),
+        Some(Err(e)) => UpdatesToml {
+            channel: format!("unreadable configuration: {e}"),
+            ..UpdatesToml::default()
         },
-        Err(e) => {
-            crate::log!(
-                "[ReleaseCheck] malformed ~/.lucidos/updates.toml ({e}); using defaults (enabled)"
-            );
-            UpdatesToml::default()
-        }
-    }
-}
-
-/// Render the file with its explanatory comments, since the `toml` serializer
-/// drops them.
-pub fn render_updates_toml(cfg: &UpdatesToml) -> String {
-    let address = if cfg.update_address.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "update_address = {}\n",
-            toml::Value::String(cfg.update_address.clone())
-        )
-    };
-    format!(
-        "# Lucidos update check (ADR 0108, ADR 0139).\n\
-         #\n\
-         # Once an hour the gateway asks lucidos.dev whether a newer Lucidos is\n\
-         # published. The request carries your platform, your architecture and\n\
-         # the version you run. It also carries your IP address, as any web\n\
-         # request does. Nothing else is sent, and nothing installs itself.\n\
-         #\n\
-         # enabled         false stops the automatic check. It is on by default,\n\
-         #                 and the same switch lives in Settings > System >\n\
-         #                 Overview > Maintenance. You can still check by hand\n\
-         #                 there while it is off.\n\
-         # update_address  a latest.json URL to read instead of the published\n\
-         #                 release, to test a release candidate. https, or http\n\
-         #                 to localhost only. Absent means the default. The same\n\
-         #                 Maintenance section shows it while it is set.\n\
-         \n\
-         [release_check]\n\
-         enabled = {}\n\
-         {address}",
-        cfg.enabled
-    )
-}
-
-/// The startup log line for a set address, or `None` when it is unset.
-pub fn update_address_log_line(cfg: &UpdatesToml) -> Option<String> {
-    match cfg.address() {
-        Ok(None) => None,
-        Ok(Some(address)) => Some(format!(
-            "[ReleaseCheck] update address overridden: updates come from {address}, not the published release"
-        )),
-        Err(e) => Some(format!(
-            "[ReleaseCheck] update address refused, no update check runs until it is fixed: {e}"
-        )),
     }
 }
 
@@ -227,24 +110,7 @@ pub fn deployment_is_installed(packaged: bool, exe: Option<&Path>) -> bool {
     }
 }
 
-/// How this install takes an update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InstallShape {
-    /// The macOS `.app`, updated in place by the client's Tauri updater.
-    DesktopApp,
-    /// A headless tarball install, updated by re-running `install.sh`.
-    InstallerRerun,
-}
-
-impl InstallShape {
-    /// The wire value the frontend switches on.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            InstallShape::DesktopApp => "desktop-app",
-            InstallShape::InstallerRerun => "installer-rerun",
-        }
-    }
-}
+pub use lucidos_update_channel::InstallShape;
 
 /// Which install shape this executable belongs to, read from its path.
 ///
@@ -363,31 +229,16 @@ pub fn parse_response(body: &str) -> Result<Option<PublishedRelease>, String> {
         .version
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty());
+    if version
+        .as_ref()
+        .is_some_and(|v| !lucidos_update_channel::is_valid_version(v))
+    {
+        return Err("origin returned an invalid semver version".into());
+    }
     Ok(version.map(|version| PublishedRelease {
         version,
         notes: parsed.notes.filter(|n| !n.trim().is_empty()),
     }))
-}
-
-/// Is `candidate` a later version than `current`?
-///
-/// Compares dot-separated numeric components, padding the shorter side with
-/// zeros. A component that is not a number makes the answer false, so an
-/// unreadable version offers nothing rather than offering everything. Mirrors
-/// `crates/lucidos-app/src/utils/version.ts`.
-pub fn version_is_newer(candidate: &str, current: &str) -> bool {
-    let parts = |s: &str| -> Option<Vec<u64>> { s.split('.').map(|p| p.parse().ok()).collect() };
-    let (Some(a), Some(b)) = (parts(candidate.trim()), parts(current.trim())) else {
-        return false;
-    };
-    for i in 0..a.len().max(b.len()) {
-        let av = a.get(i).copied().unwrap_or(0);
-        let bv = b.get(i).copied().unwrap_or(0);
-        if av != bv {
-            return av > bv;
-        }
-    }
-    false
 }
 
 /// The outbound client. Deliberately NOT `proxy::build_client`, which accepts
@@ -455,8 +306,9 @@ struct ReleaseState {
     /// up to date". Without it the caller sees the unchanged snapshot and
     /// cannot tell a working check that found nothing from one that never ran.
     last_error: Option<String>,
-    /// The raw update address the last attempt used. An answer from another
-    /// address is stale: it is not shown, and the next refresh polls again.
+    channel_version: Option<String>,
+    /// The channel and slots used by the last attempt. A changed selection
+    /// invalidates its answer and makes the next poll due immediately.
     polled_address: String,
 }
 
@@ -472,6 +324,8 @@ pub enum ConfigWriteError {
 /// backstop timer and the control endpoints.
 pub struct ReleaseCheck {
     origin: String,
+    local_origin: OnceLock<String>,
+    config_lock: Mutex<()>,
     interval: Duration,
     /// True when the deployment may poll: installed, on a published target.
     supported: bool,
@@ -509,6 +363,8 @@ impl ReleaseCheck {
         let current_version = crate::LUCIDOS_RELEASE;
         ReleaseCheck {
             origin: origin.to_string(),
+            local_origin: OnceLock::new(),
+            config_lock: Mutex::new(()),
             interval,
             supported: installed && target.is_some(),
             shape,
@@ -527,7 +383,7 @@ impl ReleaseCheck {
     pub fn latest_version(&self) -> Option<String> {
         let cfg = self.config();
         let st = self.state.lock().unwrap();
-        let current = answer_is_current(&cfg, cfg.address().is_ok(), &st);
+        let current = answer_is_current(&cfg, self.address(&cfg).is_ok(), &st);
         st.latest
             .as_ref()
             .filter(|_| current)
@@ -557,24 +413,137 @@ impl ReleaseCheck {
         enabled: Option<bool>,
         update_address: Option<&str>,
     ) -> Result<(), ConfigWriteError> {
-        let address = update_address
-            .map(UpdateAddress::parse)
-            .transpose()
-            .map_err(ConfigWriteError::InvalidAddress)?;
-        let mut cfg = read_updates_toml(self.config_path.as_deref());
-        if let Some(v) = enabled {
-            cfg.enabled = v;
+        let slot = update_address
+            .filter(|a| !a.trim().is_empty())
+            .map(|url| CustomSlot {
+                name: crate::update_channels::LEGACY_SLOT_NAME.into(),
+                url: url.into(),
+            });
+        let channel = update_address.map(|a| {
+            if a.trim().is_empty() {
+                "stable".to_owned()
+            } else {
+                format!("custom:{}", crate::update_channels::LEGACY_SLOT_NAME)
+            }
+        });
+        self.update_channels(enabled, channel.as_deref(), slot.as_ref(), None)
+    }
+
+    pub fn update_channels(
+        &self,
+        enabled: Option<bool>,
+        channel: Option<&str>,
+        upsert: Option<&CustomSlot>,
+        remove: Option<&str>,
+    ) -> Result<(), ConfigWriteError> {
+        // Serialize the read/merge/rename within this gateway.
+        let _guard = self.config_lock.lock().unwrap();
+        let invalid = ConfigWriteError::InvalidAddress;
+        // The preference is machine-global: another gateway can write it too.
+        let path = self.config_path.as_ref().ok_or_else(|| {
+            ConfigWriteError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Lucidos home is unavailable",
+            ))
+        })?;
+        if let Some(parent) = path.parent() {
+            lucidos_home::ensure_storage_root(parent).map_err(ConfigWriteError::Io)?;
         }
-        if let Some(address) = address {
-            cfg.update_address = address.map(|a| a.to_string()).unwrap_or_default();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .map_err(ConfigWriteError::Io)?;
+        fs2::FileExt::lock_exclusive(&lock).map_err(ConfigWriteError::Io)?;
+        let mut cfg = self.config();
+        if cfg.channel.starts_with("unreadable configuration") {
+            return Err(invalid(
+                "updates.toml is unreadable; fix it before saving settings".into(),
+            ));
+        }
+        if let Some(slot) = upsert {
+            let slot = crate::update_channels::validate_slot(slot).map_err(invalid)?;
+            cfg.custom.retain(|s| s.name != slot.name);
+            cfg.custom.push(slot);
+        }
+        if let Some(name) = remove {
+            if !cfg.custom.iter().any(|s| s.name == name) {
+                return Err(invalid(format!("unknown custom slot: {name}")));
+            }
+            cfg.custom.retain(|s| s.name != name);
+        }
+        if let Some(channel) = channel {
+            cfg.channel = channel.into();
+        }
+        if channel.is_some() || upsert.is_some() || remove.is_some() {
+            self.address(&cfg).map_err(invalid)?;
+        }
+        if let Some(enabled) = enabled {
+            cfg.enabled = enabled;
         }
         write_updates_toml(self.config_path.as_deref(), &cfg).map_err(ConfigWriteError::Io)
     }
 
-    /// Log the update address once at startup, when one is set.
+    pub fn set_local_origin(&self, origin: String) {
+        self.local_origin
+            .set(origin)
+            .expect("gateway origin is bound once");
+    }
+
+    pub fn local_channel_dir(&self) -> Result<PathBuf, String> {
+        self.config_path
+            .as_deref()
+            .and_then(Path::parent)
+            .map(|home| home.join("update-channels/local"))
+            .ok_or_else(|| "Lucidos home is unavailable".into())
+    }
+
+    fn unavailable_reason(&self, channel: &Channel) -> Option<String> {
+        if matches!(channel, Channel::Nightly) {
+            Some("Nightly is not published yet".into())
+        } else if channel == &Channel::Local
+            && self
+                .local_origin
+                .get()
+                .is_some_and(|origin| origin.starts_with("https:"))
+        {
+            Some("Local requires a plain HTTP loopback gateway; operator TLS does not provide that listener".into())
+        } else if !channel.serves(self.shape) {
+            Some("this channel needs the packaged macOS app; this install has no updater for its bundles".into())
+        } else {
+            None
+        }
+    }
+
+    fn address(&self, cfg: &UpdatesToml) -> Result<Option<UpdateAddress>, String> {
+        let channel = Channel::parse(&cfg.channel)?;
+        if let Some(reason) = self.unavailable_reason(&channel) {
+            return Err(reason);
+        }
+        if channel == Channel::Local {
+            let origin = self
+                .local_origin
+                .get()
+                .ok_or("Local needs this gateway's origin")?;
+            UpdateAddress::parse(&format!("{origin}/~/updates/local/latest.json"))
+        } else {
+            cfg.address()
+        }
+    }
+
     pub fn log_update_address(&self) {
-        if let Some(line) = update_address_log_line(&self.config()) {
-            crate::log!("{line}");
+        let cfg = self.config();
+        match self.address(&cfg) {
+            Ok(address) => crate::log_legacy!(
+                "[ReleaseCheck] channel {}: {}",
+                cfg.channel,
+                address
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| self.origin.clone())
+            ),
+            Err(e) => crate::log_legacy!("[ReleaseCheck] channel {} refused: {e}", cfg.channel),
         }
     }
 
@@ -600,7 +569,7 @@ impl ReleaseCheck {
         } else {
             self.interval
         };
-        let address = self.config().update_address;
+        let address = self.config().key();
         let st = self.state.lock().unwrap();
         if st.polled_address != address {
             return true;
@@ -627,8 +596,7 @@ impl ReleaseCheck {
 
     /// One request, and what it did to the stored answer.
     ///
-    /// A failure logs and leaves the previous answer standing, unless that
-    /// answer came from another update address. It still moves
+    /// A failure logs and clears the previous offer. It still moves
     /// `last_attempt`, so a broken origin is asked once an interval rather than
     /// on every refresh.
     ///
@@ -649,7 +617,7 @@ impl ReleaseCheck {
             return;
         };
         let cfg = self.config();
-        let url = match cfg.address() {
+        let url = match self.address(&cfg) {
             Ok(Some(address)) => address.to_string(),
             Ok(None) => check_url(&self.origin, platform, arch, self.current_version),
             Err(_) => return,
@@ -657,9 +625,24 @@ impl ReleaseCheck {
         let client = self.client.clone();
         let state = Arc::clone(&self.state);
         let current_version = self.current_version;
+        let local_dir = self.local_channel_dir();
+        let local_origin = self.local_origin.get().cloned();
         let poll = tokio::spawn(async move {
-            let outcome = fetch(&client, &url).await;
-            record(&state, &url, cfg.update_address, current_version, outcome);
+            let outcome = if cfg.channel == "local" {
+                local_dir
+                    .and_then(|dir| {
+                        crate::local_updates::read_feed(&dir, local_origin.as_deref().unwrap_or(""))
+                    })
+                    .and_then(|feed| parse_feed(&feed.to_string(), platform, arch))
+            } else {
+                fetch(
+                    &client,
+                    &url,
+                    (cfg.channel != "stable").then_some((platform, arch)),
+                )
+                .await
+            };
+            record(&state, &url, cfg.key(), current_version, outcome);
             drop(guard);
         });
         // A panic in the task already dropped the guard. The next due refresh
@@ -672,15 +655,14 @@ impl ReleaseCheck {
     /// An older gateway omits the whole field, and the frontend reads that as
     /// "no offer", which is the ADR 0105 degradation.
     ///
-    /// `update_address` is the address in use, or the refused raw value beside
-    /// `update_address_error`. A refused address also reads as `last_error` and
-    /// offers nothing, so it can never look like "up to date".
+    /// `update_address` is the resolved app endpoint, or null for Stable.
+    /// A refusal populates `channel_error` and the older error fields too.
     pub fn snapshot(&self) -> Value {
         let cfg = self.config();
         let st = self.state.lock().unwrap();
-        let (update_address, address_error) = match cfg.address() {
+        let (update_address, address_error) = match self.address(&cfg) {
             Ok(address) => (address.map(|a| a.to_string()), None),
-            Err(e) => (Some(cfg.update_address.clone()), Some(e)),
+            Err(e) => (cfg.address().ok().flatten().map(|a| a.to_string()), Some(e)),
         };
         let current = answer_is_current(&cfg, address_error.is_none(), &st);
         let latest = st.latest.as_ref().filter(|_| current).map(|release| {
@@ -691,7 +673,39 @@ impl ReleaseCheck {
                 "command": self.command,
             })
         });
+        let channels: Vec<_> = [
+            Channel::Stable,
+            Channel::Beta,
+            Channel::Nightly,
+            Channel::Local,
+        ]
+        .iter()
+        .map(|channel| {
+            let reason = self.unavailable_reason(channel).or_else(|| {
+                if channel != &Channel::Local {
+                    return None;
+                }
+                self.local_channel_dir()
+                    .and_then(|dir| {
+                        let origin = self
+                            .local_origin
+                            .get()
+                            .ok_or("Local needs this gateway's origin")?;
+                        crate::local_updates::read_feed(&dir, origin)
+                    })
+                    .err()
+            });
+            json!({"channel": channel.as_str(), "available": reason.is_none(), "reason": reason})
+        })
+        .collect();
         json!({
+            "channel": cfg.channel,
+            "custom": cfg.custom,
+            "channels": channels,
+            "channel_version": st.channel_version.as_ref().filter(|_| current),
+            "ahead_of_channel": current && st.channel_version.as_ref().is_some_and(|v| is_upgrade(v, self.current_version)),
+            "channel_error": address_error,
+            "local_channel_dir": self.local_channel_dir().ok(),
             "enabled": cfg.enabled,
             "supported": self.supported,
             "current_version": self.current_version,
@@ -705,7 +719,11 @@ impl ReleaseCheck {
 }
 
 /// Fetch and read one answer, with the body size capped.
-async fn fetch(client: &reqwest::Client, url: &str) -> Result<Option<PublishedRelease>, String> {
+async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    target: Option<(&str, &str)>,
+) -> Result<Option<PublishedRelease>, String> {
     let resp = client.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("origin answered {}", resp.status()));
@@ -719,7 +737,11 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<Option<PublishedRe
         }
         body.extend_from_slice(&chunk);
     }
-    parse_response(&String::from_utf8_lossy(&body))
+    let text = String::from_utf8_lossy(&body);
+    match target {
+        Some((platform, arch)) => parse_feed(&text, platform, arch),
+        None => parse_response(&text),
+    }
 }
 
 /// Store what one request to `update_address` came back with.
@@ -742,11 +764,15 @@ fn record(
     match outcome {
         Ok(published) => {
             st.checked_at = Some(chrono::Utc::now());
-            st.latest = published.filter(|p| version_is_newer(&p.version, current_version));
+            st.channel_version = published.as_ref().map(|p| p.version.clone());
+            st.latest = published.filter(|p| is_upgrade(current_version, &p.version));
             st.last_error = None;
         }
         Err(e) => {
-            crate::log!("[ReleaseCheck] {url} failed: {e}");
+            crate::log_legacy!("[ReleaseCheck] {url} failed: {e}");
+            st.latest = None;
+            st.channel_version = None;
+            st.checked_at = None;
             st.last_error = Some(e);
         }
     }
@@ -755,7 +781,35 @@ fn record(
 /// Whether the stored answer belongs to the address in use. An answer from
 /// another address, or any answer under a refused one, offers nothing.
 fn answer_is_current(cfg: &UpdatesToml, address_ok: bool, st: &ReleaseState) -> bool {
-    address_ok && st.polled_address == cfg.update_address
+    address_ok && st.polled_address == cfg.key()
+}
+
+/// A channel feed must describe a bundle for this target, under the shared transport rule.
+pub(crate) fn parse_feed(
+    body: &str,
+    platform: &str,
+    arch: &str,
+) -> Result<Option<PublishedRelease>, String> {
+    let release = parse_response(body)?.ok_or("feed has no version")?;
+    let feed: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let os = if platform == "macos" {
+        "darwin"
+    } else {
+        platform
+    };
+    let key = format!("{os}-{arch}");
+    let entry = &feed["platforms"][&key];
+    let url = entry["url"]
+        .as_str()
+        .ok_or_else(|| format!("feed has no bundle for {key}"))?;
+    UpdateAddress::parse(url)?.ok_or("bundle URL is empty")?;
+    if entry["signature"]
+        .as_str()
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err(format!("feed has no signature for {key}"));
+    }
+    Ok(Some(release))
 }
 
 #[cfg(test)]

@@ -139,6 +139,8 @@ uses that one rather than growing another.
   gave `main` whatever frame the picker had.
 - **Dev writes nothing.** Dev shares the packaged app-data dir and restores
   nothing, so a dev run could only rearrange the packaged client's windows.
+  Superseded by ADR 0659: dev now keeps its records in the checkout and
+  restores them.
 - **`window_restore::Rect` is now serializable**, because the record persists
   one per workspace. A second rect type would be a second set of units to get
   wrong.

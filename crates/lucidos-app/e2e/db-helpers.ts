@@ -1,5 +1,5 @@
 import { execSync } from 'child_process';
-import { mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, writeFileSync, rmSync, realpathSync, readFileSync } from 'fs';
 import { homedir } from 'os';
 import { join, resolve } from 'path';
 import { randomUUID } from 'crypto';
@@ -98,11 +98,18 @@ export function resetWelcomePreference(): void {
   ].join(';\n'));
 }
 
-/** The shared cluster's minted password (`shared_pg_password`,
- *  scripts/lib/pg_secret.sh). The file name is pinned by the gateway's
- *  `value_pins_tests`. */
+/** The cluster's minted password (`shared_pg_password`,
+ *  scripts/lib/pg_secret.sh), a private entry (`lucidos_home::private_entry`).
+ *  The e2e harness puts it in `LUCIDOS_PRIVATE_DIR`. Otherwise an older home
+ *  keeps it in `~/.lucidos`, and any other home in the private subtree. The
+ *  gateway's `value_pins_tests` pin the names. */
 function sharedPgPassword(): string {
-  return readFileSync(join(homedir(), '.lucidos', 'pg-shared-password'), 'utf-8').trim();
+  const entry = 'pg-shared-password';
+  const moved = process.env.LUCIDOS_PRIVATE_DIR;
+  const home = join(homedir(), '.lucidos');
+  const older = join(home, entry);
+  const path = moved ? join(moved, entry) : existsSync(older) ? older : join(home, 'private', entry);
+  return readFileSync(path, 'utf-8').trim();
 }
 
 /** Run SQL via stdin to avoid shell escaping issues with JSON payloads. The

@@ -86,7 +86,7 @@ impl ContinueKeySpec {
     /// row cannot wedge the trigger registry.
     pub(crate) fn from_stored(field: Option<&Value>, trigger_id: &str) -> Option<Self> {
         Self::parse(field).unwrap_or_else(|e| {
-            log!("[Triggers] Ignored continue_key on trigger {trigger_id}: {e}");
+            log_legacy!("[Triggers] Ignored continue_key on trigger {trigger_id}: {e}");
             None
         })
     }

@@ -28,21 +28,20 @@ use crate::runtime::CodingAgent;
 
 #[test]
 fn redirect_fires_for_codex_user_followup_mid_turn() {
-    // A Codex turn in flight + a genuine user follow-up must interrupt-and-
-    // redirect rather than queue invisibly behind the long turn. Codex does
-    // this whether or not the caller marked the follow-up urgent, because a
-    // Codex turn cannot see a queued message at all until it ends.
+    // A process without steer support retains interrupt-and-redirect.
     assert!(should_redirect_followup(
         CodingAgent::Codex,
         true,
         true,
+        false,
         false
     ));
     assert!(should_redirect_followup(
         CodingAgent::Codex,
         true,
         true,
-        true
+        true,
+        false
     ));
 }
 
@@ -54,13 +53,15 @@ fn redirect_skips_codex_when_idle() {
         CodingAgent::Codex,
         false,
         true,
+        false,
         false
     ));
     assert!(!should_redirect_followup(
         CodingAgent::Codex,
         false,
         true,
-        true
+        true,
+        false
     ));
 }
 
@@ -73,13 +74,15 @@ fn redirect_skips_codex_child_wake() {
         CodingAgent::Codex,
         true,
         false,
+        false,
         false
     ));
     assert!(!should_redirect_followup(
         CodingAgent::Codex,
         true,
         false,
-        true
+        true,
+        false
     ));
 }
 
@@ -93,6 +96,7 @@ fn redirect_skips_claude_code_unless_urgent() {
         CodingAgent::ClaudeCode,
         true,
         true,
+        false,
         false
     ));
 }
@@ -108,7 +112,8 @@ fn redirect_fires_for_urgent_claude_code_followup_mid_turn() {
         CodingAgent::ClaudeCode,
         true,
         true,
-        true
+        true,
+        false
     ));
 }
 
@@ -120,7 +125,8 @@ fn redirect_skips_idle_claude_code_even_when_urgent() {
         CodingAgent::ClaudeCode,
         false,
         true,
-        true
+        true,
+        false
     ));
 }
 
@@ -131,7 +137,8 @@ fn redirect_skips_urgent_claude_code_child_wake() {
         CodingAgent::ClaudeCode,
         true,
         false,
-        true
+        true,
+        false
     ));
 }
 
@@ -145,6 +152,7 @@ fn codex_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUser
     let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     s.coding_agent = CodingAgent::Codex;
+    s.can_steer = false;
     (s, msg_rx)
 }
 
@@ -534,4 +542,112 @@ fn only_a_person_denies_a_card_a_live_chat_turn_waits_on() {
     for mode in [ActorMode::Human, ActorMode::Agent, ActorMode::Engine] {
         assert!(chat_follow_up_supersedes_cards(mode, false));
     }
+}
+
+#[test]
+fn capable_codex_steers_plain_messages_but_interrupts_urgent_messages() {
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        false,
+        true
+    ));
+    assert!(should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        true,
+        true
+    ));
+}
+
+#[tokio::test]
+async fn a_plain_followup_preserves_a_capable_codex_turn() {
+    let thread = Uuid::new_v4();
+    let (mut session, _rx) = codex_in_flight_session();
+    session.can_steer = true;
+    let mut sessions = HashMap::from([(thread, session)]);
+    assert!(arm_followup_redirect(&mut sessions, thread, true, false, &None).is_none());
+    let session = &sessions[&thread];
+    assert!(session.redirect_cause.is_none());
+    assert!(!session.redirect_followup_pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), session.interrupt.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_human_side_request_routes_into_the_live_codex_turn() {
+    use crate::engine::chat::process::{OrphanLane, PreEmittedOrigin};
+    use crate::engine::thread_events::ActorMode;
+    use crate::engine::SessionPhase;
+    use crate::test_support::{
+        boot_mock_engine, in_engine_child, seed_coding_thread, seed_thread_event, setup_test_db,
+        teardown_test_db,
+    };
+    if !in_engine_child("engine::chat::process_helpers::process_helpers_tests::a_human_side_request_routes_into_the_live_codex_turn").await {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = boot_mock_engine(&db).await;
+    let thread = seed_coding_thread(&engine.event_bus, None).await;
+    let mut claim = engine
+        .claim_thread_for_spawn(thread, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let (control, _control_rx) = mpsc::unbounded_channel();
+    {
+        let mut sessions = engine.agent_sessions.lock().await;
+        let session = sessions.get_mut(&thread).unwrap();
+        session.phase = SessionPhase::Running {
+            control_tx: control,
+        };
+        session.coding_agent = CodingAgent::Codex;
+        session.can_steer = true;
+        session.is_waiting = false;
+    }
+    let input = seed_thread_event(
+        &engine.event_bus,
+        thread,
+        crate::test_support::message_received("Show me the colors too"),
+    )
+    .await;
+    engine
+        .process_orphan(
+            "Show me the colors too",
+            None,
+            thread,
+            None,
+            ActorMode::Human,
+            Some(PreEmittedOrigin::Message(input)),
+            OrphanLane::CodingAgent(Vec::new()),
+        )
+        .await
+        .unwrap();
+    let forwarded = claim.entry.msg_rx.try_recv().unwrap();
+    assert_eq!(forwarded.text, "Show me the colors too");
+    assert_eq!(forwarded.origin_event_id, Some(input));
+    assert!(claim.entry.msg_rx.try_recv().is_err());
+    let sessions = engine.agent_sessions.lock().await;
+    let session = &sessions[&thread];
+    assert!(session.redirect_cause.is_none());
+    assert!(!session.redirect_followup_pending);
+    drop(sessions);
+    let canceled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ResponseCanceled'",
+    )
+    .bind(thread)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        canceled, 0,
+        "a side request must preserve the original turn"
+    );
+    drop(claim);
+    teardown_test_db(&db).await;
 }

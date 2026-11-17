@@ -58,6 +58,100 @@ pub(super) async fn trigger_model_override(
         .then(|| default.to_string())
 }
 
+/// Retain the batch until a claimed or live session owns its queued inputs.
+struct CodingAgentFollowups<'a> {
+    engine: &'a LucidosEngine,
+    thread_id: Option<Uuid>,
+    inputs: Vec<AgentUserInput>,
+}
+
+impl Drop for CodingAgentFollowups<'_> {
+    fn drop(&mut self) {
+        if self.inputs.is_empty() {
+            return;
+        }
+        let thread_id = self
+            .thread_id
+            .expect("an orphan batch has an existing thread");
+        self.engine.resubmit_orphans_of_failed_turn(
+            thread_id,
+            crate::engine::agent_session::lost_followups_to_orphans(std::mem::take(
+                &mut self.inputs,
+            )),
+        );
+    }
+}
+
+/// Put the older batch ahead of inputs queued while its first prompt claims
+/// the thread. The claimed receiver cannot run until this caller starts it.
+pub(super) async fn prepend_claimed_followups(
+    engine: &LucidosEngine,
+    claim: &mut crate::engine::agent_session::spawn_claim::SpawnClaim,
+    followups: &mut Vec<AgentUserInput>,
+) {
+    if followups.is_empty() {
+        return;
+    }
+    let mut sessions = engine.agent_sessions.lock().await;
+    let session = sessions
+        .get_mut(&claim.thread_id)
+        .expect("the claim holds its entry");
+    assert!(session.msg_tx.same_channel(&claim.entry.msg_tx));
+    let newer: Vec<_> = std::iter::from_fn(|| claim.entry.msg_rx.try_recv().ok()).collect();
+    for input in followups.drain(..).chain(newer) {
+        let id = input.origin_event_id;
+        claim
+            .entry
+            .msg_tx
+            .send(input)
+            .expect("the claim owns its receiver");
+        if let Some(id) = id {
+            session.unforwarded_inputs.insert(id);
+        }
+    }
+}
+
+/// Whether this input runs a coding agent. An existing coding-agent thread runs
+/// its coding agent whatever the caller asked (ADR 0678). A thread with no row
+/// yet keeps the caller's choice. `Err` means the lane is unknown.
+pub(super) async fn resolve_coding_agent_lane(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    requested: Option<bool>,
+) -> Result<Option<bool>, sqlx::Error> {
+    match crate::engine::thread_agent(pool, thread_id).await? {
+        Some(crate::engine::ThreadAgent::CodingAgent) => {
+            if requested != Some(true) {
+                log_legacy!("[Chat] Thread {thread_id} is a coding-agent thread, so its input runs the coding agent (the caller asked for {requested:?})");
+            }
+            Ok(Some(true))
+        }
+        Some(crate::engine::ThreadAgent::LucidosAgent) | None => Ok(requested),
+    }
+}
+
+/// Resolve an input's settings separately from the live thread comparison.
+/// Saved chat inputs already carry the immutable accepted triple.
+pub(super) async fn resolve_input_settings(
+    origin: Option<&MessageOrigin>,
+    use_coding_agent: Option<bool>,
+    requested: crate::core::ResolvedModelSelection,
+    ordinary: impl std::future::Future<Output = crate::core::ResolvedModelSelection>,
+) -> Result<crate::core::ResolvedModelSelection, Box<dyn std::error::Error + Send + Sync>> {
+    if matches!(origin, Some(MessageOrigin::SavedDraft { .. })) && use_coding_agent != Some(true) {
+        if requested.model.as_deref().is_none_or(str::is_empty)
+            || requested.provider.as_deref().is_none_or(str::is_empty)
+        {
+            return Err("saved_draft_chat_settings_unresolved".into());
+        }
+        // In particular, None effort means the accepted absence of effort.
+        // Do not poll the ordinary resolver: it would re-read thread/account
+        // defaults, including after the input waited for a running turn.
+        return Ok(requested);
+    }
+    Ok(ordinary.await)
+}
+
 pub(crate) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
     defaults: crate::core::ModelDefaults<'_>,
@@ -190,6 +284,7 @@ impl LucidosEngine {
 /// `UserQuestionAsked` via the FreeText fast-path.
 ///
 /// Only a genuine **human** follow-up may be consumed as the user's answer.
+/// An *unattested caller* is never one, whatever mode it claims.
 /// Agent- and engine-driven re-entries on the same thread — most importantly a
 /// child-completion wake (`ActorMode::Agent`, see
 /// `notify_parent_of_child_completion`), but also trigger fires and engine
@@ -213,12 +308,34 @@ pub(super) fn message_can_answer_pending_question(
     user_message: &str,
     has_images: bool,
     mode: ActorMode,
+    unattested: bool,
     pre_emitted_origin: Option<PreEmittedOrigin>,
 ) -> bool {
     !is_new_thread
         && (!user_message.is_empty() || has_images)
         && mode == ActorMode::Human
+        && !unattested
         && pre_emitted_origin.is_none()
+}
+
+/// A message the user took back ends its run quietly: nothing recorded, no
+/// failure. Any other error stands.
+fn withdrawn_or(
+    error: Box<dyn std::error::Error + Send + Sync>,
+    request_id: Uuid,
+    thread_id: Uuid,
+) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+    if !crate::engine::consumption_claim::is_removed_refusal(&*error) {
+        return Err(error);
+    }
+    log_legacy!("[Chat] Thread {thread_id}: the user took this message back, so it does not run");
+    Ok(terminal_result(
+        String::new(),
+        vec![],
+        request_id,
+        thread_id,
+        false,
+    ))
 }
 
 /// The constant inputs the setup-cancel exit needs, built once before the
@@ -239,7 +356,7 @@ impl LucidosEngine {
     /// hand the error back so the caller can `return Err(..)` in one line.
     ///
     /// Idempotent: the gate skips the emit when a terminator already landed
-    /// for `anchor`. A turn is finished either way by the time this returns,
+    /// for `anchor`. A run parked on the owner's card stays unsettled. A turn is finished either way by the time this returns,
     /// which is the promise `process_message_with_steps` makes to its callers.
     async fn fail_turn(
         &self,
@@ -250,14 +367,13 @@ impl LucidosEngine {
         guard: ThreadGuard,
         injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
     ) -> Box<dyn std::error::Error + Send + Sync> {
-        crate::engine::agentic_loop::ensure_agent_failure_terminator_emitted(
+        crate::engine::agentic_loop::ensure_run_failure_terminator_emitted(
             &self.event_bus,
             &self.pool,
             thread_id,
             anchor,
             channel,
-            &error.to_string(),
-            crate::engine::agent_session::start_failure::agent_exit_of(error.as_ref()),
+            error.as_ref(),
         )
         .await;
         let orphans = self
@@ -282,7 +398,7 @@ impl LucidosEngine {
             return;
         }
         let Some(engine) = self.try_clone_arc() else {
-            log!(
+            log_legacy!(
                 "[Chat] Dropped {} follow-up(s) on thread {}: no engine handle to re-submit them",
                 orphans.len(),
                 thread_id
@@ -329,13 +445,56 @@ impl LucidosEngine {
         voice_session_id: Option<Uuid>, // set when this message was spoken on a call
         urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
         input_turn: Option<crate::engine::InputTurn>, // released once this message is recorded and routed
+        pre_admission: Option<crate::engine::PreAdmission>,
+        coding_agent_followups: Vec<AgentUserInput>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // Everything up to the release runs after every input admitted to this
         // thread before it has been recorded and routed. Every return releases it.
+        let mut coding_agent_followups = CodingAgentFollowups {
+            engine: self,
+            thread_id,
+            inputs: coding_agent_followups,
+        };
         let mut input_turn = input_turn;
         if let Some(turn) = input_turn.as_mut() {
             turn.wait_for_predecessor().await;
         }
+        if let Some(tid) = thread_id {
+            if (mode == ActorMode::Engine
+                || pre_emitted_origin.is_some_and(PreEmittedOrigin::is_engine_reentry))
+                && crate::engine::thread_stop::thread_is_stopped(self.pool(), tid).await
+            {
+                return Ok(terminal_result(
+                    String::new(),
+                    vec![],
+                    Uuid::new_v4(),
+                    tid,
+                    false,
+                ));
+            }
+        }
+        let use_coding_agent = match thread_id {
+            None => use_coding_agent,
+            Some(tid) => match resolve_coding_agent_lane(&self.pool, tid, use_coding_agent).await {
+                Ok(lane) => lane,
+                Err(e) => {
+                    log_legacy!("[Chat] Could not read which agent runs thread {tid}: {e}");
+                    emit_routing_failure(
+                        &self.event_bus,
+                        tid,
+                        "Lucidos could not tell which agent runs this thread, so the message did not run. Send it again.",
+                    )
+                    .await?;
+                    return Ok(terminal_result(
+                        String::new(),
+                        vec![],
+                        Uuid::new_v4(),
+                        tid,
+                        false,
+                    ));
+                }
+            },
+        };
         let urgent = urgency.is_urgent();
         let chat_start = std::time::Instant::now();
         // Track whether a pending change was proposed during this request
@@ -362,7 +521,7 @@ impl LucidosEngine {
         // normal path it's `None` and the current turn isn't emitted until later.
         // A Lucidos Agent turn holds its thread's gate from here until its
         // starter is recorded. A rung pick then lands before the pair resolves,
-        // or sees this turn and refuses (`chat::rung`).
+        // or lands afterward for the next turn (`chat::rung`).
         let keep_alive = pre_emitted_origin.is_some_and(PreEmittedOrigin::is_keep_alive);
         let mut turn_start = match thread_id {
             Some(tid) if use_coding_agent != Some(true) && !keep_alive => {
@@ -392,7 +551,13 @@ impl LucidosEngine {
                     overrides,
                 )
             };
-        let mut resolved = resolve_pair(pre_emitted_origin, requested.clone()).await;
+        let mut resolved = resolve_input_settings(
+            origin.as_ref(),
+            use_coding_agent,
+            requested.clone(),
+            resolve_pair(pre_emitted_origin, requested.clone()),
+        )
+        .await?;
 
         // Generate a per-request ID for ProcessResult tracking
         let request_id = Uuid::new_v4();
@@ -444,6 +609,7 @@ impl LucidosEngine {
             user_message,
             user_images.is_some_and(|images| !images.is_empty()),
             mode,
+            matches!(origin, Some(MessageOrigin::UnattestedCaller { .. })),
             pre_emitted_origin,
         ) {
             if let Some(pending_tool_use_id) =
@@ -492,18 +658,33 @@ impl LucidosEngine {
                 .await
                 {
                     AnswerResult::Resumed => {
-                        log!(
+                        log_legacy!(
                             "[Chat] Free-form answer routed to pending question for thread {}",
                             thread_id
                         );
                     }
                     AnswerResult::Conflict(msg) => {
-                        log!(
+                        log_legacy!(
                             "[Chat] Free-form answer conflict for thread {}: {}",
                             thread_id,
                             msg
                         );
-                        emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
+                        // The bus refuses an answer the user took back, and
+                        // that refusal is no failure to show.
+                        let withdrawn = match event_id.and_then(|raw| Uuid::parse_str(raw).ok()) {
+                            Some(id) => {
+                                crate::engine::consumption_claim::was_removed(
+                                    self.pool(),
+                                    thread_id,
+                                    id,
+                                )
+                                .await?
+                            }
+                            None => false,
+                        };
+                        if !withdrawn {
+                            emit_routing_failure(&self.event_bus, thread_id, &msg).await?;
+                        }
                     }
                 }
                 return Ok(terminal_result(
@@ -530,7 +711,7 @@ impl LucidosEngine {
                 // so it is refused before anything is spent. Settings shows
                 // the same refusal on the row (`GET /api/v1/models/background`).
                 if let Some(refusal) = call.selection().refusal() {
-                    log!("[Chat] Image description refused: {}", refusal);
+                    log_legacy!("[Chat] Image description refused: {}", refusal);
                     break 'describe None;
                 }
                 let provider = call.provider();
@@ -551,11 +732,11 @@ impl LucidosEngine {
                         // model its provider no longer serves (ADR 0403).
                         Ok(Ok(desc)) => Some((desc, provider.default_model().to_string())),
                         Ok(Err(e)) => {
-                            log!("[Chat] Image description failed: {}", e);
+                            log_legacy!("[Chat] Image description failed: {}", e);
                             None
                         }
                         Err(_) => {
-                            log!("[Chat] Image description timed out ({:?})", deadline);
+                            log_legacy!("[Chat] Image description timed out ({:?})", deadline);
                             None
                         }
                     }
@@ -594,7 +775,7 @@ impl LucidosEngine {
                     },
                 })
                 .await?;
-            log!("[Chat] Held an agent message on thread {}", thread_id);
+            log_legacy!("[Chat] Held an agent message on thread {}", thread_id);
             return Ok(terminal_result(
                 String::new(),
                 vec![],
@@ -681,7 +862,11 @@ impl LucidosEngine {
         // With the turn live it injects below instead. The answer's resume
         // carries it (`resume_chat_after_answer`).
         if use_coding_agent != Some(true) && !is_new_thread {
-            let has_live_turn = self.active_threads.lock().unwrap().contains_key(&thread_id);
+            let has_live_turn = crate::engine::has_other_live_turn(
+                &self.active_threads,
+                thread_id,
+                pre_admission.as_ref(),
+            );
             if super::super::held_deliveries::delivery_is_held(
                 self.pool(),
                 thread_id,
@@ -690,7 +875,7 @@ impl LucidosEngine {
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[Chat] Held a delivery behind the open question on thread {}",
                     thread_id
                 );
@@ -711,7 +896,11 @@ impl LucidosEngine {
         // never fires on a CC thread.
         let chat_follow_up =
             use_coding_agent != Some(true) && !is_new_thread && !user_message.is_empty();
-        let has_live_turn = self.active_threads.lock().unwrap().contains_key(&thread_id);
+        let has_live_turn = crate::engine::has_other_live_turn(
+            &self.active_threads,
+            thread_id,
+            pre_admission.as_ref(),
+        );
         if chat_follow_up
             && super::super::process_helpers::chat_follow_up_supersedes_cards(mode, has_live_turn)
         {
@@ -767,7 +956,9 @@ impl LucidosEngine {
                 } else {
                     self.claim_thread_for_spawn(thread_id, coding_agent).await?
                 };
-                if let Some(claim) = claim {
+                if let Some(mut claim) = claim {
+                    prepend_claimed_followups(self, &mut claim, &mut coding_agent_followups.inputs)
+                        .await;
                     self.name_requested_settings(
                         &claim,
                         cc_model,
@@ -779,7 +970,7 @@ impl LucidosEngine {
                 }
                 // Something else has the thread now, so this beat is skipped.
                 if keep_alive {
-                    log!("[KeepAlive] Thread {thread_id} is busy, so this beat is skipped");
+                    log_legacy!("[KeepAlive] Thread {thread_id} is busy, so this beat is skipped");
                     return Ok(terminal_result(
                         String::new(),
                         vec![],
@@ -794,14 +985,9 @@ impl LucidosEngine {
                 // through to route the follow-up as the next turn on the same
                 // thread, full context preserved. Never fires for a child-wake.
                 //
-                // Codex arms unconditionally because its app-server / exec
-                // protocols accept input only at a turn boundary, so a mid-turn
-                // follow-up would otherwise queue invisibly behind a long turn.
-                // Claude Code arms only when the caller marked the follow-up
-                // urgent: CC steers via stdin, so a plain follow-up is
-                // forwarded as-is and reaches the child at its next turn
-                // boundary. That boundary is the catch, and `urgent` is the
-                // opt-out from waiting for it. See `should_redirect_followup`.
+                // Ordinary follow-ups steer a capable process. Urgent messages
+                // interrupt on both backends, as do plain Codex follow-ups when
+                // this process cannot steer. See `should_redirect_followup`.
                 let redirect_idle_notify = {
                     let mut sessions = self.agent_sessions.lock().await;
                     super::super::process_helpers::arm_followup_redirect(
@@ -852,14 +1038,14 @@ impl LucidosEngine {
                             }
                         };
                         if at_boundary {
-                            log!(
+                            log_legacy!(
                                 "[Chat] Codex redirect: interrupted turn reached a boundary for thread {} — follow-up runs as the next turn",
                                 thread_id
                             );
                             break;
                         }
                         if std::time::Instant::now() >= redirect_deadline {
-                            log!(
+                            log_legacy!(
                                 "[Chat] Codex redirect: timed out waiting for the interrupt on thread {} — routing the follow-up anyway",
                                 thread_id
                             );
@@ -959,6 +1145,21 @@ impl LucidosEngine {
                             if let (true, Some(id)) = (sent, origin_event_id) {
                                 session.unforwarded_inputs.insert(id);
                             }
+                            if sent {
+                                let mut followups =
+                                    std::mem::take(&mut coding_agent_followups.inputs).into_iter();
+                                while let Some(followup) = followups.next() {
+                                    let id = followup.origin_event_id;
+                                    if let Err(unsent) = session.msg_tx.send(followup) {
+                                        coding_agent_followups.inputs.push(unsent.0);
+                                        coding_agent_followups.inputs.extend(followups);
+                                        break;
+                                    }
+                                    if let Some(id) = id {
+                                        session.unforwarded_inputs.insert(id);
+                                    }
+                                }
+                            }
                             sent
                         } else {
                             false
@@ -969,7 +1170,7 @@ impl LucidosEngine {
                 };
 
                 if send_ok {
-                    log!("[Chat] CC follow-up routed via msg_tx for thread {} (bypassed register_thread_queued)", thread_id);
+                    log_legacy!("[Chat] CC follow-up routed via msg_tx for thread {} (bypassed register_thread_queued)", thread_id);
                     return Ok(terminal_result(
                         String::new(),
                         vec![],
@@ -986,7 +1187,7 @@ impl LucidosEngine {
                 // message then spawns a fresh `--resume` session as the next turn.
                 // MessageReceived was already emitted above (`pre_emitted_origin`
                 // is set), so the slow path won't re-emit it.
-                log!(
+                log_legacy!(
                     "[Chat] CC follow-up lost the live-session race for thread {} — claiming the thread for a resume",
                     thread_id
                 );
@@ -1009,7 +1210,7 @@ impl LucidosEngine {
         // left for the orphan chain.
         if urgent && use_coding_agent != Some(true) && !is_new_thread {
             let preempted = self.cancel_thread_for_followup(thread_id, origin.clone());
-            log!(
+            log_legacy!(
                 "[Chat] Urgent follow-up preempting the live turn on thread {} (preempted={})",
                 thread_id,
                 preempted
@@ -1030,8 +1231,8 @@ impl LucidosEngine {
         // `ToolResult` the running turn never rebuilt. So it went into the
         // queue, where the stuck-turn backstop evicted the running turn to let
         // it in. A wake now carries real prose, so it injects.
-        let mut admitted: Option<crate::engine::ThreadRegistration> = None;
-        if use_coding_agent != Some(true) && !is_new_thread && !urgent {
+        let mut admitted = pre_admission.map(crate::engine::PreAdmission::take);
+        if admitted.is_none() && use_coding_agent != Some(true) && !is_new_thread && !urgent {
             for attempt in 1..=ADMISSION_ATTEMPTS {
                 if let Some(registration) = self.try_register_thread(thread_id) {
                     admitted = Some(registration);
@@ -1041,9 +1242,9 @@ impl LucidosEngine {
                 // pair than this message asks for. Then the message queues and
                 // runs next on its own pair, rather than losing its override.
                 if requested != crate::core::ResolvedModelSelection::default()
-                    && resolve_pair(pre_emitted_origin, Default::default()).await != resolved
+                    && self.live_chat_pair(thread_id).await? != resolved
                 {
-                    log!("[Chat] Thread {thread_id}: the live turn runs another pair, so this message queues");
+                    log_legacy!("[Chat] Thread {thread_id}: the live turn runs another pair, so this message queues");
                     break;
                 }
                 // Emit MessageReceived FIRST — same ordering guarantee as the CC
@@ -1065,12 +1266,13 @@ impl LucidosEngine {
                     // The live turn answers this message, so it names that
                     // turn's pair. `chat_submit` refused an override naming
                     // another one before anything was recorded.
-                    let live = self
-                        .resolve_chat_pair(
-                            thread_id,
-                            crate::core::ResolvedModelSelection::default(),
-                        )
-                        .await;
+                    let live = self.live_chat_pair(thread_id).await?;
+                    let live_anchor = self
+                        .active_threads
+                        .lock()
+                        .unwrap()
+                        .get(&thread_id)
+                        .and_then(|h| *h.request_event_id.lock().unwrap());
                     let emit_result = self
                         .event_bus
                         .emit(crate::engine::event_bus::BusEvent::Thread {
@@ -1093,10 +1295,15 @@ impl LucidosEngine {
                             meta: EventMeta {
                                 event_id: event_id.and_then(|s| uuid::Uuid::parse_str(s).ok()),
                                 channel: Some(EventChannel::Chat),
+                                request_event_id: live_anchor,
                                 ..EventMeta::NONE
                             },
                         })
-                        .await?;
+                        .await;
+                    let emit_result = match emit_result {
+                        Ok(result) => result,
+                        Err(e) => return withdrawn_or(e, request_id, thread_id),
+                    };
                     // Stash the emit for the race-recovery handoff below.
                     if let Some(result) = emit_result {
                         pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
@@ -1108,10 +1315,17 @@ impl LucidosEngine {
                     .map(PreEmittedOrigin::event_id)
                     .or_else(|| event_id.and_then(|s| Uuid::parse_str(s).ok()));
                 let images = user_images.map(|imgs| imgs.to_vec());
+                let resumed_text = crate::engine::thread_stop::resume_text(
+                    self.pool(),
+                    thread_id,
+                    user_message,
+                    origin_event_id,
+                )
+                .await?;
                 let injected = self.inject_into_live_turn(
                     thread_id,
                     crate::engine::InjectedPrompt {
-                        text: user_message.to_string(),
+                        text: resumed_text,
                         event_id: origin_event_id,
                         mode,
                         spawning_event_id,
@@ -1122,7 +1336,7 @@ impl LucidosEngine {
                 );
 
                 if injected {
-                    log!(
+                    log_legacy!(
                         "[Chat] Follow-up coalesced into the live turn on thread {}",
                         thread_id
                     );
@@ -1165,7 +1379,7 @@ impl LucidosEngine {
                 // thread it holds is about to be free. The retry is bounded, so
                 // a handle whose receiver is gone but whose guard has not
                 // dropped yet cannot spin here.
-                log!(
+                log_legacy!(
                     "[Chat] Thread {} neither admitted nor injectable (attempt {} of {})",
                     thread_id,
                     attempt,
@@ -1189,7 +1403,7 @@ impl LucidosEngine {
             ) {
                 crate::engine::Admission::Admitted(registration) => registration,
                 crate::engine::Admission::Busy { .. } => {
-                    log!("[KeepAlive] Thread {thread_id} has a turn running, so this beat is skipped");
+                    log_legacy!("[KeepAlive] Thread {thread_id} has a turn running, so this beat is skipped");
                     return Ok(terminal_result(
                         String::new(),
                         vec![],
@@ -1206,7 +1420,13 @@ impl LucidosEngine {
                     drop(gate);
                     let registration = self.register_thread_queued(thread_id).await;
                     turn_start = Some(self.turn_start_gate.hold(thread_id).await);
-                    resolved = resolve_pair(pre_emitted_origin, requested.clone()).await;
+                    resolved = resolve_input_settings(
+                        origin.as_ref(),
+                        use_coding_agent,
+                        requested.clone(),
+                        resolve_pair(pre_emitted_origin, requested.clone()),
+                    )
+                    .await?;
                     registration
                 }
                 None => self.register_thread_queued(thread_id).await,
@@ -1297,7 +1517,7 @@ impl LucidosEngine {
                         .drain_turn_orphans(thread_id, guard, &mut injection_rx)
                         .await;
                     self.resubmit_orphans_of_failed_turn(thread_id, orphans);
-                    return Err(e);
+                    return withdrawn_or(e, request_id, thread_id);
                 }
             };
             if let Some(tc) = trigger.as_ref() {
@@ -1305,6 +1525,47 @@ impl LucidosEngine {
             }
             emit_result.event_id
         };
+        let response_channel = is_trigger.then_some(EventChannel::Trigger);
+        self.set_thread_request_event_id(thread_id, guard.generation(), origin_id);
+        if use_coding_agent != Some(true) && !keep_alive {
+            if let Err(error) = self
+                .event_bus
+                .emit(crate::engine::event_bus::BusEvent::Thread {
+                    thread_id,
+                    event: crate::engine::thread_events::ThreadEvent::ChatTurnSettingsResolved {
+                        model: resolved.model.clone().unwrap_or_default(),
+                        reasoning_effort: resolved.reasoning_effort.clone(),
+                        provider: resolved.provider.clone(),
+                    },
+                    meta: EventMeta {
+                        channel: Some(response_channel.unwrap_or(EventChannel::Chat)),
+                        request_event_id: Some(origin_id),
+                        ..EventMeta::NONE
+                    },
+                })
+                .await
+            {
+                // A message recorded as a follow-up, then taken back, never
+                // anchors a turn. Its exchange belongs to the turn it followed.
+                if crate::engine::consumption_claim::is_removed_refusal(&*error) {
+                    let orphans = self
+                        .drain_turn_orphans(thread_id, guard, &mut injection_rx)
+                        .await;
+                    self.resubmit_orphans_of_failed_turn(thread_id, orphans);
+                    return withdrawn_or(error, request_id, thread_id);
+                }
+                return Err(self
+                    .fail_turn(
+                        thread_id,
+                        origin_id,
+                        response_channel,
+                        error,
+                        guard,
+                        &mut injection_rx,
+                    )
+                    .await);
+            }
+        }
         // Recorded, and the thread is registered, so a later input now queues
         // behind this turn rather than racing it. Release it, and the gate.
         // The thread now holds its continue key, so a racing fire finds it.
@@ -1312,27 +1573,8 @@ impl LucidosEngine {
         drop(turn_start);
         drop(trigger.as_mut().and_then(|tc| tc.continue_key.take()));
 
-        // Publish this turn's anchor on the handle. Everything below stamps
-        // `request_event_id: Some(origin_id)` on its events and on its own
-        // terminator; an abort emitted from OUTSIDE the loop (restart teardown,
-        // stuck-turn eviction, shutdown sweep) has no other way to learn it, and
-        // guessing it from the newest originating-type event picks a queued
-        // follow-up or a stale message instead. See
-        // `engine::in_flight_request_event_id`.
-        self.set_thread_request_event_id(thread_id, guard.generation(), origin_id);
-
-        // Hoisted above the first fallible exit that can now terminate the
-        // turn: `fail_turn` stamps it on the terminator it emits.
-        let response_channel: Option<EventChannel> = if is_trigger {
-            Some(EventChannel::Trigger)
-        } else {
-            None
-        };
-
-        // An exchange exists from here on, so EVERY error exit below settles
-        // it. There are three (this one, the coding-agent branch, and the
-        // capture-context read) plus the post-loop net. That completeness is
-        // what lets this function's callers drop their own terminators.
+        // Every error after the starter settles the exchange and hands off
+        // follow-ups, including a failed applied-settings stamp above.
         if let Err(e) = self
             .maybe_emit_titles(
                 thread_id,
@@ -1357,6 +1599,34 @@ impl LucidosEngine {
                 )
                 .await);
         }
+
+        let resumed_text = if use_coding_agent == Some(true) {
+            user_message.to_string()
+        } else {
+            match crate::engine::thread_stop::resume_text(
+                self.pool(),
+                thread_id,
+                user_message,
+                Some(origin_id),
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    return Err(self
+                        .fail_turn(
+                            thread_id,
+                            origin_id,
+                            response_channel,
+                            error.into(),
+                            guard,
+                            &mut injection_rx,
+                        )
+                        .await)
+                }
+            }
+        };
+        let user_message = resumed_text.as_str();
 
         // `guard` stays alive across this await: the run's `chat_cancel` arm
         // listens on its token (see process_cc.rs module doc).
@@ -1485,6 +1755,13 @@ impl LucidosEngine {
         // views replace the history, its summariser and memory recall. Off,
         // every line below runs exactly as before (I2).
         let memory_tree = capabilities.gates.memory_tree;
+
+        // Marked just before the turn's one history read: this load, or the
+        // memory views under the Tree module. From the mark, a row the turn
+        // must hear of reaches it by injection.
+        if !memory_tree {
+            self.note_history_read_begun(thread_id, guard.generation());
+        }
 
         // Resume tool blocks + conversation history + per-thread loaded
         // knowhow, all derived from a single events fetch (see
@@ -1641,7 +1918,7 @@ impl LucidosEngine {
                 // Not a reason to fail the turn. The list is the model's
                 // own memo, so the honest degradation is a turn without
                 // it: that costs a re-derivation, never correctness.
-                log!(
+                log_legacy!(
                     "[Chat] todo list read failed for thread {}: {}. This turn carries no checklist",
                     thread_id,
                     e
@@ -1675,7 +1952,7 @@ impl LucidosEngine {
             match super::working_understanding::latest_document(&self.pool, thread_id).await {
                 Ok(found) => found.unwrap_or_default(),
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] working understanding read failed for thread {}: {}. This turn carries none",
                         thread_id,
                         e
@@ -1706,7 +1983,7 @@ impl LucidosEngine {
         };
 
         if !memory_context.is_empty() {
-            log!(@Memory, "Retrieved {}KB of context", memory_context.len() / 1024);
+            log_legacy!(@Memory, "Retrieved {}KB of context", memory_context.len() / 1024);
         }
 
         let Some(context_sections) = until_canceled(
@@ -1800,6 +2077,7 @@ impl LucidosEngine {
 
         let memory_views = if memory_tree {
             let surface = self.chat_surface(thread_id, is_trigger).await;
+            self.note_history_read_begun(thread_id, guard.generation());
             let Some(views) = until_canceled(
                 &cancel_token,
                 self.turn_memory_views(
@@ -1885,7 +2163,7 @@ impl LucidosEngine {
                         .await);
                 };
                 let removed = removed.unwrap_or_else(|e| {
-                    log!(
+                    log_legacy!(
                         "[Chat] removed know-how lookup failed for trigger {}: {}",
                         t.trigger_id,
                         e
@@ -1926,7 +2204,7 @@ impl LucidosEngine {
         let expendable_budget = message_budget.saturating_sub(fixed_size);
         let expendable_size = memory_context.len() + history_context.len();
         if expendable_size > expendable_budget {
-            log!("[Chat] Initial context ({}KB) exceeds message budget ({}KB, prompt overhead {}KB), trimming",
+            log_legacy!("[Chat] Initial context ({}KB) exceeds message budget ({}KB, prompt overhead {}KB), trimming",
                 (fixed_size + expendable_size) / 1024, message_budget / 1024, prompt_overhead / 1024);
             let mut excess = expendable_size - expendable_budget;
             // Trim memory first (most expendable), then history from oldest (start)
@@ -2241,7 +2519,7 @@ impl LucidosEngine {
             .filter(|p| p.kind.can_carry_a_turn())
             .collect();
         if !orphans.is_empty() {
-            log!(
+            log_legacy!(
                 "[Chat] {} orphaned injection(s) after turn exit for thread {}, re-submitting as follow-ups",
                 orphans.len(),
                 thread_id

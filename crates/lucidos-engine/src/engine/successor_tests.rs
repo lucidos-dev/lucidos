@@ -265,6 +265,41 @@ fn a_bare_one_liner_lacks_every_section() {
     );
 }
 
+#[test]
+fn the_provider_blocked_brief_names_the_block_and_asks_for_the_cause() {
+    let thread = Uuid::nil();
+    let brief = handoff_brief(
+        thread,
+        BriefCause::ProviderBlocked {
+            policy: "potentially unintended activity",
+        },
+        true,
+        None,
+    );
+    assert!(brief.contains("OpenAI's safety systems blocked"), "{brief}");
+    assert!(brief.contains("potentially unintended activity"), "{brief}");
+    assert!(brief.contains("so it was not resumed"), "{brief}");
+    assert!(
+        brief.contains(&format!("--thread-id {thread}")),
+        "it points at the event log: {brief}"
+    );
+    assert!(
+        brief.contains("its last instruction and its tool"),
+        "{brief}"
+    );
+    assert!(brief.contains("Never repeat such an action"), "{brief}");
+    assert!(brief.contains("ask the user first"), "{brief}");
+    let other = handoff_brief(thread, BriefCause::ResumeFailed, true, None);
+    assert!(!other.contains("Never repeat such an action"), "{other}");
+}
+
+#[test]
+fn the_provider_blocked_input_ends_on_the_message() {
+    let input = provider_blocked_input(Uuid::nil(), "cybersecurity policy", "Carry on.");
+    assert!(input.contains("cybersecurity policy"), "{input}");
+    assert!(input.ends_with("Carry on."), "{input}");
+}
+
 mod db {
     use super::super::*;
     use crate::engine::event_bus::{BusEvent, EventBus};
@@ -494,6 +529,7 @@ mod db {
 
     fn session_handed_off(checkpoint: Option<&str>) -> ThreadEvent {
         ThreadEvent::SessionHandedOff {
+            plan_path: None,
             cause: None,
             starts: crate::engine::thread_events::SessionStart::Now,
             crossing: None,
@@ -515,6 +551,7 @@ mod db {
         continuity: Option<crate::engine::thread_events::SessionContinuity>,
     ) -> ThreadEvent {
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent,
             session_id: "test-session".into(),
             branch: format!("claude-code/{thread}"),
@@ -527,6 +564,70 @@ mod db {
             auto_compact_arm: None,
             continuity,
         }
+    }
+
+    #[tokio::test]
+    async fn handoff_plan_path_is_scoped_to_the_latest_repository_and_branch() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread = coding_thread(&bus, None).await;
+        let mut started = session_started(thread, CodingAgent::Codex, None);
+        if let ThreadEvent::SessionStarted {
+            coding_agent_folder,
+            ..
+        } = &mut started
+        {
+            *coding_agent_folder = "/test-repository".into();
+        }
+        emit(&bus, thread, started).await;
+        for (repo, path) in [
+            ("/test-repository", "docs/plans/right.md"),
+            ("/different-repository", "docs/plans/wrong.md"),
+        ] {
+            sqlx::query("INSERT INTO planned_branches (repo_root, branch_name, state, plan_path, head_sha, planned_at) VALUES ($1, $2, 'planned', $3, 'head', NOW())")
+                .bind(crate::engine::git_ops::canonical_repo_root(std::path::Path::new(repo)))
+                .bind(format!("claude-code/{thread}"))
+                .bind(path).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            handoff_plan_path(&pool, thread).await.unwrap().as_deref(),
+            Some("docs/plans/right.md")
+        );
+        let handoff = NewHandoff {
+            opening: crate::engine::thread_events::HandoffOpening::Narrative,
+            message: "Continue the plan".into(),
+            checkpoint: None,
+            progress: None,
+            implementer: super::implementer(CodingAgent::Codex, None, None),
+            request: None,
+            cause: crate::engine::thread_events::HandoffCause::User,
+            starts: crate::engine::thread_events::SessionStart::AfterThisTurn,
+            crossing: None,
+        };
+        assert_eq!(
+            record_handoff(&bus, thread, handoff.clone(), EventMeta::NONE)
+                .await
+                .unwrap(),
+            HandoffRecord::Recorded
+        );
+        assert_eq!(
+            record_handoff(&bus, thread, handoff, EventMeta::NONE)
+                .await
+                .unwrap(),
+            HandoffRecord::Pending
+        );
+        let paths: Vec<String> = sqlx::query_scalar("SELECT payload->>'plan_path' FROM events WHERE thread_id = $1 AND event_type = 'SessionHandedOff'")
+            .bind(thread).fetch_all(&pool).await.unwrap();
+        assert_eq!(paths, ["docs/plans/right.md"]);
+        sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1")
+            .bind(crate::engine::git_ops::canonical_repo_root(
+                std::path::Path::new("/test-repository"),
+            ))
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(handoff_plan_path(&pool, thread).await.unwrap(), None);
+        teardown_test_db(&db).await;
     }
 
     /// The successor session of `thread`'s pending handoff starts.
@@ -1118,6 +1219,165 @@ mod db {
 
         teardown_test_db(&db).await;
     }
+
+    mod lane_thread {
+        use super::*;
+        use crate::engine::event_bus::SystemEvent;
+
+        /// A lane thread whose batch has started.
+        async fn lane_thread(bus: &EventBus) -> (Uuid, Uuid) {
+            let thread = coding_thread(bus, None).await;
+            let batch_id = Uuid::new_v4();
+            bus.emit(BusEvent::System(SystemEvent::LaneBatchStarted {
+                batch_id,
+                members: vec![],
+                base_sha: "base".into(),
+                lane_thread_id: thread,
+            }))
+            .await
+            .expect("batch started");
+            (thread, batch_id)
+        }
+
+        async fn land(bus: &EventBus, batch_id: Uuid) {
+            bus.emit(BusEvent::System(SystemEvent::LaneBatchLanded {
+                batch_id,
+                pre_sha: "base".into(),
+                post_sha: "landed".into(),
+            }))
+            .await
+            .expect("batch landed");
+        }
+
+        fn requested(by_user: bool) -> ThreadEvent {
+            let ThreadEvent::SessionHandedOff {
+                plan_path,
+                cause,
+                starts,
+                crossing,
+                opening,
+                message,
+                checkpoint,
+                progress,
+                coding_agent,
+                coding_agent_model,
+                reasoning_effort,
+                ..
+            } = session_handed_off(Some("pre-harden"))
+            else {
+                unreachable!("session_handed_off builds a SessionHandedOff");
+            };
+            let request = by_user.then(|| HandoffRequest {
+                message: "Carry on".into(),
+                by: crate::engine::thread_events::MessageOrigin::Device {
+                    device_id: "test-device".into(),
+                },
+            });
+            ThreadEvent::SessionHandedOff {
+                plan_path,
+                cause,
+                starts,
+                crossing,
+                opening,
+                message,
+                checkpoint,
+                progress,
+                coding_agent,
+                coding_agent_model,
+                reasoning_effort,
+                request,
+            }
+        }
+
+        /// The incident: a lane thread handed off during its open batch, the
+        /// run resumed the old session, and the batch landed. No start may
+        /// replay that handoff into the closed lane thread.
+        #[tokio::test]
+        async fn a_closed_lane_thread_starts_no_engine_handoff() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            emit(&bus, thread, requested(false)).await;
+            emit(
+                &bus,
+                thread,
+                message_received("A fresh session starts here."),
+            )
+            .await;
+            let resumed = Some(crate::engine::thread_events::SessionContinuity::Resumed);
+            emit(
+                &bus,
+                thread,
+                session_started(thread, CodingAgent::ClaudeCode, resumed),
+            )
+            .await;
+            assert!(
+                successor_to_start(&pool, thread).await.unwrap().is_some(),
+                "an open batch still starts its successor session"
+            );
+
+            land(&bus, batch_id).await;
+            assert!(pending_handoff(&pool, thread).await.unwrap().is_some());
+            assert_eq!(successor_to_start(&pool, thread).await.unwrap(), None);
+
+            emit(
+                &bus,
+                thread,
+                serde_json::from_value(serde_json::json!({"type": "CodingAgentIdled"})).unwrap(),
+            )
+            .await;
+            sqlx::query(
+                "UPDATE events SET created = created - interval '5 minutes' WHERE thread_id = $1",
+            )
+            .bind(thread)
+            .execute(&pool)
+            .await
+            .unwrap();
+            let live = crate::engine::thread_liveness::liveness_for_thread(&pool, thread)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                live.state,
+                crate::engine::thread_liveness::LivenessState::Idle
+            );
+            assert!(
+                live.handoff.is_some(),
+                "the skipped handoff remains recorded"
+            );
+
+            teardown_test_db(&db).await;
+        }
+
+        /// Owed human input still gets its answer: admission refuses it.
+        #[tokio::test]
+        async fn a_closed_lane_thread_still_starts_the_users_request() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            emit(&bus, thread, requested(true)).await;
+            land(&bus, batch_id).await;
+            let handoff = successor_to_start(&pool, thread).await.unwrap();
+            assert!(handoff.is_some_and(|handoff| handoff.request.is_some()));
+
+            teardown_test_db(&db).await;
+        }
+
+        #[tokio::test]
+        async fn a_closed_lane_thread_cannot_hand_off() {
+            let (pool, db) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let (thread, batch_id) = lane_thread(&bus).await;
+            assert_eq!(handoff_block(&pool, thread).await.unwrap(), None);
+            land(&bus, batch_id).await;
+            assert_eq!(
+                handoff_block(&pool, thread).await.unwrap(),
+                Some(HandoffBlock::LaneEnded)
+            );
+
+            teardown_test_db(&db).await;
+        }
+    }
 }
 
 /// One process: the successor session waits until the old session's run lets
@@ -1271,25 +1531,33 @@ fn opening_lists_running_work() {
     }
 }
 
-/// I5: only a session past its ceiling waits for the next input, and a typed
-/// request is that input. The cause follows the ceiling, then the checkpoint.
+/// A natural turn end waits for input; an interrupted turn carries on. A typed
+/// request is input. The cause follows the ceiling, then the checkpoint.
 #[test]
 fn a_ceiling_handoff_starts_on_the_next_input() {
     use crate::engine::thread_events::{HandoffCause as C, SessionStart as S};
     assert_eq!(
-        cause_and_start(true, true, false, true),
+        cause_and_start(true, false, false, true, true),
+        (C::ContextCeiling, S::AfterThisTurn)
+    );
+    assert_eq!(
+        cause_and_start(true, false, false, false, true),
         (C::ContextCeiling, S::OnNextInput)
     );
     assert_eq!(
-        cause_and_start(true, false, true, false),
+        cause_and_start(true, true, false, true, false),
+        (C::ContextCeiling, S::OnNextInput)
+    );
+    assert_eq!(
+        cause_and_start(true, false, true, false, false),
         (C::ContextCeiling, S::Now)
     );
     assert_eq!(
-        cause_and_start(false, true, false, true),
+        cause_and_start(false, true, false, true, false),
         (C::Checkpoint, S::AfterThisTurn)
     );
     assert_eq!(
-        cause_and_start(false, false, false, false),
+        cause_and_start(false, false, false, false, false),
         (C::User, S::Now)
     );
 }

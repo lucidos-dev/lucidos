@@ -38,7 +38,7 @@ pub(super) async fn spawn_or_resume(
         match runtime.spawn(args, cancel.clone()).await {
             Ok(rt) => return Ok((rt, ResumeAttempt::Resumed)),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[AgentSession] Resume failed ({}), falling back to fresh spawn",
                     e
                 );
@@ -128,7 +128,7 @@ impl FreshBranch<'_> {
             if !branch_name_is_taken(&stderr) {
                 return Err(stderr);
             }
-            log!(
+            log_legacy!(
                 "[AgentSession] Branch {} was taken by a concurrent spawn (attempt {}/{}), re-deriving",
                 branch_name,
                 attempt,
@@ -179,7 +179,7 @@ pub(super) async fn recover_renamed_branch(
 ) -> Option<RecoveredBranch> {
     let (branch_name, adoption_note) =
         try_adopt_renegade_branch(repo_root, worktree_path, &gone.branch_name, anchor).await?;
-    log!(
+    log_legacy!(
         "[AgentSession] Recorded branch {} was renamed to {}, resuming on it",
         gone.branch_name,
         branch_name
@@ -263,14 +263,14 @@ pub(super) fn decide_branch_resolution(
     resume_session_id: Option<String>,
 ) -> BranchDecision {
     if branch_exists.is_unknown() {
-        log!(
+        log_legacy!(
             "[AgentSession] Could not verify resume branch {} (git gave no answer). Reusing it rather than starting fresh, since dropping a branch that exists loses the session",
             resume_branch
         );
     }
     if branch_exists.or_unknown(true) {
         if !branch_exists.is_unknown() {
-            log!(
+            log_legacy!(
                 "[AgentSession] Reusing existing branch {} for resumed session",
                 resume_branch
             );
@@ -280,7 +280,7 @@ pub(super) fn decide_branch_resolution(
             resume_session_id,
         }
     } else {
-        log!(
+        log_legacy!(
             "[AgentSession] Resume branch {} no longer exists, creating fresh branch unless the worktree proves a rename",
             resume_branch
         );

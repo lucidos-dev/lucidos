@@ -177,7 +177,7 @@ async fn migrate_legacy_event_images(
                 migrate_image_payload(&mut payload, workspace, legacy_field, "user_image_hashes")?;
             if let Some(m) = migration {
                 if m.failed_decode > 0 {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ImageMigration] event={id} dropped {} undecodable image(s)",
                         m.failed_decode
                     );
@@ -192,7 +192,7 @@ async fn migrate_legacy_event_images(
         }
     }
     if count > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[ImageMigration] migrated {count} MessageReceived event(s) from `{legacy_field}` → `user_image_hashes`"
         );
     }
@@ -237,7 +237,7 @@ async fn migrate_legacy_compose_images(
             )?;
             if let Some(m) = migration {
                 if m.failed_decode > 0 {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ImageMigration] thread={thread_id} dropped {} undecodable draft image(s)",
                         m.failed_decode
                     );
@@ -261,7 +261,7 @@ async fn migrate_legacy_compose_images(
         }
     }
     if count > 0 {
-        crate::log!("[ImageMigration] migrated {count} compose draft(s)");
+        crate::log_legacy!("[ImageMigration] migrated {count} compose draft(s)");
     }
     Ok(count)
 }

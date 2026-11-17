@@ -1,7 +1,7 @@
 /** Frontend action-availability tiers (see docs/glossary.md).
  *
  *  `availableThreadActions` (codegen'd from thread_lifecycle.rs) is the
- *  DB-derivable availability core — it returns bare `Action` kinds. This module
+ *  DB-derivable availability core — it returns bare `ThreadAction` kinds. This module
  *  ENRICHES that output into `TaggedAction`s: each carries a UI `category`, a
  *  `label`, and an `invoke()` that encapsulates the confirm + handler. Buttons
  *  and the close cascade both render/drive from these, so a shortcut can only
@@ -16,17 +16,17 @@
 import { threadMap, focusedThreadId, pendingChangeForThread, showConfirm, effectiveThreadStatus, applyingNowThreadIds, applyingChangeThreadIds, discardingCCThreadIds, standingApplyThreadIds, armingStandingApplyThreadIds } from '../store';
 import { archiveRequestInFlight } from '../rowIntents';
 import { getCodingAgentWaitingInfo, threadChangeWork, type ThreadMeta } from '../thread-events';
-import { availableThreadActions, type Action } from '../../generated/thread-lifecycle';
+import { availableThreadActions, type ThreadAction } from '../../generated/thread-lifecycle';
 import { getDraft, draftIsEmpty } from '../composeDrafts';
 import { handleArchiveThread, handleSaveThread, handleUnsaveThread } from './threads';
-import { endClaudeCodeAndApply, handleDiscardCCChanges } from './chat-claude-code';
+import { endClaudeCodeAndApply, handleDiscardCCChanges } from './codingAgentChanges';
 import { armStandingApply, disarmStandingApply, setAsideSingleChange, APPLY_NEW_VERSION_TOOLTIP } from './chat-changes';
 import { discardCompose, updateCompose } from './compose';
 
 export type ActionCategory = 'close' | 'primary' | 'save';
 
 export interface TaggedAction {
-  kind: Action;
+  kind: ThreadAction;
   category: ActionCategory;
   label: string;
   /** Optional hover tooltip (e.g. the Apply restart hint). */
@@ -129,9 +129,9 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
   // before ThreadArchived). Mirror `is_blocking`'s carve-out: replace the
   // change layer (discard + apply) with a single Archive. Draft + save toggle
   // are untouched.
-  let kinds: Action[] = raw;
+  let kinds: ThreadAction[] = raw;
   if (isExternalRepo && (raw.includes('apply') || raw.includes('discard'))) {
-    kinds = raw.flatMap((a): Action[] => {
+    kinds = raw.flatMap((a): ThreadAction[] => {
       if (a === 'discard' || a === 'set_aside') return [];
       if (a === 'apply') return ['archive'];
       return [a];
@@ -179,7 +179,7 @@ export function resolveThreadActions(threadId: string): TaggedAction[] {
 
 /** Menu order for the change layer: the positive actions, then Set aside,
  *  then Discard. */
-const CHANGE_MENU_ORDER: readonly Action[] = ['apply', 'apply_when_settled', 'set_aside', 'discard'];
+const CHANGE_MENU_ORDER: readonly ThreadAction[] = ['apply', 'apply_when_settled', 'set_aside', 'discard'];
 
 /**
  * The thread's change actions (Apply, Apply on settle, Set aside, Discard)
@@ -203,7 +203,7 @@ export function resolveChangeMenuActions(threadId: string): TaggedAction[] {
 }
 
 function tagAction(
-  kind: Action,
+  kind: ThreadAction,
   threadId: string,
   opts: {
     requiresRestart: boolean;

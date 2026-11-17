@@ -1,7 +1,7 @@
 import { activeInlineForm, panelOverlay, showToast } from '../store';
 import type { FormRequestEvent, FormRequestOutcome } from '../thread-events/thread-event-types';
 import type { MessageOrigin } from '../../generated/thread-event-wire';
-import { listPendingFormRequests } from '../../api/client/settings';
+import { listPendingFormRequests, listResolvedFormRequests } from '../../api/client/settings';
 import { errorDetail } from '../../utils/errorDetail';
 import { openCredentialRequest } from './credentials';
 import { openPluginInstallRequest } from './plugin-install';
@@ -9,8 +9,8 @@ import { openPluginUninstallRequest } from './plugin-uninstall';
 import { openEmailConfirmRequest } from './email-confirm';
 import { getDeviceId } from './devices';
 import { isForThisDevice } from './device-scope';
-import { isChosenForThread } from '../windowPeers';
-import { handleNavigationRequest, routeThreadNavigation } from './navigation-request';
+import { submitInteractiveRequest, resolveInteractiveForm, synchronizeInteractiveForms, reconcileInteractiveForms, snapshotInteractiveForms } from '../interactiveDeliveryService';
+import { handleNavigationRequest, presentThreadNavigation } from './navigation-request';
 import { formatThreadLabel } from './thread-label';
 
 /** *Form requests*: something the agent asked the user to act on, persisted
@@ -23,7 +23,7 @@ import { formatThreadLabel } from './thread-label';
 
 /** Requests this page load has already put in front of the user. A sync offers
  *  only what is not here, so a refocus never re-pops a form the user walked
- *  away from. A reload starts empty, and offers the open ones again. */
+ *  away from. The shared journal retains presentation receipts across reloads. */
 const offered = new Set<string>();
 
 /** Test seam: forget what this page has offered. */
@@ -36,46 +36,52 @@ export function resetOfferedFormRequests(): void {
  *
  *  `byUser` is the Open button. An authorization page the engine sent goes to
  *  one device, and never hijacks another thread's page. Any other unasked form
- *  opens in one window per device (window peers). A user who pressed Open
+ *  opens through the device delivery journal. A user who pressed Open
  *  asked for it here and now. */
 export function openFormRequest(
   threadId: string,
   event: FormRequestEvent,
   { byUser = false }: { byUser?: boolean } = {},
 ): void {
-  // A window the choice passes over still counts it offered: the device has it.
-  offered.add(event.request_id);
-  if (!byUser && !opensInThisWindow(threadId, event)) return;
+  if (byUser) { presentFormRequest(threadId, event, true); return; }
+  if (!requestIsForThisDevice(event)) return;
+  submitInteractiveRequest({ kind: 'form', payload: { threadId, event }, preference: { threadId } }, `form:${event.request_id}`);
+}
+
+/** Called synchronously only after a shared claim, or an explicit Open. */
+export function presentFormRequest(threadId: string, event: FormRequestEvent, byUser = false): boolean {
+  if (!byUser && activeInlineForm.value) return false;
   let payload: Record<string, unknown>;
   try {
     payload = JSON.parse(event.payload) as Record<string, unknown>;
   } catch (e) {
     showToast(`Failed to open the ${describeFormRequest(event)}: ${errorDetail(e)}`, 'error');
-    return;
+    return true;
   }
+  offered.add(event.request_id);
   switch (event.type) {
     case 'CredentialRequested':
       openCredentialRequest({ ...payload, form_request_id: event.request_id });
-      return;
+      return true;
     case 'EmailConfirmRequested':
       openEmailConfirmRequest({
         ...(payload as unknown as Parameters<typeof openEmailConfirmRequest>[0]),
         form_request_id: event.request_id,
       });
-      return;
+      return true;
     case 'PluginInstallRequested':
       openPluginInstallRequest(payload as unknown as Parameters<typeof openPluginInstallRequest>[0]);
-      return;
+      return true;
     case 'PluginUninstallRequested':
       openPluginUninstallRequest(
         payload as unknown as Parameters<typeof openPluginUninstallRequest>[0],
       );
-      return;
+      return true;
     case 'OAuthAuthorizationRequested': {
       const nav = payload as unknown as Parameters<typeof handleNavigationRequest>[0];
       if (byUser) handleNavigationRequest(nav, { source: formatThreadLabel(threadId) });
-      else routeThreadNavigation(nav, event.actor, threadId);
-      return;
+      else presentThreadNavigation(nav, threadId);
+      return true;
     }
   }
 }
@@ -88,18 +94,22 @@ function requestIsForThisDevice(event: FormRequestEvent): boolean {
   return isForThisDevice(event.actor);
 }
 
-/** Whether this window, of the ones on this device, opens `event` unasked. An
- *  authorization page is routed like a navigation, by `routeThreadNavigation`. */
-function opensInThisWindow(threadId: string, event: FormRequestEvent): boolean {
-  return event.type === 'OAuthAuthorizationRequested' || isChosenForThread(threadId);
-}
-
-/** Read the open requests and offer the newest one this page has not offered.
+/** Queue open requests newest first, preserving older requests behind busy forms.
  *
  *  Called on every stream open, after the open, so a request emitted between
  *  the read and the open still arrives live. A form the user has open is
  *  never replaced: the rest stay reachable from their transcript rows. */
 export async function syncPendingFormRequests(): Promise<void> {
+  try { await synchronizeInteractiveForms(syncPendingFormRequestsPass); }
+  catch (error) {
+    showToast(`Could not reconcile interactive forms: ${errorDetail(error)}`, 'error', {
+      key: 'interactive-form-reconciliation', action: { label: 'Retry', onClick: () => { void syncPendingFormRequests(); } },
+    });
+  }
+}
+
+async function syncPendingFormRequestsPass(): Promise<void> {
+  const known = await snapshotInteractiveForms();
   let pending;
   try {
     pending = await listPendingFormRequests();
@@ -111,13 +121,11 @@ export async function syncPendingFormRequests(): Promise<void> {
     console.warn('[FormRequests] reading the open form requests failed:', e);
     return;
   }
-  if (activeInlineForm.value) return;
+  await reconcileInteractiveForms(known, pending.map((request) => request.request_id), await listResolvedFormRequests(known));
   const fresh = pending.filter((p) =>
     !offered.has(p.request_id)
-    && requestIsForThisDevice(p.event)
-    && opensInThisWindow(p.thread_id, p.event));
-  const newest = fresh[fresh.length - 1];
-  if (newest) openFormRequest(newest.thread_id, newest.event);
+    && requestIsForThisDevice(p.event));
+  for (const request of fresh.reverse()) openFormRequest(request.thread_id, request.event);
 }
 
 /** Close the open form a resolved request was showing, when another device or
@@ -134,6 +142,7 @@ export function closeResolvedFormRequest(
   outcome: FormRequestOutcome,
   actor: MessageOrigin | null | undefined,
 ): void {
+  resolveInteractiveForm(requestId);
   const answeredHere = actor?.kind === 'device' && actor.device_id === getDeviceId();
   if (answeredHere && outcome !== 'superseded') return;
   const form = activeInlineForm.value;

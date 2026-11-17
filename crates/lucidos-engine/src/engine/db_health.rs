@@ -226,7 +226,7 @@ impl LucidosEngine {
         if named != Ok(true) {
             return false;
         }
-        crate::log!("[DbHealth] The database lost its migration table; stopping");
+        crate::log_legacy!("[DbHealth] The database lost its migration table; stopping");
         crate::boot_failure::report(&crate::boot_failure::wiped_database_message(workspace)).await;
         request_own_shutdown();
         true
@@ -278,13 +278,13 @@ impl LucidosEngine {
                     engine.database_health.store(now);
                     match now {
                         DatabaseHealth::Reachable => {
-                            crate::log!("[DbHealth] Database reachable again")
+                            crate::log_legacy!("[DbHealth] Database reachable again")
                         }
-                        DatabaseHealth::NotAnswering => crate::log!(
+                        DatabaseHealth::NotAnswering => crate::log_legacy!(
                             "[DbHealth] Database unreachable after {} consecutive failed probes",
                             failures
                         ),
-                        DatabaseHealth::PoolExhausted => crate::log!(
+                        DatabaseHealth::PoolExhausted => crate::log_legacy!(
                             "[DbHealth] Database answers, but no pooled connection is free \
                              after {} consecutive failed probes",
                             failures

@@ -16,7 +16,7 @@ import { rulesTargeting } from './css-rule-helpers';
 const here: string = dirname(fileURLToPath(import.meta.url));
 const shellCss: string = readFileSync(resolve(here, '../panels/shell.css'), 'utf-8');
 
-const SENTENCES = ['backup-reminder-text', 'slowness-banner-text', 'ingress-banner-text', 'refusal-banner-text'];
+const SENTENCES = ['backup-reminder-text', 'slowness-banner-text', 'ingress-banner-text', 'refusal-banner-text', 'sandbox-banner-text'];
 
 describe('banner sentence padding', () => {
   it.each(SENTENCES)('%s pads its first line from above only', (sentence) => {

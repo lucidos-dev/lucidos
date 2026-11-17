@@ -1,12 +1,13 @@
 import { Page, APIResponse, expect, Locator, Request } from '@playwright/test';
 import { HARNESS_DEVICE_ID, ensurePageDeviceRegistered, registerHarnessDevice } from './harnessDevice';
+import { withDeviceStamp } from './harnessStamp';
 import { MODAL_EXIT_DRAWING_CLASS } from '../src/components/shared/overlayExitClass';
 import { computeMinThreadPaneWidth, THREAD_ROW_LEAD_CONTROLS } from '../src/store/paneMinimums';
 import { DASHBOARD_RAIL_SHOWN_KEY } from '../src/store/dashboardRailKeys';
 import { DEVICE_ID_KEY } from '../src/utils/deviceIdKey';
 import { ANCHOR_GAP } from '../src/hooks/anchorGap';
 import { rungSwitchCopy } from '../src/components/chat/rungSwitchCopy';
-import { homeThreadIdInDb } from './db-helpers';
+import { homeThreadIdInDb, psql } from './db-helpers';
 
 /** The device id this page registered at boot, or null before it navigates. */
 async function pageDeviceId(page: Page): Promise<string | null> {
@@ -38,7 +39,7 @@ export async function shellDeviceId(page: Page): Promise<string> {
  *  harness is a legitimate external client, so it presents a credential rather
  *  than the gate being narrowed.
  *
- *  It borrows the PAGE's own id. A call the harness makes is then attributed to
+ *  It borrows the PAGE's own id, stamped as the gateway would stamp it. A call the harness makes is then attributed to
  *  the device the test is driving, and device-scoped preferences stay per-test.
  *  Before the first navigation there is no id to borrow, so it registers one.
  *
@@ -59,7 +60,7 @@ export function apiRequest(page: Page) {
       // (ADR 0169). See ensurePageDeviceRegistered.
       await ensurePageDeviceRegistered(page.request, id);
     }
-    return { ...opts, headers: { 'x-lucidos-device-id': id, ...opts?.headers } };
+    return { ...opts, headers: withDeviceStamp({ 'x-lucidos-device-id': id, ...opts?.headers }) };
   };
   return {
     post: async (url: string, opts?: Opts): Promise<APIResponse> =>
@@ -696,6 +697,35 @@ export async function currentRungValue(page: Page): Promise<string> {
   const current = page.locator('.control-dropdown .control-option-current:visible');
   await expect(current).toHaveCount(1, { timeout: 5_000 });
   return (await current.getAttribute('data-value')) ?? '';
+}
+
+/** The `CodingAgentModelSubstituted` events of a thread, oldest first. */
+export function modelSubstitutions(threadId: string): { requested: string; served: string }[] {
+  const rows = psql(
+    `SELECT payload FROM events WHERE thread_id = '${threadId}' ` +
+    `AND event_type = 'CodingAgentModelSubstituted' ORDER BY id`,
+  );
+  return rows.split('\n').filter(Boolean).map((row) => JSON.parse(row));
+}
+
+/** After a finished turn, the thread ran the picked rung, or Claude Code ran
+ *  another model and the thread says so. Then exactly one substitution step
+ *  shows, and the checked rung is the served model at the picked effort. A
+ *  model change with no step fails, and so does a lost effort. */
+export async function expectPickRanOrSubstituted(page: Page, threadId: string, picked: RungRow): Promise<void> {
+  await openRungList(page);
+  const current = await currentRungValue(page);
+  await page.keyboard.press('Escape');
+  const substitutions = modelSubstitutions(threadId);
+  if (substitutions.length === 0) {
+    expect(current).toBe(picked.value);
+    return;
+  }
+  expect(substitutions).toHaveLength(1);
+  expect(substitutions[0].requested).toBe(picked.model);
+  expect(splitRungValue(current).model).not.toBe(picked.model);
+  expect(splitRungValue(current).effort).toBe(picked.effort);
+  await expect(page.locator('.step-description', { hasText: 'this account cannot use' })).toHaveCount(1);
 }
 
 /** Tap a row of the open rung list. One tap commits the model and the effort

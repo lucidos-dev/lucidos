@@ -107,7 +107,9 @@ pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AN
 ///
 /// `__MEMORY_LOOKUP__` names what to look with, which depends on the memory
 /// module: [`MEMORY_LOOKUP_CLASSIC`] or [`MEMORY_LOOKUP_TREE`].
-pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. __MEMORY_LOOKUP__ An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- For answering, not browsing: stop once you have what you need.";
+///
+/// The liveness bullet bans a thread verdict made from history (ADR 0679).
+pub(super) const LOOK_BEFORE_ASSESSING_RULE: &str = "ESTABLISH THE STATE BEFORE YOU FORM AN ASSESSMENT:\nAsked to judge, compare or advise on something of theirs, find out how it is ACTUALLY going before deciding what you think. __MEMORY_LOOKUP__ An ORDER, not a review at the end: once you have a view you will not go looking.\n- NEVER assert something has not happened, does not exist, or was never discussed, unless you looked. Absence from your context is not absence from their history.\n- NEVER call a thread stalled, stuck, failed or done without its `liveness` from THIS turn: its `events` read or `threads` row. Your earlier messages are history.\n- For answering, not browsing: stop once you have what you need.";
 
 pub(super) const MEMORY_LOOKUP_CLASSIC: &str = "Injected memories come first; when they are thin, the `memory` and `threads` tools both have a 'search'.";
 
@@ -233,7 +235,7 @@ where
             if !s.trim().is_empty()
                 && !summary_is_too_thin(s.trim().chars().count(), older_len) =>
         {
-            log!(
+            log_legacy!(
                 "[Chat] Compressed {} older assistant turns into {} char summary in {:?}",
                 older_len,
                 s.trim().chars().count(),
@@ -242,7 +244,7 @@ where
             Some(s)
         }
         Ok(Ok(s)) => {
-            log!(
+            log_legacy!(
                 "[Chat] History summarization returned {} chars for {} turns, too thin to cache; keeping any cached summary",
                 s.trim().chars().count(),
                 older_len
@@ -250,7 +252,7 @@ where
             None
         }
         Ok(Err(e)) => {
-            log!(
+            log_legacy!(
                 "[Chat] History summarization failed after {:?}, keeping any cached summary: {}",
                 started.elapsed(),
                 e
@@ -258,7 +260,7 @@ where
             None
         }
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[Chat] History summarization timed out ({}s), keeping any cached summary",
                 deadline.as_secs()
             );
@@ -320,7 +322,7 @@ pub(super) fn pinned_classification() -> Option<crate::memory::QueryClassificati
             // meant to pin classifies on and says nothing about why.
             if parsed.is_none() {
                 if let Some(value) = raw.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                    log!(
+                    log_legacy!(
                         "[Chat] {} is set to {:?}, which is neither `all` nor `none`. Ignoring \
                          it and classifying normally.",
                         FORCE_QUERY_CLASSIFICATION_ENV,
@@ -346,7 +348,7 @@ fn log_classification(c: &crate::memory::QueryClassification, pinned: bool) {
     } else {
         String::new()
     };
-    log!("[Chat] Query classification{}: needs_memory={}, needs_file_list={}, needs_credentials={}, sub_queries={:?}",
+    log_legacy!("[Chat] Query classification{}: needs_memory={}, needs_file_list={}, needs_credentials={}, sub_queries={:?}",
         pin, c.needs_memory, c.needs_file_list, c.needs_credentials, c.sub_queries);
 }
 
@@ -372,11 +374,11 @@ where
     match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(c)) => {
             log_classification(&c, false);
-            log!("[Chat] Query classification took {:?}", started.elapsed());
+            log_legacy!("[Chat] Query classification took {:?}", started.elapsed());
             c
         }
         Ok(Err(e)) => {
-            log!(
+            log_legacy!(
                 "[Chat] Query classification failed after {:?} (defaulting to all): {}",
                 started.elapsed(),
                 e
@@ -384,7 +386,7 @@ where
             crate::memory::QueryClassification::default()
         }
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[Chat] Query classification timed out ({}s), defaulting to all",
                 deadline.as_secs()
             );
@@ -491,24 +493,10 @@ pub(super) const REDIRECT_INTERRUPT_MAX_WAIT: Duration = Duration::from_secs(30)
 /// interrupt the in-flight turn ("interrupt-and-redirect") instead of being
 /// forwarded as-is.
 ///
-/// The two backends reach the same rule from opposite directions, so the
-/// asymmetry in `urgent` is structural rather than a policy choice:
-///
-/// - **Codex redirects whether or not the caller said urgent.** Its app-server
-///   / exec protocols accept input only at a turn boundary (`turn/start` needs
-///   no turn in flight), so a mid-turn follow-up would otherwise sit invisibly
-///   in the driver's queue behind a long turn. Queueing is not a gentler
-///   option there, it is an invisible one, so `urgent` is a no-op for Codex and
-///   the LLM tool description says so.
-/// - **Claude Code redirects only when urgent.** CC accepts a follow-up
-///   mid-turn (the driver writes it to stdin at once), so a plain follow-up is
-///   forwarded as-is and steers the child at its next turn boundary, which is
-///   what keeps a benign steer from throwing away an in-flight build. But CC
-///   surfaces a queued stdin message ONLY at that boundary, and a blocking tool
-///   call pushes the boundary out by up to its own timeout: on 2026-08-06 a
-///   child parked in `TaskOutput(block: true, timeout: 600000)` did not read a
-///   STOP for nine and a half minutes. `urgent` buys the interrupt for the
-///   messages that cannot wait for it.
+/// Ordinary follow-ups steer a capable process without ending its turn. Codex
+/// exec and app-servers without `turn/steer` still interrupt before redirecting.
+/// Urgent follow-ups interrupt on either backend, since a long tool call may
+/// postpone when a steered message becomes visible to the agent.
 ///
 /// Pure so the routing rule is unit-tested without standing up a session.
 ///
@@ -527,12 +515,13 @@ pub(super) fn should_redirect_followup(
     is_in_flight: bool,
     is_user_message: bool,
     urgent: bool,
+    can_steer: bool,
 ) -> bool {
     if !is_in_flight || !is_user_message {
         return false;
     }
     match coding_agent {
-        crate::runtime::CodingAgent::Codex => true,
+        crate::runtime::CodingAgent::Codex => urgent || !can_steer,
         crate::runtime::CodingAgent::ClaudeCode => urgent,
     }
 }
@@ -574,7 +563,13 @@ pub(super) fn arm_followup_redirect(
     if !s.is_running() || s.in_ceiling_reentry {
         return None;
     }
-    if !should_redirect_followup(s.coding_agent, s.is_in_flight(), is_user_message, urgent) {
+    if !should_redirect_followup(
+        s.coding_agent,
+        s.is_in_flight(),
+        is_user_message,
+        urgent,
+        s.can_steer,
+    ) {
         return None;
     }
     // Keep the interrupted turn's idle from terminating the subprocess. A flag

@@ -5,6 +5,9 @@
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/test_skip.sh
+source "$SCRIPT_DIR/test_skip.sh"
+test_skip_unless_present "$SCRIPT_DIR/../.." scripts/lib/release_draft.sh
 # shellcheck source=scripts/lib/release_draft.sh
 source "$SCRIPT_DIR/release_draft.sh"
 # shellcheck source=scripts/lib/onnxruntime_mirror.sh

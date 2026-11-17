@@ -47,6 +47,19 @@ describe('engineResolutionNote', () => {
     );
   });
 
+  // Every lane's restart sweep writes one reason, so every card says the same.
+  // A card from before that still reads as a restart, never as a denial.
+  it('says a restart closed the card, in every lane and on older cards', () => {
+    const restart = 'Closed when Lucidos restarted. Nobody denied it.';
+    for (const reason of [
+      'Interrupted by an engine restart before anyone answered',
+      'Coding agent terminated before answering: request expired',
+      'Chat turn ended before answering — request expired',
+    ]) {
+      expect(engineResolutionNote({ allowed: false, reason })).toBe(restart);
+    }
+  });
+
   // A reason the card has no words for yet is never silent.
   it('falls back to the first sentence of a reason it cannot translate', () => {
     expect(engineResolutionNote({ allowed: false, reason: 'A new reason. With more after it.' }))

@@ -24,7 +24,7 @@ import { switchMenuItem } from './menu';
 // going back through it would close a needless module cycle between the two:
 // the exact shape `.claude/rules/frontend.md` warns about, where whichever side
 // initializes first sees the other's binding still undefined.
-import { handleNavigationRequest } from './navigation-request';
+import { handleNavigationRequest } from './navigation-dispatch';
 import {
   resolveDeepLink,
   type DeepLinkTarget,

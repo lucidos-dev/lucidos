@@ -25,3 +25,10 @@ export function askedOptions(thread: ThreadState | undefined, toolUseId: string)
   }
   return [];
 }
+
+/** Preserve selected labels alongside composer text when recovering a question answer. */
+export function questionAnswerText(answer: AnswerKind, options: readonly QuestionOption[]): string {
+  const ids = answer.kind === 'MultiSelected' ? answer.option_ids : answer.kind === 'Selected' ? [answer.option_id] : [];
+  const labels = ids.map(id => options.find(option => option.id === id)?.label ?? id);
+  return [...labels, ...('text' in answer && answer.text ? [answer.text] : [])].join('\n\n');
+}

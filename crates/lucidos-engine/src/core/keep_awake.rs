@@ -129,7 +129,7 @@ impl KeepAwake {
             match state.assertion.take(&name) {
                 Ok(()) => {
                     state.held = true;
-                    crate::log!(
+                    crate::log_legacy!(
                         "[KeepAwake] Holding the computer awake for {:?} {} ({})",
                         work,
                         label,
@@ -138,7 +138,7 @@ impl KeepAwake {
                 }
                 Err(e) if !state.warned => {
                     state.warned = true;
-                    crate::log!("[KeepAwake] Cannot keep the computer awake: {}", e);
+                    crate::log_legacy!("[KeepAwake] Cannot keep the computer awake: {}", e);
                 }
                 Err(_) => {}
             }
@@ -160,7 +160,7 @@ impl KeepAwake {
         if state.holds.is_empty() {
             state.assertion.release();
             state.held = false;
-            crate::log!(
+            crate::log_legacy!(
                 "[KeepAwake] Released: the last work in flight, {:?} {}, finished",
                 work,
                 label

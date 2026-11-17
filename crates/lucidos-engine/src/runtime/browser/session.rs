@@ -30,7 +30,7 @@ impl LaunchFailure {
             _ => &[],
         };
         if let Some(blocker) = SandboxBlocker::in_chrome_stderr(stderr) {
-            log!("[Browser] Chrome could not start its sandbox: {}", e);
+            log_legacy!("[Browser] Chrome could not start its sandbox: {}", e);
             return Self::SandboxUnavailable(blocker);
         }
         let message = format!("Failed to launch browser: {}", e);
@@ -83,7 +83,7 @@ impl BrowserRuntime {
                     return Ok(());
                 }
                 // Visibility mismatch — scan logins if headful, then close
-                log!(
+                log_legacy!(
                     "[Browser] Browser visibility mismatch (was {}, need {}), relaunching",
                     state.visible,
                     visible
@@ -109,7 +109,7 @@ impl BrowserRuntime {
                         .await;
                 }
                 state.handler_task.abort();
-                log!(
+                log_legacy!(
                     "[Browser] Closed browser for session {} (profile lock)",
                     key
                 );
@@ -131,7 +131,7 @@ impl BrowserRuntime {
             }
             Err(LaunchFailure::BeforeReady(e)) => {
                 // Stale state from a previous crash — clean up and retry
-                log!(
+                log_legacy!(
                     "[Browser] Launch failed ({}), cleaning up and retrying...",
                     e
                 );
@@ -205,7 +205,7 @@ impl BrowserRuntime {
                 if let Err(e) = event {
                     let err_msg = e.to_string();
                     if !err_msg.contains("untagged enum Message") {
-                        log!("[Browser] Handler error: {}", e);
+                        log_legacy!("[Browser] Handler error: {}", e);
                     }
                 }
             }
@@ -248,7 +248,7 @@ impl BrowserRuntime {
             for name in &["SingletonLock", "SingletonSocket", "SingletonCookie"] {
                 let p = profile_dir.join(name);
                 if p.exists() {
-                    log!("[Browser] Removing stale {}", p.display());
+                    log_legacy!("[Browser] Removing stale {}", p.display());
                     let _ = std::fs::remove_file(&p);
                 }
             }
@@ -294,7 +294,7 @@ impl BrowserRuntime {
             match Self::is_browser_process(pid_str) {
                 BrowserCheck::Chromium => {}
                 BrowserCheck::NotChromium => {
-                    log!(
+                    log_legacy!(
                         "[Browser] Skipping zombie kill for pid {} — not a Chrome/Chromium process",
                         pid_str
                     );
@@ -316,7 +316,7 @@ impl BrowserRuntime {
         }
 
         if killed > 0 {
-            log!(
+            log_legacy!(
                 "[Browser] Killed {} zombie browser process(es) for {}",
                 killed,
                 profile_marker
@@ -370,7 +370,7 @@ impl BrowserRuntime {
         if let Some(s) = instances.remove(session_key) {
             s.handler_task.abort();
         }
-        log!(
+        log_legacy!(
             "[Browser] Force-killed browser for session {} due to connection failure",
             session_key
         );
@@ -479,7 +479,7 @@ impl BrowserRuntime {
         let cookies = match browser.get_cookies().await {
             Ok(c) => c,
             Err(e) => {
-                log!("[Browser] Failed to scan cookies: {}", e);
+                log_legacy!("[Browser] Failed to scan cookies: {}", e);
                 return;
             }
         };
@@ -507,7 +507,7 @@ impl BrowserRuntime {
 
         for domain in &auth_domains {
             if let Err(e) = BrowserLogins::record(pool, domain, domain).await {
-                log!(
+                log_legacy!(
                     "[Browser] Failed to record browser login for {}: {}",
                     domain,
                     e
@@ -516,7 +516,7 @@ impl BrowserRuntime {
         }
 
         if !auth_domains.is_empty() {
-            log!(
+            log_legacy!(
                 "[Browser] Recorded {} probable login domains from cookies",
                 auth_domains.len()
             );
@@ -526,13 +526,13 @@ impl BrowserRuntime {
         if let Some(page) = current_page {
             if let Some(domain) = Self::scan_localstorage_for_auth(page).await {
                 if let Err(e) = BrowserLogins::record(pool, &domain, &domain).await {
-                    log!(
+                    log_legacy!(
                         "[Browser] Failed to record login from localStorage for {}: {}",
                         domain,
                         e
                     );
                 } else {
-                    log!("[Browser] Recorded login from localStorage: {}", domain);
+                    log_legacy!("[Browser] Recorded login from localStorage: {}", domain);
                 }
             }
         }
@@ -712,10 +712,69 @@ exec sleep 600
         browser.kill().await;
     }
 
+    const LAUNCH_SECS: u64 = 90;
+    const CDP_SECS: u64 = 30;
+    const CLEANUP_SECS: u64 = 10;
+
+    async fn browser_test_operation<F: std::future::Future>(
+        name: &str,
+        secs: u64,
+        operation: F,
+    ) -> F::Output {
+        log_legacy!("[Browser security test] {name}");
+        tokio::time::timeout(std::time::Duration::from_secs(secs), operation)
+            .await
+            .unwrap_or_else(|_| panic!("browser security test timed out: {name}"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "browser security test timed out: stalled CDP")]
+    async fn a_stalled_browser_test_operation_fails_with_its_name() {
+        browser_test_operation("stalled CDP", CDP_SECS, std::future::pending::<()>()).await;
+    }
+
+    // Browser owns its child with kill_on_drop. Abort the handler on every
+    // path, including assertion failures, rather than detaching a live task.
+    struct TestBrowser {
+        browser: Browser,
+        handler_task: JoinHandle<()>,
+    }
+
+    impl TestBrowser {
+        async fn launch(profile: &Path) -> Self {
+            let (browser, handler_task) = browser_test_operation(
+                "launch Chrome",
+                LAUNCH_SECS,
+                BrowserRuntime::launch_browser(false, profile),
+            )
+            .await
+            .expect("launch Chrome");
+            Self {
+                browser,
+                handler_task,
+            }
+        }
+
+        async fn close(&mut self) {
+            self.handler_task.abort();
+            browser_test_operation("kill and reap Chrome", CLEANUP_SECS, self.browser.kill())
+                .await
+                .expect("a launched child")
+                .expect("kill and reap test Chrome");
+        }
+    }
+
+    impl Drop for TestBrowser {
+        fn drop(&mut self) {
+            self.handler_task.abort();
+        }
+    }
+
     /// The agent browser speaks CDP over a pipe, so no other local user can
     /// reach it through a port. Its profile is this user's alone. Needs a
     /// Chrome on the machine, and passes as a no-op without one.
     #[tokio::test]
+    #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
     async fn the_agent_browser_listens_on_no_tcp_port() {
         if BrowserConfig::builder().build().is_err() {
             return;
@@ -725,14 +784,22 @@ exec sleep 600
         std::fs::create_dir(&profile).expect("an older 0755 profile");
         std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let (mut browser, handler_task) = BrowserRuntime::launch_browser(false, &profile)
-            .await
-            .expect("launch Chrome");
-        let page = browser
-            .new_page("data:text/html,<title>piped</title>")
-            .await
-            .expect("drive Chrome over the pipe");
-        assert_eq!(page.get_title().await.unwrap().as_deref(), Some("piped"));
+        let mut fixture = TestBrowser::launch(&profile).await;
+        let browser = &mut fixture.browser;
+        let page = browser_test_operation(
+            "open piped page",
+            CDP_SECS,
+            browser.new_page("data:text/html,<title>piped</title>"),
+        )
+        .await
+        .expect("drive Chrome over the pipe");
+        assert_eq!(
+            browser_test_operation("read page title", CDP_SECS, page.get_title())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("piped")
+        );
 
         let pid = browser
             .get_mut_child()
@@ -754,27 +821,28 @@ exec sleep 600
             "the profile directory must be the user's alone"
         );
 
-        browser.close().await.expect("close Chrome");
-        handler_task.abort();
+        fixture.close().await;
     }
 
     /// A renderer runs untrusted page code, so the OS must confine every one
     /// of them. Asks the kernel rather than reading Chrome's argv. Needs a
     /// Chrome on the machine, and passes as a no-op without one.
     #[tokio::test]
+    #[ignore = "confinement test: ./scripts/confinement-tests.sh runs it"]
     async fn the_agent_browser_renderers_are_sandboxed() {
         if BrowserConfig::builder().build().is_err() {
             return;
         }
         let workspace = tempfile::tempdir().expect("tempdir");
-        let (mut browser, handler_task) =
-            BrowserRuntime::launch_browser(false, &workspace.path().join("browser-profile"))
-                .await
-                .expect("launch Chrome");
-        browser
-            .new_page("data:text/html,<title>untrusted</title>")
-            .await
-            .expect("open a page");
+        let mut fixture = TestBrowser::launch(&workspace.path().join("browser-profile")).await;
+        let browser = &mut fixture.browser;
+        browser_test_operation(
+            "open untrusted page",
+            CDP_SECS,
+            browser.new_page("data:text/html,<title>untrusted</title>"),
+        )
+        .await
+        .expect("open a page");
 
         let pid = browser
             .get_mut_child()
@@ -790,8 +858,7 @@ exec sleep 600
             );
         }
 
-        browser.close().await.expect("close Chrome");
-        handler_task.abort();
+        fixture.close().await;
     }
 
     /// Every live descendant of `root` whose argv says `--type=renderer`.

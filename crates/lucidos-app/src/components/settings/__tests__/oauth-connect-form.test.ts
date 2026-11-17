@@ -2,14 +2,11 @@
  * The Connect / Reconnect decisions on Settings → Accounts.
  *
  * Every case here is one of the dead ends the page shipped with: a Reconnect
- * that could not widen, a Connect that always asked for a bare sign-in however
- * it was reached, and a quick button whose label was sent as if it were a
+ * that could not widen, and a quick button whose label was sent as if it were a
  * provider id.
  */
 import { describe, it, expect } from 'vitest';
 import {
-  SIGN_IN_SCOPES,
-  connectScopes,
   matchProvider,
   missingScopes,
   prefillLabel,
@@ -80,30 +77,6 @@ describe('reconnectScopes', () => {
     expect(reconnectScopes(account({ desired_scopes: null }))).toBe('account_info.read');
     expect(reconnectScopes(account({ desired_scopes: undefined }))).toBe('account_info.read');
     expect(reconnectScopes(account({ desired_scopes: '   ' }))).toBe('account_info.read');
-  });
-});
-
-describe('connectScopes', () => {
-  it('is a bare sign-in when nothing said what the connection is for', () => {
-    expect(connectScopes()).toBe(SIGN_IN_SCOPES);
-    expect(connectScopes(null)).toBe(SIGN_IN_SCOPES);
-    expect(connectScopes('')).toBe(SIGN_IN_SCOPES);
-  });
-
-  it('folds in the purpose a deep link supplied', () => {
-    // One consent screen instead of two. Requesting only the sign-in scopes is
-    // what left a user arriving from Backup facing *Grant access* the moment
-    // they got back, for the same provider they had just authorized.
-    const scopes = connectScopes('files.content.write files.metadata.read');
-    expect(scopes).toContain('openid');
-    expect(scopes).toContain('files.content.write');
-    expect(scopes).toContain('files.metadata.read');
-  });
-
-  it('does not repeat a scope the purpose already names', () => {
-    expect(connectScopes('email files.content.write')).toBe(
-      'openid email profile files.content.write',
-    );
   });
 });
 

@@ -1,5 +1,6 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, minThreadPane, navigateToApp, DRAWER_TOGGLE_LABEL } from './helpers';
+import { assertHealthy, minThreadPane, navigateToApp, watchPreferenceReads, DRAWER_TOGGLE_LABEL } from './helpers';
+import { ensureHomeThread } from './db-helpers';
 import { computeMinContentPaneWidth } from '../src/store/paneMinimums';
 import { THREAD_DRAWER_WIDTH_KEY } from '../src/store/drawerKeys';
 import { DASHBOARD_RAIL_SHOWN_KEY, DASHBOARD_RAIL_WIDTH_KEY } from '../src/store/dashboardRailKeys';
@@ -20,6 +21,8 @@ const WIDTHS = [900, 1100, 1280, 1600];
 const SCALES = ['100%', '125%'];
 
 test.beforeEach(async ({ page }) => {
+  // Earlier specs may truncate Home; its controls determine the header floors.
+  ensureHomeThread();
   await page.addInitScript((ratio) => {
     localStorage.setItem('lucidos-split-ratio', ratio);
   }, STORED_RATIO);
@@ -170,7 +173,10 @@ test('header controls never overlap, the Conversation keeps its floor, and the s
 
 test('a window too narrow for the drawer disables its toggle, and says why', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 800 });
+  const preferencesSettled = watchPreferenceReads(page);
   await navigateToApp(page);
+  // A preference read that lands after the scale below would undo it.
+  await preferencesSettled();
   await page.evaluate(() => document.documentElement.style.setProperty('--user-ui-scale', '125%'));
   await page.waitForTimeout(SETTLE_MS);
   const toggle = drawerToggle(page).first();

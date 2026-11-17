@@ -3,6 +3,7 @@ import { test, expect } from './fixtures';
 import type { Page } from './fixtures';
 import { createIframeAppFixture } from './db-helpers';
 import { apiRequest, gotoWithRetry, shellDeviceId, waitForEventStream, waitForWorkspaceReady } from './helpers';
+import { stampPageRequests } from './harnessStamp';
 
 // A capture names one device, the turn's last used device, and only that
 // page answers it. Every page gets the event, so a page without the app must
@@ -77,6 +78,7 @@ test.describe('an app capture goes to the device it names', () => {
     await expect(frame.locator('#probe')).toBeVisible({ timeout: 15_000 });
 
     const otherContext = await browser.newContext({ baseURL, ignoreHTTPSErrors: true });
+    await stampPageRequests(otherContext);
     try {
       const other = await otherContext.newPage();
       await gotoWithRetry(other, '/');

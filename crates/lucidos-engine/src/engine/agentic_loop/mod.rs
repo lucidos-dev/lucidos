@@ -90,3 +90,21 @@ mod turn_end_decisions_unit_tests;
 #[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]
 mod agentic_loop_db_tests;
+
+#[cfg(test)]
+pub(crate) async fn ask_prepared_batch_for_test(
+    engine: &crate::engine::LucidosEngine,
+    thread: uuid::Uuid,
+    tool: &str,
+    id: &str,
+) -> String {
+    engine
+        .handle_chat_ask_user_question(
+            thread,
+            tool,
+            &serde_json::json!({"questions": [{"question": id}]}),
+            &crate::engine::thread_events::EventMeta::NONE,
+        )
+        .await
+        .result
+}

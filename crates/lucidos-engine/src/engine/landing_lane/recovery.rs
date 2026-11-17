@@ -23,14 +23,28 @@ pub(crate) enum LaneRecord {
         members: Vec<LaneMember>,
     },
     BatchEnded(Uuid),
+    /// `LaneArrivalsHeld`, `age_secs` before the read.
+    ArrivalsHeld {
+        batch_id: Uuid,
+        age_secs: u64,
+    },
+    ArrivalsReleased(Uuid),
 }
 
-/// Fold `records`, oldest first, into the lane they describe.
+/// Fold `records`, oldest first, into the lane they describe. While a hold
+/// is open, every `ChangeQueued` is an arrival it held: nothing else queues
+/// a change then.
 pub(crate) fn fold(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) -> Lane {
     let mut lane = Lane::default();
     for record in records {
         match record {
-            LaneRecord::Queued(member) => lane.wait(member.clone()),
+            LaneRecord::Queued(member) => lane.hold(member.clone()),
+            LaneRecord::ArrivalsHeld { batch_id, .. } => {
+                lane.hold_arrivals(*batch_id);
+            }
+            LaneRecord::ArrivalsReleased(batch_id) => {
+                lane.release_arrivals(*batch_id);
+            }
             LaneRecord::Unqueued(id) => {
                 lane.unqueue(*id);
             }
@@ -66,13 +80,25 @@ pub(crate) struct LaneRestore {
     /// holds them nowhere. A crash between `LaneBatchFailed` and a member's
     /// `ChangeUnqueued` leaves one.
     pub(crate) stranded: Vec<Uuid>,
+    /// How long ago the lane's open arrival hold began, so its cap counts
+    /// from then.
+    pub(crate) hold_age_secs: Option<u64>,
 }
 
 impl LaneRestore {
     pub(crate) fn of(records: &[LaneRecord], is_pending: impl Fn(Uuid) -> bool) -> Self {
         let lane = fold(records, &is_pending);
         let stranded = stranded(records, &lane, &is_pending);
+        let hold_age_secs = lane.arrival_hold().and_then(|hold| {
+            records.iter().rev().find_map(|record| match record {
+                LaneRecord::ArrivalsHeld { batch_id, age_secs } if *batch_id == hold.batch_id => {
+                    Some(*age_secs)
+                }
+                _ => None,
+            })
+        });
         Self {
+            hold_age_secs,
             lane,
             opened_here: records
                 .iter()
@@ -95,7 +121,10 @@ fn stranded(records: &[LaneRecord], lane: &Lane, is_pending: impl Fn(Uuid) -> bo
         let (change_id, is_queued) = match record {
             LaneRecord::Queued(member) => (member.change_id, true),
             LaneRecord::Unqueued(id) | LaneRecord::Applied(id) => (*id, false),
-            LaneRecord::BatchStarted { .. } | LaneRecord::BatchEnded(_) => continue,
+            LaneRecord::BatchStarted { .. }
+            | LaneRecord::BatchEnded(_)
+            | LaneRecord::ArrivalsHeld { .. }
+            | LaneRecord::ArrivalsReleased(_) => continue,
         };
         if queued.insert(change_id, is_queued).is_none() {
             order.push(change_id);
@@ -364,6 +393,68 @@ mod tests {
         assert_eq!(LaneRestore::of(&history, all_pending).stranded, vec![id(1)]);
         let gone = LaneRestore::of(&history, |change| change != id(1));
         assert!(gone.stranded.is_empty(), "no longer pending, so not queued");
+    }
+
+    fn held(age_secs: u64) -> LaneRecord {
+        LaneRecord::ArrivalsHeld {
+            batch_id: BATCH,
+            age_secs,
+        }
+    }
+
+    /// I11: killed during a hold, the restart holds the same arrivals in
+    /// arrival order, apart from what waited before it, and knows its age.
+    #[test]
+    fn a_restart_during_a_hold_rebuilds_its_arrivals_in_order() {
+        let history = [
+            started(vec![member(1)]),
+            LaneRecord::Queued(member(2)),
+            held(120),
+            LaneRecord::Queued(member(3)),
+            LaneRecord::Queued(member(4)),
+        ];
+        let restore = LaneRestore::of(&history, all_pending);
+        let hold = restore.lane.arrival_hold().expect("the hold survives");
+        assert_eq!(hold.batch_id, BATCH);
+        assert_eq!(hold.arrivals(), &[id(3), id(4)]);
+        assert_eq!(restore.lane.waiting(), &[member(2), member(3), member(4)]);
+        assert_eq!(restore.hold_age_secs, Some(120));
+        assert!(restore.stranded.is_empty());
+    }
+
+    /// A released hold, or one whose batch ended before the release was
+    /// written, comes back closed. Its arrivals still wait, in order.
+    #[test]
+    fn a_released_or_ended_hold_is_not_rebuilt() {
+        let base = [
+            started(vec![member(1)]),
+            held(5),
+            LaneRecord::Queued(member(2)),
+        ];
+        for end in [
+            LaneRecord::ArrivalsReleased(BATCH),
+            LaneRecord::BatchEnded(BATCH),
+        ] {
+            let mut history = base.to_vec();
+            history.push(end.clone());
+            let restore = LaneRestore::of(&history, all_pending);
+            assert!(restore.lane.arrival_hold().is_none(), "after {end:?}");
+            assert_eq!(restore.hold_age_secs, None);
+            assert_eq!(restore.lane.waiting(), &[member(2)]);
+        }
+    }
+
+    /// A held arrival discarded or applied elsewhere leaves the hold too.
+    #[test]
+    fn a_held_arrival_no_longer_pending_leaves_the_hold() {
+        let history = [
+            started(vec![member(1)]),
+            held(5),
+            LaneRecord::Queued(member(2)),
+            LaneRecord::Queued(member(3)),
+        ];
+        let lane = fold(&history, |change| change != id(2));
+        assert_eq!(lane.arrival_hold().unwrap().arrivals(), &[id(3)]);
     }
 
     /// A failed batch's members come back neither queued nor resolving.

@@ -17,7 +17,7 @@ export type SendSettlement =
   /** A message that creates its thread. Refused starts a fresh draft. */
   | { kind: 'raw-new' };
 
-/** A send whose POST never got an answer, so the engine may never have seen it.
+/** A send that got no answer or was refused as overtaken by a later input.
  *  The thread shows it as an *unsent message* with a Retry button
  *  (`actions/chat.ts`). Its stored copy (`unsentMessageRecords.ts`) brings it
  *  back after a reload. */
@@ -26,12 +26,13 @@ export interface UnsentMessage {
   /** The exact request the send built. Retry re-posts it, event id included,
    *  and the engine acks a repeat without running it twice. */
   body: ChatRequestBody;
-  /** Retries that also got no answer. */
+  /** Retries that also failed to send. */
   failedRetries: number;
   settlement: SendSettlement;
   /** What the last send's quiet retries ended on. Absent for one restored
    *  after a reload, which this page never tried. */
   failure?: SendFailure;
+  refusal?: { reason: 'overtaken' | 'compose_snapshot_stale' | 'compose_fence_required'; message: string };
   /** The question card the text was typed to answer, by tool-use id. */
   answersQuestion?: string;
 }

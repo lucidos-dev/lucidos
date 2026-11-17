@@ -43,7 +43,7 @@ import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-updat
 import { usePanelRefresh } from '../../hooks/usePanelRefresh';
 import { formatBuildId } from '../../utils/buildId';
 import { clientVersionLabel } from '../../utils/clientVersion';
-import { isNewerVersion } from '../../utils/version';
+import { isNewerBuildId } from '../../utils/version';
 import { copyToClipboard } from '../../utils/clipboard';
 import { formatShortTime } from '../../utils/formatTime';
 import { connectionNotice } from '../../utils/connectionNotice';
@@ -60,7 +60,7 @@ import { DebuggingSection } from './DebuggingSection';
 import { CommunicationSurfacesPage } from './CommunicationSurfacesPage';
 import { WhatsNewPage } from './WhatsNewPage';
 import { ReleaseNoticesPage } from './ReleaseNoticesPage';
-import { UpdateAddressBanner, UpdateAddressRow } from './UpdateAddressSetting';
+import { UpdateChannelNotices, UpdateChannelSetting } from './UpdateChannelSetting';
 import { restartControlHome } from './restartControl';
 import { Explainer } from '../shared/Explainer';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -106,7 +106,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
   // routes that set it are dead there. The outdated-release check compares
   // against `latest_engine_version`, which the engine derives from the repo root
   // and so reports as the string `'unknown'` on a packaged install, and
-  // `isNewerVersion` coerces that to NaN and returns false. And an applied
+  // `isNewerBuildId` rejects that sentinel and returns false. And an applied
   // restart-requiring change needs a Lucidos-source coding-agent thread, which
   // `packaged` (engine-side `!has_lucidos_source()`, resolved from the running
   // binary's own path) is precisely the absence of. If packaged ever starts
@@ -135,7 +135,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
   }, []);
 
 
-  const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
+  const hasEngineUpdate = engineVer && latestEngineVer && isNewerBuildId(latestEngineVer, engineVer);
   // An older Lucidos is serving this workspace than the app showing this page.
   // Two installs contend for the port, and the wrong one won. Derived from the
   // engine's own `/health`, so it holds against a gateway too old to say
@@ -328,7 +328,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
 
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:maintenance">Maintenance</div>
-          <UpdateAddressBanner check={check} />
+          <UpdateChannelNotices check={check} />
           {restart && (
             <div class="system-notice">
               {hasEngineUpdate
@@ -502,11 +502,7 @@ export function SystemPage({ panel }: { panel: SystemPanel }) {
               </label>
             </div>
           )}
-          {/* Every gateway on the machine shares the setting, so a dev gateway
-              offers it too. An older gateway sends no field, and gets no row. */}
-          {check && check.update_address !== undefined && (
-            <UpdateAddressRow key={check.update_address ?? ''} stored={check.update_address ?? ''} />
-          )}
+          {check && <UpdateChannelSetting check={check} />}
         </div>
       </>
     );

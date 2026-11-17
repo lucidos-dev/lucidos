@@ -1,5 +1,5 @@
 :root {
-    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace;
+    --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Cascadia Mono', Consolas, 'Ubuntu Mono', 'DejaVu Sans Mono', 'Liberation Mono', 'Noto Sans Mono', monospace;
     --font-ui: var(--font-mono);
     /* TEMPORARY MEASURE — model-tolerance (removable — see
        docs/temporary-measures.md § Model-tolerance measures, governed by

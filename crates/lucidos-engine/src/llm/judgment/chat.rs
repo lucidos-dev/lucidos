@@ -144,7 +144,7 @@ pub(crate) fn read_answers(response: &LlmResponse, questions: &[(String, Questio
             Some(answer) => {
                 answers.insert(id.clone(), answer);
             }
-            None => log!(
+            None => log_legacy!(
                 "[Judgment] The chat model gave no readable answer to {}",
                 id
             ),

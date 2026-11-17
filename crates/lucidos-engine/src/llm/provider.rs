@@ -352,6 +352,14 @@ impl<'a> ModelSelection<'a> {
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
+    /// Resolve the backend before a metered background call checks its hold.
+    fn resolved_provider_kind(
+        &self,
+        _selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
     /// One billable call. `call` comes from the model call service, which
     /// records it (`engine::model_call`). A wrapper forwards the token it got.
     async fn chat(

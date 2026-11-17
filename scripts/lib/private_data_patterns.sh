@@ -277,7 +277,12 @@ _private_data_git_grep() {
   # benign git warning into the HIT LIST, where the release guard reads every
   # line as private data found. It's only wanted for the failure diagnostic.
   local out rc errfile
-  errfile="$(mktemp -t private-data-grep)"
+  # A template both BSD and GNU mktemp take. Without the file, the redirect
+  # below fails, git grep never runs, and its exit 1 would read as clean.
+  errfile="$(mktemp "${TMPDIR:-/tmp}/private-data-grep.XXXXXX")" || {
+    echo "private_data_grep_tree: could not create a temp file, so the scan cannot run" >&2
+    return 1
+  }
   # The capture MUST be the condition of an `if`, not a bare assignment followed
   # by `rc=$?`. rc=1 ("no matches") is the CLEAN case, but a bare assignment
   # makes that a failing command — and release.sh runs under `set -Eeuo pipefail`

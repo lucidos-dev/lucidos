@@ -257,7 +257,7 @@ impl Credential {
         match self.secret(pool).await {
             Ok(secret) => Some(secret),
             Err(reason) => {
-                log!("{module} {reason}");
+                log_legacy!("{module} {reason}");
                 None
             }
         }
@@ -1067,7 +1067,7 @@ impl CredentialStore {
                     _ => continue,
                 },
                 Err(reason) => {
-                    log!("[Credentials] not scoping '{service_name}': {reason}");
+                    log_legacy!("[Credentials] not scoping '{service_name}': {reason}");
                     continue;
                 }
             };
@@ -1743,7 +1743,7 @@ pub async fn credential_env_vars_for<R: SecretResolver + ?Sized>(
         Err(e) => {
             // The script would see both halves missing with no signal, so
             // the log is the user's only clue.
-            log!(
+            log_legacy!(
                 "[Credentials] {} has invalid password JSON, skipping env injection: {}",
                 cred.service_name,
                 e

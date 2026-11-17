@@ -376,6 +376,11 @@ pub enum ContextPurpose {
     /// `model_expected_wake_decision`, which follows no other key. The user can
     /// point it at a System One model with `judgment_expected_wake_decision`.
     ExpectedWakeDecision,
+    /// The judgment that reads the owner's typed or spoken words against an
+    /// open *permission request* (ADR 0664). It owns `model_permission_answer`,
+    /// which follows no other key. The user can point it at a System One model
+    /// with `judgment_permission_answer`.
+    PermissionAnswer,
     /// One *copy beat* of the cache keep-alive: a Claude Code session copy
     /// asked for one word while its session is parked on a card. It runs the
     /// session's own model. Its `duration_ms` dates the request that refreshed
@@ -439,6 +444,7 @@ impl ContextPurpose {
             Self::ReadDecision => "Read Decision Request",
             Self::WakeDecision => "Wake Decision Request",
             Self::ExpectedWakeDecision => "Expected Wake Decision Request",
+            Self::PermissionAnswer => "Permission Answer Request",
             Self::CacheKeepAlive => "Cache Keep-Alive Request",
             Self::PrefillProbe => "Prefill Probe Request",
         }
@@ -485,11 +491,24 @@ pub enum InputAnswered {
 }
 
 impl AgentUserInput {
+    /// The Continue a live run reads as a follow-up, anchored to its
+    /// `ContinuationRequested`.
+    pub fn continuation(text: String, continuation_requested: uuid::Uuid) -> Self {
+        Self {
+            text,
+            images: None,
+            origin_event_id: Some(continuation_requested),
+            kind: AgentInputKind::Continuation,
+            completion: None,
+        }
+    }
+
     /// The event of the user message behind this input, if a user sent one.
     /// A child wake or an engine-made prompt (auto-harden, apply) has none.
     pub fn user_origin(&self) -> Option<uuid::Uuid> {
         match self.kind {
             AgentInputKind::User
+            | AgentInputKind::Continuation
             | AgentInputKind::Redelivered {
                 input: RedeliveredInput::Message { .. },
                 ..
@@ -509,6 +528,11 @@ impl AgentUserInput {
 pub enum AgentInputKind {
     /// User-typed follow-up. Emit `CodingAgentPromptSent` as the audit trail.
     User,
+    /// A Continue the spawn dispatcher routed into a live run (ADR 0272),
+    /// anchored to its `ContinuationRequested`. Forwards and renders like
+    /// `User`. If unread when the run exits, a drain preserves its instructions
+    /// and anchor as engine re-entry.
+    Continuation,
     /// Engine-synthesized re-entry: a completed child thread, a resolved *event
     /// wait*, a continuation rerun's note. Suppress `CodingAgentPromptSent` so
     /// the response groups under the event that already started the exchange
@@ -516,8 +540,8 @@ pub enum AgentInputKind {
     /// `PreEmittedOrigin::is_engine_reentry` origin lands here, which is why the
     /// name says engine rather than child.
     ReentryFromEngine,
-    /// The *ceiling re-entry* (ADR 0629): a `ReentryFromEngine` whose turn is
-    /// the engine's, so its end forces no read or wake decision.
+    /// The *ceiling re-entry* (ADR 0629). A read after Result opens an
+    /// engine turn; a mid-turn read preserves the user's read and wake decisions.
     CeilingReentry,
     /// An input a session dropped before its agent read it, sent again by the
     /// next session (`agent_session::stranded_follow_ups`). A message is like
@@ -537,6 +561,7 @@ impl AgentInputKind {
         matches!(
             self,
             Self::User
+                | Self::Continuation
                 | Self::Redelivered {
                     input: RedeliveredInput::Message { .. },
                     ..
@@ -717,6 +742,8 @@ impl QuietPick {
 /// follow-up with 409), and the session records its backend in
 /// [`AgentSession::coding_agent`].
 pub struct AgentSession {
+    /// Captured at spawn; preference changes cannot change an existing process.
+    pub execution_sandbox: Option<crate::runtime::agent_sandbox::Sandbox>,
     pub msg_tx: tokio::sync::mpsc::UnboundedSender<AgentUserInput>,
     /// The turn reached its boundary. Only the run loop writes it, because the
     /// loop keeps a local copy in step (`only_the_run_loop_writes_the_session_phase`).
@@ -909,8 +936,8 @@ pub struct AgentSession {
     /// takes it at the turn's `Result`: the turn ends on the pick's *quiet
     /// reply* when it has one, and an empty reply counts as finished.
     pub quiet_answer_pending: Option<QuietPick>,
-    /// The turn in flight is the *ceiling re-entry*. A follow-up never
-    /// interrupts it: input waits for the successor session.
+    /// The session owes or has received its *ceiling re-entry*. A follow-up
+    /// never interrupts it: input waits for the successor session.
     pub in_ceiling_reentry: bool,
     /// Paired ToolCalled / ToolResult counter, mirrored from the local
     /// counter inside `run_session`. Read by the external watchdog
@@ -924,14 +951,11 @@ pub struct AgentSession {
     /// The question tool uses the run loop has flushed, which a question
     /// card's gate waits on before its second look.
     pub(crate) question_flushes: std::sync::Arc<crate::engine::question_card_gate::QuestionFlushes>,
-    /// Which coding-agent backend drives this session. Locked at session
-    /// creation. Read by the follow-up fast-path to decide how a mid-turn
-    /// follow-up is delivered: Claude Code steers the live turn via stdin, so
-    /// the message is forwarded as-is; Codex's app-server/exec protocols only
-    /// accept input at a turn boundary, so a mid-turn follow-up first
-    /// interrupts the running turn (see the Codex interrupt-and-redirect path
-    /// in `chat::process`).
+    /// Backend driving this session, fixed at creation. Follow-up routing also
+    /// uses the process capability negotiated at Init.
     pub coding_agent: crate::runtime::CodingAgent,
+    /// Negotiated with this process; false until its Init proves support.
+    pub can_steer: bool,
     /// Clone of `run_session`'s `agent_cancel` `CancellationToken` — the lever
     /// that tears the coding-agent subprocess down. `run_session` and its
     /// in-loop watchdog / stale-resume paths already hold the original and
@@ -1036,6 +1060,7 @@ impl AgentSession {
         use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64};
         use std::sync::Arc;
         Self {
+            execution_sandbox: None,
             msg_tx,
             is_waiting: true,
             pending_stop: None,
@@ -1073,6 +1098,7 @@ impl AgentSession {
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             question_flushes: Default::default(),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            can_steer: true,
             agent_cancel: tokio_util::sync::CancellationToken::new(),
             keep_alive: false,
         }

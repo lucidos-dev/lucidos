@@ -24,6 +24,7 @@ export function oauthClientSubmitError(
   fields: CredentialFields,
   editing: boolean,
 ): string | null {
+  if (secretRepeatsClientId(fields)) return REPEATED_SECRET_MESSAGE;
   const webRefusal = webRedirectUrisError(fields);
   if (webRefusal) return webRefusal;
 
@@ -51,6 +52,17 @@ export function oauthClientSubmitError(
     return `${missing[0]} is required: an OAuth flow cannot run without both endpoints.`;
   }
   return null;
+}
+
+const REPEATED_SECRET_MESSAGE =
+  'The client secret is identical to the client ID, so the provider would refuse it. ' +
+  "Paste the client secret from the provider's console, or clear the field to connect as a public client with PKCE.";
+
+/** A client ID is public, so a secret equal to it was pasted into the wrong
+ *  field. The engine refuses the same case in `client_secret_repeats_client_id`. */
+export function secretRepeatsClientId(fields: CredentialFields): boolean {
+  const id = fields.clientId.trim();
+  return id !== '' && id === fields.clientSecret.trim();
 }
 
 /** Why the web redirect URIs cannot be saved, or null.
@@ -120,6 +132,8 @@ export function describeMissingFields(
   formValues: Record<string, string | undefined> = {},
 ): string | null {
   if (!missing?.length) return null;
+  // The engine's `REPEATED_SECRET_FIELD`: the secret is present and wrong.
+  if (missing.includes('client_secret')) return REPEATED_SECRET_MESSAGE;
   const label = (m: string) => MISSING_FIELD_LABELS[m] ?? m;
   const stillEmpty = missing.filter((m) => !formValues[m]?.trim());
   if (stillEmpty.length === 0) {

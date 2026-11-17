@@ -6,6 +6,7 @@
  *  listed ids. The result toast carries Undo, which unarchives that batch.
  */
 
+import { signal } from '@preact/signals';
 import {
   archiveAll,
   archiveAllPreflight,
@@ -32,7 +33,7 @@ export function idBatches(ids: string[]): string[][] {
 }
 
 /** A press still running, so a second press cannot start a parallel one. */
-let pressInFlight = false;
+export const archiveAllPhase = signal<'idle' | 'checking' | 'confirming' | 'archiving'>('idle');
 
 /** Each kept reason as a count phrase, singular then plural, in the order the
  *  summary names them. Where a reason is also a thread menu blocker, the
@@ -121,12 +122,12 @@ export function archiveAllResultMessage(archived: number, changed: Record<string
 }
 
 export async function handleArchiveAll(): Promise<void> {
-  if (pressInFlight) return;
-  pressInFlight = true;
+  if (archiveAllPhase.value !== 'idle') return;
+  archiveAllPhase.value = 'checking';
   try {
     await runArchiveAll();
   } finally {
-    pressInFlight = false;
+    archiveAllPhase.value = 'idle';
   }
 }
 
@@ -143,12 +144,14 @@ async function runArchiveAll(): Promise<void> {
     showToast(nothingToArchiveMessage(preflight), 'info');
     return;
   }
+  archiveAllPhase.value = 'confirming';
   const ok = await showConfirm(confirmation.message, 'Archive', {
     title: confirmation.title,
     cancelLabel: 'Cancel',
     variant: 'default',
   });
   if (!ok) return;
+  archiveAllPhase.value = 'archiving';
 
   const batch: string[] = [];
   const kept: ArchiveAllKept[] = [];

@@ -475,6 +475,7 @@ fn a_default_shaped_row_gives_back_its_event() {
         commit: "abc123".into(),
         source: Some("chat".into()),
         writer_thread_id: Some(uuid::Uuid::new_v4()),
+        writer: None, // Legacy event fixture.
     };
     let read = SystemEvent::from_stored(written.to_payload()).expect("round trip");
     assert_eq!(

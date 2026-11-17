@@ -42,7 +42,7 @@ pub(crate) async fn seed_not_served(pool: &PgPool, ledger: &NotServedLedger) {
                 ledger.seed(ProviderKind::parse(&provider), &model, age);
             }
         }
-        Err(e) => crate::log!("[AuxPurpose] could not read not-served models: {}", e),
+        Err(e) => crate::log_legacy!("[AuxPurpose] could not read not-served models: {}", e),
     }
 }
 

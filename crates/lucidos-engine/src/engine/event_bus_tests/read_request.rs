@@ -121,6 +121,7 @@ async fn emit_answer(bus: &EventBus, thread_id: Uuid, actor: Option<MessageOrigi
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: Uuid::new_v4().to_string(),
             answer: AnswerKind::Selected {
                 option_id: "opt-0".into(),

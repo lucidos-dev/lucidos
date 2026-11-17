@@ -21,6 +21,51 @@ scan db-defaults "(^|[^[:alnum:]_])(psql|pg_dump)([^[:alnum:]_.-]|\$)|psycopg2?\
 
 ## Checks
 
+- **Update scripts resetting saved addresses.** Check channel commands against `system-knowhow/lucidos-cli.md` § `lucidos update-channel`.
+  Flag scripts deleting custom slots merely to switch to Stable as **broken**; `set stable` preserves them.
+
+- **Retrying a spawn that awaits permission.** The CLI explains direct fallback on stderr, including a generic note when gateway routing cannot carry the workspace name.
+  Follow `system-knowhow/lucidos-cli.md` § `lucidos spawn-thread`; waiting for Allow is not a failed delivery.
+
+- **Raw host reads substituted for transfers.** Flag scripts bypassing the owner card or reading protected host captures as **broken**.
+  Use `system-knowhow/lucidos-cli.md` § `lucidos diagnostic-log prepare-host-transfer`; inherited confinement remains enforced.
+
+- **Scripts forcing input after every ceiling handoff.** Check successor handling against `system-knowhow/lucidos-cli.md` § `lucidos successor start`.
+  Read `starts`: an interrupted narrative uses `after-this-turn`; a natural turn end or engine brief uses `on-next-input`.
+  Flag scripts sending Continue without checking the recorded start as **stale**.
+
+- **Pause scripts limited to Home descendants.** Check targets against `system-knowhow/lucidos-cli.md` § `lucidos threads pause-automation`.
+  Home can pause any coding-agent thread in its workspace; other agents retain subtree reach.
+
+- **Plan approval inferred from marker commands alone.** Calling-thread planning commands record lifecycle facts atomically with marker transitions.
+  Do not reconstruct approval from plan prose or replay old events to recreate edit permission.
+
+- **Device sessions in script output.** Check rig scripts against `system-knowhow/lucidos-cli.md` § `lucidos workspaces device-session`.
+  Flag printing the session or passing it through argv as **broken**; use the private output file and browser-context headers.
+  Lasting consent must retain the exact device, TTL and gateway-recorded creator scope.
+  Apply `system-knowhow/workspace-audit/cross-cutting`'s direct-port device-authority check to session minting and retries.
+
+- **Parsing thread-scoped event output.** Parse CLI stdout as JSON and treat its stderr liveness header as current metadata.
+  See `system-knowhow/lucidos-cli.md` § `lucidos events query`; HTTP event response shapes remain unchanged.
+
+- **Scripts overriding repair build priority.** Repair descendants inherit `LUCIDOS_BUILD_SLOT_CLASS` from durable repair provenance.
+  Check build wrappers against `system-knowhow/lucidos-cli.md` § `lucidos build-slot`.
+  Flag scripts upgrading automatic repairs to priority work as **broken**.
+
+- **Draft scripts reconstructing snapshots from separate reads.** A single-draft read returns text, ordered image hashes, settings, revision and epoch together.
+  Check consumers against `system-knowhow/lucidos-cli.md` § `lucidos threads drafts`; lists omit the snapshot.
+  Flag scripts combining a list preview with separately fetched settings as **stale**; those fields need not describe the same saved revision.
+  Recommend the documented single-draft read. Do not submit, clear or alter drafts during this audit.
+
+- **Draft creation retried without a key.** Check scripts against `system-knowhow/lucidos-cli.md` § `lucidos threads create-draft`.
+  Flag a script that retries a call without passing the same `--retry-key` as **broken**: each retry hands the owner another draft.
+
+- **Draft submission retried with a fresh key.** Check scripts against `system-knowhow/lucidos-cli.md` § `lucidos threads submit-draft`.
+  Flag a script that retries `threads submit-draft` with a new `--retry-key` as **broken**: a fresh key is a new send, not a receipt read.
+
+Check script recipes that expect automatic memory recall of unattended trigger output.
+Those writes remain readable files; see `docs/system-events.md` § Artifact provenance and provider holds.
+
 - **Harness cleanup.** Check cleanup recipes against the scoped owner-token contract in `docs/dev-runtime.md`. An eval prefix never authorizes filesystem or database deletion.
 
 - Snapshot automation follows `system-knowhow/lucidos-cli.md` § `lucidos snapshot`.
@@ -42,6 +87,10 @@ Per `system-knowhow/best-practices.md`:
 
 Per `system-knowhow/best-practices.md` § "The workspace database: `LUCIDOS_DATABASE_URL`":
 
+- **Writes outside the agent role's table policy.** Check each SQL write against the referenced origin-aware allow-list, even inside `BEGIN READ WRITE`.
+  Flag a refused write as **broken** and recommend the relevant CLI or API operation.
+  Never recommend broader grants or an origin change to bypass the refusal.
+
 - **Database access that leans on the engine's old `PG*` defaults.** The engine used to set `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGPORT` and `PGDATABASE` in every subprocess, and its own `DATABASE_URL` leaked into many. It sets neither now (ADR 0481). So a `psql`, `pg_dump`, `psycopg.connect()` or `pg.Client()` with no connection argument now reaches no database. Code reading `PG*` or `DATABASE_URL` for the workspace database finds nothing. Judge each `db-defaults` hit:
   - No connection argument, or a `PG*` / `DATABASE_URL` read meant for the workspace database: severity **broken**.
   - A write through `$LUCIDOS_DATABASE_URL` with no `BEGIN READ WRITE`: severity **broken**, since the handle is read-only by default.
@@ -58,8 +107,8 @@ route.
 
 ### Pointing database access at `LUCIDOS_DATABASE_URL`
 
-**Route: inline**, except the last row. Each of the others passes the same
-variable to an existing call. Wrapping a write goes to a coding agent, since
+**Route: inline**, except the last two rows. Each of the others passes the same
+variable to an existing call. Changing a write goes to a coding agent, since
 the user should read each write before Apply.
 
 | Old | New |
@@ -69,10 +118,16 @@ the user should read each write before Apply.
 | `psycopg.connect()` or `psycopg2.connect("")` | `psycopg.connect(os.environ["LUCIDOS_DATABASE_URL"])` |
 | `new pg.Client()` | `new pg.Client({ connectionString: process.env.LUCIDOS_DATABASE_URL })` |
 | `$DATABASE_URL`, `os.environ["DATABASE_URL"]` or a `PG*` read, meant for the workspace | the same read of `LUCIDOS_DATABASE_URL` |
-| A write: `INSERT`, `UPDATE`, `DELETE` or DDL | the same statements inside `BEGIN READ WRITE; … COMMIT;` |
+| A write permitted by the agent role's table policy | the same statements inside `BEGIN READ WRITE; … COMMIT;` |
+| A write outside the agent role's table policy | the relevant CLI or API operation |
 
 Three rules the rewrite has to follow:
 
 - **Name the variable, never its value.** A pasted URL puts the password in the script and in every tool call that runs it.
 - **List every write you wrapped** in the report's `## Remediation` section. The read-only default exists to catch an accident, so a human confirms each write was meant.
 - **Leave a project's own database alone.** A connection the script configures for another database is not a finding.
+
+## Diagnostic evidence
+
+When this audit needs runtime evidence, follow [Agent Sandbox](../agent-sandbox.md) for bounded diagnostic access.
+A maintainer bundle omits legacy log text; its absence does not establish an audit finding.

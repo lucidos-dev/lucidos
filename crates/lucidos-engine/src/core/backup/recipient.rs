@@ -183,8 +183,8 @@ pub async fn sealing_key(pool: &PgPool, workspace: &Path) -> Result<Option<Seali
 /// and keeping it for old archives was always the user's job.
 pub fn forget_legacy_key(workspace: &Path) {
     match BackupKeyStore::for_engine(workspace).and_then(|keys| keys.delete()) {
-        Ok(()) => log!("[Backup] Switched to the backup recipient; forgot the legacy key"),
-        Err(e) => log!(
+        Ok(()) => log_legacy!("[Backup] Switched to the backup recipient; forgot the legacy key"),
+        Err(e) => log_legacy!(
             "[Backup] Switched to the backup recipient, but cannot delete the legacy key: {}",
             e
         ),

@@ -46,7 +46,15 @@ vi.mock('../../api/client', () => ({
   postAppCapture: vi.fn().mockResolvedValue(undefined),
 }));
 
-const { popOutApp } = await import('./apps');
+// Getters, because the real values are fixed at module load from `<base href>`.
+const route = vi.hoisted(() => ({ basePath: '/dev', gateway: null as string | null }));
+vi.mock('../../utils/basePath', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/basePath')>()),
+  get BASE_PATH() { return route.basePath; },
+  get REMOTE_GATEWAY() { return route.gateway; },
+}));
+
+const { appPopoutHref, popOutApp } = await import('./apps');
 
 const habitTracker: App = {
   id: 'habit-tracker',
@@ -72,6 +80,8 @@ describe('popOutApp hands the open app to the OS opener', () => {
     openExternal.mockClear();
     openExternal.mockResolvedValue(undefined);
     vi.stubGlobal('location', { href: PAGE_URL });
+    route.basePath = '/dev';
+    route.gateway = null;
   });
 
   afterEach(() => {
@@ -133,5 +143,46 @@ describe('popOutApp hands the open app to the OS opener', () => {
     expect(toasts.value[0].type).toBe('error');
     expect(toasts.value[0].message).toContain('http://localhost:4711/dev/app/habit-tracker/');
     expect(toasts.value[0].message).toContain('no handler for scheme');
+  });
+
+  it('a remote workspace opens its own shell with an #app= landing, never the bare app', () => {
+    route.basePath = '/dev@office';
+    route.gateway = 'office';
+    vi.stubGlobal('location', { href: 'http://localhost:4711/dev@office/' });
+
+    popOutApp();
+
+    // The relayed app document alone runs under an opaque sandbox (ADR 0723).
+    expect(openExternal).toHaveBeenCalledWith('http://localhost:4711/dev@office/#app=habit-tracker');
+  });
+});
+
+describe('appPopoutHref, which the browser anchor reads', () => {
+  beforeEach(() => {
+    panelOverlay.value = { type: 'app-ui', app: habitTracker };
+    wipPreviewThreadId.value = null;
+    route.basePath = '/dev';
+    route.gateway = null;
+  });
+
+  it('local: the bare app URL', () => {
+    expect(appPopoutHref()).toBe('/dev/app/habit-tracker/');
+  });
+
+  it('remote: the shell landing, carrying the app fragment', () => {
+    route.basePath = '/dev@office';
+    route.gateway = 'office';
+    panelOverlay.value = { type: 'app-ui', app: habitTracker, fragment: 'pr-1645' };
+
+    const href = appPopoutHref();
+
+    expect(href).toBe('/dev@office/#app=habit-tracker&fragment=pr-1645');
+    expect(href).not.toContain('/app/');
+  });
+
+  it('null when no app is open', () => {
+    panelOverlay.value = null;
+    route.gateway = 'office';
+    expect(appPopoutHref()).toBeNull();
   });
 });

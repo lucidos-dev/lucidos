@@ -218,6 +218,7 @@ fn artifact_created_serializes_and_persists() {
         commit: "abc1234".to_string(),
         source: Some("run_python".to_string()),
         writer_thread_id: Some(uuid::Uuid::nil()),
+        writer: None, // Legacy event fixture.
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactCreated");
@@ -240,6 +241,7 @@ fn artifact_updated_skips_none_source() {
         commit: "def5678".to_string(),
         source: None,
         writer_thread_id: None,
+        writer: None, // Legacy event fixture.
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "ArtifactUpdated");
@@ -512,6 +514,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
             reasoning_effort: None,
         },
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: "c-1".into(),
             description: Some("Fix bug".into()),
             files: vec!["src/main.rs".into()],
@@ -536,6 +539,7 @@ fn coding_agent_idled_is_last_event_after_change_proposed() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     ];
 

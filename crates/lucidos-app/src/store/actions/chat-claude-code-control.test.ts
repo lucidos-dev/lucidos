@@ -30,6 +30,8 @@ vi.mock('../../api/client', () => ({
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
 
+vi.mock('../composeSync', () => ({ knownComposeEpoch: vi.fn(), parseComposeReport: vi.fn(), acceptComposeReport: vi.fn() }));
+
 const { sendCodingAgentControl } = await import('./chat-claude-code');
 
 const effort = { subtype: 'set_reasoning_effort', effort: 'low' };

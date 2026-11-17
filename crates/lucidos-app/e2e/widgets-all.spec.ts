@@ -1,5 +1,6 @@
 import { test, expect, Page } from './fixtures';
 import { randomUUID } from 'crypto';
+import { readFileSync } from 'node:fs';
 import { apiRequest, assertHealthy, navigateToApp, isMobileViewport, hideDashboardRail, openWidgetCardMenu, rightClickInsideFrame } from './helpers';
 import { psql } from './db-helpers';
 
@@ -44,7 +45,7 @@ async function writeWidget(page: Page, appId: string, threadId: string, html: st
   }));
 }
 
-function seedThreadShowingWidget(threadId: string, appId: string, { legacyPin = false }: { legacyPin?: boolean } = {}): void {
+function seedThreadShowingWidget(threadId: string, appId: string, { legacyPin = false, params = {} }: { legacyPin?: boolean; params?: Record<string, string> } = {}): void {
   const now = new Date().toISOString();
   psql([
     `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count, coding_agent_change_state, coding_agent_is_external_repo) `
@@ -52,7 +53,7 @@ function seedThreadShowingWidget(threadId: string, appId: string, { legacyPin = 
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
       + `VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"compare the fares","mode":"human","channel":"chat"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
-      + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${appId}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      + `VALUES ('${randomUUID()}', 'WidgetShown', '{"app_id":"${appId}","params":${JSON.stringify(params)}}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
     // Nothing writes a pin any more, but old rows remain.
     ...(legacyPin ? [
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) `
@@ -88,6 +89,44 @@ test.describe('Widgets', () => {
     for (const path of written) {
       await apiRequest(page).delete(`/api/v1/data/${path}`);
     }
+  });
+
+  test('a refused video poster stays hidden while play remains available', async ({ page }) => {
+    seedThreadShowingWidget(threadId, 'lucidos-video-player', { params: { clip: `artifacts/missing-${randomUUID()}.mp4` } });
+    await openThread(page, threadId);
+    const frame = card(page).frameLocator('iframe');
+    await expect(frame.locator('#stage')).toHaveAttribute('title', 'Preview unavailable. Tap to play.');
+    expect(await frame.locator('#poster').evaluate(image => getComputedStyle(image).display)).toBe('none');
+    await expect(frame.locator('#play')).toBeVisible();
+    await expect(frame.locator('video')).not.toHaveAttribute('src');
+  });
+
+  test('a built-in video draws a real poster with no idle media and loads on play', async ({ page }) => {
+    const path = `artifacts/e2e-poster-${randomUUID()}.mp4`;
+    written.push(path);
+    const response = await apiRequest(page).put(`/api/v1/data/${path}`, {
+      headers: { 'Content-Type': 'video/mp4' },
+      data: readFileSync(new URL('./__fixtures__/poster-clip.mp4', import.meta.url)),
+    });
+    expect(response.ok()).toBeTruthy();
+    seedThreadShowingWidget(threadId, 'lucidos-video-player', { params: { clip: path } });
+    await openThread(page, threadId);
+    const frame = card(page).frameLocator('iframe');
+    const poster = frame.locator('#poster');
+    const video = frame.locator('video');
+    await expect(poster).toHaveAttribute('src', /^data:image\/jpeg;base64,/, { timeout: 30_000 });
+    await expect.poll(() => poster.evaluate((image: HTMLImageElement) => image.naturalWidth)).toBeGreaterThan(0);
+    await expect(video).not.toHaveAttribute('src');
+    expect(await video.evaluate((media: HTMLVideoElement) => media.readyState)).toBe(0);
+    await expect(frame.locator('#time')).toHaveText('0:00 / 0:02');
+    await frame.locator('#play').click();
+    await expect(video).toHaveAttribute('src', /#t=0.001$/);
+    await expect.poll(() => video.evaluate((media: HTMLVideoElement) => media.currentTime)).toBeGreaterThan(0);
+    await frame.locator('#play').click();
+    await page.reload();
+    await expect(card(page).frameLocator('iframe').locator('#poster'))
+      .toHaveAttribute('src', /^data:image\/jpeg;base64,/, { timeout: 30_000 });
+    await expect(card(page).frameLocator('iframe').locator('video')).not.toHaveAttribute('src');
   });
 
   /** I8 and I9: a legacy pin still loads, draws no chip, and its card stays. */

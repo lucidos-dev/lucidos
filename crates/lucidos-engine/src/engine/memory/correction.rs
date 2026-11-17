@@ -129,10 +129,10 @@ pub(crate) async fn replay_corrections(
     if corrections.is_empty() {
         return;
     }
-    log!(@Memory, "Phase 3: Replaying {} memory corrections", corrections.len());
+    log_legacy!(@Memory, "Phase 3: Replaying {} memory corrections", corrections.len());
     for event in corrections {
         let Some(recorded) = RecordedCorrection::from_row(event) else {
-            log!(@Memory, "Correction replay: unreadable payload on event {}", event.id);
+            log_legacy!(@Memory, "Correction replay: unreadable payload on event {}", event.id);
             continue;
         };
         let window = ReplayWindow {
@@ -150,7 +150,7 @@ pub(crate) async fn replay_corrections(
             if let Err(e) =
                 index_correction(index, embedder, event.id, correction_text, event.created).await
             {
-                log!(@Memory, "Failed to re-add correction: {}", e);
+                log_legacy!(@Memory, "Failed to re-add correction: {}", e);
             }
         }
     }
@@ -171,7 +171,7 @@ async fn re_extracted_matches(
         let removed_embedding = match embedder.embed(&item.summary).await {
             Ok(e) => e,
             Err(e) => {
-                log!(@Memory, "Correction replay: embedding failed: {}", e);
+                log_legacy!(@Memory, "Correction replay: embedding failed: {}", e);
                 continue;
             }
         };
@@ -204,7 +204,7 @@ async fn folded_matches(
     {
         Ok(similar) => similar,
         Err(e) => {
-            log!(@Memory, "Correction replay: similarity lookup failed: {}", e);
+            log_legacy!(@Memory, "Correction replay: similarity lookup failed: {}", e);
             return Vec::new();
         }
     };
@@ -236,7 +236,7 @@ async fn same_source_match(
     let candidates: Vec<MemoryEntry> = match candidates {
         Ok(c) => c.into_iter().filter(|entry| window.admits(entry)).collect(),
         Err(e) => {
-            log!(@Memory, "Correction replay: source lookup failed: {}", e);
+            log_legacy!(@Memory, "Correction replay: source lookup failed: {}", e);
             return None;
         }
     };
@@ -247,7 +247,7 @@ async fn same_source_match(
     let embeddings = match embedder.embed_batch(&texts).await {
         Ok(e) => e,
         Err(e) => {
-            log!(@Memory, "Correction replay: embedding failed: {}", e);
+            log_legacy!(@Memory, "Correction replay: embedding failed: {}", e);
             return None;
         }
     };
@@ -266,7 +266,7 @@ async fn entries_by_id(index: &PgVectorIndex, ids: impl Iterator<Item = Uuid>) -
         match index.get_by_id(id).await {
             Ok(Some(entry)) => entries.push(entry),
             Ok(None) => {}
-            Err(e) => log!(@Memory, "Correction replay: get_by_id failed: {}", e),
+            Err(e) => log_legacy!(@Memory, "Correction replay: get_by_id failed: {}", e),
         }
     }
     entries
@@ -294,7 +294,7 @@ async fn legacy_matches(
                 matches.extend(entries_by_id(index, similar.into_iter().map(|hit| hit.id)).await)
             }
             Err(e) => {
-                log!(@Memory, "Correction replay (legacy): lookup failed for '{}': {}", &summary[..summary.floor_char_boundary(50)], e);
+                log_legacy!(@Memory, "Correction replay (legacy): lookup failed for '{}': {}", &summary[..summary.floor_char_boundary(50)], e);
             }
         }
     }
@@ -313,8 +313,8 @@ async fn delete_returned(index: &PgVectorIndex, matches: Vec<MemoryEntry>, windo
         return;
     }
     match index.delete_many(&ids).await {
-        Ok(n) => log!(@Memory, "Correction replay: deleted {} re-extracted entries", n),
-        Err(e) => log!(@Memory, "Correction replay: delete_many failed: {}", e),
+        Ok(n) => log_legacy!(@Memory, "Correction replay: deleted {} re-extracted entries", n),
+        Err(e) => log_legacy!(@Memory, "Correction replay: delete_many failed: {}", e),
     }
 }
 

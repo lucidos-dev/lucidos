@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::http::{client as http_client, client_with_timeout, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
-fn calling_thread() -> Result<String, BoxError> {
+pub(crate) fn calling_thread() -> Result<String, BoxError> {
     std::env::var("LUCIDOS_THREAD_ID").map_err(|_| {
         "LUCIDOS_THREAD_ID is not set, so there is no thread to run a background task \
          for. This subcommand only works from inside a Lucidos coding-agent session."
@@ -23,7 +23,7 @@ fn calling_thread() -> Result<String, BoxError> {
     })
 }
 
-fn tasks_url(ws: &Workspace, thread_id: &str) -> String {
+pub(crate) fn tasks_url(ws: &Workspace, thread_id: &str) -> String {
     format!(
         "{}/api/v1/threads/{}/background-tasks",
         ws.base_url(),
@@ -62,7 +62,7 @@ fn shell_quote(arg: &str) -> String {
 
 /// How long `wait` lets the engine answer. The engine caps one wait at 230 s,
 /// so this only has to outlast that and the round trip.
-const WAIT_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(290);
+pub(crate) const WAIT_RESPONSE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(290);
 
 /// What `run` asks for, beside the command.
 pub(crate) struct RunOptions<'a> {

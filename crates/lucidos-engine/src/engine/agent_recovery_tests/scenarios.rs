@@ -993,11 +993,8 @@ fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
 fn a_device_id_header_alone_produces_the_switch_fingerprints_actor() {
     use crate::engine::thread_events::{AbortCause, MessageOrigin};
 
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        crate::api::actor::HEADER_DEVICE_ID,
-        axum::http::HeaderValue::from_static("picker-device"),
-    );
+    // The gateway stamps the device it names, and only a stamped id is one.
+    let headers = crate::api::gateway_stamp::test_support::stamped_device_headers("picker-device");
     let actor = crate::api::actor::user_actor(&headers, None)
         .expect("a device-id header always resolves to some actor");
     assert!(
@@ -1040,6 +1037,7 @@ fn coding_agent_idled_engine_restart_interrupt_roundtrips() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     let json = serde_json::to_value(&event).expect("serializes");
     assert_eq!(json["type"], "CodingAgentIdled");
@@ -1219,6 +1217,7 @@ fn coding_agent_idled_without_reason_skips_field_in_wire_format() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     let json = serde_json::to_value(&event).expect("serializes");
     assert!(

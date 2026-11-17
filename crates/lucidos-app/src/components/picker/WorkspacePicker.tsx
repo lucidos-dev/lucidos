@@ -383,6 +383,7 @@ export function WorkspacePicker() {
   const footerMode = useSignal<FooterMode>('none');
   const remoteDraft = useSignal<RemoteGatewayDraft>(EMPTY_REMOTE_GATEWAY_DRAFT);
   const pairedRemote = useSignal<string | null>(null);
+  const remoteAwaitingOwner = useSignal(false);
   const newName = useSignal('');
   const renamingId = useSignal<string | null>(null);
   const renameValue = useSignal('');
@@ -401,7 +402,7 @@ export function WorkspacePicker() {
   // process). Anchored to the header reload icon.
   const reloadConfirmOpen = useSignal(false);
   const reloadAnchor = useSignal<HTMLElement | null>(null);
-  // Machine-global Network access control (writes ~/.lucidos/network.toml): the
+  // Machine-global Network access control (writes the machine-global network.toml): the
   // gateway bind + the "engines inherit gateway bind" toggle. Anchored to the
   // header gear. Re-read from the gateway on every open.
   //
@@ -821,10 +822,16 @@ export function WorkspacePicker() {
   function onAddRemote() {
     if (remoteGatewayBlocker(remoteDraft.value) !== null) return;
     void withBusy(async () => {
-      const added = await submitRemoteGateway(remoteDraft.value);
-      remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
-      pairedRemote.value = added.name;
-      await refreshRemoteWorkspaces();
+      try {
+        const added = await submitRemoteGateway(remoteDraft.value, () => {
+          remoteAwaitingOwner.value = true;
+        });
+        remoteDraft.value = EMPTY_REMOTE_GATEWAY_DRAFT;
+        pairedRemote.value = added.name;
+        await refreshRemoteWorkspaces();
+      } finally {
+        remoteAwaitingOwner.value = false;
+      }
     });
   }
 
@@ -1592,6 +1599,7 @@ export function WorkspacePicker() {
           onAddRemote,
           onCancelRemote: closeRemote,
           pairedRemote: pairedRemote.value,
+          remoteAwaitingOwner: remoteAwaitingOwner.value,
         })}
       </div>
     </div>

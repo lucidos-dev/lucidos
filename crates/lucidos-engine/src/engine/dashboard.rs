@@ -275,7 +275,7 @@ async fn seed_events(pool: &PgPool) -> Result<Vec<ThreadEvent>, BoxError> {
             |(event_type, payload)| match ThreadEvent::from_stored(&event_type, payload) {
                 Ok(event) => Some(event),
                 Err(e) => {
-                    log!("[Dashboard] skipped an unreadable {event_type} seed row: {e}");
+                    log_legacy!("[Dashboard] skipped an unreadable {event_type} seed row: {e}");
                     None
                 }
             },
@@ -296,7 +296,7 @@ async fn dashboard_events(pool: &PgPool) -> Result<Vec<SystemEvent>, BoxError> {
         .filter_map(|(id, payload)| match SystemEvent::from_stored(payload) {
             Ok(event) => Some(event),
             Err(e) => {
-                log!("[Dashboard] skipped unreadable dashboard event {id}: {e}");
+                log_legacy!("[Dashboard] skipped unreadable dashboard event {id}: {e}");
                 None
             }
         })
@@ -640,7 +640,7 @@ pub async fn device_dashboard(pool: &PgPool, device_id: Option<&str>) -> Option<
     match crate::core::devices::DeviceStore::user_agent(pool, device_id).await {
         Ok(ua) => ua.map(|ua| Dashboard::for_user_agent(&ua)),
         Err(e) => {
-            log!("[Dashboard] reading device {device_id}'s user agent failed: {e}");
+            log_legacy!("[Dashboard] reading device {device_id}'s user agent failed: {e}");
             None
         }
     }

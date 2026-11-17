@@ -73,7 +73,7 @@ impl ApplyClaims {
     /// Set what a release the lane waits on calls, once, at lane start.
     pub(crate) fn on_lane_wait_release(&self, release: impl Fn(Uuid) + Send + Sync + 'static) {
         if self.lane_wait_release.set(Box::new(release)).is_err() {
-            log!("[ApplyClaim] the lane's release callback was already set");
+            log_legacy!("[ApplyClaim] the lane's release callback was already set");
         }
     }
 

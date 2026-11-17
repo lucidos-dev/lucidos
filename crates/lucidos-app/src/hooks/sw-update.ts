@@ -1,6 +1,6 @@
 import { signal } from '@preact/signals';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
-import { withBase } from '../utils/basePath';
+import { withBase, REMOTE_GATEWAY } from '../utils/basePath';
 import { isUnstampedBuildId } from '../utils/buildId';
 import { preferences, showToast } from '../store/store';
 import { setPreference } from '../api/client';
@@ -271,7 +271,7 @@ export function refreshClient(opts: { evictAssets?: boolean } = {}): void {
   // the instant the refresh is requested, mirroring an engine restart.
   clientRefreshing.value = true;
   markSplashQuiet();
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
+  if (REMOTE_GATEWAY !== null || typeof navigator === 'undefined' || !('serviceWorker' in navigator)) {
     window.location.reload();
     return;
   }
@@ -413,9 +413,9 @@ const SW_BUILD_ID_RE = /BUILD_ID\s*=\s*['"]([^'"]+)['"]/;
  *  the HTTP cache, so the fetched copy is the live served build. Returns null in
  *  the live dev server, where sw.js carries the un-stamped placeholder. */
 export async function getServedBuildId(): Promise<string | null> {
-  if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+  if (typeof navigator === 'undefined' || (REMOTE_GATEWAY === null && !('serviceWorker' in navigator))) return null;
   try {
-    const resp = await fetch(withBase('/sw.js'), { cache: 'no-store' });
+    const resp = await fetch(REMOTE_GATEWAY === null ? withBase('/sw.js') : '/~/sw.js', { cache: 'no-store' });
     if (!resp.ok) return null;
     const id = SW_BUILD_ID_RE.exec(await resp.text())?.[1];
     if (!id || isUnstampedBuildId(id)) return null;

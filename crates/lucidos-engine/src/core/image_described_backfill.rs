@@ -133,7 +133,7 @@ async fn backfill_with_batch_size(
                 // path. A NULL here means the row predates the column or
                 // was inserted by something else — either way we have
                 // nothing to attach the `ImageDescribed` to.
-                crate::log!(
+                crate::log_legacy!(
                     "[ImageDescribedBackfill] source={} has NULL thread_id column — skipping",
                     source_id
                 );
@@ -154,7 +154,7 @@ async fn backfill_with_batch_size(
                 // attach an ImageDescribed to; the sequence cursor advances
                 // past the row, so the permanent skip can neither loop the
                 // walk nor strand later rows.
-                crate::log!(
+                crate::log_legacy!(
                     "[ImageDescribedBackfill] source={} has image_description but no user_image_hashes — skipping",
                     source_id
                 );
@@ -200,7 +200,7 @@ async fn backfill_with_batch_size(
         }
     }
     if total_inserted > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[ImageDescribedBackfill] backfilled {} ImageDescribed event(s) from legacy MessageReceived.image_description rows",
             total_inserted
         );

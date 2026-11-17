@@ -5,7 +5,7 @@
  * button alone, and Start waits for the estimate. Cancel writes nothing. Once
  * a backfill has started, Tree is written at once.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import type { BackgroundModels, TreeBackfillEstimate } from '../../../api/types';
 
 const {
@@ -65,6 +65,12 @@ const ESTIMATE: TreeBackfillEstimate = {
     }],
   }],
 };
+
+/** A cold import takes about 5 s on a busy host. The hook pays it once,
+ *  with its own budget, instead of the first test. */
+beforeAll(async () => {
+  await import('../MemoryModuleSection');
+}, 30_000);
 
 async function mount(host: HTMLElement): Promise<() => void> {
   const { h, render } = await import('preact');

@@ -408,7 +408,7 @@ async fn each_surface_s_pairs_that_are_on_form_a_frontier_apart_from_its_shipped
 }
 
 #[test]
-fn the_claude_code_ladder_climbs_haiku_then_sonnet_and_opus_to_opus_max() {
+fn the_claude_code_ladder_climbs_haiku_then_sonnet_and_opus_to_fable_max() {
     let ladder = effective_ladder(LadderSurface::ClaudeCode, None, everything_offered);
     assert_eq!(
         pairs_of(&ladder),
@@ -422,8 +422,12 @@ fn the_claude_code_ladder_climbs_haiku_then_sonnet_and_opus_to_opus_max() {
             "claude-sonnet-5-5=high",
             "claude-opus-5-5=medium",
             "claude-opus-5-5=high",
+            "claude-fable-5-2=low",
             "claude-opus-5-5=xhigh",
-            "claude-opus-5-5=max",
+            "claude-fable-5-2=medium",
+            "claude-fable-5-2=high",
+            "claude-fable-5-2=xhigh",
+            "claude-fable-5-2=max",
         ]
     );
 }
@@ -435,7 +439,6 @@ fn the_codex_ladder_climbs_luna_then_sol_to_sol_xhigh() {
         pairs_of(&ladder),
         [
             "gpt-6-luna=low",
-            "gpt-5.6-luna=medium",
             "gpt-6-luna=medium",
             "gpt-6-luna=high",
             "gpt-6-luna=xhigh",
@@ -681,7 +684,7 @@ fn an_override_decides_which_intelligence_rungs_the_prompt_bar_lists() {
 fn under_an_override_an_off_pair_follows_the_shipped_pair_before_it() {
     let ladder = served(
         LadderSurface::ClaudeCode,
-        Some("claude-opus-5-5=max, claude-haiku-5-5=low"),
+        Some("claude-fable-5-2=max, claude-haiku-5-5=low"),
         "medium",
         0.0,
     );
@@ -693,13 +696,17 @@ fn under_an_override_an_off_pair_follows_the_shipped_pair_before_it() {
     assert_eq!(
         order[..4],
         [
-            "claude-opus-5-5=max",
+            "claude-fable-5-2=max",
             "claude-haiku-5-5=low",
             "claude-haiku-5-5=medium off",
             "claude-haiku-5-5=high off",
         ]
     );
-    assert_eq!(order.len(), 15, "{order:?}");
+    assert_eq!(
+        order.len(),
+        LadderSurface::ClaudeCode.shipped_pairs().len(),
+        "{order:?}"
+    );
     assert!(ladder.customised);
 }
 
@@ -724,7 +731,8 @@ fn an_off_intelligence_rung_is_served_but_refused_naming_every_one_that_is_on() 
     assert!(ladder.position_of(&off).is_some());
     let err = ladder.check_pick(&off).unwrap_err();
     assert!(err.contains("claude-sonnet-5-5=max is not a rung"), "{err}");
-    assert!(err.contains("claude-opus-5-5=max"), "{err}");
+    assert!(err.contains("claude-fable-5-2=max"), "{err}");
+    assert!(!err.contains("claude-opus-5-5=max"), "{err}");
     assert!(!err.contains("claude-sonnet-5-5=low"), "{err}");
     assert!(err.contains("lucidos intelligence-ladder"), "{err}");
 }
@@ -807,7 +815,7 @@ fn the_bands_follow_the_reference_intelligence_rung() {
     );
     let at_high = served(LadderSurface::ClaudeCode, None, "high", 0.0);
     assert_eq!(cost_label(&at_high, "claude-opus-5-5", "high"), "1.0×");
-    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "medium"), "0.8×");
+    assert_eq!(cost_label(&at_high, "claude-opus-5-5", "medium"), "0.7×");
     assert_eq!(
         intelligence_label(&at_high, "claude-opus-5-5", "high"),
         "1.0×"
@@ -914,9 +922,9 @@ fn a_pair_with_no_estimate_has_no_band() {
 fn the_long_prompt_share_prices_in_only_a_model_with_a_long_tier() {
     let base = served(LadderSurface::ClaudeCode, None, "medium", 0.0);
     let long = served(LadderSurface::ClaudeCode, None, "medium", 0.8);
-    assert_eq!(cost_label(&long, "claude-haiku-5-5", "low"), "0.08×");
-    assert_eq!(cost_label(&long, "claude-haiku-5-5", "max"), "0.6×");
-    assert_eq!(cost_label(&long, "claude-sonnet-5-5", "high"), "0.6×");
+    assert_eq!(cost_label(&long, "claude-haiku-5-5", "low"), "0.09×");
+    assert_eq!(cost_label(&long, "claude-haiku-5-5", "max"), "0.7×");
+    assert_eq!(cost_label(&long, "claude-sonnet-5-5", "high"), "0.7×");
     assert_eq!(
         served_intelligence_rung(&long, "claude-haiku-5-5", "low").time,
         served_intelligence_rung(&base, "claude-haiku-5-5", "low").time,
@@ -1463,4 +1471,34 @@ fn every_models_effort_bands_are_nondecreasing() {
             previous = Some(pair);
         }
     }
+}
+
+#[test]
+fn other_backends_exclude_the_current_and_uninstalled_agents() {
+    let other = |current, installed| other_coding_agents(current, |a| a == installed);
+    assert_eq!(
+        other(CodingAgent::ClaudeCode, CodingAgent::Codex),
+        vec![CodingAgent::Codex]
+    );
+    assert!(other(CodingAgent::ClaudeCode, CodingAgent::ClaudeCode).is_empty());
+    assert!(other_coding_agents(CodingAgent::Codex, |_| false).is_empty());
+}
+
+#[test]
+fn codex_can_count_from_the_claude_code_reference() {
+    let reference = opus_at("medium");
+    let ladder = assemble(
+        LadderSurface::Codex,
+        &CodingAgentOffer(CodingAgent::Codex),
+        None,
+        Some(IntelligenceRung::new("gpt-6.1-sol", "medium")),
+        Some(reference.clone()),
+        Some(share_of(0.0)),
+    );
+    assert_eq!(ladder.reference, Some(reference));
+    assert!(ladder
+        .intelligence_rungs
+        .iter()
+        .filter(|r| r.on)
+        .all(|r| r.cost.is_some() && r.intelligence.is_some()));
 }

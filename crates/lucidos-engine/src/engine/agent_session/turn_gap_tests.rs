@@ -107,6 +107,7 @@ async fn emit_idled(bus: &EventBus, thread_id: Uuid) {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     )
     .await;
@@ -122,6 +123,7 @@ async fn emit_change_applied(
         bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: Uuid::new_v4().to_string(),
             requires_restart: false,
             client_update: false,
@@ -150,6 +152,7 @@ async fn emit_change_proposed(
         bus,
         thread_id,
         ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.clone(),
             description: Some(description.into()),
             files: vec!["src/feature.rs".into()],
@@ -407,6 +410,7 @@ async fn multiple_events_listed_oldest_first_and_capped() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: Uuid::new_v4().to_string(),
             requires_restart: false,
             client_update: false,
@@ -767,6 +771,9 @@ async fn apply_failed_quotes_engine_error() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplyFailed {
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            landing_merge_sha: None,
             change_id: change_id.clone(),
             error: error.into(),
             actor: None,
@@ -956,6 +963,8 @@ async fn a_withdrawn_follow_up_leaves_its_gap_to_the_next_prompt() {
         thread_id,
         ThreadEvent::QueuedMessageRemoved {
             removed_message_id: withdrawn,
+            restore_to_compose: false,
+            compose: None,
         },
     )
     .await;
@@ -1781,6 +1790,7 @@ async fn a_large_apply_does_not_bury_the_background_task_line() {
         &bus,
         thread_id,
         ThreadEvent::ChangeApplied {
+            content: Default::default(),
             change_id: Uuid::new_v4().to_string(),
             requires_restart: false,
             client_update: false,
@@ -1838,6 +1848,7 @@ async fn a_gap_full_of_applies_does_not_bury_the_background_task_line() {
             &bus,
             thread_id,
             ThreadEvent::ChangeApplied {
+                content: Default::default(),
                 change_id: Uuid::new_v4().to_string(),
                 requires_restart: false,
                 client_update: false,
@@ -2128,21 +2139,21 @@ async fn only_a_coding_agent_restart_abort_names_a_restart() {
     }
 }
 
-fn people_message(text: &str, device_id: &str) -> ThreadEvent {
-    ThreadEvent::PeopleMessagePosted {
+fn user_only_message(text: &str, device_id: &str) -> ThreadEvent {
+    ThreadEvent::UserOnlyMessagePosted {
         text: text.into(),
         user_image_hashes: vec![],
         device_id: Some(device_id.into()),
-        mentioned_operator_ids: vec![],
+        mentioned_user_ids: vec![],
     }
 }
 
-/// Emit a people-only message with its device as the actor, as `chat_submit`
+/// Emit a user-only message with its device as the actor, as `chat_submit`
 /// records it.
-async fn emit_people_message(bus: &EventBus, thread_id: Uuid, text: &str, device_id: &str) {
+async fn emit_user_only_message(bus: &EventBus, thread_id: Uuid, text: &str, device_id: &str) {
     bus.emit(BusEvent::Thread {
         thread_id,
-        event: people_message(text, device_id),
+        event: user_only_message(text, device_id),
         meta: EventMeta::with_actor(Some(crate::engine::thread_events::MessageOrigin::Device {
             device_id: device_id.into(),
         })),
@@ -2152,18 +2163,18 @@ async fn emit_people_message(bus: &EventBus, thread_id: Uuid, text: &str, device
     .expect("emit produced no EmitResult");
 }
 
-/// I8: people-only messages ride the next woken prompt in order, and the wake
+/// I8: user-only messages ride the next woken prompt in order, and the wake
 /// after it does not repeat them (ADR 0649).
 #[tokio::test]
-async fn people_only_messages_reach_the_next_woken_prompt_once() {
+async fn user_only_messages_reach_the_next_woken_prompt_once() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, BRANCH, None).await;
     emit_message_received(&bus, thread_id, "turn 1").await;
 
-    emit_people_message(&bus, thread_id, "the copy feels long", "dev-alex").await;
-    emit_people_message(&bus, thread_id, "agreed, cut it", "dev-sam").await;
+    emit_user_only_message(&bus, thread_id, "the copy feels long", "dev-alex").await;
+    emit_user_only_message(&bus, thread_id, "agreed, cut it", "dev-sam").await;
     let woken = emit_message_received(&bus, thread_id, "cut the copy").await;
     let note = compute_turn_gap_note(&pool, thread_id, woken, Some(BRANCH))
         .await
@@ -2172,7 +2183,7 @@ async fn people_only_messages_reach_the_next_woken_prompt_once() {
     let first = note.find("the copy feels long").expect(&note);
     let second = note.find("agreed, cut it").expect(&note);
     assert!(first < second, "oldest first: {note}");
-    assert!(note.contains("[People-only messages"), "{note}");
+    assert!(note.contains("[User-only messages"), "{note}");
 
     let next = emit_message_received(&bus, thread_id, "and the title").await;
     assert!(
@@ -2186,21 +2197,21 @@ async fn people_only_messages_reach_the_next_woken_prompt_once() {
     crate::test_support::teardown_test_db(&db_name).await;
 }
 
-/// On a team gateway each line carries its sender's operator name; a long
+/// On a team gateway each line carries its sender's user name; a long
 /// paused conversation keeps only its newest messages.
 #[test]
 fn the_people_block_names_each_speaker_and_keeps_the_newest() {
-    use crate::gateway_operators::{Operator, OperatorSnapshot};
-    let operator = |id: &str, name: &str, device: &str| Operator {
+    use crate::gateway_users::{User, UserSnapshot};
+    let user = |id: &str, name: &str, device: &str| User {
         id: id.into(),
         name: name.into(),
         emails: vec![],
         device_ids: vec![device.into()],
     };
-    let team = OperatorSnapshot {
-        operators: vec![
-            operator("op-sam", "Sam", "dev-sam"),
-            operator("op-alex", "Alex", "dev-alex"),
+    let team = UserSnapshot {
+        users: vec![
+            user("op-sam", "Sam", "dev-sam"),
+            user("op-alex", "Alex", "dev-alex"),
         ],
         relayed: vec![],
     };
@@ -2210,7 +2221,7 @@ fn the_people_block_names_each_speaker_and_keeps_the_newest() {
             "actor": {"kind": "device", "device_id": device},
         })
     };
-    let block = super::people_talk_block(
+    let block = super::user_talk_block(
         &[
             payload("too long", "dev-alex"),
             payload("cut it", "dev-sam"),
@@ -2220,12 +2231,12 @@ fn the_people_block_names_each_speaker_and_keeps_the_newest() {
     .expect("two messages make a block");
     assert!(block.contains("\nAlex: too long\nSam: cut it]"), "{block}");
 
-    let many: Vec<_> = (0..super::MAX_PEOPLE_MESSAGES + 2)
+    let many: Vec<_> = (0..super::MAX_USER_ONLY_MESSAGES + 2)
         .map(|i| payload(&format!("line {i}"), "dev-sam"))
         .collect();
-    let block = super::people_talk_block(&many, &team).expect("a block");
+    let block = super::user_talk_block(&many, &team).expect("a block");
     assert!(block.contains("2 earlier message(s) not shown"), "{block}");
     assert!(!block.contains("Sam: line 1\n"), "{block}");
-    assert!(block.contains(&format!("Sam: line {}]", super::MAX_PEOPLE_MESSAGES + 1)));
-    assert!(super::people_talk_block(&[], &team).is_none());
+    assert!(block.contains(&format!("Sam: line {}]", super::MAX_USER_ONLY_MESSAGES + 1)));
+    assert!(super::user_talk_block(&[], &team).is_none());
 }

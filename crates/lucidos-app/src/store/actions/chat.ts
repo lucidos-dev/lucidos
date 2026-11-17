@@ -12,13 +12,12 @@ import {
   removingQueuedMessageIds,
   queuedMessageRemovalKey,
   setFocusedThread,
-  effectiveThreadStatus,
 } from '../store';
 import type { ChatContext } from './chatContext';
 import { retainSendingImageHashes } from '../pendingUploadRecords';
 import type { ChatRequestBody } from '../../api/types';
 import { submitChat, cancelChat, stopClaudeCode, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
-import { sendFailureOf, withQuietRetries, type SendFailure } from './sendRetry';
+import { inputRefusalOf, sendFailureOf, withQuietRetries, type SendFailure } from './sendRetry';
 import { enterSendChain, type SendSlot } from './sendChain';
 import { getDeviceId } from './devices';
 import { endUnsentMessage, recordUnsentMessage, takeUnsentMessage, unsentMessages, type SendSettlement } from '../unsentMessages';
@@ -26,9 +25,8 @@ import { forgetUnsentMessageRecord, markUnsentMessageRecordUnsent, persistSendin
 import { restoreRefusedSend, settleAcceptedSend } from './sendSettlement';
 import { questionTheSendAnswers, unsentPicks } from '../pendingDecisions';
 import { generateUuid } from '../../utils/uuid';
-import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, retireUnsentExchange, type PendingUserMessage, type StoredEvent, type QueuedMessage } from '../thread-events';
-import { getDraft } from '../composeDrafts';
-import { reopenEmptyDraft, updateCompose } from './compose';
+import { handleEvent, makeOptimisticThreadState, retireUnsentExchange, type PendingUserMessage, type StoredEvent, type QueuedMessage } from '../thread-events';
+import { appendMessagesToCompose, reopenEmptyDraft } from './compose';
 import { focusPromptNow } from '../../components/chat/promptFocus';
 import { bumpThreadEvents } from '../threadActivity';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
@@ -44,8 +42,8 @@ import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
-import { sendAddressing } from './people';
-import { acceptComposeReport, parseComposeReport } from '../composeSync';
+import { sendAddressing } from './users';
+import { acceptComposeReport, knownComposeEpoch, parseComposeReport } from '../composeSync';
 
 /** Safety timeout (ms) for an accepted send's pending row. If SSE doesn't
  *  deliver the MessageReceived event within this window, we force-refresh
@@ -94,18 +92,12 @@ function restorePendingMessage(threadId: string, removed: RemovedPendingMessage 
  *  running response), or `failed` (transport/other). */
 export type QueuedRemovalOutcome = 'removed' | 'already-injected' | 'failed';
 
-type QueuedRemovalResult = { outcome: QueuedRemovalOutcome; error?: unknown };
+type QueuedRemovalResult = { outcome: QueuedRemovalOutcome; error?: unknown; restoredByStop?: boolean };
 
-/** In-flight retract promises keyed by `queuedMessageRemovalKey`, so a second
- *  retract for the same message (trash-then-Stop, or a double click) AWAITS the
- *  first's real outcome instead of assuming success. Assuming success let Stop
- *  append the text to compose + cancel while the removal was still pending — if
- *  that removal then failed/409'd, the message re-ran or duplicated. */
+/** Concurrent trash or Edit requests share the actual removal outcome. */
 const inFlightQueuedRemovals = new Map<string, Promise<QueuedRemovalResult>>();
 
-/** Retract one queued message via the `QueuedMessageRemoved` tombstone. Shared
- *  by the per-message trash button (`removeQueuedMessage`) and the
- *  Stop-clears-queue path (`clearQueuedMessagesToCompose`). Optimistically drops
+/** Retract one queued message for trash or Edit. Optimistically drops
  *  the pending row and rolls it back on failure; returns the outcome (never
  *  throws) so each caller decides how to surface it. Deduped + awaited across
  *  concurrent callers so the outcome a caller sees is the ACTUAL request result. */
@@ -118,8 +110,9 @@ function retractQueuedMessage(threadId: string, messageId: string): Promise<Queu
     removingQueuedMessageIds.value = new Set([...removingQueuedMessageIds.value, key]);
     const removedPending = removePendingMessage(threadId, messageId);
     try {
-      await removeQueuedMessageRequest(threadId, messageId);
-      return { outcome: 'removed' };
+      const compose = await removeQueuedMessageRequest(threadId, messageId);
+      if (compose) acceptComposeReport(threadId, parseComposeReport(compose));
+      return { outcome: 'removed', restoredByStop: !!compose };
     } catch (err) {
       const next = new Set(removingQueuedMessageIds.value);
       next.delete(key);
@@ -145,12 +138,12 @@ export async function removeQueuedMessage(threadId: string, messageId: string): 
  *  compose box after any draft. Compose changes only once the removal took, so
  *  a message the agent already read never also sits in compose. */
 export async function editQueuedMessage(threadId: string, message: QueuedMessage): Promise<void> {
-  const { outcome, error } = await retractQueuedMessage(threadId, message.id);
+  const { outcome, error, restoredByStop } = await retractQueuedMessage(threadId, message.id);
   if (outcome !== 'removed') {
     reportFailedRetract(threadId, 'edit', error);
     return;
   }
-  appendMessagesToCompose(threadId, [message]);
+  if (!restoredByStop) appendMessagesToCompose(threadId, [message]);
   focusPromptNow();
 }
 
@@ -356,7 +349,7 @@ export async function sendMessage(
     providerOverride?: string;
     ccModelOverride?: CodingAgentModelValue | null;
     ccReasoningEffortOverride?: CodingAgentReasoningEffort | null;
-    /** People the send addresses outright, by person id, as a compose to a
+    /** Users the send addresses outright, by person id, as a compose to a
      *  teammate does. Joins the mentions in the text (ADR 0649). */
     alsoMention?: string[];
     /** Which kind of send this is, for a decision after the first attempt.
@@ -376,7 +369,7 @@ export async function sendMessage(
   // Claim the chain slot before ANY await below, so this send's place in the
   // thread's order is the order the user pressed send. Released however the
   // send ends, a throw before its POST included.
-  const sendSlot = enterSendChain(threadId);
+  const sendSlot = enterSendChain(threadId, knownComposeEpoch(threadId));
   const releaseImages = retainSendingImageHashes(imageHashes);
   try {
     return await buildAndPostSend({ message, imageHashes, options, eventId, threadId, isNewThread, shouldFocus, sendSlot });
@@ -456,6 +449,7 @@ async function buildAndPostSend({ message, imageHashes, options, eventId, thread
     event_id: eventId,
     thread_id: threadId,
     ...sendSlot.position,
+    compose_epoch: sendSlot.intentEpoch,
     ...(options?.context ?? {}),
   };
   if (imageHashes?.length) body.image_hashes = imageHashes;
@@ -572,6 +566,7 @@ async function postSend(send: {
   sendSlot: SendSlot;
   failedRetries: number;
   settlement: SendSettlement;
+  preserveWireIntent?: boolean;
 }): Promise<SendOutcome> {
   const { threadId, eventId, body, sendSlot } = send;
   // Read before the POST: the engine's answer clears the pending row on arrival.
@@ -589,6 +584,13 @@ async function postSend(send: {
   // costs the user nothing visible. It keeps a quick second send from
   // overtaking this one, which the engine would refuse (ADR 0449).
   if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
+  if (!send.preserveWireIntent) {
+    body.compose_epoch = sendSlot.epochForPost();
+    // Retain the final wire intent, including any causal rebase and extracted
+    // context, before its first POST. Quiet retries send this same object.
+    persistSendingMessage({ eventId, threadId, body, settlement: send.settlement,
+      sentAt: new Date().toISOString(), answersQuestion });
+  }
   const result = await withQuietRetries(() => submitChat(body), {
     path: 'message',
     // The engine's own row can beat a lost answer over SSE. The send landed,
@@ -597,6 +599,7 @@ async function postSend(send: {
   });
   switch (result.kind) {
     case 'done':
+      if (!send.preserveWireIntent) sendSlot.accepted(result.value.compose?.compose_epoch ?? undefined);
       // The send consumed the thread's compose slot at accept; the report says
       // what that left (ADR 0450).
       if (result.value.compose) acceptComposeReport(threadId, parseComposeReport(result.value.compose));
@@ -610,6 +613,14 @@ async function postSend(send: {
       markUnsentMessageRecordUnsent(eventId, send.failedRetries);
       return 'shown-as-failed';
     case 'refused':
+      // An ordering conflict refuses this submission, not its
+      // content. Keep the original request on its existing thread for Retry.
+      const refusal = inputRefusalOf(result.error);
+      if (!body.new_thread && refusal) {
+        showUnsentExchange({ ...send, refusal, copy: `Not sent: ${refusal.message}` });
+        markUnsentMessageRecordUnsent(eventId, send.failedRetries, refusal);
+        return 'shown-as-failed';
+      }
       // HTTP error (4xx/5xx with body) or unknown bug. A raw new send created
       // its thread optimistically (`new_thread`), and the engine has no record
       // of it. A row left behind would be a phantom in the Active drawer that
@@ -690,6 +701,7 @@ function showUnsentExchange(send: {
    *  send carries it on its pending row instead. */
   answersQuestion?: string;
   failure?: SendFailure;
+  refusal?: UnsentMessageRecord['refusal'];
 }): void {
   const { threadId, eventId, body } = send;
   const failedSeq = nextUnsentSeq;
@@ -725,6 +737,7 @@ function showUnsentExchange(send: {
     settlement: send.settlement,
     ...(answersQuestion ? { answersQuestion } : {}),
     ...(send.failure ? { failure: send.failure } : {}),
+    ...(send.refusal ? { refusal: send.refusal } : {}),
   });
 }
 
@@ -733,7 +746,8 @@ function showUnsentExchange(send: {
 export function showRestoredUnsentMessage(record: UnsentMessageRecord): void {
   showUnsentExchange({
     ...record,
-    copy: record.phase === 'sending' ? UNSENT_AFTER_RELOAD_COPY : unsentMessageCopy(record.failedRetries),
+    copy: record.phase === 'sending' ? UNSENT_AFTER_RELOAD_COPY
+      : record.refusal ? `Not sent: ${record.refusal.message}` : unsentMessageCopy(record.failedRetries),
   });
 }
 
@@ -752,9 +766,12 @@ export async function retryUnsentMessage(eventId: string): Promise<SendOutcome |
     const unsent = takeUnsentMessage(eventId);
     if (!unsent) return null;
     const { threadId } = unsent;
-    const sendSlot = enterSendChain(threadId);
-    // A fresh place at the tail: the engine already admitted what was sent since.
-    const body = { ...unsent.body, ...sendSlot.position };
+    const preserveWireIntent = !unsent.refusal;
+    const sendSlot = enterSendChain(threadId, preserveWireIntent ? unsent.body.compose_epoch : knownComposeEpoch(threadId));
+    // An uncertain send may already have a receipt: replay its exact request.
+    // A confirmed refusal accepted nothing, so Retry creates a fresh intent.
+    const body = preserveWireIntent ? { ...unsent.body }
+      : { ...unsent.body, ...sendSlot.position, compose_epoch: sendSlot.intentEpoch };
     persistSendingMessage({ eventId, threadId, body, settlement: original.settlement,
       sentAt: new Date().toISOString(), answersQuestion: original.answersQuestion });
     let outcome: SendOutcome;
@@ -766,6 +783,7 @@ export async function retryUnsentMessage(eventId: string): Promise<SendOutcome |
         eventId,
         body,
         sendSlot,
+        preserveWireIntent,
         failedRetries: unsent.failedRetries + 1,
         settlement: unsent.settlement,
       });
@@ -807,82 +825,7 @@ export function discardUnsentMessage(eventId: string): void {
  *   - 'failed'   — the API call itself failed (a toast was already shown). */
 export type CancelOutcome = 'canceled' | 'noop' | 'failed';
 
-/** The thread's queued (un-injected) chat follow-ups in FIFO order: the set a
- *  user Stop returns to compose. Chat-only: a coding agent keeps its queued
- *  messages across a Stop, so only the bin or Edit takes one back. Derived from
- *  the same `queuedFollowupRun` the UI renders "Queued" bubbles from, so Stop
- *  clears exactly what the user saw queued. */
-function getQueuedMessages(threadId: string): QueuedMessage[] {
-  const thread = threadMap.value.get(threadId);
-  if (!thread || thread.meta.channel === 'claude_code') return [];
-  const status = effectiveThreadStatus(thread);
-  const threadBusy = status === 'running' || status === 'waiting_for_user_answer';
-  // Exclude messages already being trashed — the UI hides them from the queued
-  // group the same way (CreateThreadView `removedQueuedIndices`), so Stop clears
-  // exactly what the user still sees queued and never resurfaces a just-trashed
-  // message into compose (its own removal already owns it).
-  const removing = removingQueuedMessageIds.value;
-  return queuedMessagesFromExchanges(computeExchanges(thread), threadBusy, false)
-    .filter(q => !removing.has(queuedMessageRemovalKey(threadId, q.id)));
-}
-
-/** Append taken-back messages (FIFO) to the thread's compose draft, after any
- *  existing draft: retracted queued messages, or a refused follow-up. Texts
- *  join with a blank line, and images go after the draft's own, each hash
- *  once, as `addAttachedImageHash` keeps it. Forces the prompt input to show
- *  the text. The compose→textarea sync skips a focused non-empty input, so a
- *  programmatic append needs the explicit override, as `seedSuggestion` does. */
-export function appendMessagesToCompose(threadId: string, messages: ReadonlyArray<{ text: string; imageHashes: readonly string[] }>): void {
-  const draftImages = getDraft(threadId).image_hashes;
-  const images = [...new Set(messages.flatMap(m => m.imageHashes))].filter(h => !draftImages.includes(h));
-  if (images.length > 0) {
-    updateCompose(threadId, { image_hashes: [...draftImages, ...images] });
-  }
-  const texts = messages.map(m => m.text).filter(t => t.length > 0);
-  if (texts.length === 0) return;
-  const existing = getDraft(threadId).text;
-  const addition = texts.join('\n\n');
-  const combined = existing.trim().length > 0 ? `${existing}\n\n${addition}` : addition;
-  // An append: the draft keeps its prefix, so the caret stays where it was.
-  updateCompose(threadId, { text: combined });
-}
-
-/** On a user Stop of a chat thread, return un-injected queued follow-ups to the
- *  compose box instead of letting them re-run as a new response after the cancel
- *  (the bug where a queued message streamed above "Response canceled"). Retracts
- *  each via the `QueuedMessageRemoved` tombstone so the backend's
- *  `filter_removed_queued_prompts` drops it at loop finalize — see
- *  `docs/plans/2026-07-19-stop-clears-queued-messages.md`. MUST run BEFORE
- *  `cancelChat` so the tombstones persist before the loop finalizes. Messages
- *  the loop already injected (409) stay under the cancelled exchange and are NOT
- *  moved to compose. */
-async function clearQueuedMessagesToCompose(threadId: string): Promise<void> {
-  const queued = getQueuedMessages(threadId);
-  if (queued.length === 0) return;
-  const removed: QueuedMessage[] = [];
-  let failed = 0;
-  for (const q of queued) {
-    const { outcome } = await retractQueuedMessage(threadId, q.id);
-    if (outcome === 'removed') removed.push(q);
-    // 'already-injected' → now part of the cancelled response, so nothing is
-    // owed. 'failed' → no tombstone persisted, so the loop will NOT drop it at
-    // finalize. Neither goes to compose.
-    if (outcome === 'failed') failed++;
-  }
-  appendMessagesToCompose(threadId, removed);
-  // The user pressed Stop, so this is theirs to know. A retract that got no
-  // tombstone leaves the follow-up queued, and it runs as a fresh response
-  // after the cancel. That is the exact outcome this function exists to
-  // prevent, so it cannot be silent. The row stays on screen and trashable.
-  if (failed > 0) {
-    showToast(
-      `Stopped, but ${failed} queued message${failed > 1 ? 's' : ''} could not be retracted `
-      + `in ${formatThreadLabel(threadId)}. They may still run.`,
-      'error',
-      { key: `queued-retract-${threadId}` },
-    );
-  }
-}
+export { appendMessagesToCompose } from './compose';
 
 /**
  * Cancel a thread's in-flight exchange. Routes to the chat or CC endpoint
@@ -898,20 +841,20 @@ export async function cancelCurrentExchange(threadId?: string): Promise<CancelOu
       const canceled = await stopClaudeCode(undefined, tid);
       return canceled ? 'canceled' : 'noop';
     }
-    // Chat (Lucidos Agent): return any un-injected queued follow-ups to compose
-    // and retract them BEFORE cancelling, so they don't re-run as a new response
-    // above the "Response canceled" marker. Best-effort — a queue-clear hiccup
-    // must never block the actual cancel (a still-queued message stays visible
-    // and trashable; telemetry carve-out per .claude/rules/frontend.md).
-    if (tid) {
-      try {
-        await clearQueuedMessagesToCompose(tid);
-      } catch (e) {
-        console.warn('[cancel] failed to clear queued messages to compose', e);
-      }
+    const result = await cancelChat(tid);
+    for (const message of result.taken_back_messages) {
+      removePendingMessage(message.thread_id, message.id);
+      acceptComposeReport(message.thread_id, parseComposeReport(message.compose));
     }
-    const canceled = await cancelChat(tid);
-    return canceled ? 'canceled' : 'noop';
+    if (result.failed_take_back_ids.length > 0) {
+      const count = result.failed_take_back_ids.length;
+      showToast(
+        `Stopped, but ${count} queued message${count > 1 ? 's' : ''} could not be retracted `
+        + `in ${tid ? formatThreadLabel(tid) : 'this workspace'}. They may still run.`,
+        'error', { key: `queued-retract-${tid ?? 'all'}` },
+      );
+    }
+    return result.canceled ? 'canceled' : 'noop';
   } catch (err) {
     showToast(`Failed to cancel: ${errorDetail(err)}`, 'error');
     return 'failed';

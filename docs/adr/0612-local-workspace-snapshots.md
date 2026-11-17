@@ -81,7 +81,8 @@ start it again.
    owner approval (0387). The owner can set a per-workspace policy from a
    registered device that lets agents restore without a card. That policy
    never covers an agent restoring its own workspace. The agent DB role
-   cannot write that policy or the restore boundary (0481).
+   cannot write that policy or the restore boundary (0481). A restore into a
+   machine-made workspace needs no card (0676, amendment).
 
    Like every refusal of an agent caller, this stops an agent using the
    credentials it was handed. An agent set on impersonating the user can

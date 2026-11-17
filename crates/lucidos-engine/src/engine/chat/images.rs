@@ -129,7 +129,7 @@ pub(super) fn build_user_content_with_images(
             // The model then answers about a picture it never received, so the
             // two skips are logged rather than silent.
             let Some(blob) = resolve_blob(workspace, hash) else {
-                log!(
+                log_legacy!(
                     "[Chat] History image {} has no blob on disk, so the model sees the text without it",
                     hash
                 );
@@ -138,7 +138,7 @@ pub(super) fn build_user_content_with_images(
             let bytes = match std::fs::read(&blob.path) {
                 Ok(b) => b,
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Chat] Cannot read history image blob {}: {}. The model sees the text without it",
                         blob.path.display(),
                         e

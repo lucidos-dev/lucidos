@@ -238,3 +238,13 @@ describe('direct SDK generation fencing', () => {
     expect(fetch).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('direct SDK read transport recovery', () => {
+  it('retries a failed GET once', async () => {
+    const fetcher = vi.fn().mockRejectedValueOnce(new TypeError('Load failed'))
+      .mockResolvedValueOnce(new Response('{"ok":true}'));
+    globalThis.fetch = fetcher;
+    await expect(request('/threads/list')).resolves.toEqual({ ok: true });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+});

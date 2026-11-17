@@ -73,6 +73,12 @@ pub fn render_all(repo_root: &Path) -> Vec<GeneratedFile> {
             title_match::codegen::render_fixture(),
         ),
         file(APP, "gateway-constants.ts", gateway_constants::render()),
+        file(
+            APP,
+            "version-order-fixture.json",
+            serde_json::to_string_pretty(lucidos_update_channel::ORDERED_VERSIONS)
+                .expect("the version fixture serialises"),
+        ),
         file(STYLES, "font-faces.css", fonts::codegen::render_css()),
         file(
             STYLES,
@@ -132,48 +138,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    fn repo_root() -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-    }
-
-    /// Every renderer runs on every `make test`, so a refusal (an unregistered
-    /// wire type, say) fails the suite rather than the next codegen run.
-    #[test]
-    fn every_generated_file_renders_once_into_a_generated_folder() {
-        let files = render_all(&repo_root());
-        let mut seen = BTreeSet::new();
-        for f in &files {
-            assert!(seen.insert(&f.path), "{} is rendered twice", f.path);
-            assert!(
-                GENERATED_DIRS
-                    .iter()
-                    .any(|dir| f.path.strip_prefix(dir).is_some_and(|n| n.starts_with('/'))),
-                "{} is outside the generated folders",
-                f.path
-            );
-            assert!(
-                f.contents.contains(REGENERATE) || f.path.ends_with(".json"),
-                "{} does not name {REGENERATE} in its header",
-                f.path
-            );
-        }
-    }
-
-    /// The shell cannot read `render_all`, so a pin holds its one copy.
-    #[test]
-    fn codegen_sentinel_is_rendered() {
-        let script = std::fs::read_to_string(repo_root().join("scripts/lib/codegen.sh"))
-            .expect("scripts/lib/codegen.sh exists");
-        let sentinel = script
-            .lines()
-            .find_map(|l| l.strip_prefix("CODEGEN_SENTINEL="))
-            .expect("codegen.sh names a sentinel");
-        assert!(
-            render_all(&repo_root()).iter().any(|f| f.path == sentinel),
-            "CODEGEN_SENTINEL={sentinel} is not a file render_all writes"
-        );
-    }
-
     /// `scripts/codegen.sh` runs this when no freshly built `lucidos-codegen`
     /// is at hand, because it reuses the compile `make test` already paid for.
     #[test]
@@ -182,7 +146,53 @@ mod tests {
         let out = std::env::var_os("LUCIDOS_CODEGEN_OUT")
             .expect("LUCIDOS_CODEGEN_OUT names the folder to write into");
         let root = std::env::var_os("LUCIDOS_CODEGEN_REPO_ROOT")
-            .map_or_else(repo_root, std::path::PathBuf::from);
+            .map_or_else(guard_tests::repo_root, std::path::PathBuf::from);
         write_all(&render_all(&root), Path::new(&out)).expect("the outputs write");
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        pub(super) fn repo_root() -> std::path::PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+        }
+
+        /// Every renderer runs on every `make test`, so a refusal (an unregistered
+        /// wire type, say) fails the suite rather than the next codegen run.
+        #[test]
+        fn every_generated_file_renders_once_into_a_generated_folder() {
+            let files = render_all(&repo_root());
+            let mut seen = BTreeSet::new();
+            for f in &files {
+                assert!(seen.insert(&f.path), "{} is rendered twice", f.path);
+                assert!(
+                    GENERATED_DIRS
+                        .iter()
+                        .any(|dir| f.path.strip_prefix(dir).is_some_and(|n| n.starts_with('/'))),
+                    "{} is outside the generated folders",
+                    f.path
+                );
+                assert!(
+                    f.contents.contains(REGENERATE) || f.path.ends_with(".json"),
+                    "{} does not name {REGENERATE} in its header",
+                    f.path
+                );
+            }
+        }
+
+        /// The shell cannot read `render_all`, so a pin holds its one copy.
+        #[test]
+        fn codegen_sentinel_is_rendered() {
+            let script = std::fs::read_to_string(repo_root().join("scripts/lib/codegen.sh"))
+                .expect("scripts/lib/codegen.sh exists");
+            let sentinel = script
+                .lines()
+                .find_map(|l| l.strip_prefix("CODEGEN_SENTINEL="))
+                .expect("codegen.sh names a sentinel");
+            assert!(
+                render_all(&repo_root()).iter().any(|f| f.path == sentinel),
+                "CODEGEN_SENTINEL={sentinel} is not a file render_all writes"
+            );
+        }
     }
 }

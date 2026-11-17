@@ -1,21 +1,16 @@
 use super::*;
 
 #[test]
-fn cc_allowed_tools_seeds_the_file_and_allows_only_engine_tools_on_first_use() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = GrantFile::CodingAgentTools;
-    let path = dir.path().join(file.file_name());
-    assert!(!path.exists());
-
-    let result = cc_allowed_tools(dir.path());
-
+fn allowed_tools_flag_allows_only_engine_tools_with_no_grants() {
     assert_eq!(
-        result,
+        allowed_tools_flag(Vec::new()),
         ENGINE_ALLOWED_TOOLS.join(","),
         "a workspace with no grants allows only the engine's own tools"
     );
-    assert!(path.exists(), "seed file should have been written");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), file.header());
+}
+
+fn lines(body: &str) -> Vec<String> {
+    crate::core::grants::parse_patterns(body)
 }
 
 /// A Codex command persists Claude Code's own lines, `Bash` and
@@ -205,14 +200,10 @@ fn derive_allow_pattern_reads_through_a_nested_shell_and_never_stores_one() {
 /// Claude Code prefix-matches `--allowedTools` itself, so a line naming a
 /// shell or an exec wrapper would skip its card for any wrapped command.
 #[test]
-fn cc_allowed_tools_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = GrantFile::CodingAgentTools;
-    let lines = "Bash\nBash(git:*)\nBash(rm:*)\nBash(find:*)\nBash(python3:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
+fn allowed_tools_flag_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
+    let body = "Bash\nBash(git:*)\nBash(rm:*)\nBash(find:*)\nBash(python3:*)\nBash(bash:*)\nBash(zsh:*)\nBash(timeout:*)\nRead\n\
                  Bash(/bin/bash:*)\nBash(\\bash:*)\nBash(sudo rm:*)\nBash(eval:*)\nBash(env)\n";
-    std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
-
-    let result = cc_allowed_tools(dir.path());
+    let result = allowed_tools_flag(lines(body));
 
     let mut want = ENGINE_ALLOWED_TOOLS.to_vec();
     want.push("Read");
@@ -222,15 +213,11 @@ fn cc_allowed_tools_drops_a_line_that_names_a_shell_or_an_exec_wrapper() {
 /// A path line is the engine's to check: Claude Code would prefix-match it
 /// with no trust check (ADR 0571).
 #[test]
-fn cc_allowed_tools_drops_a_path_line() {
-    let dir = tempfile::tempdir().unwrap();
-    let file = GrantFile::CodingAgentTools;
-    let lines = "Bash(./scripts/check.sh:*)\nBash(scripts/check.sh:*)\nBash(/tmp/x.sh:*)\n\
+fn allowed_tools_flag_drops_a_path_line() {
+    let body = "Bash(./scripts/check.sh:*)\nBash(scripts/check.sh:*)\nBash(/tmp/x.sh:*)\n\
                  Bash(check.sh:*)\nBash(git:*)\n";
-    std::fs::write(dir.path().join(file.file_name()), lines).unwrap();
-
     let want = ENGINE_ALLOWED_TOOLS.to_vec();
-    assert_eq!(cc_allowed_tools(dir.path()), want.join(","));
+    assert_eq!(allowed_tools_flag(lines(body)), want.join(","));
 }
 
 /// A command running nothing derivable gets NO session pattern. The bare-name
@@ -866,20 +853,16 @@ fn derive_allow_pattern_session_other_tool_falls_back_to_bare_name() {
     );
 }
 
-// Appending, reading and overwriting the file are covered in `core::grants`,
-// which owns it for all three permission lanes.
+// Reading and rewriting the file are covered in `core::grants` and
+// `permission::tool_grants`, which own it for all three permission lanes.
 
 #[test]
-fn cc_allowed_tools_parses_user_file_strips_comments_and_blanks() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(
-        dir.path().join("cc-allowed-tools"),
-        "# header comment\n\nBash\nRead\n  Edit  \n# inline comment\nSkill(superpowers:*)\n\n",
-    )
-    .unwrap();
+fn allowed_tools_flag_keeps_grants_in_order_after_the_engine_tools() {
+    let body =
+        "# header comment\n\nBash\nRead\n  Edit  \n# inline comment\nSkill(superpowers:*)\n\n";
 
     assert_eq!(
-        cc_allowed_tools(dir.path()),
+        allowed_tools_flag(lines(body)),
         format!(
             "{},Read,Edit,Skill(superpowers:*)",
             ENGINE_ALLOWED_TOOLS.join(",")

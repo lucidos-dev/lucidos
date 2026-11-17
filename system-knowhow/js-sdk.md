@@ -14,6 +14,17 @@ The SDK is available as the `lucidos` global in app UIs (loaded via `<script src
 
 > From a coding-agent subprocess, prefer the `lucidos` CLI for `data.*` and `events.*` operations. See [`lucidos-cli.md`](./lucidos-cli.md).
 
+## Remote workspace client contract
+
+The connecting gateway serves its own installed frontend for remote workspaces.
+It checks both the remote gateway and its running engine for a compatible client contract.
+The health response advertises `workspace_client`; this is separate from SDK method availability.
+The generated client version adds no `lucidos.*` method or permission.
+
+Remote app documents remain opaque, including standalone remote app tabs.
+Their scoped file passes bind the serving workspace while URLs retain the remote alias.
+Use the SDK bridge for private operations; public SDK assets and fonts remain readable.
+
 ## Setup
 
 The engine serves app HTML as static content and injects nothing, except `?thread_id=` rewriting on WIP-preview requests. Apps opt into each piece they want.
@@ -392,6 +403,8 @@ Re-declare `font-family` only to override it deliberately, with `var(--font-ui)`
 `--font-family` and `--font` are tolerated **aliases** of `--font-ui`, so a
 guess still resolves to the user's font. Write `--font-ui`.
 
+`--font-mono` defaults to the native OS monospace stack, matching the host shell. It names macOS, Windows and Linux fonts before the generic fallback, with no user-installed coding fonts or font downloads.
+
 **`--font-features-text` and `--font-features-code` carry programming ligatures,
 and only code gets them.** Fira Code (the default), JetBrains Mono and Cascadia
 Code ship programming ligatures. With one of them as the UI font, the two
@@ -600,6 +613,9 @@ class SdkError extends Error {
 }
 ```
 
+GET requests retry a browser transport failure once, unless the caller canceled or the workspace generation changed.
+HTTP errors and body parsing errors are not transport retries.
+
 A call that never gets an answer rejects with a `DOMException` instead, and the
 `name` says which kind of nothing you got:
 
@@ -719,6 +735,31 @@ Behind a gateway, a returned URL carries your frame's pass to its own files, so 
 The pass behind a URL lasts an hour, and `url()` reads the current one on every call. So build the URL where you use it rather than caching the string. An `<iframe src>` left open past the hour needs its `src` rebuilt before an in-page link inside it works again.
 
 The same applies to a URL the browser captured at load. A dynamic `import()` resolves against its module's URL, and a stylesheet's `url()` against the stylesheet's. Both keep the pass they loaded with, so a chunk first imported an hour in answers 401. Load what you need up front, or accept that the user reloads.
+
+## lucidos.media
+
+`lucidos.media.poster(clip, { maxSize? })` returns a promise of
+`{ poster, width, height, duration }`.
+`poster` is a JPEG data URL; dimensions and duration describe the original clip.
+`clip` is a workspace path or HTTPS URL.
+`maxSize` is the box's long side in CSS pixels, default 640.
+The host scales by device pixel ratio, capped at 1280 pixels.
+
+```js
+const still = await lucidos.media.poster('artifacts/demo.mp4', { maxSize: 400 });
+image.src = still.poster;
+```
+
+Use a poster for an idle video widget instead of loading its video source.
+Attach the video source only on play, a scrub or full screen.
+The host captures one poster at a time and releases its decoder afterwards.
+It checks credential-less access before capture or cache lookup.
+Posters are cached by URL and ETag or Last-Modified, in memory and Cache Storage.
+Without a validator, a later call captures again.
+
+An HTTPS server must allow CORS for capture.
+On rejection, show the stage and play button, then load the video on intent.
+Workspace apps with their own videos must adopt this method themselves.
 
 ## lucidos.events: Event Store
 
@@ -1087,6 +1128,9 @@ const { models } = await lucidos.request('/models');
 
 ### Not every endpoint is reachable
 
+Host-log transfer routes are agent-only. An app cannot prepare or execute
+a transfer through `lucidos.request`; see `system-knowhow/lucidos-cli.md` § `lucidos diagnostic-log prepare-host-transfer`.
+
 The engine classifies every route, and an app frame reaches only the ones marked
 app-reachable. Anything else answers `SdkError` with a 403, whichever realm the
 app runs in. The whole reachable set, with the methods each opens:
@@ -1105,7 +1149,7 @@ app runs in. The whole reachable set, with the methods each opens:
 | `/notification`, `/notifications/before` | GET |
 | `/notification/read`, `/notifications/read-all` | POST |
 | `/apps`, `/app` | GET |
-| `/threads/list`, `/threads/count` | GET |
+| `/threads/list`, `/threads/count`, `/threads/:thread_id/liveness` | GET |
 | `/oauth/:provider/access-token` | GET |
 | `/proxy/:name/*path` | any method |
 | `/ui/navigate` | POST |
@@ -1126,6 +1170,7 @@ Denied, and why:
 | credentials, backup keys, OAuth accounts, the email account | the secret never enters the iframe, which is what `lucidos.proxy` exists for |
 | `/chat/stream`, thread creation, follow-ups, compose | `lucidos.ui.startThread()` prefills and never submits, so the user always sends their own prompt |
 | answering a question, every consent route, the `/internal/` tree | an app never answers as the user |
+| `/permissions`, permission batches, a thread's `/automation-pause` | only the owner grants, revokes or pauses, and an app is never the owner |
 | applying a change, restarting, rebuilding, installing a plugin | an app does not change the platform under the user |
 | writing an env var (the read is open) | an env var reaches every command the agent runs, so a loader-hook name would be host code execution |
 | writing a preference the Lucidos Agent may not write | a security setting such as the command guard or the local model host (`local_base_url`) stays the user's, changed in Settings |
@@ -1133,6 +1178,9 @@ Denied, and why:
 | reading or writing engine bookkeeping such as `backup_last_run` | it is engine state, not a setting: a read leaves it out |
 | message bodies, history, search, memory | an app sees that a thread exists, never what is in it |
 | repositories, `/browse-directories`, `/workspaces` | outside the workspace |
+
+Provider hold status and manual clear are host-only: apps cannot call `/models/spend-cap-holds` or `/models/spend-cap-holds/:provider/clear`.
+Use Settings → Providers for **Try now**. Provider hold notifications use the existing navigation tap to that page.
 
 If your app needs a denied route, say so rather than working around it. The
 list lives in `crates/lucidos-engine/src/api/app_reach.rs`, and opening a route
@@ -1524,7 +1572,9 @@ lucidos.preferences.set(key: string, value: string, deviceId?: string): Promise<
 ```
 
 `get()` defaults to the device the app runs on, so it sees the same merged view
-as the shell. Theme, font and scale are device-scoped, and a read naming no
+as the shell. Theme, font, scale and `agent-brand-colours` are device-scoped.
+Agent brand colours default On in the thread drawer. Off preserves the existing appearance, including the flat Lucidos mark.
+Other surfaces and status indicators stay unchanged. A read naming no
 device gets only the global rows. The device id is per-workspace, and an app
 never handles it. An app frame names its device, and the host substitutes the
 id. A standalone app tab reads the id itself.
@@ -1533,9 +1583,14 @@ A popped-out tab follows the shell it left, named by the `?device=` in its URL,
 so it keeps that shell's theme. Otherwise the tab reads the workspace-scoped
 `ws:<slug>:lucidos-device-id`. Pass `null` to fetch only global preferences.
 
+A remote workspace's popout is a shell tab with no `?device=` (ADR 0726). It
+uses the browser's own device for that workspace. From the desktop client, that
+can differ from the shell it left.
+
 `set()` refuses any key the Lucidos Agent may not write, such as
-`command_guard`, `max_tool_calls`, `network_bind` or `local_base_url`. Those
-are security settings the user changes in Settings. It also refuses the keys
+`command_guard`, `max_tool_calls`, `network_bind`, `local_base_url` or
+`model_permission_answer`. Those are security settings the user changes in
+Settings. It also refuses the keys
 that choose what a coding-agent session spawns (`coding_agent_claude_path`,
 `coding_agent_codex_path`, `coding_agent_claude_permission_mode`), and
 `opencode_free_enabled`, which sends chat to an anonymous third-party relay.
@@ -1724,7 +1779,7 @@ type NavigateTarget =
 // `communication-surfaces`.
 type SettingsViewTarget =
   | 'providers' | 'models' | 'intelligence' | 'permissions' | 'mcp' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
-  | 'access' | 'devices' | 'system' | 'appearance' | 'keyboard-shortcuts'
+  | 'access' | 'devices' | 'users' | 'system' | 'appearance' | 'keyboard-shortcuts'
   | 'system-overview' | 'release-notices' | 'whats-new'
   | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
@@ -1873,10 +1928,25 @@ From scripts (Python/bash), use the `lucidos notify` CLI, which builds the same 
 ```ts
 lucidos.threads.list(opts?: ThreadsListOptions): Promise<ThreadSummary[]>
 lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
-lucidos.threads.people  // driver and watchers, see § lucidos.threads.people
+lucidos.threads.liveness(threadId: string): Promise<ThreadLiveness>
+lucidos.threads.users  // driver and watchers, see § lucidos.threads.users
 ```
 
 `list()` calls `GET /api/v1/threads/list` and returns a newest-first array of `ThreadSummary` rows from the projection. `count()` calls `GET /api/v1/threads/count` and resolves to the count under the same filter, cheaper on big workspaces than `(await list()).length`.
+
+`liveness()` calls `GET /api/v1/threads/:thread_id/liveness` and resolves to the thread's *thread liveness*: what it is doing now, as the engine derives it. `list()` rows carry the same object as `liveness`. Show it as given; never derive a state from `status` and timestamps yourself.
+
+```ts
+interface ThreadLiveness {
+  state: 'working' | 'quiet' | 'waiting_for_user_answer' | 'paused'
+       | 'failed' | 'stalled' | 'waiting' | 'idle';
+  status: string;                  // the thread's ThreadStatus
+  last_activity_age_secs?: number; // since its newest event
+  session?: { ordinal: number; continuity: 'first' | 'fresh' | 'handoff'; age_secs: number };
+  handoff?: 'pending';             // only while a successor session is owed
+  as_of: string;                   // the engine's clock when it looked
+}
+```
 
 The CLI equivalents are `lucidos threads list` and `lucidos threads count`.
 The LLM uses the grouped `threads` tool with `list` or `count`.
@@ -1917,6 +1987,7 @@ interface ThreadsListOptions {
 type UnproposedReason =
   | 'plan_missing'
   | 'plan_awaiting_approval'
+  | 'plan_only_code'
   | 'outside_bound'
   | 'hardening_missing'
   | 'turn_incomplete'
@@ -2015,6 +2086,8 @@ interface ThreadSummary {
   draft_preview?: string;
   draft_length?: number;
   link?: string;
+  /** The thread's liveness, on `list` rows only. See `liveness()`. */
+  liveness?: ThreadLiveness;
 }
 ```
 
@@ -2024,6 +2097,7 @@ interface ThreadSummary {
 |---|---|
 | Render a list of threads in an app UI | `lucidos.threads.list()` |
 | Ask "is the workspace busy?" | `lucidos.threads.count({ status: 'running' })` |
+| Show whether one thread is working, quiet or stalled | `lucidos.threads.liveness(id)` |
 | Show "N threads need me" | `lucidos.threads.count({ status: 'waiting_for_user_answer' })` |
 | Show "N active threads" badge (working AND asking) | `lucidos.threads.count({ active: true })` |
 | Render one thread's children (a fan-out board) | `lucidos.threads.list({ parent: id })` |
@@ -2031,36 +2105,37 @@ interface ThreadSummary {
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })`, plus `coding_agent` and `folder` to preselect a coding target |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
-## lucidos.threads.people: Driver and Watchers
+## lucidos.threads.users: Driver and Watchers
 
-In a *team workspace*, a root thread and its sub-threads have at most one *driver* and any number of *watchers* (ADR 0623). Each is a person (an operator). Roles route pushes and feed the factory app's views. They are never authority: anyone can still answer any gate.
+In a *team workspace*, a root thread and its sub-threads have at most one *driver* and any number of *watchers* (ADR 0623). Each is a *user*. Roles route pushes and feed the factory app's views. They are never authority: anyone can still answer any gate.
 
 ```javascript
-const { items, person } = await lucidos.threads.people.list();
+const { items, user } = await lucidos.threads.users.list();
 // items: open root threads, newest activity first, at most 200:
 // [{ root_thread_id, title, last_activity, driver, watchers,
 //    gate_open, escalated, needs_team, yours }]
-// person: the calling device's person, or null
+// user: the calling device's user, or null
 
-const people = await lucidos.threads.people.get(threadId);
+const users = await lucidos.threads.users.get(threadId);
 // { root_thread_id, driver: { id, name } | null, watchers: [{ id, name }] }
 
-await lucidos.threads.people.take(threadId);    // Take, or Take over from the driver
-await lucidos.threads.people.release(threadId); // stop driving; a no-op if you do not drive
-await lucidos.threads.people.watch(threadId);
-await lucidos.threads.people.unwatch(threadId); // from any of your devices
+await lucidos.threads.users.take(threadId);    // Take, or Take over from the driver
+await lucidos.threads.users.release(threadId); // stop driving; a no-op if you do not drive
+await lucidos.threads.users.watch(threadId);
+await lucidos.threads.users.unwatch(threadId); // from any of your devices
 ```
 
-- Routes: `GET /api/v1/threads/people`, `GET /api/v1/threads/:thread_id/people`, and `POST` on `.../people/take`, `release`, `watch` and `unwatch`.
+- Routes: `GET /api/v1/threads/users`, `GET /api/v1/threads/:thread_id/users`, and `POST` on `.../users/take`, `release`, `watch` and `unwatch`.
 - `list` returns root threads that are not archived, the home thread aside. Archiving the root completes its work.
-- `gate_open`: a thread in the family waits on a question. `needs_team` is the Team view: an open gate with no driver, or one that escalated. `yours`: your person drives or watches it, so Mine is `items.filter(i => i.yours)`.
+- `gate_open`: a thread in the family waits on a question. `needs_team` is the Team view: an open gate with no driver, or one that escalated. `yours`: your user drives or watches it, so Mine is `items.filter(i => i.yours)`.
 - Any thread id names its root thread, through its family root.
-- Each change acts as the person holding the calling device and returns the people after it. A repeat that changes nothing records nothing.
-- A device that belongs to no person gets a 409 with `reason: "no_person"`. Add it to a person in Settings, People.
+- Each change acts as the user holding the calling device and returns the users after it. A repeat that changes nothing records nothing.
+- A device that belongs to no user gets a 409 with `reason: "no_user"`. Add it to a user in Settings, Users.
 - Answering a gate also makes you the driver. So does a keyed trigger fire whose *actor* email you hold.
-- A push about a root thread with a driver reaches the driver's and watchers' devices. With no driver, or once a gate escalated past `driver_timeout_hours`, it reaches the whole team. A gateway with one person always pushes everyone.
+- A push about a root thread with a driver reaches the driver's and watchers' devices. With no driver, or once a gate escalated past `driver_timeout_hours`, it reaches the whole team. A gateway with one user always pushes everyone.
 - Watch the role events (`WorkItemDriverTaken` and the rest, `thread-events.md`) through `lucidos.sse` to refresh a view. Their names are legacy spellings, kept because stored events never change.
 - `lucidos.workItems` was the retired name of this namespace. An app copied before the rename must be copied again.
+- `lucidos.threads.people` is a deprecated alias of `lucidos.threads.users`, kept for apps written before the user rename (ADR 0655). Its `list()` also names the caller `person`. Write `users` in new code.
 
 ## lucidos.modelRequest
 
@@ -2224,7 +2299,9 @@ widget looks the same in both. The full contract is
   it reports each text, image, SVG, canvas or video the box cuts off. The
   engine turns that report into the `[WIDGET FIT]` note
   (`system-knowhow/building-an-app.md` § The widget box, rule 8). A widget
-  does nothing for it but load the SDK.
+  does nothing for it but load the SDK. A fit-only agent renderer uses this
+  same measurement path. Its launcher holds the report credential; the SDK
+  never receives it. See `docs/widget-fit-renderer.md` for the host contract.
 - The same widget opened full size in the Canvas pane gets no size, so there
   it is an ordinary app.
 
@@ -2265,7 +2342,7 @@ show(await lucidos.ui.focusedThread());
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`), `fragment` (optional) | Open an app UI, optionally at a place inside it. See the fragment param below. |
-| `settings` | `settings_view` (optional), `fragment` (optional) | Open Settings, optionally a sub-section: `providers`, `models`, `intelligence`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. A `fragment` scrolls to a row on that page: `settings_view: 'providers'` with `fragment: 'xai'` lands on the xAI block. An unknown row still opens the page, then shows a toast. |
+| `settings` | `settings_view` (optional), `fragment` (optional) | Open Settings, optionally a sub-section: `providers`, `models`, `intelligence`, `permissions`, `mcp`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `users`, `appearance`, `keyboard-shortcuts`, or a System page (`system` is the list of them; `system-overview`, `release-notices`, `whats-new`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging` are the pages themselves). Omit `settings_view` for the Settings home list. A `fragment` scrolls to a row on that page: `settings_view: 'providers'` with `fragment: 'xai'` lands on the xAI block. An unknown row still opens the page, then shows a toast. |
 | `new-chat` | `prompt`, `coding_agent`, `folder` (all optional) | Open a fresh chat thread, optionally prefilling the compose textarea and preselecting the coding agent and folder. Prefer `lucidos.ui.startThread()`, the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row. The plugin-update notification uses this, so a tap on one update lands on its plugin. |
 | `app-store` | (none) | Open the Plugins panel's Store (marketplace) tab. |
@@ -2568,9 +2645,8 @@ interface ToastOptions {
    *  warnings and keyed spinning toasts stay until dismissed or replaced;
    *  success/info auto-close, with or without a key. */
   durationMs?: number;
-  /** false = never show the close (X) button, and a tap on the toast never
-   *  closes it. A toast that leaves on its own timer and has no button shows
-   *  no X either way. Default true. */
+  /** false = hide the close (X) on persistent toasts. Timed toasts always
+   *  show the X so the user can dismiss them early. Default true. */
   dismissable?: boolean;
   /** Stable key for in-place replacement. A later toast with the same key
    *  updates the existing toast (message/type/etc.) instead of stacking a new
@@ -3087,3 +3163,10 @@ addEventListener('pageshow', (event) => {
 ```
 
 The full pattern is `system-knowhow/building-an-app.md` § Live data. It covers the events per path, the writes that announce nothing, a deleted file, and your own writes.
+
+## Diagnostic evidence
+
+Host theme breadcrumbs classify known category and code values separately from private message and data fields.
+App frames cannot read diagnostic inbox contents; that query requires the receiving workspace's own agent token.
+
+Follow [Agent Sandbox](agent-sandbox.md) for bounded diagnostic access and the raw-host-log restriction.

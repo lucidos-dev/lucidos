@@ -87,7 +87,7 @@ pub enum CacheKeepAliveStatus {
         cost_usd: f64,
         /// What the warm cache saved the next request: the reread price of the
         /// run's context. Absent unless that request began while the cache was
-        /// still warm.
+        /// still warm. Zero when the last real request alone kept it warm.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         saved_usd: Option<f64>,
         /// The context the run kept warm. Absent on statuses stored before it.

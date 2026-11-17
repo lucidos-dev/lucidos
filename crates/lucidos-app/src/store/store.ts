@@ -1,3 +1,4 @@
+import { PREF_CODING_AGENT_DEFAULT, PREF_NOTIFICATIONS_FILTER } from '@lucidos/preference-catalog';
 import { readWindowItem, removeWindowItem, writeWindowItem } from '../utils/windowStorage';
 import { signal, computed, batch, type ReadonlySignal, type Signal } from '@preact/signals';
 import type { WidgetParams } from '../utils/widgetParams';
@@ -52,13 +53,14 @@ import type { SubscriptionGroup, ThreadMeta, ThreadState, ThreadStatus, Exchange
 import { changeReadyToReview, computeExchanges, isExcludedFromSections, plainEventName } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
 import { DEFAULT_CHAT_MODEL } from './models';
-import { PREFERENCE_CATALOG, type PreferenceValues } from '@lucidos/preference-catalog';
+import { type PreferenceValues } from '@lucidos/preference-catalog';
 import { displaySection, EVENT_CHANNELS } from '../generated/thread-lifecycle';
 import type { EventChannel, ArchiveState, DisplaySection } from '../generated/thread-lifecycle';
 import type { UnproposedReason } from '../generated/thread-event-wire';
 import { resetContentScroll } from './savedScroll';
 import type { Change, ChangelogRelease, PendingCommits, ReaderDevices, ReleaseNoticeView, ThreadContext } from '../api/client';
 import type { UpdateRelay, ReleaseCheck } from '../api/client/control';
+import type { LastSuccessfulBackupResponse } from '../api/client/settings';
 import type { ApplyEstimates, LandingLane, MainCheck } from '../api/client/changes';
 import type { EnvironmentVariable, IntelligenceLadder, ModelInfo, ResponseStyle } from '../api/types';
 import type { ChunkGate } from '../utils/lazyComponent';
@@ -244,7 +246,7 @@ export function closeInlineFormIfActive(form: InlineForm): void {
 // `system` is the System submenu, the list of the sub-pages below it. Overview
 // is one of those sub-pages and holds `system-overview`, so it is reached as a
 // row like every sibling.
-export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'providers' | 'models' | 'intelligence' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
+export type SettingsSubview = 'main' | 'system' | 'system-overview' | 'providers' | 'models' | 'intelligence' | 'appearance' | 'memory' | 'devices' | 'users' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'prompt-footprint' | 'permissions' | 'mcp' | 'keyboard-shortcuts' | 'access' | 'webhooks' | 'environment-variables' | 'thread-queue' | 'whats-new' | 'release-notices' | 'debugging' | 'communication-surfaces';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -350,6 +352,9 @@ export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   // third-party service posts to.
   { key: 'webhooks', label: 'Webhooks', group: 'Workspace' },
   { key: 'devices', label: 'Devices', group: 'Workspace' },
+  // Beside Devices, since a user is who holds them. A page of its own
+  // because, as a section at the foot of Devices, nobody found it.
+  { key: 'users', label: 'Users', group: 'Workspace' },
   { key: 'system', label: 'System', group: 'Workspace' },
   // Where a link opens is behaviour rather than display, so the label says
   // both. The KEY stays the head noun, matching the repo's own ampersand
@@ -545,9 +550,9 @@ export const whatsNewTargetRelease = signal<string | null>(null);
  *  phone too, which is the opposite of {@link whatsNewSeenRelease} and is
  *  deliberate: a notice asks for work on the workspace, done once. */
 export const releaseNoticeView = signal<Loadable<ReleaseNoticeView>>({ status: 'not-loaded' });
-/** The devices whose reads count as this page's: its person's, on a team
- *  gateway (ADR 0623). Decides which read requests are still this person's
- *  to read. Reloaded on `OperatorsChanged`. */
+/** The devices whose reads count as this page's: its user's, on a team
+ *  gateway (ADR 0623). Decides which read requests are still this user's
+ *  to read. Reloaded on `UsersChanged`. */
 export const readerDevices = signal<Loadable<ReaderDevices>>({ status: 'not-loaded' });
 export const engineVersion = signal<string | null>(null);
 export const latestEngineVersion = signal<string | null>(null);
@@ -651,6 +656,15 @@ export const enginePackaged = signal<boolean>(false);
  *  and defaults to `true` so onboarding never flashes before the first
  *  probe. */
 export const llmConfigured = signal<boolean>(true);
+
+/** Why the connected engine's machine cannot sandbox agents, or null when it
+ *  can. Set from /health. The sandbox banner pairs it with
+ *  `agents_unsandboxed`. ADR 0645. */
+export const agentSandboxUnavailable = signal<string | null>(null);
+
+/** Whether the connected engine's sandbox cannot stop an agent emptying a
+ *  protected file (Linux below Landlock ABI 3). Set from /health. ADR 0645. */
+export const agentSandboxTruncationUnguarded = signal<boolean>(false);
 
 /** Provider backends the connected engine actually has configured, from
  *  /health. Filters the chat model picker to providers the user has set up.
@@ -1252,7 +1266,7 @@ export function readRequestStanding(thread: ThreadState): boolean {
   return readRequestedForMe(thread.meta) && !isMidTurn(effectiveThreadStatus(thread));
 }
 
-/** Whether a read request is still this person's to read. On a team gateway
+/** Whether a read request is still this user's to read. On a team gateway
  *  one person's sighting leaves it for the others (ADR 0623). Until the
  *  page knows its person, and for a page reading as the team, every
  *  pending request counts. */
@@ -1503,16 +1517,12 @@ function restoreScope(): Scope {
 
 export const selectedScope = signal<Scope>(restoreScope());
 
-/** The account DEFAULT coding agent: the SEED for a fresh compose's backend
- *  chip, from the `coding_agent_default` preference.
- *
- *  A per-draft pick lives in `composeSelections` and does NOT write back here,
- *  so changing the chip on one draft never changes another or this default.
- *  `resolveCodingAgent` falls back here for an override-less draft.
- *  `sendCompose` binds the result onto the thread's meta at promotion. See ADR
- *  0006 for the workspace-scoped default. */
+/** Last selected coding agent, persisted as the workspace `coding_agent_default`
+ *  preference. New drafts copy it into their own selection; explicit chip picks
+ *  preserve legacy selections through the atomic server preference write.
+ *  `sendCompose` binds the resolved draft value at promotion (ADR 0006). */
 export const selectedCodingAgent = signal<import('../api/types').CodingAgent>(
-  PREFERENCE_CATALOG.coding_agent_default.fallback,
+  PREF_CODING_AGENT_DEFAULT.fallback,
 );
 
 /** Translate a Scope into the engine's `folder` request field.
@@ -2156,8 +2166,8 @@ export type NotificationsFilter = PreferenceValues<'notifications_filter'>;
 export const NOTIFICATIONS_FILTER_STORAGE_KEY = 'lucidos-notifications-filter';
 const cachedFilter = localStorage.getItem(NOTIFICATIONS_FILTER_STORAGE_KEY);
 export const notificationsFilter = signal<NotificationsFilter>(
-  PREFERENCE_CATALOG.notifications_filter.values.find((f) => f === cachedFilter)
-    ?? PREFERENCE_CATALOG.notifications_filter.fallback,
+  PREF_NOTIFICATIONS_FILTER.values.find((f) => f === cachedFilter)
+    ?? PREF_NOTIFICATIONS_FILTER.fallback,
 );
 export const notificationsHasMore = signal(false);
 export const notificationsLoadingMore = signal(false);
@@ -2664,6 +2674,13 @@ export function registerAskDialogChunk(chunk: ChunkGate | null): void {
   askDialogChunk = chunk;
 }
 
+/** Prepare automatic prompts before taking an interactive delivery claim. */
+export async function ensureAskDialogsReady(): Promise<void> {
+  if (askDialogChunk && !askDialogChunk.isLoaded() && !await askDialogChunk.preload()) {
+    throw new Error('Could not load the dialog. Reopen Lucidos and retry.');
+  }
+}
+
 /** Run `show` once the dialogs can draw, which is at once when warm. A call a
  *  later one replaced, or one whose chunk failed, runs `decline` instead. */
 function whenAskDialogsDraw(show: () => void, decline: () => void, current: () => boolean): void {
@@ -2864,6 +2881,11 @@ export const backupProgress = gapClearedProgress<{ phase: string; progress: numb
  *  BackupFailed). BackupSection re-fetches `/backup/status` when this changes
  *  so the health card reflects the new last-run outcome. */
 export const backupStatusVersion = gapRefreshedVersion();
+
+/** The workspace's backup history, read by the app-shell banner. Loaded at
+ *  startup and re-read on `BackupCompleted`, `BackupFailed` and an event gap
+ *  (`loadLastSuccessfulBackup`). */
+export const lastSuccessfulBackup = signal<Loadable<LastSuccessfulBackupResponse>>({ status: 'not-loaded' });
 export const snapshotsVersion = gapRefreshedVersion();
 
 /** Bumped on `BackupRecipientSet`: a backup key setup finished, or the user

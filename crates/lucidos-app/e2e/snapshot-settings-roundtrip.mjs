@@ -1,5 +1,6 @@
 /** Real Settings restore against the private gateway fixture. Only client
- * assets are fulfilled locally; every API request and SSE reaches its engines.
+ * assets are fulfilled locally; every API request and SSE reaches its engine
+ * through the gateway, as a paired device.
  * Run with E2E_SNAPSHOT_BROWSER=chromium scripts/e2e-api.sh --local -f
  * server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip after a
  * frontend build. The shared browser-suite workspace is never restored. */
@@ -9,29 +10,22 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const config = JSON.parse(process.env.E2E_SNAPSHOT_BROWSER_CONFIG ?? 'null');
-if (!config?.workspace?.startsWith('snapshot-e2e-') || !config.token || !config.handle) {
+if (!config?.workspace?.startsWith('snapshot-e2e-') || !config.credential || !config.handle) {
   throw new Error('Private snapshot browser fixture required');
 }
 const dist = resolve(dirname(fileURLToPath(import.meta.url)), '../dist');
-// The ordinary direct-engine shell uses stamped workspace identity. This also
-// keeps the real SSE worker on its engine origin without inventing pairing.
-const prefix = '/';
-const origin = `http://127.0.0.1:${config.engine_port}`;
+// Engines trust a device only under the gateway's stamp, so the page is a
+// paired device on the gateway origin. The shell carries what the engine
+// stamps behind the gateway, and the SSE worker loads through the same prefix.
+const prefix = `/${config.workspace}/`;
+const origin = `http://127.0.0.1:${config.port}`;
 const shell = (await readFile(join(dist, 'index.html'), 'utf8')).replace('<head>',
   `<head><base href="${prefix}"><meta name="lucidos-workspace-id" content="${config.workspace}"><meta name="lucidos-gateway-port" content="${config.port}">`);
 const browser = await chromium.launch({
   headless: true, executablePath: process.env.E2E_SNAPSHOT_BROWSER_EXECUTABLE,
 });
-const context = await browser.newContext({
-  serviceWorkers: 'block', reducedMotion: 'reduce',
-  extraHTTPHeaders: {
-    'x-lucidos-local-token': config.token,
-    'x-lucidos-device-id': config.device,
-  },
-});
-await context.addInitScript(({ device }) => {
-  localStorage.setItem('lucidos-device-id', device);
-}, { device: config.device });
+const context = await browser.newContext({ serviceWorkers: 'block', reducedMotion: 'reduce' });
+await context.addCookies([{ name: config.cookie, value: config.credential, url: origin }]);
 const page = await context.newPage();
 const errors = [];
 page.on('pageerror', error => errors.push(error.message));

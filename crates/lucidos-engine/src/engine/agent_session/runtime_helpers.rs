@@ -17,7 +17,7 @@ impl LucidosEngine {
                 .fetch_optional(&self.pool)
                 .await
                 .unwrap_or_else(|e| {
-                    crate::log!(
+                    crate::log_legacy!(
                 "[AgentSession] thread_coding_agent({}) DB error: {} — defaulting to ClaudeCode",
                 thread_id,
                 e
@@ -180,8 +180,13 @@ impl LucidosEngine {
             // error string is what the frontend renders next to the red dot.
             TerminalKind::Failed { error } => {
                 crate::engine::thread_events::ThreadEvent::ResponseFailed {
+                    spend_cap: crate::llm::spend_cap::SpendCapNotice::from_agent_text(
+                        "Coding agent",
+                        &error,
+                    ),
                     error,
                     agent_exit: None,
+                    provider_error: None,
                 }
             }
         }
@@ -250,7 +255,7 @@ impl LucidosEngine {
         .await;
         let Some(mut kind) = stop_terminal_kind(is_shutdown, is_waiting, suppress_user_terminal)
         else {
-            crate::log!(
+            crate::log_legacy!(
                 "[AgentSession] {} arm: session {} stopped without a terminal event \
                  (idle, user-action, or idle shutdown)",
                 arm,
@@ -469,7 +474,7 @@ impl LucidosEngine {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    crate::log!("[AgentSession] engine turn on {} failed: {}", thread_id, e);
+                    crate::log_legacy!("[AgentSession] engine turn on {} failed: {}", thread_id, e);
                     on_failure(&e.to_string());
                     crate::engine::claude_code::emit_background_task_failure(
                         &engine,
@@ -498,6 +503,9 @@ impl LucidosEngine {
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
                 if join_err.is_panic() {
+                    crate::internal_faults::record_pending(
+                        crate::internal_faults::FaultKind::TaskPanic,
+                    );
                     let panic_msg = match join_err.into_panic().downcast::<String>() {
                         Ok(s) => *s,
                         Err(e) => match e.downcast::<&str>() {
@@ -505,7 +513,7 @@ impl LucidosEngine {
                             Err(_) => "unknown panic".to_string(),
                         },
                     };
-                    crate::log!(
+                    crate::log_legacy!(
                         "[AgentSession] CC task panicked for thread {}: {}",
                         thread_id,
                         panic_msg
@@ -517,7 +525,9 @@ impl LucidosEngine {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                     error: format!("Internal error: {}", panic_msg),
+                                    spend_cap: None,
                                     agent_exit: None,
+                                    provider_error: None,
                                 },
                                 // The channel lets a reader of the latest
                                 // coding-agent terminal see this one.
@@ -617,7 +627,7 @@ pub(super) async fn external_terminal_already_emitted(
     site: &'static str,
 ) -> bool {
     if flag.load(std::sync::atomic::Ordering::Acquire) {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentSession] Skipping terminal emit ({}) for thread {}: external pre-emit already landed",
             site,
             thread_id
@@ -631,7 +641,7 @@ pub(super) async fn external_terminal_already_emitted(
         return false;
     };
     if crate::engine::agent_recovery::boundary_abort_covers_turn(pool, thread_id, anchor).await {
-        crate::log!(
+        crate::log_legacy!(
             "[AgentSession] Skipping terminal emit ({}) for thread {}: this session registered \
              after the teardown boundary, which already covers turn {}",
             site,
@@ -730,137 +740,6 @@ mod tests {
         };
         LucidosEngine::stamp_host_actor_if_aborted(&mut meta, true, MessageOrigin::system());
         assert_eq!(meta.actor, Some(device));
-    }
-
-    /// Source-scan tripwire: **`is_shutdown` always holds the effective
-    /// answer**, never the raw per-session flag.
-    ///
-    /// This is the shape of the 2026-08-06 switch report, and a behavioural
-    /// test cannot reach it: every consumer is buried inside `run_session`,
-    /// which needs a whole live `LucidosEngine` plus a subprocess. What went
-    /// wrong was purely textual. One function bound `is_shutdown` from the bare
-    /// atomic, asked the widened question in one place and the narrow one three
-    /// lines later, and the narrow read is the one that chose the terminal
-    /// event. `run_session` then used the same NAME for both meanings in the
-    /// same file, which is what made the discrepancy invisible on review.
-    ///
-    /// So the rule is about the name: in the three production files that decide
-    /// a terminal, every `let is_shutdown = …` must be produced by
-    /// `session_is_shutting_down`. Widening at a site that later re-widens is
-    /// harmless (the OR is idempotent) and worth it, because a reader must
-    /// never have to trace a call chain to learn which of the two questions a
-    /// variable answers.
-    ///
-    /// Scoped to those three deliberately. Test files bind the name to a plain
-    /// literal to drive the pure truth tables (`cancel_lifecycle_tests.rs`), and
-    /// `run_session/entry_guard.rs` reads the per-session flag on purpose (see
-    /// its own doc); neither is a terminal decision.
-    #[test]
-    fn is_shutdown_is_always_the_effective_answer() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("engine")
-            .join("agent_session");
-        let files = [
-            dir.join("runtime_helpers.rs"),
-            dir.join("run_session").join("run.rs"),
-            dir.join("run_session").join("completion.rs"),
-        ];
-        let mut violations: Vec<String> = Vec::new();
-        let mut checked = 0usize;
-        for path in &files {
-            let content = std::fs::read_to_string(path).expect("read source");
-            let lines: Vec<&str> = content.lines().collect();
-            for (i, line) in lines.iter().enumerate() {
-                if !line.trim_start().starts_with("let is_shutdown =") {
-                    continue;
-                }
-                checked += 1;
-                // The binding's own statement, which may wrap over several
-                // lines or open a block. Three lines is enough for every
-                // current shape and keeps the scan from swallowing the next
-                // statement.
-                let window = lines[i..(i + 4).min(lines.len())].join(" ");
-                if !window.contains("session_is_shutting_down") {
-                    violations.push(format!(
-                        "{}:{}: {}",
-                        path.file_name().unwrap().to_string_lossy(),
-                        i + 1,
-                        line.trim()
-                    ));
-                }
-            }
-        }
-        assert!(
-            checked >= 6,
-            "the scan found only {checked} `is_shutdown` bindings, so it has \
-             stopped matching the source it is supposed to guard"
-        );
-        assert!(
-            violations.is_empty(),
-            "`is_shutdown` must be the effective answer \
-             (`session_is_shutting_down`), not the raw per-session flag. A bare \
-             read here classifies an engine restart as a user Stop for any \
-             session that registered after the teardown snapshot:\n{}",
-            violations.join("\n")
-        );
-    }
-
-    /// Source-scan tripwire: **a terminal event reports the model and effort
-    /// the session entry holds.** Only the entry knows the *effort in force*,
-    /// so no terminal may be built from the loop's
-    /// spawn-time `normalized_model` and `cc_reasoning_effort` locals.
-    #[test]
-    fn terminal_events_never_take_the_spawn_time_model() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("engine")
-            .join("agent_session");
-        let files = [
-            dir.join("runtime_helpers.rs"),
-            dir.join("run_session").join("run.rs"),
-            dir.join("run_session").join("completion.rs"),
-        ];
-        let builders = [
-            "make_terminal_event(",
-            "emit_stop_terminal(",
-            "emit_response_aborted(",
-        ];
-        let mut violations: Vec<String> = Vec::new();
-        let mut checked = 0usize;
-        for path in &files {
-            let content = std::fs::read_to_string(path).expect("read source");
-            let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
-            for builder in builders {
-                for (at, _) in production.match_indices(builder) {
-                    if production[..at].ends_with("fn ") {
-                        continue;
-                    }
-                    // The call runs to the end of its statement.
-                    let call = &production[at..];
-                    let call = &call[..call.find(';').unwrap_or(call.len())];
-                    checked += 1;
-                    if call.contains("normalized_model") || call.contains("cc_reasoning_effort") {
-                        violations.push(format!(
-                            "{}: {}",
-                            path.file_name().unwrap().to_string_lossy(),
-                            call.lines().next().unwrap_or_default().trim()
-                        ));
-                    }
-                }
-            }
-        }
-        assert!(
-            checked >= 5,
-            "the scan found only {checked} terminal builder calls, so it has \
-             stopped matching the source it is supposed to guard"
-        );
-        assert!(
-            violations.is_empty(),
-            "a terminal event must report the session's current model, not the \
-             spawn-time locals:\n{}",
-            violations.join("\n")
-        );
     }
 
     // -- external_terminal_already_emitted ---------------------------------
@@ -1230,5 +1109,134 @@ mod tests {
             max_seen.load(Ordering::SeqCst) <= 2,
             "Semaphore should limit to 2 concurrent startups"
         );
+    }
+
+    mod guard_tests {
+        /// Source-scan tripwire: **`is_shutdown` always holds the effective
+        /// answer**, never the raw per-session flag.
+        ///
+        /// A behavioural test cannot reach this shape of a past switch report:
+        /// every consumer sits inside `run_session`, which needs a live engine and
+        /// a subprocess. One function bound `is_shutdown` from the bare atomic. It
+        /// asked the widened question once and the narrow one three lines later,
+        /// and the narrow read chose the terminal event.
+        ///
+        /// So the rule is about the name. In the three production files that
+        /// decide a terminal, every `let is_shutdown = …` comes from
+        /// `session_is_shutting_down`. Widening twice is harmless, since the OR is
+        /// idempotent, and a reader never traces a call chain to learn its meaning.
+        ///
+        /// Scoped to those three deliberately. Test files bind the name to a plain
+        /// literal for the truth tables (`cancel_lifecycle_tests.rs`), and
+        /// `run_session/entry_guard.rs` reads the per-session flag on purpose.
+        /// Neither is a terminal decision.
+        #[test]
+        fn is_shutdown_is_always_the_effective_answer() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("engine")
+                .join("agent_session");
+            let files = [
+                dir.join("runtime_helpers.rs"),
+                dir.join("run_session").join("run.rs"),
+                dir.join("run_session").join("completion.rs"),
+            ];
+            let mut violations: Vec<String> = Vec::new();
+            let mut checked = 0usize;
+            for path in &files {
+                let content = std::fs::read_to_string(path).expect("read source");
+                let lines: Vec<&str> = content.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if !line.trim_start().starts_with("let is_shutdown =") {
+                        continue;
+                    }
+                    checked += 1;
+                    // The binding's own statement, which may wrap over several
+                    // lines or open a block. Three lines is enough for every
+                    // current shape and keeps the scan from swallowing the next
+                    // statement.
+                    let window = lines[i..(i + 4).min(lines.len())].join(" ");
+                    if !window.contains("session_is_shutting_down") {
+                        violations.push(format!(
+                            "{}:{}: {}",
+                            path.file_name().unwrap().to_string_lossy(),
+                            i + 1,
+                            line.trim()
+                        ));
+                    }
+                }
+            }
+            assert!(
+                checked >= 6,
+                "the scan found only {checked} `is_shutdown` bindings, so it has \
+             stopped matching the source it is supposed to guard"
+            );
+            assert!(
+                violations.is_empty(),
+                "`is_shutdown` must be the effective answer \
+             (`session_is_shutting_down`), not the raw per-session flag. A bare \
+             read here classifies an engine restart as a user Stop for any \
+             session that registered after the teardown snapshot:\n{}",
+                violations.join("\n")
+            );
+        }
+
+        /// Source-scan tripwire: **a terminal event reports the model and effort
+        /// the session entry holds.** Only the entry knows the *effort in force*,
+        /// so no terminal may be built from the loop's
+        /// spawn-time `normalized_model` and `cc_reasoning_effort` locals.
+        #[test]
+        fn terminal_events_never_take_the_spawn_time_model() {
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src")
+                .join("engine")
+                .join("agent_session");
+            let files = [
+                dir.join("runtime_helpers.rs"),
+                dir.join("run_session").join("run.rs"),
+                dir.join("run_session").join("completion.rs"),
+            ];
+            let builders = [
+                "make_terminal_event(",
+                "emit_stop_terminal(",
+                "emit_response_aborted(",
+            ];
+            let mut violations: Vec<String> = Vec::new();
+            let mut checked = 0usize;
+            for path in &files {
+                let content = std::fs::read_to_string(path).expect("read source");
+                let production = content.split("#[cfg(test)]").next().unwrap_or(&content);
+                for builder in builders {
+                    for (at, _) in production.match_indices(builder) {
+                        if production[..at].ends_with("fn ") {
+                            continue;
+                        }
+                        // The call runs to the end of its statement.
+                        let call = &production[at..];
+                        let call = &call[..call.find(';').unwrap_or(call.len())];
+                        checked += 1;
+                        if call.contains("normalized_model") || call.contains("cc_reasoning_effort")
+                        {
+                            violations.push(format!(
+                                "{}: {}",
+                                path.file_name().unwrap().to_string_lossy(),
+                                call.lines().next().unwrap_or_default().trim()
+                            ));
+                        }
+                    }
+                }
+            }
+            assert!(
+                checked >= 5,
+                "the scan found only {checked} terminal builder calls, so it has \
+             stopped matching the source it is supposed to guard"
+            );
+            assert!(
+                violations.is_empty(),
+                "a terminal event must report the session's current model, not the \
+             spawn-time locals:\n{}",
+                violations.join("\n")
+            );
+        }
     }
 }

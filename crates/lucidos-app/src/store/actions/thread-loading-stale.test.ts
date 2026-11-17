@@ -111,6 +111,24 @@ describe('markLoadedThreadsStale', () => {
     expect(fetchEvents.mock.calls.map(c => c[0])).toEqual(['has-events']);
   });
 
+  // A notification tap reads its thread before admission, and admission's gap
+  // resync can run while that first load is still in flight.
+  it('catches the open thread up when its first load lands after a gap opened', async () => {
+    putThreads([['opening', makeThreadState('opening')]]);
+    focusedThreadId.value = 'opening';
+    let answer!: (snapshot: { events: never[]; currentAggregate: null }) => void;
+    fetchEvents.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const load = loadThreadEvents('opening');
+    await settle();
+
+    markLoadedThreadsStale();
+    answer({ events: [], currentAggregate: null });
+    await load;
+    await settle();
+
+    expect(fetchEvents.mock.calls.map(c => c[0])).toEqual(['opening', 'opening']);
+  });
+
   it('rebuilds the set, so a departed thread leaves no entry behind', async () => {
     putThreads([['gone', loaded('gone')], ['stays', loaded('stays')]]);
     markLoadedThreadsStale();

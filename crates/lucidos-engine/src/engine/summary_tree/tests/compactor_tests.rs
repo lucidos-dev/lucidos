@@ -1222,6 +1222,8 @@ fn the_progress_frame_carries_the_rest_shape() {
         nodes_total: 6,
         waiting_for_model: true,
         retrying: false,
+        spend_cap_held_until: None,
+        spend_cap_resets_at: None,
         failing_model: Some(COMPACTOR_MODEL.to_string()),
         ready: false,
         spent_usd: Some(1.25),
@@ -2599,5 +2601,51 @@ async fn a_seed_with_nothing_owed_closes_the_open_episode() {
     c.seed().await.unwrap();
     assert_eq!(count_events(&pool, "TreeBackfillEnded").await, 2);
     assert_eq!(c.backfill_progress(), None);
+    teardown_test_db(&db_name).await;
+}
+
+/// Forward-only writer filtering must preserve a tree built from legacy rows.
+#[tokio::test]
+async fn unattended_writes_leave_an_existing_legacy_tree_untouched() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    seed_workspace(&pool, &bus).await;
+    run_to_rest(&compactor(&pool, &bus, deps(EchoProvider::new()))).await;
+    let before = snapshot(&pool).await;
+    let leaves_before: Vec<_> = workspace_log(&pool)
+        .await
+        .leaves
+        .iter()
+        .map(|l| l.event_id())
+        .collect();
+    bus.emit(BusEvent::System(SystemEvent::artifact_change(
+        false,
+        "notes/scheduled.md".into(),
+        "c3".into(),
+        None,
+        None,
+        crate::engine::event_bus::ArtifactWriter::Trigger {
+            trigger_id: "report".into(),
+        },
+    )))
+    .await
+    .unwrap();
+    age_events(&pool).await;
+    // A newly booted compactor has no cached tree or workspace log.
+    run_to_rest(&compactor(&pool, &bus, deps(EchoProvider::new()))).await;
+    assert_eq!(snapshot(&pool).await, before);
+    assert_eq!(
+        workspace_log(&pool)
+            .await
+            .leaves
+            .iter()
+            .map(|l| l.event_id())
+            .collect::<Vec<_>>(),
+        leaves_before
+    );
+    assert!(
+        store::caught_up(&pool).await.unwrap(),
+        "excluded writes still advance reflection"
+    );
     teardown_test_db(&db_name).await;
 }

@@ -95,8 +95,39 @@ async fn cancel(
     Ok(Json(CancelResponse { resolved }))
 }
 
+#[derive(Deserialize)]
+struct ResolvedQuery {
+    request_ids: String,
+}
+
+/// Resolve only identities with event evidence, never absence from the pending list.
+async fn list_resolved(
+    State(state): State<AppState>,
+    Query(query): Query<ResolvedQuery>,
+) -> Result<Json<Vec<uuid::Uuid>>, ApiError> {
+    let ids: Vec<uuid::Uuid> = query
+        .request_ids
+        .split(',')
+        .take(101)
+        .map(|id| {
+            id.parse()
+                .map_err(|_| ApiError::bad_request("Invalid form request id"))
+        })
+        .collect::<Result<_, _>>()?;
+    if ids.len() > 100 {
+        return Err(ApiError::bad_request(
+            "At most 100 form request ids are allowed",
+        ));
+    }
+    form_requests::resolved_ids(&state.pool, &ids)
+        .await
+        .map(Json)
+        .map_err(ApiError::db)
+}
+
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/form-requests/pending", get(list_pending))
+        .route("/form-requests/resolved", get(list_resolved))
         .route("/form-requests/:request_id/cancel", post(cancel))
 }

@@ -52,7 +52,7 @@ pub(crate) async fn emit_response_canceled(
 ) {
     if let Some(req_id) = meta.request_event_id {
         if has_terminator_for(pool, thread_id, req_id).await {
-            crate::log!(
+            crate::log_legacy!(
                 "[{}] Skipping ResponseCanceled — terminator already exists for request {} on thread {}",
                 log_tag,
                 req_id,
@@ -104,7 +104,7 @@ pub(crate) async fn has_terminator_for(
     .fetch_one(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[ThreadEvents] has_terminator_for query failed for request {} on thread {}: {}",
             request_event_id,
             thread_id,
@@ -183,14 +183,14 @@ pub(crate) async fn emit_continuation_requested_or_log(
     match bus.emit(event).await {
         Ok(Some(_)) => true,
         Ok(None) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventBus] {} not persisted (rejected by lifecycle)",
                 log_tag
             );
             false
         }
         Err(e) => {
-            crate::log!("[EventBus] {} emit failed: {}", log_tag, e);
+            crate::log_legacy!("[EventBus] {} emit failed: {}", log_tag, e);
             false
         }
     }

@@ -357,6 +357,7 @@ fn engine_turn_idles_are_never_subscribable() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     assert!(is_subscribable(&idle(None)), "the agent's own idle fires");
     for reason in [KEEP_ALIVE_IDLE_REASON, CEILING_REENTRY_IDLE_REASON] {

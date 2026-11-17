@@ -77,6 +77,15 @@ pub struct ImplementerRequest {
     pub reasoning_effort: Option<String>,
 }
 
+impl ImplementerRequest {
+    /// Any named implementer field takes precedence over the pending card pick.
+    pub fn is_explicit(&self) -> bool {
+        self.coding_agent.is_some()
+            || self.coding_agent_model.is_some()
+            || self.reasoning_effort.is_some()
+    }
+}
+
 /// The successor's implementer: what the handoff asked for, the old thread's
 /// for the rest. Refuses a model or effort the backend does not offer.
 ///
@@ -378,6 +387,9 @@ pub enum BriefCause {
     /// The previous session reached its *context ceiling* and ended its
     /// *ceiling re-entry* without handing off.
     NoNarrative,
+    /// The provider's safety systems blocked the previous session's last turn
+    /// (a *provider block*). `policy` is the reason, in plain words.
+    ProviderBlocked { policy: &'static str },
 }
 
 /// The opening of a session that starts with no *handoff narrative*. It tells
@@ -393,19 +405,36 @@ pub fn handoff_brief(
         BriefCause::CacheCold => {
             "The previous session in this thread handed off with no handoff narrative: \
              waking it would cost too much."
+                .to_string()
         }
         BriefCause::ResumeFailed => {
             "The coding agent could not resume this thread's previous session, so its \
              context did not carry over."
+                .to_string()
         }
         BriefCause::NoNarrative => {
             "The previous session in this thread reached its context ceiling and ended \
              without writing a handoff narrative."
+                .to_string()
         }
+        BriefCause::ProviderBlocked { policy } => format!(
+            "OpenAI's safety systems blocked the previous session's last turn. Reason: \
+             {policy}. OpenAI does not say which part triggered it, and resuming that \
+             session would replay it, so it was not resumed."
+        ),
     };
     let applied = applied
         .map(|s| format!(" The change this thread applied last: {s}"))
         .unwrap_or_default();
+    let block_guidance = match cause {
+        BriefCause::ProviderBlocked { .. } => {
+            "\n\nFind the blocked turn in those events: its last instruction and its tool \
+             calls. Look for an action beyond what the user asked for, such as reading \
+             secrets or reaching outside the task. Never repeat such an action. If the task \
+             seems to need it, ask the user first."
+        }
+        _ => "",
+    };
     let ending = if request_follows {
         ""
     } else {
@@ -420,8 +449,25 @@ pub fn handoff_brief(
          - `git status` first: the previous session may have left uncommitted work.\n\
          - The thread's recent turns: `lucidos events query --thread-id {thread_id} --limit 30`.\n\
          - The branch history: `git log`.\n\
-         - Any plan under `docs/plans/` that the branch touched.{ending}"
+         - Any plan under `docs/plans/` that the branch touched.{block_guidance}{ending}"
     )
+}
+
+/// The first message of a fresh session that starts after a *provider block*:
+/// a *handoff brief* that names the block and ends on `message`. The thread's
+/// recap travels in the session context, as it does for any fresh session.
+pub(crate) fn provider_blocked_input(
+    thread_id: Uuid,
+    policy: &'static str,
+    message: &str,
+) -> String {
+    let brief = handoff_brief(
+        thread_id,
+        BriefCause::ProviderBlocked { policy },
+        true,
+        None,
+    );
+    successor_first_message(&brief, Some(message), message)
 }
 
 /// The input of a fresh session that starts because a resume failed: the
@@ -498,10 +544,10 @@ pub struct PendingHandoff {
 }
 
 impl PendingHandoff {
-    /// Whether the engine starts its session by itself, at boot or once the
-    /// thread is free. A *next-input start* waits for an input instead.
+    /// Whether the engine starts its session by itself, by
+    /// [`SessionStart::is_unprompted`].
     pub fn starts_unprompted(&self) -> bool {
-        self.starts != SessionStart::OnNextInput
+        self.starts.is_unprompted()
     }
 
     /// The first message of its session, given the `input` that started it.
@@ -571,6 +617,13 @@ const HANDOFF_LIFECYCLE_EVENT_TYPES: [&str; 5] = [
 /// keeps the planner from turning the end probe into a scan of every end event.
 /// It never yields NULL, so a caller may test membership with `NOT IN`.
 pub(crate) fn pending_handoff_threads_sql() -> String {
+    pending_handoff_rows_sql("pending_handoff.thread_id")
+}
+
+/// The same set as [`pending_handoff_threads_sql`], selecting `columns` of
+/// each pending `SessionHandedOff` row, aliased `pending_handoff`. A thread
+/// with two pending handoffs yields two rows.
+pub(crate) fn pending_handoff_rows_sql(columns: &str) -> String {
     let lifecycle = HANDOFF_LIFECYCLE_EVENT_TYPES
         .iter()
         .map(|event_type| format!("'{event_type}'"))
@@ -578,7 +631,7 @@ pub(crate) fn pending_handoff_threads_sql() -> String {
         .join(", ");
     format!(
         concat!(
-            "SELECT pending_handoff.thread_id FROM events pending_handoff \
+            "SELECT {columns} FROM events pending_handoff \
                LEFT JOIN LATERAL (SELECT 1 AS ended FROM events handoff_end \
                      WHERE handoff_end.thread_id = pending_handoff.thread_id \
                        AND handoff_end.event_type IN ({lifecycle}) \
@@ -591,6 +644,7 @@ pub(crate) fn pending_handoff_threads_sql() -> String {
                 AND handoff_ended.ended IS NULL"
         ),
         ends_handoff_sql("handoff_end", "pending_handoff"),
+        columns = columns,
         lifecycle = lifecycle
     )
 }
@@ -599,7 +653,8 @@ pub(crate) fn pending_handoff_threads_sql() -> String {
 /// `SessionHandedOff` row `handoff`, on the same thread. Four things end one:
 ///
 /// - its successor session's `SessionStarted`, whose `continuity` is
-///   `handoff`. A recovery or conflict-resolution session records none;
+///   `handoff`. A recovery or conflict-resolution session records none, and
+///   a lane run records it only when it consumes the handoff (ADR 0675);
 /// - a user's Stop, or an Apply, Discard or Archive that stopped a turn;
 /// - a failed turn that began after it: the successor session never started;
 /// - a person's *Return to the old session*, `SessionHandoffWithdrawn`.
@@ -647,7 +702,7 @@ pub(crate) async fn pending_handoff(
     match serde_json::from_value(payload) {
         Ok(handoff) => Ok(Some(handoff)),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Successor] unreadable SessionHandedOff on {}: {}",
                 thread_id,
                 e
@@ -663,7 +718,7 @@ pub(crate) async fn handoff_pending(pool: &PgPool, thread_id: Uuid) -> bool {
     pending_handoff(pool, thread_id)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[Successor] pending handoff of {}: {}", thread_id, e);
+            crate::log_legacy!("[Successor] pending handoff of {}: {}", thread_id, e);
             None
         })
         .is_some()
@@ -712,6 +767,9 @@ pub(crate) enum HandoffBlock {
     /// It continued in a *legacy successor thread*.
     LegacySuccessor(Uuid),
     Archived,
+    /// A lane thread whose batch landed or failed: no session runs on it
+    /// again, so nothing would start the handoff (ADR 0662).
+    LaneEnded,
     /// Its change is applying.
     Applying,
     /// Its change waits in the landing lane.
@@ -740,6 +798,8 @@ pub(crate) async fn handoff_block(
         Some(HandoffBlock::LegacySuccessor(successor))
     } else if archive_state == "archived" {
         Some(HandoffBlock::Archived)
+    } else if super::landing_lane::lane_batch_ended(pool, thread_id).await? {
+        Some(HandoffBlock::LaneEnded)
     } else if applying {
         Some(HandoffBlock::Applying)
     } else if awaits_landing(pool, thread_id).await? {
@@ -765,14 +825,15 @@ pub(crate) struct NewHandoff {
 }
 
 /// Why a handoff happens and when its session starts. A session past its
-/// *context ceiling* starts on the next input, unless the user typed a request:
-/// that request is the input. An agent's own handoff holds the thread until
-/// its turn ends.
+/// *context ceiling* waits for input unless its re-entry cut a turn short.
+/// An agent's interrupted turn carries on after the narrative turn ends.
+/// A request typed by the user starts immediately.
 pub(crate) fn cause_and_start(
     past_ceiling: bool,
     at_checkpoint: bool,
     request: bool,
     from_agent: bool,
+    ceiling_cut_turn_short: bool,
 ) -> (HandoffCause, SessionStart) {
     let cause = if past_ceiling {
         HandoffCause::ContextCeiling
@@ -781,7 +842,7 @@ pub(crate) fn cause_and_start(
     } else {
         HandoffCause::User
     };
-    let starts = if past_ceiling && !request {
+    let starts = if past_ceiling && !request && !(from_agent && ceiling_cut_turn_short) {
         SessionStart::OnNextInput
     } else if from_agent {
         SessionStart::AfterThisTurn
@@ -817,6 +878,34 @@ pub(crate) enum HandoffRecord {
     CeilingLifted,
 }
 
+/// Resolve a plan only from this session's repository AND branch. Legacy
+/// sessions without a folder have no provable binding and carry no plan path.
+async fn handoff_plan_path(pool: &PgPool, thread_id: Uuid) -> Result<Option<String>, sqlx::Error> {
+    let session: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT payload->>'coding_agent_folder', payload->>'branch' FROM events \
+         WHERE thread_id = $1 AND event_type = 'SessionStarted' ORDER BY sequence DESC LIMIT 1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((Some(folder), Some(branch))) = session else {
+        return Ok(None);
+    };
+    if folder.is_empty() || branch.is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, Option<String>>(
+        "SELECT plan_path FROM planned_branches WHERE repo_root = $1 AND branch_name = $2",
+    )
+    .bind(super::git_ops::canonical_repo_root(std::path::Path::new(
+        &folder,
+    )))
+    .bind(branch)
+    .fetch_optional(pool)
+    .await
+    .map(Option::flatten)
+}
+
 /// Record `handoff` on `thread_id`, unless one is pending already. One
 /// handoff per session, across engines ([`lock_handoff`]). A ceiling handoff
 /// re-reads the crossing under the lock, so a person's raise always wins.
@@ -841,6 +930,7 @@ pub(crate) async fn record_handoff(
     bus.emit(super::event_bus::BusEvent::Thread {
         thread_id,
         event: super::thread_events::ThreadEvent::SessionHandedOff {
+            plan_path: handoff_plan_path(pool, thread_id).await?,
             cause: Some(handoff.cause),
             starts: handoff.starts,
             crossing: handoff.crossing,
@@ -872,7 +962,7 @@ pub(crate) async fn last_applied_summary(pool: &PgPool, thread_id: Uuid) -> Opti
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        crate::log!("[Successor] last applied change of {}: {}", thread_id, e);
+        crate::log_legacy!("[Successor] last applied change of {}: {}", thread_id, e);
         None
     })
 }
@@ -946,7 +1036,7 @@ impl super::LucidosEngine {
         .fetch_all(self.pool())
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[Successor] working children of {}: {}", thread_id, e);
+            crate::log_legacy!("[Successor] working children of {}: {}", thread_id, e);
             Vec::new()
         });
         StillRunning {
@@ -963,7 +1053,7 @@ pub(crate) async fn handed_off(pool: &PgPool, thread_id: Uuid) -> bool {
     successor_thread_of(pool, thread_id)
         .await
         .unwrap_or_else(|e| {
-            crate::log!("[Successor] handoff of {}: {}", thread_id, e);
+            crate::log_legacy!("[Successor] handoff of {}: {}", thread_id, e);
             None
         })
         .is_some()
@@ -1067,7 +1157,7 @@ pub(crate) async fn carry_plan_marker(
         }
         Ok(None) => None,
         Err(e) => {
-            crate::log!("[Successor] predecessor of {}: {}", successor_thread_id, e);
+            crate::log_legacy!("[Successor] predecessor of {}: {}", successor_thread_id, e);
             None
         }
     };
@@ -1077,7 +1167,7 @@ pub(crate) async fn carry_plan_marker(
     if let Err(e) =
         super::git_ops::carry_planned(pool, repo_root, &old_branch, successor_branch).await
     {
-        crate::log!(
+        crate::log_legacy!(
             "[Successor] could not carry the plan marker from {} to {}: {}",
             old_branch,
             successor_branch,
@@ -1132,7 +1222,8 @@ impl super::LucidosEngine {
     /// so its old session's process has exited first. Does nothing when no
     /// handoff is pending by then: another input already started the session,
     /// and its first prompt carried the opening. A *next-input start* waits for
-    /// that input instead.
+    /// that input instead. A closed lane thread starts no engine handoff
+    /// ([`successor_to_start`]).
     pub(crate) fn start_successor_session(self: &std::sync::Arc<Self>, thread_id: Uuid) {
         let Some(guard) = StartingGuard::take(self, thread_id) else {
             return;
@@ -1141,21 +1232,21 @@ impl super::LucidosEngine {
         tokio::spawn(async move {
             wait_until_thread_released(&engine.agent_sessions, thread_id).await;
             if engine.is_shutting_down() {
-                crate::log!(
+                crate::log_legacy!(
                     "[Successor] Engine shutting down; thread {} starts its successor session on the next boot",
                     thread_id
                 );
                 return;
             }
-            let handoff = match pending_handoff(engine.pool(), thread_id).await {
-                Ok(Some(handoff)) if handoff.starts_unprompted() => handoff,
-                Ok(_) => return,
+            let handoff = match successor_to_start(engine.pool(), thread_id).await {
+                Ok(Some(handoff)) => handoff,
+                Ok(None) => return,
                 Err(e) => {
-                    crate::log!("[Successor] pending handoff of {}: {}", thread_id, e);
+                    crate::log_legacy!("[Successor] pending handoff of {}: {}", thread_id, e);
                     return;
                 }
             };
-            crate::log!(
+            crate::log_legacy!(
                 "[Successor] Thread {} starts its successor session on {:?}",
                 thread_id,
                 handoff.coding_agent
@@ -1183,6 +1274,30 @@ impl super::LucidosEngine {
             );
         });
     }
+}
+
+/// The handoff whose successor session the engine starts on `thread_id` by
+/// itself, read once no run holds the thread. A closed lane thread starts no
+/// engine handoff, since its batch already ended (ADR 0675). A user's request
+/// still starts, because the user asked for it.
+pub(crate) async fn successor_to_start(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> Result<Option<PendingHandoff>, sqlx::Error> {
+    let Some(handoff) = pending_handoff(pool, thread_id)
+        .await?
+        .filter(PendingHandoff::starts_unprompted)
+    else {
+        return Ok(None);
+    };
+    if handoff.request.is_none() && super::landing_lane::lane_batch_ended(pool, thread_id).await? {
+        crate::log_legacy!(
+            "[Successor] Thread {} is a closed lane thread and skips its stale handoff",
+            thread_id
+        );
+        return Ok(None);
+    }
+    Ok(Some(handoff))
 }
 
 /// Wait until no run holds `thread_id`: its process exited, and its teardown
@@ -1221,7 +1336,7 @@ pub async fn start_pending_successor_sessions(engine: std::sync::Arc<super::Luci
     {
         Ok(threads) => threads,
         Err(e) => {
-            crate::log!("[Successor] Could not list pending handoffs: {}", e);
+            crate::log_legacy!("[Successor] Could not list pending handoffs: {}", e);
             return;
         }
     };
@@ -1233,3 +1348,17 @@ pub async fn start_pending_successor_sessions(engine: std::sync::Arc<super::Luci
 #[cfg(test)]
 #[path = "successor_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod explicit_pick_tests {
+    use super::*;
+    #[test]
+    fn backend_only_is_an_explicit_pick() {
+        assert!(!ImplementerRequest::default().is_explicit());
+        assert!(ImplementerRequest {
+            coding_agent: Some(CodingAgent::Codex),
+            ..Default::default()
+        }
+        .is_explicit());
+    }
+}

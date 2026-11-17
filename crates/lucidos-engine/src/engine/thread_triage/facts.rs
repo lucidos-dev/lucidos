@@ -40,6 +40,10 @@ pub(crate) enum TriageScope<'a> {
     Inbox { except: Option<Uuid> },
     /// Exactly these ids, wherever they sit now, for an apply-time re-check.
     Ids(&'a [Uuid]),
+    /// Counted completed candidates, excluding discarded and home rows.
+    CompletedIds(&'a [Uuid]),
+    /// All descendants, including those below archived or busy ancestors.
+    Descendants(Uuid),
 }
 
 /// The row filter for a root, over `thread_summaries r`.
@@ -175,14 +179,44 @@ pub(crate) async fn load(
                 .fetch_all(pool)
                 .await?
         }
+        TriageScope::Descendants(parent) => {
+            let ids = descendant_ids(pool, parent).await?;
+            sqlx::query(&query_sql(COMPLETED_ROOT_SQL, "TRUE"))
+                .bind(ids)
+                .fetch_all(pool)
+                .await?
+        }
         TriageScope::Ids(ids) => {
             sqlx::query(&query_sql("r.thread_id = ANY($1)", "TRUE"))
                 .bind(ids)
                 .fetch_all(pool)
                 .await?
         }
+        TriageScope::CompletedIds(ids) => {
+            sqlx::query(&query_sql(COMPLETED_ROOT_SQL, "TRUE"))
+                .bind(ids)
+                .fetch_all(pool)
+                .await?
+        }
     };
     rows.iter().map(row_from).collect()
+}
+
+const COMPLETED_ROOT_SQL: &str =
+    "r.thread_id = ANY($1) AND r.state <> 'discarded' AND NOT r.is_home";
+
+/// Recursive scope independent of inbox boundaries. UNION deduplicates members.
+pub(crate) async fn descendant_ids(pool: &PgPool, parent: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH RECURSIVE descendants AS ( \
+             SELECT thread_id FROM thread_summaries WHERE parent_thread_id = $1 \
+             UNION SELECT t.thread_id FROM thread_summaries t \
+             JOIN descendants d ON t.parent_thread_id = d.thread_id \
+         ) SELECT thread_id FROM descendants WHERE thread_id <> $1",
+    )
+    .bind(parent)
+    .fetch_all(pool)
+    .await
 }
 
 fn row_from(row: &sqlx::postgres::PgRow) -> Result<TriageRow, sqlx::Error> {

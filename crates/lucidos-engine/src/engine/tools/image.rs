@@ -255,7 +255,7 @@ impl LucidosEngine {
             }
         }
 
-        crate::log!(
+        crate::log_legacy!(
             "[Image] Generating with {} (prompt: {}, inputs: {}, size: {:?})",
             provider.name(),
             &prompt[..prompt.floor_char_boundary(50)],
@@ -292,12 +292,15 @@ impl LucidosEngine {
                     &raw_bytes,
                     &format!("feat: generated image {}", artifact_path),
                     WriteAnnouncement::Entity {
+                        writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(
+                            thread_id,
+                        ),
                         source: Some("generate_image".to_string()),
                         writer_thread_id: Some(thread_id),
                     },
                 )
                 .await?;
-            crate::log!("[Image] Saved to artifact: {}", artifact_path);
+            crate::log_legacy!("[Image] Saved to artifact: {}", artifact_path);
         }
 
         // Return a JSON result with the image info — the agentic loop will
@@ -353,13 +356,14 @@ impl LucidosEngine {
                 &raw_bytes,
                 &format!("feat: save thread image to {}", artifact_path),
                 WriteAnnouncement::Entity {
+                    writer: crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id),
                     source: Some("save_thread_image".to_string()),
                     writer_thread_id: Some(thread_id),
                 },
             )
             .await?;
 
-        crate::log!("[Image] Saved thread image to artifact: {}", artifact_path);
+        crate::log_legacy!("[Image] Saved thread image to artifact: {}", artifact_path);
 
         Ok(format!("Image saved to artifacts/{}.", artifact_path))
     }
@@ -393,7 +397,7 @@ impl LucidosEngine {
         let img = self.resolve_thread_image(reference, thread_id).await?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(&img.base64)?;
 
-        crate::log!("[Image] view_image loaded {} into vision", reference);
+        crate::log_legacy!("[Image] view_image loaded {} into vision", reference);
         Ok(crate::engine::tools::files::encode_image_for_read(
             bytes,
             &img.mime_type,

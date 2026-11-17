@@ -1,3 +1,4 @@
+import { spendCapResetTime } from '../../utils/spendCap';
 import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import {
@@ -37,13 +38,19 @@ export function TreeBackfillStatus({ onPickModel, onSwitchToClassic }: {
   const percent = filling ? backfillPercent(filling) : ready ? 100 : progress ? backfillPercent(progress) : 0;
   const held = counted?.held && counted.cap_usd !== null ? { cap: counted.cap_usd, next: counted.next_cap_usd } : null;
   // A finished backfill still names a failing model: live summaries wait on it.
-  const failingModel = (counted ?? (state?.state === 'ready' ? state.filling : null))?.failing_model ?? null;
-  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held && !failingModel;
+  const liveProgress = counted ?? (state?.state === 'ready' ? state.filling : null);
+  const failingModel = liveProgress?.failing_model ?? null;
+  const spendCapHeldUntil = liveProgress?.spend_cap_held_until ?? null;
+  const working = counted !== null && counted.total > 0 && !counted.waiting_for_model && !held && !failingModel && !spendCapHeldUntil;
   const spend = counted ? formatBackfillSpend(counted) : null;
 
   let label: ComponentChildren = null;
   if (loadable.status === 'failed') {
     label = <span class="error-text">Could not read the progress: {loadable.error}</span>;
+  } else if (spendCapHeldUntil) {
+    label = liveProgress?.spend_cap_resets_at
+      ? <>Waiting for the spend cap to reset at {spendCapResetTime(liveProgress.spend_cap_resets_at)}.</>
+      : <>Waiting for the spend cap to reset. Reset time not supplied.</>;
   } else if (held) {
     label = (
       <>

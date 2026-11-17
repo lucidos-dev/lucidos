@@ -179,27 +179,6 @@ mod tests {
         }
     }
 
-    /// The prose that states the cap and the raise reads these constants.
-    /// A pin, since prose cannot import them.
-    #[test]
-    fn every_prose_copy_states_the_cap_and_the_raise() {
-        let doc = |path: &str| {
-            std::fs::read_to_string(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR")))
-                .unwrap_or_else(|e| panic!("{path}: {e}"))
-        };
-        let cap = format!("{CAP_MULTIPLE} times");
-        let raise = match RAISE_SHARE {
-            0.5 => "half the estimate",
-            other => panic!("say how far a raise moves the cap ({other}), then pin it here"),
-        };
-        for path in ["system-knowhow/preferences.md", "docs/glossary.md"] {
-            assert!(doc(path).contains(&cap), "{path} omits {cap}");
-        }
-        for path in ["system-knowhow/thread-events.md", "docs/glossary.md"] {
-            assert!(doc(path).contains(raise), "{path} omits {raise}");
-        }
-    }
-
     #[test]
     fn an_episode_holds_once_it_has_spent_its_cap() {
         assert!(!episode(Some(15.0), 14.99).held());
@@ -256,5 +235,30 @@ mod tests {
             flash.usd(call, None),
             "no Flex rate prices at the standard rate"
         );
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The prose that states the cap and the raise reads these constants.
+        /// A pin, since prose cannot import them.
+        #[test]
+        fn every_prose_copy_states_the_cap_and_the_raise() {
+            let doc = |path: &str| {
+                std::fs::read_to_string(format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR")))
+                    .unwrap_or_else(|e| panic!("{path}: {e}"))
+            };
+            let cap = format!("{CAP_MULTIPLE} times");
+            let raise = match RAISE_SHARE {
+                0.5 => "half the estimate",
+                other => panic!("say how far a raise moves the cap ({other}), then pin it here"),
+            };
+            for path in ["system-knowhow/preferences.md", "docs/glossary.md"] {
+                assert!(doc(path).contains(&cap), "{path} omits {cap}");
+            }
+            for path in ["system-knowhow/thread-events.md", "docs/glossary.md"] {
+                assert!(doc(path).contains(raise), "{path} omits {raise}");
+            }
+        }
     }
 }

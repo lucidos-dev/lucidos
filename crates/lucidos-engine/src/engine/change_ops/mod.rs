@@ -20,7 +20,7 @@ mod proposal_hold;
 mod propose;
 mod set_aside;
 pub(crate) use proposal_hold::{
-    apply_must_harden, read_proposal_hold, PlanFloor, PlanHold, ProposalHold,
+    apply_must_harden, held_plan, read_proposal_hold, PlanFloor, PlanHold, ProposalHold,
 };
 #[cfg(test)]
 pub(crate) use propose::{
@@ -364,7 +364,7 @@ impl super::LucidosEngine {
         {
             Ok(open) => Some(open),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] conflict_pairing_open({}, {}) failed: {}. Treating the resolution as in flight",
                     thread_id,
                     change_id,
@@ -433,7 +433,7 @@ pub(crate) async fn branch_is_hardened(
             Ok(Some(c)) => c.hardened,
             Ok(None) => false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Changes] branch_is_hardened: get_open_by_branch({}): {}; \
                      treating as not hardened (safer than letting a stale check pass)",
                     branch_name,

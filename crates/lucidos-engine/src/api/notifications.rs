@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 use crate::scheduler::notifications::{
     default_tap, refuse_engine_only_tap, resolve_thread_tap_id, verify_event_anchors, Tap,
 };
@@ -106,13 +106,60 @@ pub(super) async fn create_notification(
     })))
 }
 
+#[derive(Deserialize)]
+struct NativeReceiptRequest {
+    notification_id: Uuid,
+}
+
+async fn native_push_receipt(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<NativeReceiptRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Some(crate::engine::thread_events::MessageOrigin::Device { device_id }) =
+        crate::api::actor::user_actor(&headers, None)
+    else {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "A device must acknowledge its banner",
+        ));
+    };
+    let audience = NotificationStore::audience(state.engine.pool(), body.notification_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    if !crate::engine::thread_users::Audience::from_device_ids(audience).reaches(Some(&device_id)) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "Notification not found",
+        ));
+    }
+    // Ordinary notifications also acknowledge; only durable dispatches need a receipt.
+    let durable: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM user_only_message_dispatches WHERE notification_id = $1)",
+    )
+    .bind(body.notification_id)
+    .fetch_one(state.engine.pool())
+    .await
+    .map_err(ApiError::db)?;
+    if durable {
+        crate::scheduler::push::record_push_receipt(
+            state.engine.pool(),
+            body.notification_id,
+            &format!("native:{device_id}"),
+        )
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    }
+    Ok(Json(serde_json::json!({"ok": true})))
+}
+
 // ===== Notification Endpoints =====
 
-/// Whose read state a request reads: its device's person on a team gateway.
+/// Whose read state a request reads: its device's user on a team gateway.
 fn reader_of(headers: &HeaderMap) -> Reader {
     Reader::of(
         crate::api::actor::user_actor(headers, None).as_ref(),
-        &crate::gateway_operators::current(),
+        &crate::gateway_users::current(),
     )
 }
 
@@ -530,6 +577,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/notifications/read-all", post(mark_all_notifications_read))
         .route("/notification", get(get_notification))
         .route("/notification/read", post(mark_notification_read))
+        .route("/notification/native-receipt", post(native_push_receipt))
         // Push notification endpoints
         .route("/push/vapid-key", get(get_vapid_key))
         .route("/push/subscribe", post(push_subscribe))
@@ -555,38 +603,6 @@ mod tests {
             h.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
         }
         h
-    }
-
-    /// This file with its test module cut off. Uncut, the scan below matches
-    /// its own fixture strings and passes while the handler has lost the gate.
-    fn production_src() -> String {
-        crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("api/notifications.rs"),
-        )
-    }
-
-    /// The refusal runs BEFORE the store, because storing deletes first.
-    ///
-    /// `PushSubscriptionStore::subscribe` drops every row for the device id
-    /// and then inserts. Checking after the call would still silence the
-    /// phone, which is half the harm.
-    #[test]
-    fn push_subscribe_refuses_before_it_reaches_the_store() {
-        let src = production_src();
-        let at = src
-            .find("pub(super) async fn push_subscribe")
-            .expect("push_subscribe is still here");
-        let body = &src[at..];
-        let guard = body
-            .find("subscribe_refusal(&headers, &request)")
-            .expect("push_subscribe must check the request it is handed");
-        let store = body
-            .find("PushSubscriptionStore::subscribe")
-            .expect("push_subscribe still writes through the store");
-        assert!(
-            guard < store,
-            "the refusal must precede the delete-then-insert"
-        );
     }
 
     fn subscribe_request(device_id: Option<&str>) -> PushSubscribeRequest {
@@ -723,5 +739,39 @@ mod tests {
             &headers("/dev/", Some("https://lucidos.test")),
         );
         assert!(scope.is_none());
+    }
+
+    mod guard_tests {
+        /// This file with its test module cut off. Uncut, the scan below matches
+        /// its own fixture strings and passes while the handler has lost the gate.
+        fn production_src() -> String {
+            crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("api/notifications.rs"),
+            )
+        }
+
+        /// The refusal runs BEFORE the store, because storing deletes first.
+        ///
+        /// `PushSubscriptionStore::subscribe` drops every row for the device id
+        /// and then inserts. Checking after the call would still silence the
+        /// phone, which is half the harm.
+        #[test]
+        fn push_subscribe_refuses_before_it_reaches_the_store() {
+            let src = production_src();
+            let at = src
+                .find("pub(super) async fn push_subscribe")
+                .expect("push_subscribe is still here");
+            let body = &src[at..];
+            let guard = body
+                .find("subscribe_refusal(&headers, &request)")
+                .expect("push_subscribe must check the request it is handed");
+            let store = body
+                .find("PushSubscriptionStore::subscribe")
+                .expect("push_subscribe still writes through the store");
+            assert!(
+                guard < store,
+                "the refusal must precede the delete-then-insert"
+            );
+        }
     }
 }

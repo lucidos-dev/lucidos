@@ -322,10 +322,10 @@ export function ChevronDownIcon({ size = '1.25rem' }: { size?: string }) {
  *  accent to the text colour, so colour alone cannot show the state.
  *
  *  INK IS 0.667 OF THE BOX on both axes, the GEOMETRIC extent, stroke
- *  excluded. It floats in a circle under the down chevron, and the composer
+ *  excluded. It floats in a circle beside the down chevron, and the composer
  *  row's 0.750 read too heavy there. Keep the poles 4 units over the line's
  *  centre: the 2-unit strokes leave 2 units clear, and less fuses the two.
- *  No inline size either: the chevron stack's CSS sizes the svg. */
+ *  No inline size either: the chevron row's CSS sizes the svg. */
 export function FollowLiveEdgeIcon({ armed = false }: { armed?: boolean }) {
   return (
     <svg viewBox="0 0 24 24" fill={armed ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -972,7 +972,7 @@ export function TriggerFiredIcon() {
  *  notch. Solid keeps head and shoulders legible as two masses at any size.
  *  The head sits clear of the cap rather than touching it, so the pair still
  *  reads as a figure and not as a single lump. */
-export function PersonIcon() {
+export function UserIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
       <circle cx="12" cy="7.75" r="4" />
@@ -989,7 +989,7 @@ export function PersonIcon() {
  *  unlike its two neighbours above, and that difference is load-bearing rather
  *  than incidental. The chip exists so an anonymous mutating POST can never be
  *  rendered as "You", so this glyph's whole job is to not be mistaken for
- *  `PersonIcon`: two open prongs over a hollow body against one solid mass is a
+ *  `UserIcon`: two open prongs over a hollow body against one solid mass is a
  *  difference in weight as well as in shape, legible before either outline is.
  *  The prongs are 6 units apart, three times the daylight a stroke needs at chip
  *  size, so what survives shrinking is exactly the part that distinguishes it. */

@@ -139,7 +139,7 @@ describe("the thread's prompt row", () => {
   it('in the open batch, says so and opens the lane thread', () => {
     focusedThreadId.value = 't-batch';
     const state = getWaitingState();
-    expect(state).toEqual({ type: 'landing', place: 'in-batch', laneThreadId: 'lane-t' });
+    expect(state).toEqual({ type: 'landing', place: 'in-batch', laneThreadId: 'lane-t', threadId: 't-batch', showDiff: true });
     const { face } = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>).slot;
     expect(face.label).toBe('Landing');
     expect(face.ariaLabel).toBe('Landing in a batch');
@@ -155,6 +155,25 @@ describe("the thread's prompt row", () => {
     expect(face.label).toBe('Waiting');
     expect(face.ariaLabel).toBe('Waiting to land');
     expect(face.invoke).toBeNull();
+  });
+
+  it.each([['t-batch'], ['t-wait']])('keeps Diff beside the lane face in %s', (threadId) => {
+    focusedThreadId.value = threadId;
+    const state = getWaitingState();
+    const { situational } = getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>);
+    expect(situational.map((member) => member.dataRole)).toEqual(['thread-diff']);
+  });
+
+  it('hides Diff in the lane once the branch holds no work', () => {
+    focusedThreadId.value = 't-batch';
+    const thread = threadMap.value.get('t-batch')!;
+    threadMap.value = new Map([['t-batch', {
+      ...thread,
+      meta: { ...thread.meta, codingAgentChangeState: { kind: 'none' } },
+    }]]);
+    const state = getWaitingState();
+    expect(state).toMatchObject({ type: 'landing', showDiff: false });
+    expect(getBannerActions(state as Exclude<typeof state, null | { type: 'canceling' }>).situational).toEqual([]);
   });
 
   it('outside the lane, offers Apply as before', () => {

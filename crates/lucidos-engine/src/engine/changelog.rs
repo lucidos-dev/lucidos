@@ -206,19 +206,19 @@ async fn fetch_published_changelog() -> Option<String> {
     {
         Ok(client) => client,
         Err(e) => {
-            crate::log!("[Changelog] could not build the HTTP client: {e}");
+            crate::log_legacy!("[Changelog] could not build the HTTP client: {e}");
             return None;
         }
     };
     let mut response = match client.get(PUBLISHED_CHANGELOG_URL).send().await {
         Ok(response) => response,
         Err(e) => {
-            crate::log!("[Changelog] {PUBLISHED_CHANGELOG_URL} unreachable: {e}");
+            crate::log_legacy!("[Changelog] {PUBLISHED_CHANGELOG_URL} unreachable: {e}");
             return None;
         }
     };
     if !response.status().is_success() {
-        crate::log!(
+        crate::log_legacy!(
             "[Changelog] {PUBLISHED_CHANGELOG_URL} answered {}",
             response.status()
         );
@@ -229,7 +229,9 @@ async fn fetch_published_changelog() -> Option<String> {
         match response.chunk().await {
             Ok(Some(chunk)) => {
                 if body.len() + chunk.len() > PUBLISHED_MAX_BYTES {
-                    crate::log!("[Changelog] published changelog is over the size cap; ignored");
+                    crate::log_legacy!(
+                        "[Changelog] published changelog is over the size cap; ignored"
+                    );
                     return None;
                 }
                 body.extend_from_slice(&chunk);
@@ -238,7 +240,7 @@ async fn fetch_published_changelog() -> Option<String> {
             // A truncated body still parses, and its newest releases are intact,
             // so nothing downstream would notice the missing tail. Refuse here.
             Err(e) => {
-                crate::log!("[Changelog] download failed part-way through: {e}");
+                crate::log_legacy!("[Changelog] download failed part-way through: {e}");
                 return None;
             }
         }
@@ -246,7 +248,7 @@ async fn fetch_published_changelog() -> Option<String> {
     match String::from_utf8(body) {
         Ok(text) => Some(text),
         Err(_) => {
-            crate::log!("[Changelog] published changelog is not UTF-8; ignored");
+            crate::log_legacy!("[Changelog] published changelog is not UTF-8; ignored");
             None
         }
     }

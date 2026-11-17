@@ -59,7 +59,7 @@ async fn recorded_sequence(pool: &sqlx::PgPool, event_id: Uuid) -> Option<i64> {
 
 /// Wait for the engine's own turn to record `event_id`. The input was already
 /// acked, so this waits on a detached task, not on a race.
-async fn wait_until_recorded(pool: &sqlx::PgPool, event_id: Uuid) -> i64 {
+pub(crate) async fn wait_until_recorded(pool: &sqlx::PgPool, event_id: Uuid) -> i64 {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Some(seq) = recorded_sequence(pool, event_id).await {

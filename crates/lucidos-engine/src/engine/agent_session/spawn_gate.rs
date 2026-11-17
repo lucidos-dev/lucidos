@@ -11,18 +11,33 @@
 //! back to the thread that caused it, and so does a moved child. Neither
 //! launders a trigger's run into an owner's.
 //!
+//! A caller with no signed identity, an *unattested caller*, starts a run only
+//! on the owner's Allow. Spending the start grant adopts the thread for later
+//! runs and provenance hops. Feeding triggers still need grants. The gate
+//! parks the first run on a card in its thread,
+//! and the Allow starts it (`engine::unattested_act`). A parked run is waiting,
+//! not refused: the card holds the turn, and nothing writes a failure.
+//!
+//! A call from another workspace carries that workspace's own verdict on its
+//! thread ([`spawn_verdict`]), under a gateway stamp. Only the caller can read
+//! its provenance, so the gate here honors the verdict and never upgrades it.
+//!
 //! A refusal is never silent. It ends the turn with `ResponseFailed`, and a
 //! trigger's refusal also notifies, naming the trigger and the missing grant.
+//! A run parked on the owner's card returns [`StartAwaitsOwner`] instead.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::RwLock;
 
 use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
-    ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadDirection, ThreadEvent,
+    ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, SpawnVerdict, ThreadDirection,
+    ThreadEvent, UnattestedAct, UnattestedRequest,
 };
+use crate::engine::unattested_act;
 use crate::scheduler::notifications::Tap;
 use crate::scheduler::user_tasks::{
     emit_trigger_notification, trigger_failure_title, TriggerNotification,
@@ -34,7 +49,7 @@ use crate::triggers::TriggerConfig;
 const MAX_ANCESTRY_HOPS: usize = 16;
 
 /// The cause at the root of a thread's provenance.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SpawnRoot {
     /// A person, the CLI, an API caller, another workspace, or the engine on
     /// its own work.
@@ -44,8 +59,13 @@ pub(crate) enum SpawnRoot {
         trigger_id: String,
         trigger_name: Option<String>,
     },
+    /// A caller with no signed identity: no origin token, no gateway stamp.
+    /// Its run waits for the owner's Allow.
+    Unattested(MessageOrigin),
     /// A cause no grant can cover.
     Refused(RefusedOrigin),
+    /// Another workspace's gate refused the thread that called in.
+    RefusedByCaller { workspace: String, reason: String },
 }
 
 /// A root that never starts a coding-agent run.
@@ -121,6 +141,10 @@ enum Step {
 
 fn step(origin: MessageOrigin, linkage: Option<Uuid>) -> Step {
     match origin {
+        MessageOrigin::SavedDraft {
+            submitted_by_thread_id,
+            ..
+        } => Step::Hop(submitted_by_thread_id),
         MessageOrigin::Device { .. } => Step::Root(SpawnRoot::Owner),
         MessageOrigin::Api {
             mode,
@@ -139,9 +163,26 @@ fn step(origin: MessageOrigin, linkage: Option<Uuid>) -> Step {
             (ActorMode::Engine, None, None) => Step::Root(SpawnRoot::Owner),
             (ActorMode::Agent, None, None) => Step::Root(SpawnRoot::Refused(RefusedOrigin::Agent)),
         },
-        // A caller with no token from this engine: another workspace. Its
-        // thread has no origin here, so the walk ends at the owner.
-        MessageOrigin::Workspace { thread_id, .. } => match thread_id {
+        // Another workspace, which judged its own thread. Its verdict roots
+        // the walk here, since its thread has no origin in this database.
+        MessageOrigin::Workspace {
+            verdict: Some(ref verdict),
+            ref workspace,
+            ..
+        } => Step::Root(match verdict {
+            SpawnVerdict::Allowed => SpawnRoot::Owner,
+            SpawnVerdict::Refused { reason } => SpawnRoot::RefusedByCaller {
+                workspace: workspace.clone(),
+                reason: reason.clone(),
+            },
+            SpawnVerdict::Unattested => SpawnRoot::Unattested(origin.clone()),
+        }),
+        // A row from before stamps keeps its old reading (invariant 11).
+        MessageOrigin::Workspace {
+            verdict: None,
+            thread_id,
+            ..
+        } => match thread_id {
             Some(caller) => Step::Hop(caller),
             None => Step::Root(SpawnRoot::Owner),
         },
@@ -158,6 +199,9 @@ fn step(origin: MessageOrigin, linkage: Option<Uuid>) -> Step {
         MessageOrigin::Engine { reason } => Step::Root(root_of_engine_reason(reason)),
         MessageOrigin::Agent { .. } => Step::Root(SpawnRoot::Refused(RefusedOrigin::Agent)),
         MessageOrigin::Webhook { .. } => Step::Root(SpawnRoot::Refused(RefusedOrigin::Webhook)),
+        caller @ MessageOrigin::UnattestedCaller { .. } => {
+            Step::Root(SpawnRoot::Unattested(caller))
+        }
         MessageOrigin::System => Step::Root(SpawnRoot::Refused(RefusedOrigin::System)),
     }
 }
@@ -182,6 +226,7 @@ fn root_of_engine_reason(reason: EngineReason) -> SpawnRoot {
         | EngineReason::HardenRetrigger
         | EngineReason::MissingHardening
         | EngineReason::MissingPlan
+        | EngineReason::ApprovedPlanUnstarted
         | EngineReason::ContextCeiling
         | EngineReason::SuccessorSession
         | EngineReason::PluginSetup { .. }
@@ -198,7 +243,7 @@ fn root_of_engine_reason(reason: EngineReason) -> SpawnRoot {
 }
 
 /// Who caused a thread's work, and which triggers fed it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Provenance {
     pub(crate) root: SpawnRoot,
     /// Every trigger whose fire entered a thread on the walk. Each one needs
@@ -209,21 +254,85 @@ pub(crate) struct Provenance {
 /// The provenance of `thread_id`. Each thread's originating origin either
 /// names the root or leads to the thread that caused it. Only the earliest
 /// origin sets the root, so a later message or answer never raises trust.
-/// A later trigger fire can only lower it. A thread with no recorded origin
+/// A later trigger fire can only lower it. Saved submissions also retain the
+/// submitting sources' provenance and trigger grants. A thread with no recorded origin
 /// is a legacy row, read as the owner's. A read that fails is untraceable.
 pub(crate) async fn spawn_provenance(pool: &sqlx::PgPool, thread_id: Uuid) -> Provenance {
     let mut fired_triggers: Vec<FiredTrigger> = Vec::new();
-    let root = walk(pool, thread_id, &mut fired_triggers).await;
+    let mut pending = BinaryHeap::from([Reverse((0, thread_id))]);
+    let mut seen = HashSet::new();
+    let mut root = SpawnRoot::Refused(RefusedOrigin::Untraceable);
+    let mut unattested_submitter = None;
+    // Saved submissions can feed an existing owner thread. Trace every
+    // submitting source and original cause. A later saved send must not
+    // launder a trigger, an unattested caller or a refusing workspace into
+    // owner authority.
+    while let Some(Reverse((depth, source))) = pending.pop() {
+        if !seen.insert(source) {
+            continue;
+        }
+        let source_root = walk(pool, source, depth, &mut fired_triggers, &mut pending).await;
+        if matches!(
+            source_root,
+            SpawnRoot::Refused(_) | SpawnRoot::RefusedByCaller { .. }
+        ) {
+            return Provenance {
+                root: source_root,
+                fired_triggers,
+            };
+        }
+        if source == thread_id {
+            root = source_root;
+            continue;
+        }
+        match source_root {
+            SpawnRoot::Trigger {
+                trigger_id,
+                trigger_name,
+            } => note_fired(&mut fired_triggers, (trigger_id, trigger_name)),
+            SpawnRoot::Unattested(caller) => {
+                unattested_submitter.get_or_insert(caller);
+            }
+            _ => {}
+        }
+    }
+    // The root holds one cause. An unattested submitter takes it, and a
+    // trigger root moves to the fired list, where its grant is still checked.
+    if let Some(caller) = unattested_submitter {
+        match std::mem::replace(&mut root, SpawnRoot::Unattested(caller)) {
+            SpawnRoot::Trigger {
+                trigger_id,
+                trigger_name,
+            } => note_fired(&mut fired_triggers, (trigger_id, trigger_name)),
+            SpawnRoot::Unattested(own) => root = SpawnRoot::Unattested(own),
+            _ => {}
+        }
+    }
     Provenance {
         root,
         fired_triggers,
     }
 }
 
-async fn walk(pool: &sqlx::PgPool, thread_id: Uuid, fired: &mut Vec<FiredTrigger>) -> SpawnRoot {
+fn note_fired(fired: &mut Vec<FiredTrigger>, trigger: FiredTrigger) {
+    if !fired.iter().any(|(id, _)| *id == trigger.0) {
+        fired.push(trigger);
+    }
+}
+
+async fn walk(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    depth: usize,
+    fired: &mut Vec<FiredTrigger>,
+    pending: &mut BinaryHeap<Reverse<(usize, Uuid)>>,
+) -> SpawnRoot {
     let mut current = thread_id;
+    // Saved submissions have no legacy provenance. Losing a submitting
+    // thread or one of its causes must not promote the saved send to Owner.
+    let mut require_origin = depth > 0;
     let mut seen: HashSet<Uuid> = HashSet::new();
-    for _ in 0..MAX_ANCESTRY_HOPS {
+    for hop in depth..MAX_ANCESTRY_HOPS {
         if !seen.insert(current) {
             break;
         }
@@ -234,18 +343,39 @@ async fn walk(pool: &sqlx::PgPool, thread_id: Uuid, fired: &mut Vec<FiredTrigger
                         fired.push(trigger);
                     }
                 }
-                fetch_thread_origin_and_linkage(pool, current).await
+                let submitters: Result<Vec<Uuid>,sqlx::Error> = sqlx::query_scalar(
+                    "SELECT DISTINCT (payload->'origin'->>'submitted_by_thread_id')::uuid FROM events \
+                     WHERE thread_id=$1 AND event_type IN ('MessageReceived','PromptInjected') \
+                     AND payload->'origin'->>'kind'='saved_draft'",
+                ).bind(current).fetch_all(pool).await;
+                match submitters {
+                    Ok(submitters) => {
+                        pending.extend(submitters.into_iter().map(|id| Reverse((hop + 1, id))));
+                        fetch_thread_origin_and_linkage(pool, current).await
+                    }
+                    Err(error) => Err(error.into()),
+                }
             }
             Err(e) => Err(e.into()),
         };
         let (origin, linkage) = match read {
             Ok(Some(found)) => found,
+            Ok(None) if require_origin => return SpawnRoot::Refused(RefusedOrigin::Untraceable),
             Ok(None) => return SpawnRoot::Owner,
             Err(e) => {
-                crate::log!("[SpawnGate] Could not read the provenance of {current}: {e}");
+                crate::log_legacy!("[SpawnGate] Could not read the provenance of {current}: {e}");
                 return SpawnRoot::Refused(RefusedOrigin::Untraceable);
             }
         };
+        match unattested_act::thread_adopted(pool, current).await {
+            Ok(true) => return SpawnRoot::Owner,
+            Ok(false) => {}
+            Err(e) => {
+                crate::log_legacy!("[SpawnGate] Could not read adoption of {current}: {e}");
+                return SpawnRoot::Refused(RefusedOrigin::Untraceable);
+            }
+        }
+        require_origin |= matches!(origin, MessageOrigin::SavedDraft { .. });
         match step(origin, linkage) {
             Step::Root(root) => return root,
             Step::Hop(next) => current = next,
@@ -254,8 +384,49 @@ async fn walk(pool: &sqlx::PgPool, thread_id: Uuid, fired: &mut Vec<FiredTrigger
     SpawnRoot::Refused(RefusedOrigin::Untraceable)
 }
 
+/// What this workspace's gate says about a run that `origin` would cause,
+/// for a cross-workspace call to carry. The walk and the grants are the ones a
+/// local run on that thread meets.
+pub(crate) async fn spawn_verdict(
+    pool: &sqlx::PgPool,
+    trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
+    origin: MessageOrigin,
+) -> SpawnVerdict {
+    let provenance = match step(origin, None) {
+        Step::Root(root) => Provenance {
+            root,
+            fired_triggers: Vec::new(),
+        },
+        Step::Hop(thread_id) => spawn_provenance(pool, thread_id).await,
+    };
+    verdict_of(provenance, trigger_configs)
+}
+
+/// [`spawn_verdict`] for work running in `thread_id` itself, as an in-process
+/// tool's call is.
+pub(crate) async fn thread_spawn_verdict(
+    pool: &sqlx::PgPool,
+    trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
+    thread_id: Uuid,
+) -> SpawnVerdict {
+    verdict_of(spawn_provenance(pool, thread_id).await, trigger_configs)
+}
+
+fn verdict_of(
+    provenance: Provenance,
+    trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
+) -> SpawnVerdict {
+    match spawn_refusal(provenance, trigger_configs) {
+        None => SpawnVerdict::Allowed,
+        Some(SpawnRefusal::Unattested(_)) => SpawnVerdict::Unattested,
+        Some(refusal) => SpawnVerdict::Refused {
+            reason: refusal.to_string(),
+        },
+    }
+}
+
 /// Why the gate refused a run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum SpawnRefusal {
     UngrantedTrigger {
         trigger_id: String,
@@ -267,6 +438,13 @@ pub(crate) enum SpawnRefusal {
         trigger_name: String,
     },
     Origin(RefusedOrigin),
+    /// An unattested caller started the run, and no Allow covers it.
+    Unattested(MessageOrigin),
+    /// The calling workspace's gate refused its thread, for `reason`.
+    CallerWorkspace {
+        workspace: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for SpawnRefusal {
@@ -297,6 +475,13 @@ impl std::fmt::Display for SpawnRefusal {
                      coding agent, so the run was refused."
                 )
             }
+            Self::Unattested(_) => std::fmt::Display::fmt(&StartAwaitsOwner, f),
+            Self::CallerWorkspace { workspace, reason } => write!(
+                f,
+                "The workspace \"{workspace}\" started this coding agent, and its own gate \
+                 refused the thread that asked, so the run was refused here too. It said: \
+                 {reason}"
+            ),
         }
     }
 }
@@ -308,18 +493,23 @@ pub(crate) fn spawn_refusal(
     provenance: Provenance,
     trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
 ) -> Option<SpawnRefusal> {
-    let root_trigger = match provenance.root {
-        SpawnRoot::Owner => None,
+    let (root_trigger, unattested) = match provenance.root {
+        SpawnRoot::Owner => (None, None),
+        SpawnRoot::Unattested(caller) => (None, Some(caller)),
         SpawnRoot::Refused(origin) => return Some(SpawnRefusal::Origin(origin)),
+        SpawnRoot::RefusedByCaller { workspace, reason } => {
+            return Some(SpawnRefusal::CallerWorkspace { workspace, reason })
+        }
         SpawnRoot::Trigger {
             trigger_id,
             trigger_name,
-        } => Some((trigger_id, trigger_name)),
+        } => (Some((trigger_id, trigger_name)), None),
     };
     root_trigger
         .into_iter()
         .chain(provenance.fired_triggers)
         .find_map(|(trigger_id, trigger_name)| ungranted(trigger_id, trigger_name, trigger_configs))
+        .or(unattested.map(SpawnRefusal::Unattested))
 }
 
 fn ungranted(
@@ -348,11 +538,55 @@ fn ungranted(
 pub(crate) struct SpawnRefused {
     pub(crate) refusal: SpawnRefusal,
     pub(crate) notice: Option<TriggerNotification>,
+    /// The `ResponseFailed` error that ended the turn. `None` when the run
+    /// parked on the owner's card instead.
+    pub(crate) failure: Option<String>,
+}
+
+/// A run the gate parked on the owner's Allow card. It is waiting, not
+/// failed, so no caller writes a terminator: the card holds the turn.
+#[derive(Debug)]
+pub(crate) struct StartAwaitsOwner;
+
+impl std::fmt::Display for StartAwaitsOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "A caller Lucidos cannot verify started this coding agent, so it waits for the \
+             owner's answer on its card."
+        )
+    }
+}
+
+impl std::error::Error for StartAwaitsOwner {}
+
+/// Whether `error` is a run parked on the owner's card rather than a failure.
+pub(crate) fn awaits_owner(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.is::<StartAwaitsOwner>()
+}
+
+/// The error a refused or parked run returns to its caller.
+fn refusal_error(refused: &SpawnRefused) -> Box<dyn std::error::Error + Send + Sync> {
+    match &refused.failure {
+        None => {
+            debug_assert!(
+                matches!(refused.refusal, SpawnRefusal::Unattested(_)),
+                "only an unattested run parks"
+            );
+            Box::new(StartAwaitsOwner)
+        }
+        Some(failure) => failure.clone().into(),
+    }
 }
 
 /// Refuse a run on `thread_id` that its root may not start. The refusal ends
 /// the turn anchored at `origin_id` with `ResponseFailed`. A trigger's refusal
 /// also records a failure notification for that trigger.
+///
+/// An unattested caller's run starts when the owner allowed it once, and that
+/// run spends the Allow. Only the run the Allow resumed may spend it. Otherwise
+/// the run parks on a card, with no terminator, until the owner answers. A card
+/// that cannot be raised fails the turn, since nothing else would end it.
 pub(crate) async fn enforce_spawn_gate(
     bus: &EventBus,
     trigger_configs: &RwLock<HashMap<String, TriggerConfig>>,
@@ -363,13 +597,46 @@ pub(crate) async fn enforce_spawn_gate(
     let Some(refusal) = spawn_refusal(provenance, trigger_configs) else {
         return Ok(());
     };
-    crate::log!("[SpawnGate] Refused a coding-agent run on thread {thread_id}: {refusal:?}");
+    let failure = if let SpawnRefusal::Unattested(caller) = &refusal {
+        if unattested_act::origin_is_an_allowed_start(bus.pool(), origin_id).await
+            && unattested_act::spend_allowed_start(bus, thread_id).await
+        {
+            crate::log_legacy!(
+                "[SpawnGate] Starting thread {thread_id}'s run on the owner's Allow"
+            );
+            return Ok(());
+        }
+        crate::log_legacy!("[SpawnGate] Thread {thread_id}'s run waits for the owner: {refusal:?}");
+        match park_on_owner_card(bus, thread_id, caller.clone()).await {
+            Ok(()) => {
+                return Err(SpawnRefused {
+                    refusal,
+                    notice: None,
+                    failure: None,
+                })
+            }
+            Err(e) => {
+                crate::log_legacy!("[SpawnGate] Could not park thread {thread_id}'s run: {e}");
+                format!(
+                    "A caller Lucidos cannot verify started this coding agent, and Lucidos \
+                     could not ask the owner to allow it: {e}"
+                )
+            }
+        }
+    } else {
+        crate::log_legacy!(
+            "[SpawnGate] Refused a coding-agent run on thread {thread_id}: {refusal:?}"
+        );
+        refusal.to_string()
+    };
     bus.emit_or_log(
         BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ResponseFailed {
-                error: refusal.to_string(),
+                error: failure.clone(),
+                spend_cap: None,
                 agent_exit: None,
+                provider_error: None,
             },
             meta: EventMeta {
                 request_event_id: Some(origin_id),
@@ -397,18 +664,44 @@ pub(crate) async fn enforce_spawn_gate(
                 emit_trigger_notification(bus, trigger_id, &notice, Some(thread_id), Tap::Modal)
                     .await
             {
-                crate::log!("[SpawnGate] Failed to notify that {trigger_id} was refused: {e}");
+                crate::log_legacy!(
+                    "[SpawnGate] Failed to notify that {trigger_id} was refused: {e}"
+                );
             }
             Some(notice)
         }
-        SpawnRefusal::Origin(_) => None,
+        SpawnRefusal::Origin(_)
+        | SpawnRefusal::CallerWorkspace { .. }
+        | SpawnRefusal::Unattested(_) => None,
     };
-    Err(SpawnRefused { refusal, notice })
+    Err(SpawnRefused {
+        refusal,
+        notice,
+        failure: Some(failure),
+    })
+}
+
+/// Raise the card an unattested run waits on, unless one already waits.
+async fn park_on_owner_card(
+    bus: &EventBus,
+    thread_id: Uuid,
+    caller: MessageOrigin,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if unattested_act::start_card_waiting(bus.pool(), thread_id).await? {
+        return Ok(());
+    }
+    let act = UnattestedAct {
+        caller,
+        request: UnattestedRequest::StartCodingAgent,
+    };
+    let question = unattested_act::card_question("start a coding agent in this thread", &act);
+    unattested_act::raise_card(bus, thread_id, question, act, EventChannel::ClaudeCode).await?;
+    Ok(())
 }
 
 impl crate::engine::LucidosEngine {
     /// [`enforce_spawn_gate`] for a run on `thread_id`, pushing a trigger's
-    /// failure notice to every device.
+    /// failure notice to every device. A parked run returns [`StartAwaitsOwner`].
     pub(crate) async fn gate_coding_agent_spawn(
         &self,
         thread_id: Uuid,
@@ -424,7 +717,7 @@ impl crate::engine::LucidosEngine {
         if let (Some(notice), Some(engine)) = (&refused.notice, self.try_clone_arc()) {
             notice.send_push(&engine);
         }
-        Err(refused.refusal.to_string().into())
+        Err(refusal_error(&refused))
     }
 }
 

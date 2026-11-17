@@ -51,13 +51,16 @@
       background: var(--bg-tertiary);
       cursor: pointer;
     }
-    video {
+    video, .poster {
       display: block;
       width: 100%;
       height: 100%;
       object-fit: contain;
       transform: translateZ(0);
     }
+    .poster { position: absolute; inset: 0; pointer-events: none; }
+    .poster[hidden] { display: none; }
+    .has-frame .poster { visibility: hidden; }
     /* The SDK's own `button` and `input` rules pad and fill every control.
        Override them all here: their padding squeezes the icon to zero width,
        and their hover fill sticks grey after a tap. */
@@ -182,7 +185,8 @@
 <body>
   <div class="player" id="player">
     <div class="stage" id="stage">
-      <video id="video" preload="metadata" playsinline></video>
+      <video id="video" preload="none" playsinline></video>
+      <img id="poster" class="poster" alt="" hidden>
       <!-- The bar's play button is the keyboard's; this one is for a tap. -->
       <button class="big-play" type="button" aria-hidden="true" tabindex="-1">
         <svg viewBox="0 0 16 16"><path d="M4 2.5v11l9-5.5z"/></svg>
@@ -211,6 +215,10 @@
     const time = document.getElementById('time');
     const full = document.getElementById('full');
     const video = document.getElementById('video');
+    const poster = document.getElementById('poster');
+    let posterRequested = false;
+    let duration = 0;
+    let intended = false;
 
     // A workspace path plays through the /data mount, which serves ranges, so
     // Safari can seek. An https URL plays as given.
@@ -225,11 +233,13 @@
     }
 
     function showPosition() {
-      scrub.value = String(video.currentTime);
-      time.textContent = video.duration
-        ? `${clock(video.currentTime)} / ${clock(video.duration)}`
-        : clock(video.currentTime);
-      const played = video.duration ? video.currentTime / video.duration : 0;
+      const position = resumeAt ?? (released ? releasedAt ?? 0 : video.currentTime);
+      const length = video.duration || duration;
+      scrub.value = String(position);
+      time.textContent = length
+        ? `${clock(position)} / ${clock(length)}`
+        : clock(position);
+      const played = length ? position / length : 0;
       scrub.style.setProperty('--played', String(played));
     }
 
@@ -312,7 +322,7 @@
     // clip out of sight lets go of its media and reloads at its position.
     let url = '';
     let hostVisible = true;
-    // A clip starts released and loads once it is first on screen.
+    // Visibility requests only a still image. Intent attaches the media source.
     let released = true;
     // Null when the clip had no metadata yet, so its own fragment still decides
     // where it starts.
@@ -320,6 +330,7 @@
     // Until the reload reaches its metadata, currentTime still reads 0, so
     // the position lives here.
     let resumeAt = null;
+    let awaitingCanPlay = false;
 
     // The time fragment makes Safari draw that frame before playing. A clip
     // URL with a fragment of its own keeps it and seeks at its metadata.
@@ -331,9 +342,7 @@
     // canplay, then drop the target even when it is out of range.
     function resume(lastChance) {
       if (resumeAt === null) return;
-      if (!url.includes('#')) {
-        resumeAt = null;
-      } else if (canSeekTo(resumeAt)) {
+      if (canSeekTo(resumeAt)) {
         video.currentTime = resumeAt;
         resumeAt = null;
       } else if (lastChance) {
@@ -347,6 +356,7 @@
       released = true;
       releasedAt = resumeAt ?? (video.readyState > 0 ? video.currentTime : null);
       resumeAt = null;
+      player.classList.remove('has-frame', 'started');
       video.removeAttribute('src');
       video.load();
     }
@@ -359,8 +369,37 @@
 
     function show() {
       if (!onScreen || !hostVisible) return;
+      requestPoster();
       if (!released) return repaint();
+      if (!intended) return;
+      attach();
+    }
+
+    function requestPoster() {
+      if (posterRequested) return;
+      posterRequested = true;
+      const maxSize = Math.max(stage.clientWidth, stage.clientHeight) || 640;
+      lucidos.media.poster(clip.trim(), { maxSize }).then(result => {
+        poster.src = result.poster;
+        poster.hidden = false;
+        if (released) {
+          player.style.setProperty('--ratio', `${result.width} / ${result.height}`);
+          duration = result.duration;
+          scrub.max = String(duration);
+          showPosition();
+        }
+      }).catch(() => {
+        // A server without CORS cannot supply a poster. The stage still offers play.
+        stage.title = 'Preview unavailable. Tap to play.';
+      });
+    }
+
+    function attach() {
+      intended = true;
+      if (!released) return;
       resumeAt = releasedAt === null ? null : Math.max(releasedAt, 0.001);
+      awaitingCanPlay = true;
+      video.preload = 'auto';
       video.src = sourceAt(resumeAt ?? 0.001);
       released = false;
     }
@@ -376,46 +415,72 @@
     // rejects with AbortError. That is not a failure.
     function toggle() {
       if (!video.paused) return video.pause();
+      attach();
       video.play().catch((e) => {
         if (e.name !== 'AbortError') fail(`Could not play the clip: ${e.message}`);
       });
     }
 
-    // Safari's own video player comes first wherever it exists: an iPhone has
-    // no other full screen. A request can also stall without an answer, so
-    // one that has not opened after a while says so. Either failure keeps the
-    // player, which still works in place.
+    // Idle clips use standard full screen within the tap where available.
+    // iPhone needs Safari's own player. A request that stalls reports failure
+    // after a timeout and leaves the player available in place.
     const FULL_SCREEN_WAIT_MS = 2000;
 
     function enterFullScreen() {
+      const standardIdle = video.readyState === 0 && document.fullscreenEnabled && video.requestFullscreen;
+      const idleSafari = video.webkitEnterFullscreen && video.readyState === 0 && !standardIdle;
+      attach();
       let answered = false;
+      let triedFallback = false;
       const settle = () => {
         if (answered) return;
         answered = true;
         fullScreenRequestsPending -= 1;
+        video.removeEventListener('loadedmetadata', open);
+        video.removeEventListener('webkitbeginfullscreen', settle);
+        document.removeEventListener('fullscreenchange', settle);
       };
       video.addEventListener('webkitbeginfullscreen', settle, { once: true });
       document.addEventListener('fullscreenchange', settle, { once: true });
       const refused = (reason) => {
+        if (answered) return;
         settle();
+        video.setAttribute('playsinline', '');
         lucidos.ui.toast(`Could not go full screen: ${reason}`, 'error');
         releaseIfHidden();
       };
       fullScreenRequestsPending += 1;
       // Only Safari's own player is known to stick until Lucidos restarts.
       let neverOpened = 'it never opened';
-      try {
-        if (video.webkitEnterFullscreen) {
-          neverOpened = 'it never opened. iOS may be stuck: close and reopen Lucidos';
-          video.webkitEnterFullscreen();
-        } else if (document.fullscreenEnabled && video.requestFullscreen) {
-          video.requestFullscreen().catch((e) => refused(e.message));
-        } else {
-          return refused('this browser has no full screen for video');
+      const fallback = () => {
+        if (triedFallback) return;
+        triedFallback = true;
+        video.removeAttribute('playsinline');
+        video.play().catch(e => refused(e.message));
+      };
+      function open() {
+        if (answered) return;
+        try {
+          if (standardIdle) {
+            video.requestFullscreen().catch((e) => refused(e.message));
+          } else if (video.webkitEnterFullscreen) {
+            neverOpened = 'it never opened. iOS may be stuck: close and reopen Lucidos';
+            video.webkitEnterFullscreen();
+          } else if (document.fullscreenEnabled && video.requestFullscreen) {
+            video.requestFullscreen().catch((e) => refused(e.message));
+          } else {
+            return refused('this browser has no full screen for video');
+          }
+        } catch (e) {
+          if (video.webkitEnterFullscreen && !standardIdle) fallback();
+          else refused(e.message);
         }
-      } catch (e) {
-        return refused(e.message);
       }
+      if (idleSafari) {
+        video.addEventListener('loadedmetadata', open, { once: true });
+        // Start native playback within the tap, before metadata consumes the gesture.
+        fallback();
+      } else open();
       setTimeout(() => {
         video.removeEventListener('webkitbeginfullscreen', settle);
         document.removeEventListener('fullscreenchange', settle);
@@ -440,6 +505,10 @@
         video.controls = document.fullscreenElement === video;
         releaseIfHidden();
       });
+      video.addEventListener('webkitendfullscreen', () => video.setAttribute('playsinline', ''));
+      video.addEventListener('loadeddata', () => {
+        if (!released) player.classList.add('has-frame');
+      });
       for (const event of ['webkitpresentationmodechanged', 'webkitendfullscreen', 'leavepictureinpicture']) {
         video.addEventListener(event, releaseIfHidden);
       }
@@ -462,7 +531,10 @@
         resume(false);
         showPosition();
       });
-      video.addEventListener('canplay', () => resume(true));
+      video.addEventListener('canplay', () => {
+        awaitingCanPlay = false;
+        resume(true);
+      });
       video.addEventListener('timeupdate', () => {
         showPosition();
       });
@@ -495,8 +567,12 @@
         if (!released) fail(`Could not load ${clip}.`);
       });
       scrub.addEventListener('input', () => {
-        resumeAt = null;
-        video.currentTime = Number(scrub.value);
+        const target = Number(scrub.value);
+        attach();
+        if (video.readyState > 0 && (!awaitingCanPlay || canSeekTo(target))) {
+          resumeAt = null;
+          video.currentTime = target;
+        } else resumeAt = target;
         showPosition();
       });
     }

@@ -154,7 +154,7 @@ async fn deliver(
     };
 
     let Ok(path) = engine_delivery_path(&hook_id) else {
-        crate::log!("[Hook] '{slug}' delivery could not construct the engine URL");
+        crate::log_legacy!("[Hook] '{slug}' delivery could not construct the engine URL");
         return StatusCode::BAD_GATEWAY.into_response();
     };
     let mut request = axum::http::Request::post(path);
@@ -167,7 +167,7 @@ async fn deliver(
         request = request.header(name.as_str(), value);
     }
     let Ok(request) = request.body(Body::from(body)) else {
-        crate::log!("[Hook] '{slug}' delivery could not build the engine request");
+        crate::log_legacy!("[Hook] '{slug}' delivery could not build the engine request");
         return StatusCode::BAD_GATEWAY.into_response();
     };
 
@@ -188,7 +188,7 @@ async fn deliver(
             (status, Body::from(bytes)).into_response()
         }
         Err(e) => {
-            crate::log!("[Hook] '{slug}' delivery could not reach the engine: {e}");
+            crate::log_legacy!("[Hook] '{slug}' delivery could not reach the engine: {e}");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }

@@ -2,23 +2,22 @@
 //! of `command_permission::submit_command_consent`. The `PermissionCard`
 //! rendered for an `McpPermissionRequested` event POSTs here; the handler wakes
 //! the in-process agentic loop blocked on the entry, records any "Always allow"
-//! grant to `mcp-allowed-tools` (or the per-thread session set), and emits the
-//! paired `McpPermissionResolved`.
+//! as a *tool grant*, and emits the paired `McpPermissionResolved`.
 
 use super::*;
 use crate::engine::claude_code::AllowScope;
 use crate::engine::mcp_permission::resolve_mcp_permission;
+use crate::engine::permission::tool_grants::AnsweredBy;
 
 #[derive(Deserialize)]
 pub(super) struct McpPermissionConsentRequest {
     pub request_id: String,
     pub allowed: bool,
     /// When `Some(_)` and `allowed`, the engine records the derived
-    /// `Mcp(server:tool)` / `Mcp(server:*)` pattern so future matching calls
-    /// skip the prompt: `session` into the in-memory per-thread allow set;
-    /// `narrow` / `broad` into `<workspace>/.lucidos/mcp-allowed-tools`. Absent
-    /// (Allow-once) records nothing. Unknown wire values 4xx via serde — match
-    /// the engine's typed enum exactly.
+    /// `Mcp(server:tool)` / `Mcp(server:*)` pattern as a *tool grant*, so
+    /// future matching calls skip the prompt: `session` held by the thread,
+    /// `narrow` / `broad` standing. Absent (Allow once) records nothing.
+    /// Unknown wire values 4xx via serde, matching the engine's typed enum.
     #[serde(default)]
     pub persist_scope: Option<AllowScope>,
 }
@@ -57,7 +56,7 @@ pub(super) async fn submit_mcp_permission_consent(
         body.request_id,
         body.allowed,
         body.persist_scope,
-        actor,
+        AnsweredBy::tap(actor),
         "[McpPermission] McpPermissionResolved",
     )
     .await;

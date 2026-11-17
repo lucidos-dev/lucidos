@@ -560,6 +560,9 @@ async fn pending_conflict_change_follows_merge_event_pairing() {
         &bus,
         thread,
         ThreadEvent::ChangeApplyFailed {
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            landing_merge_sha: None,
             change_id: change.to_string(),
             error: "merge aborted".to_string(),
             actor: None,
@@ -759,6 +762,7 @@ async fn conflict_pairing_stays_open_through_the_resolver_mid_turn_traffic() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         aggregate_proposed(change, "jitter", "/r"),
     ] {
@@ -824,6 +828,9 @@ async fn pending_conflict_change_prefers_newest_open_pairing() {
         &bus,
         thread,
         ThreadEvent::ChangeApplyFailed {
+            pre_merge_sha: None,
+            post_merge_sha: None,
+            landing_merge_sha: None,
             change_id: live.to_string(),
             error: "aborted".to_string(),
             actor: None,
@@ -907,6 +914,7 @@ fn idled() -> ThreadEvent {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     }
 }
 
@@ -1052,7 +1060,7 @@ async fn the_list_and_the_apply_gate_agree_on_every_thread_state() {
         let refused = crate::api::changes::change_action_refusal(
             &pool,
             change,
-            crate::engine::thread_lifecycle::Action::Apply,
+            crate::engine::thread_lifecycle::ThreadAction::Apply,
         )
         .await
         .unwrap();

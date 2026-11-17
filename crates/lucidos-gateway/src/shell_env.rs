@@ -118,7 +118,9 @@ pub fn hydrate_login_shell_env() {
     let shlvl = std::env::var_os("SHLVL");
     if !should_hydrate(packaged.as_deref(), shlvl.as_deref()) {
         if shlvl.is_some() && is_packaged(packaged.as_deref()) {
-            crate::log!("[shell-env] started from a shell; keeping the inherited environment");
+            crate::log_legacy!(
+                "[shell-env] started from a shell; keeping the inherited environment"
+            );
         }
         return;
     }
@@ -126,12 +128,12 @@ pub fn hydrate_login_shell_env() {
     let stdout = match read_login_shell_env(&shell, SHELL_TIMEOUT) {
         Ok(stdout) => stdout,
         Err(e) => {
-            crate::log!("[shell-env] {e}; continuing without the login-shell environment");
+            crate::log_legacy!("[shell-env] {e}; continuing without the login-shell environment");
             return;
         }
     };
     let Some(payload) = env_after_marker(&stdout) else {
-        crate::log!(
+        crate::log_legacy!(
             "[shell-env] {} produced no environment dump; continuing without it",
             shell.display()
         );
@@ -149,7 +151,7 @@ pub fn hydrate_login_shell_env() {
     }
 
     if plan.is_empty() {
-        crate::log!(
+        crate::log_legacy!(
             "[shell-env] {} contributed nothing new; continuing with the inherited environment",
             shell.display()
         );
@@ -157,7 +159,7 @@ pub fn hydrate_login_shell_env() {
         // NAMES only. Several of these are API keys, and this line lands in the
         // service log.
         let names: Vec<&str> = plan.iter().map(|(name, _)| name.as_str()).collect();
-        crate::log!(
+        crate::log_legacy!(
             "[shell-env] hydrated from {}: {}",
             shell.display(),
             names.join(", ")

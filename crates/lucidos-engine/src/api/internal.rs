@@ -62,7 +62,7 @@ pub(super) async fn permission_prompt(
     // An "Allow for this thread" here widens what that thread's agent may do,
     // so another thread must not raise the card.
     if asks_for_another_thread(&headers, thread_id) {
-        crate::log!(
+        crate::log_legacy!(
             "[PermissionPrompt] refused {thread_id}/{}: the caller's token names another thread",
             body.tool_use_id
         );
@@ -170,7 +170,7 @@ pub(super) async fn restart_intent(
     // First writer wins: an in-workspace *Switch* stashed its own actor before it
     // asked the gateway for this respawn, and that one is the click's.
     let stashed = state.engine.stash_restart_actor(Some(actor));
-    crate::log!(
+    crate::log_legacy!(
         "[Restart] Gateway restart intent recorded (stashed={})",
         stashed
     );
@@ -198,9 +198,11 @@ pub(super) async fn oauth_callback(
             .into_response();
     }
     use crate::core::oauth_callback::{deliver_callback, CallbackDelivery};
-    let (status, page) = match deliver_callback(query.as_deref().unwrap_or("")) {
-        CallbackDelivery::Accepted { ok: true, page } => (StatusCode::OK, page),
-        CallbackDelivery::Accepted { ok: false, page } => (StatusCode::BAD_REQUEST, page),
+    let (status, page) = match deliver_callback(query.as_deref().unwrap_or("")).await {
+        CallbackDelivery::Accepted { state, page } if state.is_error() => {
+            (StatusCode::BAD_REQUEST, page)
+        }
+        CallbackDelivery::Accepted { page, .. } => (StatusCode::OK, page),
         CallbackDelivery::Unclaimed { page } => (StatusCode::NOT_FOUND, page),
     };
     (status, axum::response::Html(page)).into_response()
@@ -214,6 +216,8 @@ fn may_deliver_oauth_callback(headers: &HeaderMap) -> bool {
 #[derive(Deserialize)]
 pub(super) struct ClientLogRequest {
     pub category: String,
+    #[serde(default)]
+    pub code: Option<String>,
     pub message: String,
     #[serde(default)]
     pub data: serde_json::Value,
@@ -232,6 +236,10 @@ pub(crate) const CLIENT_LOG_MAX_BATCH: usize = 100;
 fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static str> {
     if entry.category.len() > CLIENT_LOG_MAX_FIELD_LEN
         || entry.message.len() > CLIENT_LOG_MAX_FIELD_LEN
+        || entry
+            .code
+            .as_ref()
+            .is_some_and(|code| code.len() > CLIENT_LOG_MAX_FIELD_LEN)
     {
         return Err("category/message too long");
     }
@@ -241,6 +249,146 @@ fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static st
         return Err("data too large");
     }
     Ok(data_str)
+}
+
+/// Only this closed vocabulary can cross the maintainer boundary. A client
+/// cannot mark arbitrary strings shareable by choosing a JSON field name.
+/// Unknown/older codes remain useful to the owner as private values.
+enum ClientToken<'a> {
+    Known(&'static str),
+    Private(&'a str),
+}
+
+impl std::fmt::Display for ClientToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(value) => f.write_str(value),
+            Self::Private(value) => f.write_str(value),
+        }
+    }
+}
+
+impl lucidos_diagnostic_log::LogValue for ClientToken<'_> {
+    fn is_private(&self) -> bool {
+        matches!(self, Self::Private(_))
+    }
+}
+
+fn client_token<'a>(value: &'a str, vocabulary: &[&'static str]) -> ClientToken<'a> {
+    vocabulary
+        .iter()
+        .copied()
+        .find(|known| *known == value)
+        .map(ClientToken::Known)
+        .unwrap_or(ClientToken::Private(value))
+}
+
+const CLIENT_CATEGORIES: &[&str] = &[
+    "sw",
+    crate::core::prefs::THEME_MODE.key(),
+    "perf",
+    "error",
+    "lifecycle",
+    "deeplink",
+    "nav",
+    "widget",
+    "chunk",
+    "device-database",
+    "scroll",
+    "restore-admission",
+    "event-stream",
+    "native-tap",
+    "devices",
+    "mobile",
+    "page-health",
+    "safe-area",
+    "seen-target",
+    "ipc",
+    "connection",
+    "chat",
+    "toast-press",
+    "render",
+    "shell-scroll",
+    "composer-press",
+    "follow",
+    "composer-typing",
+    "app-link",
+    "app-fullscreen",
+];
+
+const CLIENT_CODES: &[&str] = &[
+    "uncaught",
+    "unhandledrejection",
+    "startup",
+    "dispatch",
+    "probe",
+    "load_failed",
+    "fetch_path_slow",
+    "fetch_path_wedged",
+    "released_on_hide",
+    "open_blocked",
+    "restore",
+    "failed",
+    "stalled",
+    "admitted_after_stall",
+    "drain",
+    "hand_over_failed",
+    "cleared_ghost_focus",
+    "focus-reveal",
+    "sample",
+    "stall",
+    "invoke-failed",
+    "invoke-recovered",
+    "state_changed",
+    "send_retried",
+    "thread_render_probe",
+    "rebuild_corrupted_thread",
+    "snap-back",
+    "short",
+    "outcome",
+    "reading",
+    "settled",
+    "missed-frame",
+    "asset_failed",
+    "push",
+    "notificationclick",
+    "fouc",
+    "pageshow",
+    "route_thread_hash_landed",
+    "route_thread_hash_not_found",
+    "route_thread_hash_failed",
+    "route_notifications_hash",
+    "route_thread_hash",
+    "handle_hash_location",
+    "external-url-blocked",
+    "external-url-opened-on-retry",
+    "link-click-after-swipe",
+    "thread-load",
+    "thread-backfill",
+    "main-thread-stall",
+    "interaction",
+    "loaf",
+    "longtask",
+    "perf-probe-support",
+    "boot",
+    "navigation",
+    "group",
+    "thread-render",
+    "thread-rerender",
+    "open",
+    "answer",
+];
+
+fn client_line(entry: &ClientLogRequest, data: &str, ua: &str) -> lucidos_diagnostic_log::Line {
+    use lucidos_diagnostic_log::{line, private};
+    line!(
+        "[Client/{}] {} {} code={} ua={}",
+        client_token(&entry.category, CLIENT_CATEGORIES),
+        private(&entry.message),
+        private(data),
+        client_token(entry.code.as_deref().unwrap_or(""), CLIENT_CODES),
+        private(ua)
+    )
 }
 
 fn user_agent(headers: &HeaderMap) -> &str {
@@ -259,12 +407,9 @@ pub(super) async fn client_log(
 ) -> impl IntoResponse {
     match validate_client_entry(&body) {
         Ok(data_str) => {
-            crate::log!(
-                "[Client/{}] {} {} ua={}",
-                body.category,
-                body.message,
-                data_str,
-                user_agent(&headers)
+            crate::typed_log_line(
+                "Client",
+                client_line(&body, &data_str, user_agent(&headers)),
             );
             StatusCode::NO_CONTENT.into_response()
         }
@@ -294,13 +439,7 @@ pub(super) async fn client_logs(
     }
     let ua = user_agent(&headers);
     for (entry, data_str) in body.iter().zip(serialized) {
-        crate::log!(
-            "[Client/{}] {} {} ua={}",
-            entry.category,
-            entry.message,
-            data_str,
-            ua
-        );
+        crate::typed_log_line("Client", client_line(entry, &data_str, ua));
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -412,7 +551,7 @@ pub(super) async fn coding_agent_diff_refresh(
     let has_diff = match probe_branch_has_diff(&repo_root, branch_name).await {
         Ok(has_diff) => has_diff,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] coding-agent diff probe could not answer for thread {} branch {}: {}",
                 thread_id,
                 branch_name,
@@ -434,7 +573,7 @@ pub(super) async fn coding_agent_diff_refresh(
     {
         Ok(changed) => Json(CodingAgentDiffRefreshResponse { has_diff, changed }).into_response(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] coding-agent diff refresh failed for thread {} branch {}: {}",
                 thread_id,
                 branch_name,
@@ -605,7 +744,7 @@ pub(super) async fn mark_hardened(
             Json(report.to_json()).into_response()
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] record_hardened failed for {}: {}",
                 body.branch_name,
                 e
@@ -686,6 +825,39 @@ struct IntegratedHeadsResponse {
     heads: Vec<String>,
 }
 
+/// The skill declares its planning purpose before writing a plan.
+#[derive(serde::Deserialize)]
+pub(super) struct StartPlanRequest {
+    #[serde(default)]
+    kind: crate::engine::thread_events::PlanKind,
+}
+
+pub(super) async fn start_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(body): Json<StartPlanRequest>,
+) -> axum::response::Response {
+    if let Some(refusal) = marker_write_refusal(&headers) {
+        return refusal;
+    }
+    let Some(thread_id) = caller_thread(&headers).and_then(|id| id.parse().ok()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "planned start requires a calling thread",
+        )
+            .into_response();
+    };
+    match crate::engine::plan_lifecycle::start(&state.engine.event_bus, thread_id, body.kind).await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("planned start: {e}"),
+        )
+            .into_response(),
+    }
+}
+
 /// Body for `POST /api/v1/internal/mark-planned`. `state` is `"proposed"` (a
 /// plan was written and awaits the user's approval — what the skill records),
 /// `"planned"` (legacy/approved), `"acknowledged_simple"` (local fix), or
@@ -698,6 +870,8 @@ pub(super) struct MarkPlannedRequest {
     pub branch_name: String,
     pub head_sha: String,
     pub state: String,
+    #[serde(default)]
+    pub kind: crate::engine::thread_events::PlanKind,
     #[serde(default)]
     pub plan_path: Option<String>,
     #[serde(default)]
@@ -733,11 +907,11 @@ pub(super) async fn mark_planned(
     // typo. `bounded-security-fix` is the one that matters.
     let Some(kind) = PlanMarkerKind::parse_strict(&body.state) else {
         let msg = format!(
-            "Unknown plan-marker state {:?}. Use one of: proposed, planned, \
+            "Unknown plan-marker state {:?}. Use one of: proposed, planned, plan_only, \
              acknowledged_simple, bounded_security_fix (snake_case, not kebab-case).",
             body.state
         );
-        crate::log!(
+        crate::log_legacy!(
             "[Internal] mark-planned refused for {}: {}",
             body.branch_name,
             msg
@@ -747,7 +921,7 @@ pub(super) async fn mark_planned(
     let files = match validate_plan_files(kind, &body.files) {
         Ok(files) => files,
         Err(rejection) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] mark-planned refused for {}: {}",
                 body.branch_name,
                 rejection
@@ -765,9 +939,24 @@ pub(super) async fn mark_planned(
     {
         return refusal;
     }
-    match state
-        .engine
-        .record_planned(
+    let thread = caller_thread(&headers).and_then(|id| uuid::Uuid::parse_str(&id).ok());
+    let result = if let (PlanMarkerKind::Proposed, Some(thread), Some(path)) =
+        (kind, thread, body.plan_path.as_deref())
+    {
+        crate::engine::plan_lifecycle::propose(
+            &state.engine.event_bus,
+            thread,
+            &repo_root,
+            &body.branch_name,
+            path,
+            &body.head_sha,
+            body.reason.as_deref(),
+            body.kind,
+        )
+        .await
+    } else {
+        crate::engine::git_ops::record_planned_with_kind(
+            &state.pool,
             &repo_root,
             &body.branch_name,
             kind,
@@ -775,12 +964,14 @@ pub(super) async fn mark_planned(
             body.reason.as_deref(),
             &files,
             &body.head_sha,
+            body.kind,
         )
         .await
-    {
+    };
+    match result {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] record_planned failed for {}: {}",
                 body.branch_name,
                 e
@@ -832,28 +1023,25 @@ struct QueryPlannedResponse {
 pub(super) struct ApprovePlanRequest {
     pub repo_root: String,
     pub branch_name: String,
+    #[serde(default)]
+    pub plan_only: bool,
 }
 
 #[derive(Serialize)]
 struct ApprovePlanResponse {
-    /// Whether a `proposed` row was flipped to `planned`. `false` means there
-    /// was nothing to approve (no row, or it was already planned / simple).
+    /// Whether a proposed marker transitioned to the approved scope.
     approved: bool,
+    plan_only: bool,
     /// The flipped plan's file, for the CLI to mark `Approved`.
     #[serde(skip_serializing_if = "Option::is_none")]
     plan_path: Option<String>,
 }
 
-/// POST /api/v1/internal/approve-plan — invoked by `lucidos planned approve`
-/// after the user approves a proposed plan in chat. Flips the branch's marker
-/// from `proposed` to `planned` so the cc-plan-gate hook and the Apply floor
-/// pass. Idempotent: re-approving an already-`planned` (or `simple`) branch is a
-/// no-op that reports `approved: false`.
-///
-/// The engine checks the user's own answer first. Without it the reply is a 409
-/// with reason `no-plan-approval`, and an unreadable answer is a 500. A branch
-/// the calling thread's Apply never lands is a 409 `marker-off-tracked-branch`,
-/// as on `mark-planned`.
+/// Approve the recorded plan for the scope the user's answer grants.
+/// Design approvals always stay plan-only. A missing approval returns 409
+/// `no-plan-approval`; a changed batch binding returns 409 `plan-changed`.
+/// An unreadable answer returns 500. Off-branch writes return 409
+/// `marker-off-tracked-branch`, as on `mark-planned`.
 pub(super) async fn approve_plan(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -876,10 +1064,16 @@ pub(super) async fn approve_plan(
     }
     match state
         .engine
-        .approve_plan(&repo_root, &body.branch_name, caller_thread.as_deref())
+        .approve_plan(
+            &repo_root,
+            &body.branch_name,
+            caller_thread.as_deref(),
+            body.plan_only,
+        )
         .await
     {
         Ok(approved) => Json(ApprovePlanResponse {
+            plan_only: approved.as_ref().is_some_and(|a| a.plan_only),
             approved: approved.is_some(),
             plan_path: approved.and_then(|a| a.plan_path),
         })
@@ -889,8 +1083,13 @@ pub(super) async fn approve_plan(
                 .with_reason("no-plan-approval")
                 .into_response()
         }
+        Err(e @ PlanApprovalError::PlanChanged) => {
+            ApiError::new(StatusCode::CONFLICT, e.to_string())
+                .with_reason("plan-changed")
+                .into_response()
+        }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] approve_plan failed for {}: {}",
                 body.branch_name,
                 e
@@ -1055,6 +1254,7 @@ pub(super) async fn seed_change_for_test(
         .emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ChangeProposed {
+                content: crate::engine::thread_events::ChangeContent::from_files(&body.files),
                 change_id: body.change_id.clone(),
                 description: Some(body.description),
                 files: body.files,
@@ -1095,7 +1295,7 @@ pub(super) async fn seed_change_for_test(
             )
             .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[Internal] seed-change-for-test record_planned failed: {}",
                 e
             );
@@ -1109,7 +1309,7 @@ pub(super) async fn seed_change_for_test(
         )
             .into_response(),
         Err(e) => {
-            crate::log!("[Internal] seed-change-for-test emit failed: {}", e);
+            crate::log_legacy!("[Internal] seed-change-for-test emit failed: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("emit failed: {e}"),
@@ -1204,7 +1404,7 @@ pub(super) async fn ask_user_question(
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid thread_id").into_response(),
     };
     if asks_for_another_thread(&headers, thread_id) {
-        crate::log!(
+        crate::log_legacy!(
             "[AskUserQuestion] refused {thread_id}/{}: the caller's token names another thread",
             body.tool_use_id
         );
@@ -1225,27 +1425,24 @@ pub(super) async fn ask_user_question(
     let flushes = state.engine.question_flushes(thread_id).await;
     let ask = flushes.as_ref().map(|f| f.ask(&body.tool_use_id));
 
-    // An ask naming an owner approval request shows the engine's card in its
-    // place (ADR 0387). Everything below then reads that card, exactly as it
-    // would read the agent's own question.
-    let (questions, owner_approval) =
-        match crate::api::owner_approval::approval_ask(&state.pool, thread_id, &body.questions)
-            .await
-        {
-            Ok(crate::api::owner_approval::ApprovalAsk::Ordinary) => (body.questions, None),
-            Ok(crate::api::owner_approval::ApprovalAsk::Approval {
-                approval,
-                questions,
-            }) => (questions, Some(approval)),
-            Err(refusal) => {
-                return Json(AskUserQuestionResponse {
-                    questions: body.questions,
-                    answers: serde_json::Value::Object(serde_json::Map::new()),
-                    refusal: Some(refusal),
-                    quiet: false,
-                })
-                .into_response();
-            }
+    // An ask naming a prepared permission request shows the engine's card in
+    // its place. Everything below then reads that card, exactly as it would
+    // read the agent's own question.
+    let refuse = |questions, refusal| {
+        Json(AskUserQuestionResponse {
+            questions,
+            answers: serde_json::Value::Object(serde_json::Map::new()),
+            refusal: Some(refusal),
+            quiet: false,
+        })
+        .into_response()
+    };
+    use crate::engine::permission::prepare::{prepared_ask, PreparedAsk};
+    let (questions, permission_request) =
+        match prepared_ask(&state.pool, thread_id, &body.questions).await {
+            Ok(PreparedAsk::Ordinary) => (body.questions, None),
+            Ok(PreparedAsk::Request { request, questions }) => (questions, Some(request)),
+            Err(refusal) => return refuse(body.questions, refusal),
         };
 
     let text_persisted = async move {
@@ -1263,7 +1460,7 @@ pub(super) async fn ask_user_question(
     )
     .await
     {
-        crate::log!(
+        crate::log_legacy!(
             "[AskUserQuestion] refused {thread_id}/{}: {refusal:?}",
             body.tool_use_id
         );
@@ -1286,7 +1483,7 @@ pub(super) async fn ask_user_question(
             crate::engine::agent_question::QuestionAsker {
                 cc_session_id: body.session_id.clone(),
                 channel: EventChannel::ClaudeCode,
-                owner_approval,
+                permission_request,
             },
         )
         .await;
@@ -1297,7 +1494,7 @@ pub(super) async fn ask_user_question(
             // Both callers turn a 500 into a failed tool call carrying this
             // text. It tells the agent to ask again with the tool
             // (`card_not_shown_reason` in lucidos-cli).
-            crate::log!(
+            crate::log_legacy!(
                 "[AskUserQuestion] walk failed for {thread_id}/{}: {e}",
                 body.tool_use_id
             );
@@ -1309,7 +1506,7 @@ pub(super) async fn ask_user_question(
     // will read the tool result and decide what to do (typically: reissue
     // with a real question).
     if answer_kinds.is_empty() {
-        crate::log!(
+        crate::log_legacy!(
             "[AskUserQuestion] CC sent zero questions for {thread_id}/{}",
             body.tool_use_id
         );
@@ -1409,6 +1606,7 @@ pub(super) fn router() -> Router<AppState> {
         )
         .route("/internal/hardened-state", get(query_hardened))
         .route("/internal/integrated-heads", get(query_integrated_heads))
+        .route("/internal/start-plan", post(start_plan))
         .route("/internal/mark-planned", post(mark_planned))
         .route("/internal/planned-state", get(query_planned))
         .route("/internal/approve-plan", post(approve_plan))
@@ -1640,9 +1838,130 @@ mod tests {
     fn entry(category: &str, message: &str, data: serde_json::Value) -> ClientLogRequest {
         ClientLogRequest {
             category: category.into(),
+            code: None,
             message: message.into(),
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn client_log_handlers_persist_classification_and_validate_batches_atomically() {
+        use lucidos_diagnostic_log::{writer::Record, Destination};
+        const CHILD: &str = "CLIENT_LOG_HANDLER_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD) {
+            crate::diagnostic_log::start(std::path::Path::new(&root)).unwrap();
+            let payload = serde_json::json!({
+                "category": "error", "code": "uncaught", "message": "PRIVATE_ROUTE_MESSAGE",
+                "data": {"detail": "PRIVATE_ROUTE_DATA"}
+            });
+            let entry = || serde_json::from_value::<ClientLogRequest>(payload.clone()).unwrap();
+            let mut headers = HeaderMap::new();
+            headers.insert("user-agent", "PRIVATE_ROUTE_UA".parse().unwrap());
+            assert_eq!(
+                client_log(headers.clone(), Json(entry()))
+                    .await
+                    .into_response()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+            assert_eq!(
+                client_logs(headers.clone(), Json(vec![entry(), entry()]))
+                    .await
+                    .into_response()
+                    .status(),
+                StatusCode::NO_CONTENT
+            );
+            let mut invalid = entry();
+            invalid.code = Some("x".repeat(CLIENT_LOG_MAX_FIELD_LEN + 1));
+            assert_eq!(
+                client_logs(headers, Json(vec![entry(), invalid]))
+                    .await
+                    .into_response()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+            assert!(lucidos_diagnostic_log::flush(
+                std::time::Duration::from_secs(2)
+            ));
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "api::internal::tests::client_log_handlers_persist_classification_and_validate_batches_atomically", "--nocapture"])
+            .env(CHILD, root.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = std::fs::read_to_string(
+            crate::diagnostic_log::dir_for(root.path())
+                .join(lucidos_diagnostic_log::writer::FILE_NAME),
+        )
+        .unwrap();
+        let records: Vec<Record> = text
+            .lines()
+            .map(|line| serde_json::from_str::<Record>(line).unwrap())
+            .filter(|record| record.label == "Client")
+            .collect();
+        assert_eq!(records.len(), 3, "invalid batch must write nothing");
+        for record in records {
+            assert!(record.line.is_some());
+            assert!(record.ts.ends_with('Z'));
+            let rendered = record.render(Destination::Maintainer);
+            assert!(rendered.contains("code=uncaught"));
+            assert!(!rendered.contains("PRIVATE_"));
+        }
+    }
+
+    #[test]
+    fn client_lines_keep_codes_but_never_share_message_data_or_user_agent() {
+        use lucidos_diagnostic_log::Destination;
+        let mut e = entry(
+            "error",
+            "PRIVATE_CLIENT_MESSAGE",
+            serde_json::json!({
+                "url": "PRIVATE_CLIENT_DATA", "status": 500
+            }),
+        );
+        e.code = Some("uncaught".into());
+        let line = client_line(
+            &e,
+            &validate_client_entry(&e).unwrap(),
+            "PRIVATE_USER_AGENT",
+        );
+        let maintainer = line.render(Destination::Maintainer);
+        assert!(maintainer.contains("[Client/error]"));
+        assert!(maintainer.contains("code=uncaught"));
+        assert!(!maintainer.contains("PRIVATE_"), "{maintainer}");
+        let owner = line.render(Destination::Owner);
+        for marker in [
+            "PRIVATE_CLIENT_MESSAGE",
+            "PRIVATE_CLIENT_DATA",
+            "PRIVATE_USER_AGENT",
+        ] {
+            assert!(owner.contains(marker));
+        }
+    }
+
+    #[test]
+    fn client_supplied_classifications_cannot_make_arbitrary_text_shareable() {
+        use lucidos_diagnostic_log::Destination;
+        let mut e = entry(
+            "PRIVATE_CATEGORY",
+            "PRIVATE_MESSAGE",
+            serde_json::Value::Null,
+        );
+        e.code = Some("PRIVATE_CODE".into());
+        let line = client_line(&e, "null", "");
+        assert!(!line.render(Destination::Maintainer).contains("PRIVATE_"));
+        assert!(line.render(Destination::Owner).contains("PRIVATE_CODE"));
+        // Older pages have no code field: their message stays private.
+        let e = entry("error", "PRIVATE_LEGACY_MESSAGE", serde_json::Value::Null);
+        assert!(!client_line(&e, "null", "")
+            .render(Destination::Maintainer)
+            .contains("PRIVATE_"));
     }
 
     #[test]
@@ -1748,6 +2067,9 @@ mod tests {
             validate_client_entry(&entry(&long, "m", serde_json::Value::Null)),
             Err("category/message too long")
         );
+        let mut oversized_code = entry("error", "uncaught", serde_json::Value::Null);
+        oversized_code.code = Some(long);
+        assert!(validate_client_entry(&oversized_code).is_err());
         let big = serde_json::json!({ "blob": "y".repeat(CLIENT_LOG_MAX_DATA_LEN) });
         assert_eq!(
             validate_client_entry(&entry("perf", "m", big)),

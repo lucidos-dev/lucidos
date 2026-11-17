@@ -78,6 +78,7 @@ impl Thread {
     async fn session_started_by(&self, anchor: Option<Uuid>) {
         self.emit_answering(
             ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: String::new(),
                 branch: "work".into(),
@@ -193,6 +194,8 @@ impl Thread {
     async fn removed(&self, message: Uuid) {
         self.emit(ThreadEvent::QueuedMessageRemoved {
             removed_message_id: message,
+            restore_to_compose: false,
+            compose: None,
         })
         .await;
     }

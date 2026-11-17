@@ -1,4 +1,4 @@
-.PHONY: build-local check lint lint-knowhow lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
+.PHONY: build-local check lint lint-static lint-knowhow lint-eval lint-fmt lint-rust lint-rust-clippy lint-shell fix fmt test test-crates test-eval test-gateway test-full test-scripts clean clean-all run-local stop restart status
 
 # Run a heavy build under a *build slot*, so parallel coding-agent worktrees
 # cannot pile N full compiles onto one host. Degrades to a plain run when the
@@ -44,7 +44,11 @@ check: lint
 # Run every linter. THE clean-build lint gate, ordered cheapest first so a
 # finding surfaces immediately instead of after a full clippy pass: shell takes
 # under a second, the fmt check a few seconds, clippy minutes.
-lint: lint-shell lint-eval lint-knowhow lint-fmt lint-rust
+# Two halves, and /harden runs exactly these two: lint-static beside its cargo
+# lane, lint-rust in it. lint-static never runs cargo.
+lint: lint-static lint-rust
+
+lint-static: lint-shell lint-eval lint-knowhow
 
 lint-knowhow:
 	@./scripts/check-knowhow-refs.sh & refs_pid=$$!; \
@@ -108,7 +112,7 @@ lint-fmt:
 # is admitted once and does not re-queue between them. `lint-shell` and
 # `lint-fmt` stay outside the slot: seconds of work must not wait behind
 # minutes of clippy.
-lint-rust:
+lint-rust: lint-fmt
 	@$(BUILD_SLOT) --label "make lint" -- $(MAKE) --no-print-directory lint-rust-clippy
 
 # The clippy pair itself. Reached through `lint-rust`, which is what holds the
@@ -187,9 +191,9 @@ test-gateway:
 # (a throwaway $HOME, pool or lock dir, no Postgres) and they all finish in
 # about a second. `make lint` compiles them under `--all-targets` and runs none, so
 # without this target a broken token check or capability check still passes.
-TEST_CRATES := lucidos-build-slot lucidos-capabilities lucidos-claude-code-managed \
-	lucidos-file-backup-exclusion lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-home \
-	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-secret-store lucidos-tailscale lucidos-update-address
+TEST_CRATES := lucidos-agent-sandbox lucidos-build-slot lucidos-capabilities lucidos-claude-code-managed \
+	lucidos-file-backup-exclusion lucidos-frame-capability lucidos-engine-socket lucidos-gateway-constants lucidos-gateway-stamp lucidos-home \
+	lucidos-installs lucidos-local-token lucidos-owner-lock lucidos-pg-url lucidos-secret-store lucidos-tailscale lucidos-update-channel
 test-crates:
 	cargo test --locked $(addprefix -p ,$(TEST_CRATES))
 

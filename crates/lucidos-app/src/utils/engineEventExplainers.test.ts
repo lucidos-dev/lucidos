@@ -41,6 +41,7 @@ const CANCEL_CAUSE_FLAGS = {
   user_action: true,
   superseded_by_followup: true,
   effort_restart: true,
+  refused: true,
   unknown: true,
 } satisfies Record<CancelCause, true>;
 const CANCEL_CAUSES = Object.keys(CANCEL_CAUSE_FLAGS) as CancelCause[];
@@ -154,7 +155,7 @@ describe('every explainer is plain', () => {
       ...CANCEL_CAUSES.map(describeCancelCause),
       ...(['continuation_started', 'session_recovered', 'orphan_recovery', 'harden_retrigger',
         'stale_session', 'archived_branch_work', 'unmerged_integrated_work', 'successor_residue', 'merge_conflict', 'main_check_red', 'main_check_flaky',
-        'missing_hardening', 'missing_plan', 'context_ceiling'] as const)
+        'missing_hardening', 'missing_plan', 'approved_plan_unstarted', 'context_ceiling'] as const)
         .map(kind => describeEngineReason({ kind })),
     ];
     for (const text of texts) expect(text).not.toMatch(ENGINE_INTERNALS);

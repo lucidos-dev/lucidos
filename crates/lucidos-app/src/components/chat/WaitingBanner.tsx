@@ -48,7 +48,7 @@ const DISCARD_SET_ASIDE_TOOLTIP = "Throw away this thread's set-aside change.";
 type WaitingState =
   | { type: 'applying' }
   /** The thread's change is in the landing lane, which decides when it lands. */
-  | { type: 'landing'; place: LanePlace; laneThreadId: string | null }
+  | { type: 'landing'; place: LanePlace; laneThreadId: string | null; threadId: string; showDiff: boolean }
   | { type: 'discarding' }
   | { type: 'canceling'; threadId: string; isCanceling: boolean }
   | {
@@ -125,7 +125,15 @@ export function getWaitingState(): WaitingState | null {
   // decides when it lands, so the row says where it stands in place of Apply.
   const lane = landingLane.value;
   const place = lanePlace(lane, pendingChangeForThread(focused)?.id);
-  if (place) return { type: 'landing', place, laneThreadId: lane.open_batch?.lane_thread_id ?? null };
+  if (place) {
+    return {
+      type: 'landing',
+      place,
+      laneThreadId: lane.open_batch?.lane_thread_id ?? null,
+      threadId: focused,
+      showDiff: hasCcDiff(thread),
+    };
+  }
 
   // Applying but NOT mid-turn — a queued Apply All member waiting its turn: its
   // change is marked applying (reverse-mapped via applyingChangeThreadIds) but no
@@ -205,7 +213,13 @@ export interface BannerActions {
 
 export function getBannerActions(state: BannerState): BannerActions {
   if (state.type === 'applying') return alone(busyAction('applying', 'Apply', 'confirm', 'Applying'));
-  if (state.type === 'landing') return alone(laneAction(state));
+  // The lane decides when the change lands, not whether it can be reviewed.
+  if (state.type === 'landing') {
+    return {
+      situational: state.showDiff ? [diffAction(state.threadId)] : [],
+      slot: { face: laneAction(state), menu: [], menuLabel: '' },
+    };
+  }
   if (state.type === 'discarding') return alone(busyAction('discarding', 'Discard', 'danger', 'Discarding'));
   // Archive in flight: a dedicated busy face (the selector no longer returns an
   // Archive action once the optimistic section flips).

@@ -221,7 +221,7 @@ pub(super) async fn arm_wait_for_running_tasks(
     let watermark = match super::register::read_watermark(pool, thread_id).await {
         Ok(w) => w,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Could not read the watermark for thread {thread_id}: {e}. \
                  Any background work it owns will finish unwatched."
             );
@@ -259,7 +259,9 @@ pub(super) async fn arm_wait_for_running_tasks(
     let recent = super::register::recent_subscriptions(pool, thread_id)
         .await
         .inspect_err(|e| {
-            crate::log!("[EventWait] Subscription-count read failed for thread {thread_id}: {e}.");
+            crate::log_legacy!(
+                "[EventWait] Subscription-count read failed for thread {thread_id}: {e}."
+            );
         })
         .ok();
 
@@ -270,7 +272,7 @@ pub(super) async fn arm_wait_for_running_tasks(
         // Every refusal is a real regression back to the stall this
         // prevents, so it says so rather than reading as a routine skip.
         ArmingPlan::Refused(why) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Thread {thread_id} has unwatched background work and \
                  nothing will re-open it when that finishes: {why}"
             );
@@ -300,7 +302,7 @@ pub(super) async fn arm_wait_for_running_tasks(
     let watermark = match below_completions(pool, thread_id, &unread_ids, watermark).await {
         Ok(w) => w,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Could not find the unread completions of thread {thread_id}: {e}. \
                  Its background work will finish unwatched."
             );
@@ -321,13 +323,13 @@ pub(super) async fn arm_wait_for_running_tasks(
     // turn here to report into. The equivalent gap is closed structurally
     // instead, by reading the watermark before the registry.
     if let Err(e) = super::register::persist_wait(bus, live_waits, &wait).await {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Could not arm a background-task wait for thread {thread_id}: {e}. \
              Its background work will finish unwatched."
         );
         return unarmed;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[EventWait] Armed wait {} for thread {thread_id} over {} unwatched background \
          task(s), expiring in {timeout_secs}s",
         wait.wait_id,
@@ -658,10 +660,10 @@ pub(super) async fn stop_and_stand_down(
             StandDown::EndWithOthers => outcome.stopped.ended_with_others.push(wait.reason.clone()),
             StandDown::Narrow(rest) => {
                 let replacement = narrowed(&wait, rest, &running, owner);
-                // The replacement commits BEFORE the cancel, so a waiting
-                // child never reads as finished in between (ADR 0254).
+                // The replacement commits BEFORE the cancel, so a child holding
+                // the wait never reads as finished in between (ADR 0254).
                 if let Err(e) = super::register::persist_wait(bus, live_waits, &replacement).await {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventWait] Could not narrow wait {} on thread {issuer}: {e}. It stays \
                          live, so the stopped task's completion will still reach it.",
                         wait.wait_id,
@@ -678,7 +680,7 @@ pub(super) async fn stop_and_stand_down(
         {
             // Nothing was written, so the wait is still live in the store and
             // goes back in the cache. The stopped task will then reach it.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Stand-down of wait {} on thread {issuer} failed: {e}. Re-arming it.",
                 wait.wait_id,
             );
@@ -709,7 +711,7 @@ async fn withdraw(bus: &EventBus, live_waits: &LiveWaits, wait_id: Uuid) {
     )
     .await
     {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Could not withdraw replacement wait {wait_id}: {e}. It and the \
              original both stay live, so a remaining task may be delivered twice.",
         );

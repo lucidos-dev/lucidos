@@ -106,8 +106,8 @@ expect_ne "a deleted input changes it" "$clean" "$(codegen_fingerprint "$R")"
 git -C "$R" checkout -q -- Cargo.lock
 expect_eq "the tree is back to its commit" "$clean" "$(codegen_fingerprint "$R")"
 
-echo "CLI dependency fingerprints"
-for crate in lucidos-cli lucidos-installs lucidos-update-address; do
+echo "local dependency fingerprints"
+for crate in lucidos-cli lucidos-installs lucidos-update-channel lucidos-diagnostic-log lucidos-diagnostic-log-macros; do
     mkdir -p "$R/crates/$crate/src"
     echo 'pub fn flag() {}' > "$R/crates/$crate/src/lib.rs"
     expect_ne "$crate changes the fingerprint" "$clean" "$(codegen_fingerprint "$R")"
@@ -153,7 +153,29 @@ rm "$R/$WIRE"
 expect_eq "a miss with no outputs fails" "1" "$(codegen_main "$R" --cached-only 2>/dev/null; echo $?)"
 git -C "$R" reset -q --hard
 
+echo "fill-cache"
+echo 'kept' > "$R/$WIRE"
+echo 'pub const A: u32 = 7;' > "$R/crates/lucidos-engine/src/lib.rs"
+sleep 1
+touch "$BIN"
+: > "$TMP/sdk-log"
+expect_eq "a miss renders and succeeds" "0" "$(codegen_main "$R" --fill-cache --bin "$BIN" 2>/dev/null; echo $?)"
+expect_eq "the rendering is cached" "pub const A: u32 = 7;" \
+    "$(cat "$(codegen_cached "$R" "$(codegen_fingerprint "$R")")/$WIRE" 2>/dev/null)"
+expect_eq "the checkout keeps its outputs" "kept" "$(cat "$R/$WIRE")"
+expect_eq "no SDK builds" "" "$(cat "$TMP/sdk-log")"
+expect_eq "a hit succeeds" "0" "$(codegen_main "$R" --fill-cache --bin "$BIN" 2>/dev/null; echo $?)"
+expect_eq "and still writes nothing" "kept" "$(cat "$R/$WIRE")"
+expect_eq "it needs a binary" "2" "$(codegen_main "$R" --fill-cache 2>/dev/null; echo $?)"
+expect_eq "it never mixes with cached-only" "2" \
+    "$(codegen_main "$R" --fill-cache --cached-only --bin "$BIN" 2>/dev/null; echo $?)"
+git -C "$R" reset -q --hard
+rm -f "$R/$WIRE"
+
 echo "dep-info check"
+printf '%s: %s\n' "$R/target/debug/x" "$R/crates/lucidos-app/VERSION" > "$TMP/frontend-version.d"
+expect_eq "embedded frontend version is compile-only" "" \
+    "$(codegen_undeclared_inputs "$R" "$TMP/frontend-version.d")"
 expect_eq "declared inputs pass" "" \
     "$(codegen_undeclared_inputs "$R" "$BIN.d")"
 printf '%s: %s %s %s %s\n' "$R/target/debug/x" \

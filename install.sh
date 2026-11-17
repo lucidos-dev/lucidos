@@ -41,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.58.0"
+LUCIDOS_DEFAULT_VERSION="0.59.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -123,7 +123,7 @@ LUCIDOS_UNINSTALL_URL="${LUCIDOS_UNINSTALL_URL:-}"          # URL for uninstall.
 LUCIDOS_TLS_CERT="${LUCIDOS_TLS_CERT:-}"                    # opt-in TLS (--tls-cert): cert path; with --tls-key the gateway serves https
 LUCIDOS_TLS_KEY="${LUCIDOS_TLS_KEY:-}"                      # opt-in TLS (--tls-key): private-key path; both-or-neither
 LUCIDOS_NO_TLS="${LUCIDOS_NO_TLS:-}"                        # set to 1 (or --no-tls) to drop the TLS pair a re-run would keep from the service
-LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global ~/.lucidos/network.toml
+LUCIDOS_BIND="${LUCIDOS_BIND:-}"                            # optional (--bind): all | loopback | <IP> — written to the machine-global network.toml
 INSTALL_EXTERNAL_ADDRESS=""                                  # optional (--external-address): origin written to network.toml. Flag only: the gateway reads LUCIDOS_EXTERNAL_ADDRESS itself, as a lock
 
 # Source-build (--dev) config — preserves the legacy behavior verbatim.
@@ -1009,11 +1009,13 @@ register_systemd() {
     ok "systemd unit $unit_name enabled + started"
     # Survive logout/reboot. May require privileges; announce + best-effort, never
     # fail the install over it.
-    if loginctl enable-linger "$USER" >/dev/null 2>&1; then
+    # A container or a cron shell may leave USER unset, and set -u is on.
+    local user="${USER:-$(id -un)}"
+    if loginctl enable-linger "$user" >/dev/null 2>&1; then
         ok "Enabled user lingering (the service runs across logout/reboot)"
     else
         warn "Could not enable user lingering — the service may stop on logout."
-        info "To make it survive logout/reboot, run:  sudo loginctl enable-linger $USER"
+        info "To make it survive logout/reboot, run:  sudo loginctl enable-linger $user"
     fi
 }
 
@@ -1396,7 +1398,7 @@ ensure_docker_running() {
     if $SUDO docker info >/dev/null 2>&1; then
         warn "Docker works with sudo but not as your user — you are not in the 'docker' group."
         info "Adding you to the docker group (requires sudo)…"
-        $SUDO usermod -aG docker "$USER" 2>/dev/null || true
+        $SUDO usermod -aG docker "${USER:-$(id -un)}" 2>/dev/null || true
         die "Log out and back in (or run: newgrp docker) so the group change takes effect, then re-run this installer. Lucidos must use Docker without sudo."
     fi
     die "The Docker daemon is not running. Start it (e.g. 'sudo systemctl start docker') and re-run."
@@ -1636,14 +1638,14 @@ Flags:
                         free port for a NEW instance if it's taken). Pinning it sets/
                         changes this instance's port.
   --bind B              gateway network bind: all | loopback | <IP>. Written to the
-                        machine-global ~/.lucidos/network.toml (the same knob the
+                        machine-global network.toml (the same knob the
                         picker's Settings → Network access edits). Default: loopback
                         only — use an SSH tunnel or tailscale serve for remote access.
   --external-address URL
                         the origin other devices reach this gateway at, through a
                         route you run: a reverse proxy, a VPN or a company name.
                         Scheme, host and optional port, no path. Written to
-                        ~/.lucidos/network.toml, and put in every pairing QR ahead
+                        the machine-global network.toml, and put in every pairing QR ahead
                         of the tailnet. The same value as Settings → Access and
                         'lucidos external-address'. LUCIDOS_EXTERNAL_ADDRESS in the
                         gateway's environment overrides it and locks the setting.

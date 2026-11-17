@@ -621,7 +621,7 @@ fn parse_event(id: Uuid, event_type: &str, payload: serde_json::Value) -> Option
     match ThreadEvent::from_stored(event_type, payload) {
         Ok(event) => Some(event),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[SummaryTree] Event {} ({}) no longer parses, so the log skips it: {}",
                 id,
                 event_type,

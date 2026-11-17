@@ -139,10 +139,11 @@ describe('the pairing screen owns its own boot', () => {
   });
 
   it('leaves no screen it can paint under the cover', () => {
-    // One call per screen: the self-pair card, the install recipe, the form.
-    // Each uncovers for itself, because a parent cannot see a child decide.
+    // One call per screen: the self-pair card, the install recipe, the form,
+    // and the wait for a paired device's Allow. Each uncovers for itself,
+    // because a parent cannot see a child decide.
     const uses = gate.match(/useUncoverOnPaint\(/g) ?? [];
-    expect(uses, 'one per screen the gate can paint, plus the definition').toHaveLength(4);
+    expect(uses, 'one per screen the gate can paint, plus the definition').toHaveLength(5);
     expect(
       /dismissBootSplash\(\)/.test(gate.slice(gate.indexOf('function useUncoverOnPaint'))),
       'the hook is the only thing that lifts the cover',

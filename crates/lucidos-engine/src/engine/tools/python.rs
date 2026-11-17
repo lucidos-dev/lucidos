@@ -5,6 +5,7 @@ use super::files::{data_file_event, DataFileChange};
 use super::ToolOutcome;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tools::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS};
+use crate::runtime::agent_sandbox::Sandbox;
 
 /// The packages a `run_python` / `run_python_background` call installs before
 /// it runs. The command guard reads the same list, so it judges what pip gets.
@@ -24,6 +25,7 @@ fn staged_write_events(
     updated: &[String],
     commit: &str,
     thread_id: uuid::Uuid,
+    writer: crate::engine::event_bus::ArtifactWriter,
 ) -> Vec<SystemEvent> {
     let created = created.iter().map(|path| (path, false));
     let updated = updated.iter().map(|path| (path, true));
@@ -36,6 +38,7 @@ fn staged_write_events(
                 commit.to_string(),
                 Some("run_python".to_string()),
                 Some(thread_id),
+                writer.clone(),
             )),
             None => data_file_event(path, DataFileChange::Written { commit }),
         })
@@ -48,13 +51,14 @@ impl LucidosEngine {
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
         device_id: Option<&str>,
+        sandbox: &Sandbox,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let code = args["code"].as_str().unwrap_or("");
         let commit_message = args.get("commit_message").and_then(|v| v.as_str());
 
         if let Err(e) = self
             .python_runtime
-            .ensure_packages(&requested_packages(args))
+            .ensure_packages(sandbox, &requested_packages(args))
             .await
         {
             return Err(format!("installing packages: {}", e).into());
@@ -76,6 +80,7 @@ impl LucidosEngine {
 
         let output = match execute_staged_and_clean_up_on_failure(
             &self.python_runtime,
+            sandbox,
             code,
             env.vars.clone(),
             &staging_dir,
@@ -107,6 +112,10 @@ impl LucidosEngine {
             )?;
 
             if !created.is_empty() || !updated.is_empty() {
+                let writer = crate::core::artifact_writer::ArtifactWriterOrigin::Thread(thread_id)
+                    .resolve(self.event_bus.pool())
+                    .await?;
+
                 // Held from the first copy into `data/` through the commit.
                 let held = self.lock_workspace_repo().await;
                 for path in created.iter().chain(updated.iter()) {
@@ -149,7 +158,8 @@ impl LucidosEngine {
                     }
                 }
 
-                for event in staged_write_events(&created, &updated, &commit_sha, thread_id) {
+                for event in staged_write_events(&created, &updated, &commit_sha, thread_id, writer)
+                {
                     self.event_bus.emit(BusEvent::System(event)).await?;
                 }
             }
@@ -205,6 +215,7 @@ impl LucidosEngine {
         &self,
         args: &serde_json::Value,
         thread_id: uuid::Uuid,
+        sandbox: &Sandbox,
     ) -> ToolOutcome {
         let code = match args.get("code").and_then(|v| v.as_str()) {
             Some(c) if !c.is_empty() => c,
@@ -228,7 +239,7 @@ impl LucidosEngine {
 
         if let Err(e) = self
             .python_runtime
-            .ensure_packages(&requested_packages(args))
+            .ensure_packages(sandbox, &requested_packages(args))
             .await
         {
             return Err(format!("Error: installing packages: {}", e));
@@ -272,6 +283,7 @@ impl LucidosEngine {
         // events, and so the same event wait re-opens the thread.
         let (task_id, started_at) = match self
             .start_background_task(
+                sandbox,
                 thread_id,
                 &command,
                 self.workspace_path(),
@@ -375,12 +387,13 @@ impl LucidosEngine {
 /// tested against a bare `PythonRuntime`, with no engine, pool or git repo.
 async fn execute_staged_and_clean_up_on_failure(
     python_runtime: &crate::runtime::PythonRuntime,
+    sandbox: &Sandbox,
     code: &str,
     env_vars: Vec<(String, String)>,
     staging_dir: &std::path::Path,
 ) -> Result<String, String> {
     match python_runtime
-        .execute_staged(code, env_vars, staging_dir)
+        .execute_staged(sandbox, code, env_vars, staging_dir)
         .await
     {
         Ok(output) => Ok(output),
@@ -484,7 +497,13 @@ mod tests {
             "artifacts/notes.md".to_string(),
             "knowhow/fares.md".to_string(),
         ];
-        let events = staged_write_events(&created, &updated, "abc123", thread);
+        let events = staged_write_events(
+            &created,
+            &updated,
+            "abc123",
+            thread,
+            crate::engine::event_bus::ArtifactWriter::Thread,
+        );
 
         let shapes: Vec<(String, String)> = events
             .iter()
@@ -514,7 +533,17 @@ mod tests {
             ]
         );
 
-        // The writer stays named on the artifact events, as before.
+        for event in &events {
+            match event {
+                SystemEvent::ArtifactCreated { writer, .. }
+                | SystemEvent::ArtifactUpdated { writer, .. } => assert_eq!(
+                    writer.as_ref(),
+                    Some(&crate::engine::event_bus::ArtifactWriter::Thread)
+                ),
+                _ => {}
+            }
+        }
+        // The writer thread stays named on the artifact events, as before.
         let SystemEvent::ArtifactCreated {
             source,
             writer_thread_id,
@@ -533,38 +562,6 @@ mod tests {
         assert_eq!(commit.as_deref(), Some("abc123"));
     }
 
-    /// This file with its test module cut off, through the shared reader.
-    fn production_src() -> String {
-        crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/tools/python.rs"),
-        )
-    }
-
-    /// Both exits leave through the redaction, not around one of them.
-    ///
-    /// The Ok path returns the script's stdout, and the Err path returns its
-    /// stderr. Both are persisted verbatim in `ToolResult`, and every
-    /// secret it names is in this child's environment. The composition is
-    /// covered in `core::subprocess_secrets`; this is the wiring.
-    #[test]
-    fn both_python_tool_exits_leave_through_the_secret_redaction() {
-        let src = production_src();
-        let at = src
-            .find("pub(crate) async fn execute_python_tool")
-            .expect("execute_python_tool is still here");
-        let end = src[at..]
-            .find("\n    /// `run_python_background(")
-            .expect("execute_python_tool is still followed by the background tool");
-        let body = &src[at..at + end];
-        assert_eq!(
-            body.matches("redact_subprocess_output(").count(),
-            2,
-            "both the Ok and the Err exit of execute_python_tool must go through \
-             `core::redact_subprocess_output`. A traceback carries the script's stderr, \
-             which is where an echoed credential lands."
-        );
-        assert!(body.contains("subprocess_secret_values(&env.vars,"));
-    }
     use crate::runtime::python::PythonRuntime;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -648,7 +645,13 @@ mod tests {
         let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
         // Venv creation is not covered by the ceiling, but a cold tempdir can
         // spend seconds on it, so build it before shortening the budget.
-        runtime.execute("print('warmup')").await.expect("warmup");
+        runtime
+            .execute(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+                "print('warmup')",
+            )
+            .await
+            .expect("warmup");
         runtime.with_execution_timeout(ceiling)
     }
 
@@ -669,6 +672,7 @@ mod tests {
         let staging = ws.join(".lucidos/staging").join("timed-out-run");
         let err = execute_staged_and_clean_up_on_failure(
             &runtime,
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('half written')\n\
              import time\n\
              time.sleep(60)",
@@ -703,6 +707,7 @@ mod tests {
         let staging = ws.join(".lucidos/staging").join("clean-run");
         let out = execute_staged_and_clean_up_on_failure(
             &runtime,
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('fresh'); print('done')",
             vec![],
             &staging,
@@ -730,6 +735,7 @@ mod tests {
         let staging = ws.join(".lucidos/staging").join("crashed-run");
         let err = execute_staged_and_clean_up_on_failure(
             &runtime,
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('half written')\n\
              raise ValueError('kaboom')",
             vec![],
@@ -925,5 +931,40 @@ mod tests {
             "stdout did not see LUCIDOS_WORKSPACE: {}",
             snap.stdout
         );
+    }
+
+    mod guard_tests {
+        /// This file with its test module cut off, through the shared reader.
+        fn production_src() -> String {
+            crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("engine/tools/python.rs"),
+            )
+        }
+
+        /// Both exits leave through the redaction, not around one of them.
+        ///
+        /// The Ok path returns the script's stdout, and the Err path returns its
+        /// stderr. Both are persisted verbatim in `ToolResult`, and every
+        /// secret it names is in this child's environment. The composition is
+        /// covered in `core::subprocess_secrets`; this is the wiring.
+        #[test]
+        fn both_python_tool_exits_leave_through_the_secret_redaction() {
+            let src = production_src();
+            let at = src
+                .find("pub(crate) async fn execute_python_tool")
+                .expect("execute_python_tool is still here");
+            let end = src[at..]
+                .find("\n    /// `run_python_background(")
+                .expect("execute_python_tool is still followed by the background tool");
+            let body = &src[at..at + end];
+            assert_eq!(
+                body.matches("redact_subprocess_output(").count(),
+                2,
+                "both the Ok and the Err exit of execute_python_tool must go through \
+             `core::redact_subprocess_output`. A traceback carries the script's stderr, \
+             which is where an echoed credential lands."
+            );
+            assert!(body.contains("subprocess_secret_values(&env.vars,"));
+        }
     }
 }

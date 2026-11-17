@@ -12,15 +12,11 @@ export function showEngineBuildLog(): void {
   engineBuildLogOpen.value = true;
 }
 
-/** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
- *  pending / build-failed toasts. The version-status poll (and the
- *  `EngineBuildStateChanged` SSE poke) then surfaces building → ready → the
- *  normal "Switch to new version". The engine's self-heal driver rebuilds on its
- *  own too; this is the manual override when it has given up (retry cap) or for
- *  immediate action. Toasts on failure (the user clicked, so they're owed it). */
-async function triggerRebuild(): Promise<void> {
+/** Build pending source, or explicitly restart a failed build. Version polling
+ *  and SSE show progress, then offer Switch once the binary is ready. */
+async function triggerRebuild(mode: 'join' | 'restart' = 'restart'): Promise<void> {
   try {
-    await rebuildEngine();
+    await rebuildEngine(mode);
   } catch (e) {
     // A bare `e.message` prints the raw browser string for a cancelled or
     // timed-out fetch, which is the shape an iOS suspend gives this click.
@@ -140,8 +136,8 @@ function renderVersionToast(shape: VersionAnnouncement): void {
     key: NEW_VERSION_TOAST_KEY,
     secondaryAction: later,
     action: {
-      label: 'Rebuild',
-      onClick: () => { void triggerRebuild(); },
+      label: 'Build new version',
+      onClick: () => { void triggerRebuild('join'); },
     },
   });
 }
@@ -322,9 +318,9 @@ async function pollEngineVersion(): Promise<void> {
   //  - `!sharedBuilding`: a co-located peer building the shared binary is NOT a
   //    stuck state, since its build WILL advance the binary and surface the
   //    Switch. In the multi-workspace case a lost-the-lock workspace has
-  //    build_state 'idle' but a build is in flight; showing "Rebuild" there is
+  //    build_state 'idle' but a build is in flight; showing "Build new version" there is
   //    wrong (it'd just SkippedLock again) and misleading. That case shows the
-  //    spinner instead (engineBuilding below); pending is for genuinely stuck.
+  //    spinner instead (engineBuilding below); pending covers unbuilt source, including manual build mode.
   // `!== 'building'` rather than `=== 'idle'` deliberately ('failed' already
   // returned above via the build-failed toast, so this admits idle + ready): a
   // rebuild that COMPLETED without producing anything newer leaves build_state

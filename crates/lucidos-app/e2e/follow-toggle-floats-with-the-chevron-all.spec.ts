@@ -1,10 +1,10 @@
 /**
- * The follow toggle floats in the down chevron's old slot, over the composer's
- * top edge. The chevron stands one slot over it while the reader is scrolled
- * up, and the magnet never moves.
+ * The follow toggle floats over the composer's top edge. While the reader is
+ * scrolled up, the down chevron takes the toggle's slot. The magnet slides one
+ * slot to its left, in the same row.
  *
  * A browser test, because each claim is a measurement. The two circles share a
- * right edge and a size. The chevron sits one stack gap over the magnet. At the
+ * row and a size. The magnet sits one stack gap left of the chevron. At the
  * live edge the last turn ends above the magnet.
  *
  * Plan: `docs/plans/2026-10-28-the-follow-toggle-floats-with-the-down-chevron.md`.
@@ -134,13 +134,14 @@ test.describe('the follow toggle floats with the down chevron', () => {
     const up = (await geometry(page))!;
     const gap = await lengthPx(page, 'var(--scroll-chevron-stack-gap)');
     console.log(`${where} scrolled up: chevron ${fmt(up.chevron)}, magnet ${fmt(up.magnet)}, gap ${gap}`);
-    expect(up.magnet, `${where}: the magnet moved when the chevron came`).toEqual(edge.magnet);
-    expect(up.chevron.right, `${where}: right edges differ`).toBeCloseTo(up.magnet.right, 0);
+    expect(up.magnet.top, `${where}: the magnet left its row`).toBeCloseTo(edge.magnet.top, 0);
+    expect(up.chevron.right, `${where}: the chevron left the magnet's slot`).toBeCloseTo(edge.magnet.right, 0);
     expect(up.chevron.right - up.chevron.left, `${where}: sizes differ`).toBeCloseTo(up.magnet.right - up.magnet.left, 0);
-    expect(up.magnet.top - up.chevron.bottom, `${where}: the stack gap`).toBeCloseTo(gap, 0);
+    expect(up.chevron.top, `${where}: the two are not in one row`).toBeCloseTo(up.magnet.top, 0);
+    expect(up.chevron.left - up.magnet.right, `${where}: the stack gap`).toBeCloseTo(gap, 0);
   }
 
-  test('stands under the chevron, and the last turn clears it at the live edge', async ({ page }) => {
+  test('slides left of the chevron, and the last turn clears it at the live edge', async ({ page }) => {
     await openThread(page);
     await checkSlots(page, isMobileViewport(page) ? 'phone' : 'desktop');
   });
@@ -152,7 +153,7 @@ test.describe('the follow toggle floats with the down chevron', () => {
     await checkSlots(page, 'dynamic bars');
   });
 
-  test('stays one slot under the chevron when the prompt slides away over a home indicator', async ({ page }) => {
+  test('stays in the chevron\'s row when the prompt slides away over a home indicator', async ({ page }) => {
     test.skip(!isMobileViewport(page), 'dynamic bars are a phone layout');
     await enableMobileDynamicBars(page);
     await openThread(page);
@@ -179,7 +180,8 @@ test.describe('the follow toggle floats with the down chevron', () => {
     const g = (await geometry(page))!;
     const gap = await lengthPx(page, 'var(--scroll-chevron-stack-gap)');
     console.log(`home indicator, prompt away: chevron ${fmt(g.chevron)}, magnet ${fmt(g.magnet)}, gap ${gap}`);
-    expect(g.magnet.top - g.chevron.bottom, 'the stack gap, with the prompt away').toBeCloseTo(gap, 0);
+    expect(g.chevron.top, 'one row, with the prompt away').toBeCloseTo(g.magnet.top, 0);
+    expect(g.chevron.left - g.magnet.right, 'the stack gap, with the prompt away').toBeCloseTo(gap, 0);
   });
 
   test('stands over the composer in the compose view, where no chevron is', async ({ page }) => {

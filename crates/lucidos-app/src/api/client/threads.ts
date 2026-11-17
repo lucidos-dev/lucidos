@@ -3,7 +3,7 @@ import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from 
 import { postWithUploadProgress, type UploadObserver } from './uploadProgress';
 import type { PreservedComposeIntent } from '../../store/restoreGenerationRecords';
 import type { ComposeSelectionOverride } from '../../store/composeSelections';
-import { parseComposeReport, type ComposeReport, type ComposeReportWire } from '../../store/composeReport';
+import { parseComposeReport, type ParsedComposeReport, type ComposeReportWire } from '../../store/composeReport';
 
 // --- Compose state machine (threads-as-drafts) ---
 //
@@ -23,12 +23,12 @@ import { parseComposeReport, type ComposeReport, type ComposeReportWire } from '
  *
  *  Resolves with the draft's *compose report*, or `null` from an engine that
  *  answers without one. */
-export async function ensureThreadStarted(id: string, mode: string): Promise<ComposeReport | null> {
+export async function ensureThreadStarted(id: string, mode: string): Promise<ParsedComposeReport | null> {
   const res = await mutatingFetchIdempotent(`${API}/threads`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id, mode }),
-    signal: AbortSignal.timeout(THREAD_START_TIMEOUT_MS),
+    timeoutMs: THREAD_START_TIMEOUT_MS,
   });
   await throwIfNotOk(res);
   return readComposeReport(res);
@@ -71,14 +71,14 @@ export async function createRecoveredDraft(
       generation, text: source.draft.text, image_hashes: hashes,
       selection: source.selection,
     } }),
-    signal: AbortSignal.timeout(THREAD_START_TIMEOUT_MS),
+    timeoutMs: THREAD_START_TIMEOUT_MS,
   }, true);
   await throwIfNotOk(res);
 }
 
 /** The *compose report* a response carries, or `null` when it carries none:
  *  an empty body, or one from an engine that predates reports. */
-async function readComposeReport(res: Response): Promise<ComposeReport | null> {
+async function readComposeReport(res: Response): Promise<ParsedComposeReport | null> {
   const body = await res.json().catch(() => null) as ComposeReportWire | null;
   return typeof body?.summary_version === 'number' ? parseComposeReport(body) : null;
 }
@@ -95,8 +95,8 @@ export const THREAD_START_TIMEOUT_MS = 15_000;
  *  has nothing to fix. `applied` carries the report the write left, or `null`
  *  from an engine that answers without one. */
 export type ComposePutResult =
-  | { status: 'applied'; report: ComposeReport | null }
-  | { status: 'stale'; report: ComposeReport };
+  | { status: 'applied'; report: ParsedComposeReport | null }
+  | { status: 'stale'; report: ParsedComposeReport };
 
 /** PUT /api/v1/threads/:id/compose. `image_hashes` semantics mirror the
  *  SQL COALESCE on the backend: `null` preserves, `[]` clears, `[h,…]`

@@ -25,6 +25,20 @@ test.describe('Stop clears queued messages to compose', () => {
     const activeMarker = `active-${randomUUID().slice(0, 8)}`;
     const queuedOne = `queued-one-${randomUUID().slice(0, 8)}`;
     const queuedTwo = `queued-two-${randomUUID().slice(0, 8)}`;
+    const queuedOneId = randomUUID();
+    const queuedTwoId = randomUUID();
+    // Stop withdraws what the engine durably accepted (OrdinarySubmissionAccepted),
+    // so each seeded follow-up needs its acceptance beside its MessageReceived.
+    const accepted = (messageId: string, text: string, created: string) =>
+      `INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created) ` +
+        `VALUES ('${randomUUID()}', 'system', 'system', 'OrdinarySubmissionAccepted', ` +
+        `'${JSON.stringify({ type: 'OrdinarySubmissionAccepted', data: {
+          thread_id: threadId, message_event_id: messageId, entry_id: randomUUID(),
+          request: {
+            type: 'agent-chat', thread_id: threadId, event_id: messageId,
+            mode: 'human', message: text, image_hashes: [],
+          },
+        } })}'::jsonb, '${created}')`;
     // In the past. The retractions and the abort Stop writes are stamped now,
     // and must sort after every seeded message, however fast the click lands.
     const at = (secondsAgo: number) => new Date(Date.now() - secondsAgo * 1000).toISOString();
@@ -46,11 +60,13 @@ test.describe('Stop clears queued messages to compose', () => {
         `VALUES ('${randomUUID()}', 'TextStreamed', ` +
         `'${JSON.stringify({ text: 'Still working...', request_event_id: activeMessageId })}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
-        `VALUES ('${randomUUID()}', 'MessageReceived', ` +
+        `VALUES ('${queuedOneId}', 'MessageReceived', ` +
         `'${JSON.stringify({ text: queuedOne, channel: 'chat' })}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
       `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
-        `VALUES ('${randomUUID()}', 'MessageReceived', ` +
+        `VALUES ('${queuedTwoId}', 'MessageReceived', ` +
         `'${JSON.stringify({ text: queuedTwo, channel: 'chat' })}'::jsonb, '${t3}', 'thread', '${threadId}', '${threadId}')`,
+      accepted(queuedOneId, queuedOne, t2),
+      accepted(queuedTwoId, queuedTwo, t3),
     ].join(';\n'));
 
     try {
@@ -82,6 +98,8 @@ test.describe('Stop clears queued messages to compose', () => {
     } finally {
       psql([
         `DELETE FROM events WHERE thread_id = '${threadId}'`,
+        `DELETE FROM events WHERE event_type = 'OrdinarySubmissionAccepted' ` +
+          `AND payload->'data'->>'thread_id' = '${threadId}'`,
         `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
       ].join(';\n'));
     }

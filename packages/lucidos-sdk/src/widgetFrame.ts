@@ -19,6 +19,8 @@
  */
 
 import { onHostPush, postToHost } from './_bridge';
+import { watchWidgetResources, WIDGET_RESOURCES_MESSAGE_TYPE } from './widgetResources';
+export { WIDGET_RESOURCES_MESSAGE_TYPE, type WidgetResources } from './widgetResources';
 import { hapticTick } from './haptic';
 import { opensContextMenu, selectionCovers, shouldSuppressContextMenu, textAt, type Point } from './contextMenu';
 import { runIsolated } from './_isolate';
@@ -155,6 +157,7 @@ function stamp(attribute: string, value: string | null): void {
 }
 
 let installed = false;
+let stopResources: (() => void) | null = null;
 let size: WidgetSize | null = null;
 let place: WidgetPlace | null = null;
 let visible = true;
@@ -382,6 +385,7 @@ export function installWidgetFrame(): void {
     }
     if (!installed) {
       installed = true;
+      stopResources = watchWidgetResources(document, counts => postToHost({ type: WIDGET_RESOURCES_MESSAGE_TYPE, ...counts }));
       if (document.body) new ResizeObserver(schedule).observe(document.body);
       document.addEventListener('pointerdown', trackPress, { capture: true, passive: true });
       document.addEventListener('pointerdown', notePress, { capture: true, passive: true });
@@ -432,6 +436,8 @@ export const widget = {
 /** Test-only: forget the one-shot install, so a case can set up a fresh frame. */
 export function _resetWidgetFrameForTesting(): void {
   installed = false;
+  stopResources?.();
+  stopResources = null;
   size = null;
   place = null;
   visible = true;

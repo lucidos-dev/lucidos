@@ -116,6 +116,7 @@ pub struct OpenAiResponsesSearch {
     api_key: String,
     model: String,
     responses_url: String,
+    billing_provider: Option<crate::runtime::billing_provider::BillingProvider>,
     client: reqwest::Client,
 }
 
@@ -138,6 +139,9 @@ impl OpenAiResponsesSearch {
         Ok(Self {
             api_key,
             model,
+            billing_provider: (base_url.trim_end_matches('/')
+                == crate::llm::OPENAI_DEFAULT_BASE_URL)
+                .then_some(crate::runtime::billing_provider::BillingProvider::Openai),
             responses_url: format!("{}/responses", base_url.trim_end_matches('/')),
             client,
         })
@@ -152,6 +156,7 @@ impl WebSearchProvider for OpenAiResponsesSearch {
         max_results: usize,
         _call: CallToken,
     ) -> Result<WebSearchResult, Box<dyn std::error::Error + Send + Sync>> {
+        crate::llm::metered::check_provider(crate::llm::ProviderKind::OpenAi).await?;
         let response = self
             .client
             .post(&self.responses_url)
@@ -161,10 +166,23 @@ impl WebSearchProvider for OpenAiResponsesSearch {
             .send()
             .await?;
 
+        let error_headers = response.headers().clone();
         let status = response.status();
         let body = response.text().await?;
         if !status.is_success() {
-            return Err(format!("OpenAI search API error ({status}): {body}").into());
+            if let Some(cap) = crate::llm::metered::http_spend_cap(
+                crate::llm::ProviderKind::OpenAi,
+                status.as_u16(),
+                &error_headers,
+                &body,
+            )
+            .await
+            {
+                return Err(cap.into());
+            }
+            return Err(
+                crate::llm::ProviderError::from_http("OpenAI", status.as_u16(), &body).into(),
+            );
         }
 
         let parsed: serde_json::Value = serde_json::from_str(&body)
@@ -173,6 +191,7 @@ impl WebSearchProvider for OpenAiResponsesSearch {
             text: parse_response(&parsed, max_results)?,
             usage: crate::llm::usage_wire::from_json(&parsed),
             model: self.model.clone(),
+            provider: self.billing_provider,
         })
     }
 
@@ -198,6 +217,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.responses_url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn search_billing_requires_the_canonical_openai_endpoint() {
+        for (base, expected) in [
+            (
+                crate::llm::OPENAI_DEFAULT_BASE_URL,
+                Some(crate::runtime::billing_provider::BillingProvider::Openai),
+            ),
+            (
+                "https://api.openai.com/v1/",
+                Some(crate::runtime::billing_provider::BillingProvider::Openai),
+            ),
+            ("https://example.com/v1", None),
+            ("https://api.openai.com.example.com/v1", None),
+            ("http://api.openai.com/v1", None),
+        ] {
+            let search =
+                OpenAiResponsesSearch::new("fixture".into(), "model".into(), base).unwrap();
+            assert_eq!(search.billing_provider, expected);
+        }
     }
 
     #[test]

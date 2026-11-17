@@ -87,13 +87,17 @@ async function openImageOfWidth(page: Page, width: number): Promise<void> {
         'Content-Type': 'image/png',
         ...(deviceId ? { 'x-lucidos-device-id': deviceId } : {}),
       },
-      body: blob,
+      // Bytes, never the Blob itself: WebKit sometimes sends a canvas Blob body
+      // as zero bytes, which the engine stores as an empty file.
+      body: await blob.arrayBuffer(),
     });
-    return resp.status;
+    if (resp.status !== 200) return resp.status;
+    const stored = await fetch(`/data/${target}`, { cache: 'no-store' });
+    return (await stored.arrayBuffer()).byteLength === blob.size ? resp.status : -1;
   }, { target: path, w: width });
   created.push(path);
   // Exactly 200, never a range: the helper answers 0 when the canvas or the
-  // blob is unavailable, and a range check would read that sentinel as a pass.
+  // blob is unavailable, and -1 when the stored file is not the bytes sent.
   expect(status, 'the fixture upload').toBe(200);
 
   await openFilesPanel(page);
@@ -114,12 +118,15 @@ async function openImageOfWidth(page: Page, width: number): Promise<void> {
   await preview.click();
   await expect(page.locator('.image-popup-content')).toBeVisible({ timeout: 5_000 });
 
-  // A transform is written once the popup has measured the loaded image. Until
-  // then the level control reads the unmeasured default of 100%, which an
-  // assertion expecting 100% would pass against without measuring anything.
+  // The popup writes a transform on mount, at the unmeasured fit scale of 1,
+  // before the image has arrived. WebKit can also report `complete` while the
+  // request is still pending. Neither proves a load, so the wait needs a
+  // decoded width. Until then the level control reads the unmeasured default
+  // of 100%, which an assertion expecting 100% would pass against without
+  // measuring anything.
   await page.waitForFunction(() => {
     const img = document.querySelector('.image-popup-slide img') as HTMLImageElement | null;
-    return !!img && img.complete && img.style.transform !== '';
+    return !!img && img.complete && img.naturalWidth > 0 && img.style.transform !== '';
   }, undefined, { timeout: 10_000 });
   expect((await drawnAgainstNatural(page)).natural, 'the fixture arrived intact')
     .toBe(width);

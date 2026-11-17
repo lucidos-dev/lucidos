@@ -55,6 +55,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
   submitChat: vi.fn(),
+  answerThreadQuestion: vi.fn(),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
@@ -87,7 +88,7 @@ vi.mock('../../utils/tauri', () => ({
 
 import { focusedThreadId, threadMap, selectedScope, connectionStatus, panelOverlay } from '../store';
 import { retryUnsentMessage, sendMessage } from './chat';
-import { inSendChain } from './sendChain';
+import { answerThreadQuestion } from './chat-claude-code';
 import { SEND_RETRY_BACKOFF_MS } from './sendRetry';
 import { pageOwnerId } from '../pageOwner';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
@@ -98,8 +99,11 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { getDeviceId } from './devices';
 import { makeOptimisticThreadState } from '../thread-events';
-import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { ApiError, submitChat } from '../../api/client';
+import { _resetComposeDraftsForTesting, getDraft, patchDraft } from '../composeDrafts';
+import { ApiError, submitChat, answerThreadQuestion as apiAnswerThreadQuestion } from '../../api/client';
+import { unsentMessages } from '../unsentMessages';
+import { liveUnsentMessageRecords } from '../unsentMessageRecords';
+import { acceptComposeReport, parseComposeReport, _resetComposeSyncForTesting } from '../composeSync';
 import { isTauri } from '../../utils/platform';
 import { getWebviewContent } from '../../utils/tauri';
 
@@ -153,6 +157,7 @@ beforeEach(() => {
   mockedIsTauri.mockReturnValue(false);
   mockedGetWebviewContent.mockReset();
   _resetComposeDraftsForTesting();
+  _resetComposeSyncForTesting();
 });
 
 afterEach(() => {
@@ -160,6 +165,75 @@ afterEach(() => {
 });
 
 describe('per-thread send serialization', () => {
+  it('rebases rapid ordinary sends through their acknowledgements', async () => {
+    seedActiveThread(THREAD_A);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    const first = deferred<{ event_id: string; compose: { summary_version: number; compose_epoch: number } }>();
+    mockedSubmitChat.mockReturnValueOnce(first.promise);
+    for (const epoch of [8, 9]) mockedSubmitChat.mockImplementationOnce(async (body) => {
+      expect(body.compose_epoch).toBe(epoch);
+      return { event_id: body.event_id!, compose: { summary_version: epoch + 1, compose_epoch: epoch + 1 } };
+    });
+    const sends = ['first', 'second', 'third'].map(message => sendMessage(message, undefined, { threadId: THREAD_A, focus: false }));
+    expect(mockedSubmitChat.mock.calls[0][0].compose_epoch).toBe(7);
+    first.resolve({ event_id: mockedSubmitChat.mock.calls[0][0].event_id!, compose: { summary_version: 8, compose_epoch: 8 } });
+    expect(await Promise.all(sends)).toEqual(['sent', 'sent', 'sent']);
+  });
+
+  it('retains a stale chained intent after saved acceptance and renews it only on explicit Retry', async () => {
+    seedActiveThread(THREAD_A);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    const first = deferred<{ event_id: string; compose: { summary_version: number; compose_epoch: number } }>();
+    mockedSubmitChat.mockReturnValueOnce(first.promise).mockRejectedValueOnce(
+      new ApiError(409, 'The saved draft changed before this send', { reason: 'compose_snapshot_stale' }),
+    );
+    const p1 = sendMessage('first', undefined, { threadId: THREAD_A, focus: false });
+    const images = ['a'.repeat(64)];
+    const p2 = sendMessage('keep stale content', images, { threadId: THREAD_A, focus: false });
+    // SSE for a saved acceptance arrives before the first ordinary ack.
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 9, compose_epoch: 9 }));
+    patchDraft(THREAD_A, { text: 'newer local draft', image_hashes: [], mode: 'lucidos' });
+    first.resolve({ event_id: mockedSubmitChat.mock.calls[0][0].event_id!, compose: { summary_version: 8, compose_epoch: 8 } });
+    expect(await Promise.all([p1, p2])).toEqual(['sent', 'shown-as-failed']);
+    const stale = mockedSubmitChat.mock.calls[1][0];
+    expect(stale.compose_epoch).toBe(8);
+    expect(getDraft(THREAD_A).text).toBe('newer local draft');
+    expect(liveUnsentMessageRecords().find(record => record.eventId === stale.event_id)).toMatchObject({
+      body: { message: 'keep stale content', image_hashes: images, compose_epoch: 8 },
+      refusal: { reason: 'compose_snapshot_stale' },
+    });
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: stale.event_id!, compose: { summary_version: 10, compose_epoch: 10 } });
+    expect(await retryUnsentMessage(stale.event_id!)).toBe('sent');
+    expect(mockedSubmitChat.mock.calls[2][0]).toMatchObject({ event_id: stale.event_id, compose_epoch: 9 });
+  });
+
+  it('retains a conflicting send and its images for an explicit retry', async () => {
+    seedActiveThread(THREAD_A);
+    const images = ['a'.repeat(64), 'b'.repeat(64)];
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'A later input overtook this send', { reason: 'overtaken' }));
+    const outcome = await sendMessage('keep this message', images, { threadId: THREAD_A, focus: false });
+    const original = mockedSubmitChat.mock.calls[0][0];
+    expect(outcome).toBe('shown-as-failed');
+    expect(unsentMessages.value.get(original.event_id!)).toMatchObject({ body: original });
+    expect(liveUnsentMessageRecords().find(r => r.eventId === original.event_id)).toMatchObject({
+      phase: 'unsent', body: original, refusal: { reason: 'overtaken', message: 'A later input overtook this send' },
+    });
+    const newerDraft = { text: 'newer draft', image_hashes: ['c'.repeat(64)], mode: 'lucidos' as const };
+    patchDraft(THREAD_A, newerDraft);
+    mockedSubmitChat.mockRejectedValueOnce(new ApiError(409, 'Still overtaken', { reason: 'overtaken' }));
+    expect(await retryUnsentMessage(original.event_id!)).toBe('shown-as-failed');
+    expect(getDraft(THREAD_A)).toEqual(newerDraft);
+    expect(unsentMessages.value.get(original.event_id!)?.body).toMatchObject({
+      message: 'keep this message', image_hashes: images, event_id: original.event_id,
+    });
+    mockedSubmitChat.mockResolvedValueOnce({ event_id: original.event_id! });
+    expect(await retryUnsentMessage(original.event_id!)).toBe('sent');
+    expect(mockedSubmitChat.mock.calls[1][0]).toMatchObject({
+      message: 'keep this message', image_hashes: images, event_id: original.event_id,
+    });
+    expect(unsentMessages.value.has(original.event_id!)).toBe(false);
+  });
+
   it('holds the second POST until the first settles, and sends them in order', async () => {
     seedActiveThread(THREAD_A);
     const first = deferred<{ event_id: string }>();
@@ -272,7 +346,13 @@ describe('per-thread send serialization', () => {
     const answer = deferred<boolean>();
     mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
 
-    const answering = inSendChain(THREAD_A, () => answer.promise);
+    acceptComposeReport(THREAD_A, parseComposeReport({ summary_version: 7, compose_epoch: 7 }));
+    vi.mocked(apiAnswerThreadQuestion).mockImplementationOnce(async (_thread, _tool, _answer, _position, accepted) => {
+      await answer.promise;
+      accepted?.({ summary_version: 8, compose_epoch: 8, text: '', image_hashes: [] });
+      return true;
+    });
+    const answering = answerThreadQuestion(THREAD_A, 'synthetic-question', { kind: 'FreeText', text: 'the answer' });
     const p = sendMessage('after the tap', undefined, { threadId: THREAD_A, focus: false });
     await flush();
     expect(sentMessages()).toEqual([]);
@@ -280,6 +360,7 @@ describe('per-thread send serialization', () => {
     answer.resolve(true);
     await Promise.all([answering, p]);
     expect(sentMessages()).toEqual(['after the tap']);
+    expect(mockedSubmitChat.mock.calls[0][0].compose_epoch).toBe(8);
   });
 
   it('a successor waits for an unsettled send however long it takes, with no timer', async () => {
@@ -343,7 +424,7 @@ describe('per-thread send serialization', () => {
     expect(retry.event_id).toBe(attempt.event_id);
   });
 
-  it('a manual Retry of a Not sent message takes a fresh sequence and keeps its event id', async () => {
+  it('a manual Retry after an unknown outcome preserves the exact wire intent', async () => {
     vi.useFakeTimers();
     seedActiveThread(THREAD_A);
     mockedSubmitChat.mockRejectedValue(new TypeError('Load failed'));
@@ -358,9 +439,10 @@ describe('per-thread send serialization', () => {
     await retryUnsentMessage(original.event_id);
 
     const [after, retried] = sentBodies();
-    // The engine dedupes it by event id, and orders it after what was sent since.
+    // A receipt may already exist, even after a later send was accepted.
     expect(retried.event_id).toBe(original.event_id);
-    expect(retried.input_seq).toBeGreaterThan(after.input_seq);
+    expect(retried).toEqual(original);
+    expect(retried.input_seq).toBeLessThan(after.input_seq);
   });
 
   it('does not serialize across different threads', async () => {

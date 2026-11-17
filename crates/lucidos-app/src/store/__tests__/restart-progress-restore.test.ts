@@ -14,7 +14,7 @@ vi.mock('../../api/client', () => ({
   API_BASE: 'http://localhost:3000',
   API: 'http://localhost:3000/api/v1',
 }));
-vi.mock('../actions/thread-sync', () => ({
+vi.mock('../actions/thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),

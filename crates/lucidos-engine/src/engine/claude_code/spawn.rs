@@ -108,7 +108,7 @@ impl LucidosEngine {
                     {
                         Ok(id) => id,
                         Err(e) => {
-                            log!(
+                            log_legacy!(
                                 "[ClaudeCode] Failed to emit hardening prompt for thread {}: {}",
                                 thread_id,
                                 e
@@ -120,7 +120,9 @@ impl LucidosEngine {
                                         thread_id,
                                         event: crate::engine::thread_events::ThreadEvent::ResponseFailed {
                                             error: format!("Failed to emit prompt: {}", e),
+                                            spend_cap: None,
                                             agent_exit: None,
+                                            provider_error: None,
                                         },
                                         meta: crate::engine::thread_events::EventMeta::NONE,
                                     },
@@ -163,11 +165,11 @@ impl LucidosEngine {
 
             let Some(change_id) = auto_apply_change_id else {
                 match result {
-                    Ok(_) => log!(
+                    Ok(_) => log_legacy!(
                         "[ClaudeCode] Hardening session completed for thread {}",
                         thread_id
                     ),
-                    Err(e) => log!(
+                    Err(e) => log_legacy!(
                         "[ClaudeCode] Hardening session failed for thread {}: {}",
                         thread_id,
                         e
@@ -206,7 +208,7 @@ impl LucidosEngine {
             // A rejected prompt or an ended session ran no `/harden`, and the
             // marker check in `apply_after_hardening` reports that.
             if let Err(e) = wait_for_prompt_turn(answered, "waiting for hardening").await {
-                log!("[ClaudeCode] Hardening for change {}: {}", change_id, e);
+                log_legacy!("[ClaudeCode] Hardening for change {}: {}", change_id, e);
             }
             let settled = wait_until_settled(
                 || engine.agent_turn_settled(thread_id),
@@ -221,7 +223,7 @@ impl LucidosEngine {
             let run = if settled {
                 HardeningRun::Ended { aborted: false }
             } else {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Thread {} did not settle within {:?} of its hardening turn; \
                      not applying change {}",
                     thread_id,
@@ -264,7 +266,7 @@ impl LucidosEngine {
         let concurrent_status = match self.changes().get_by_id(change_id).await {
             Ok(change) => change.map(|c| c.status()),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Concurrent-apply check: get_by_id({}): {}. Treating as not applied",
                     change_id,
                     e
@@ -273,7 +275,7 @@ impl LucidosEngine {
             }
         };
         if change_applied_concurrently(concurrent_status) {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] Hardening for change {} found it already applied (concurrent apply), skipping the post-hardening apply",
                 change_id
             );
@@ -284,7 +286,7 @@ impl LucidosEngine {
         let was_aborted = match run {
             HardeningRun::Ended { aborted } => aborted,
             HardeningRun::Failed(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Hardening session failed for change {}: {}",
                     change_id,
                     e
@@ -316,7 +318,7 @@ impl LucidosEngine {
             }
             Ok(None) => false,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Hardening check: get_by_id({}): {}. Treating as unhardened",
                     change_id,
                     e
@@ -326,7 +328,7 @@ impl LucidosEngine {
         };
 
         if !hardening_succeeded(was_aborted, hardened) {
-            log!(
+            log_legacy!(
                 "[ClaudeCode] Hardening for change {} did not succeed (aborted={}, hardened={}), skipping apply",
                 change_id,
                 was_aborted,
@@ -343,7 +345,7 @@ impl LucidosEngine {
             return;
         }
 
-        log!(
+        log_legacy!(
             "[ClaudeCode] Hardening completed for change {}, auto-applying",
             change_id
         );
@@ -353,7 +355,7 @@ impl LucidosEngine {
             .await;
         match self.apply_change(change_id, actor).await {
             Ok(r) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Auto-applied change {} after hardening: {}",
                     change_id,
                     r.message
@@ -363,7 +365,7 @@ impl LucidosEngine {
             // Log only: `apply_change` announces its own failures,
             // and a second emit draws the same card twice.
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] Auto-apply failed after hardening for change {}: {}",
                     change_id,
                     e
@@ -576,7 +578,7 @@ impl LucidosEngine {
                     }
                 }
                 Err(e) => {
-                    log!("[ClaudeCode] Background Claude Code session failed: {}", e);
+                    log_legacy!("[ClaudeCode] Background Claude Code session failed: {}", e);
                     emit_background_task_failure(
                         &engine,
                         cc_thread_id,
@@ -602,7 +604,7 @@ impl LucidosEngine {
         let pending = match self.changes().list_pending().await {
             Ok(v) => v,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[ClaudeCode] auto-apply: list_pending: {} — skipping auto-apply",
                     e
                 );
@@ -614,11 +616,11 @@ impl LucidosEngine {
         };
         match self.apply_change(change.id, actor).await {
             Ok(r) => {
-                log!("[ClaudeCode] Auto-applied change: {}", r.message)
+                log_legacy!("[ClaudeCode] Auto-applied change: {}", r.message)
             }
             // Log only: `apply_change` announces its own failures.
             Err(e) => {
-                log!("[ClaudeCode] Failed to auto-apply: {}", e);
+                log_legacy!("[ClaudeCode] Failed to auto-apply: {}", e);
             }
         }
     }
@@ -628,46 +630,6 @@ impl LucidosEngine {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// This file with its test module cut off, through the shared reader the
-    /// engine's other source scans use.
-    fn production_src() -> String {
-        crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("engine/claude_code/spawn.rs"),
-        )
-    }
-
-    /// No teardown here awaits while holding the `agent_sessions` guard.
-    ///
-    /// `agent_sessions` is engine-global, so one held guard blocks every live
-    /// run loop, the Stop button, Apply and every permission answer. A
-    /// `return <expr>` evaluates its expression BEFORE the enclosing block's
-    /// guard drops, which is how `discard_cc_changes` came to await a
-    /// multi-minute teardown under the lock.
-    ///
-    /// A scan, because the failure is a wall-clock stall rather than a wrong
-    /// value: nothing a unit test can assert on, and the shape is exact.
-    #[test]
-    fn no_stale_session_teardown_here_awaits_under_the_sessions_guard() {
-        let src = production_src();
-        for (at, _) in src.match_indices("end_stale_waiting_session(") {
-            let Some(lock_at) = src[..at].rfind("self.agent_sessions.lock().await") else {
-                continue;
-            };
-            if src[lock_at..at].contains("drop(guard)") {
-                continue;
-            }
-            let closed = end_of_guard_block(&src, lock_at)
-                .expect("the guard's enclosing block is brace-balanced");
-            assert!(
-                closed < at,
-                "an `end_stale_waiting_session` await in spawn.rs is still inside \
-                 the `agent_sessions` guard's block. Copy what you need out of the \
-                 map, close the block, then await. See `control.rs`, which drops \
-                 the guard before the same call."
-            );
-        }
-    }
 
     /// Byte index just past the `}` closing the block that declares the guard.
     ///
@@ -768,5 +730,49 @@ mod tests {
         .await;
         assert!(settled);
         assert_eq!(asked.load(Ordering::SeqCst), 3, "one ask per tick, no spin");
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// This file with its test module cut off, through the shared reader the
+        /// engine's other source scans use.
+        fn production_src() -> String {
+            crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("engine/claude_code/spawn.rs"),
+            )
+        }
+
+        /// No teardown here awaits while holding the `agent_sessions` guard.
+        ///
+        /// `agent_sessions` is engine-global, so one held guard blocks every live
+        /// run loop, the Stop button, Apply and every permission answer. A
+        /// `return <expr>` evaluates its expression BEFORE the enclosing block's
+        /// guard drops, which is how `discard_cc_changes` came to await a
+        /// multi-minute teardown under the lock.
+        ///
+        /// A scan, because the failure is a wall-clock stall rather than a wrong
+        /// value: nothing a unit test can assert on, and the shape is exact.
+        #[test]
+        fn no_stale_session_teardown_here_awaits_under_the_sessions_guard() {
+            let src = production_src();
+            for (at, _) in src.match_indices("end_stale_waiting_session(") {
+                let Some(lock_at) = src[..at].rfind("self.agent_sessions.lock().await") else {
+                    continue;
+                };
+                if src[lock_at..at].contains("drop(guard)") {
+                    continue;
+                }
+                let closed = end_of_guard_block(&src, lock_at)
+                    .expect("the guard's enclosing block is brace-balanced");
+                assert!(
+                    closed < at,
+                    "an `end_stale_waiting_session` await in spawn.rs is still inside \
+                 the `agent_sessions` guard's block. Copy what you need out of the \
+                 map, close the block, then await. See `control.rs`, which drops \
+                 the guard before the same call."
+                );
+            }
+        }
     }
 }

@@ -76,4 +76,17 @@ async fn health_has_expected_fields() {
         body["database_reachable"], true,
         "a booted e2e engine can reach its database"
     );
+    // Null where the host can sandbox agents, else the reason the sandbox
+    // banner quotes.
+    let sandbox = &body["agent_sandbox_unavailable"];
+    assert!(
+        body.get("agent_sandbox_unavailable").is_some()
+            && (sandbox.is_null() || sandbox.is_string()),
+        "agent_sandbox_unavailable must be null or a reason, got {sandbox}"
+    );
+    let unguarded = &body["agent_sandbox_truncation_unguarded"];
+    assert!(
+        unguarded.is_boolean(),
+        "agent_sandbox_truncation_unguarded must be a bool, got {unguarded}"
+    );
 }

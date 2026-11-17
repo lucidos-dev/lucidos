@@ -2,7 +2,7 @@ import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator, ThreadAggregate, EventWaitSummary, ThreadComposeState } from '../store/thread-events';
 import type { ThreadStatus } from '../generated/thread-lifecycle';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
-import type { CacheKeepAliveStatus, UnproposedReason } from '../generated/thread-event-wire';
+import type { CacheKeepAliveStatus, UnproposedReason, ComposeRestoration } from '../generated/thread-event-wire';
 import type { AppKind, WidgetSize } from '../store/types';
 
 /** What a coding-agent thread's branch holds, as the engine projects it (ADR
@@ -49,10 +49,12 @@ export interface ThreadSummary {
   home?: boolean;
   section: ThreadSection;
   active_children_count: number;
-  /** Direct children idle on their own live event wait. Such a child has not
-   *  finished (ADR 0254), so the parent waits on it as on an active one.
-   *  Absent on an engine that predates the field. */
-  waiting_children_count?: number;
+  /** Direct children this thread waits on: each one's finish wakes it, and
+   *  each is unfinished, at any depth (ADR 0672). Optional only so test mocks
+   *  needn't supply it. */
+  awaited_children_count?: number;
+  /** This thread's parent waits on it. The engine sends it on every row. */
+  awaited_by_parent?: boolean;
   total_children_count: number;
   /** Count of descendants (transitive) currently in a state that blocks this
    *  thread from being archived. Maintained by EventBus on
@@ -157,6 +159,7 @@ export interface ThreadSummary {
    *  write composed before a submission that has since landed. Absent on a
    *  pre-epoch engine, which leaves those writes unfenced. */
   compose_epoch?: number;
+  compose_restorations?: ComposeRestoration[];
 }
 
 export interface ThreadsResponse {
@@ -294,16 +297,18 @@ export interface ArchiveAllKept {
   thread_count: number;
 }
 
-export async function archiveAllPreflight(): Promise<ArchiveAllPreflight> {
-    return json<ArchiveAllPreflight>(`${API}/threads/archive-all-preflight`);
+export async function archiveAllPreflight(parentThreadId?: string): Promise<ArchiveAllPreflight> {
+    const query = parentThreadId ? `?parent_thread_id=${encodeURIComponent(parentThreadId)}` : '';
+    return json<ArchiveAllPreflight>(`${API}/threads/archive-all-preflight${query}`);
 }
 
 /** Archive the confirmed threads that are still safe. `archived` lists every
  *  member the cascades took, which is what Undo hands back to `unarchiveThreads`. */
 export async function archiveAll(
   threadIds: string[],
+  parentThreadId?: string,
 ): Promise<{ archived: string[]; kept: ArchiveAllKept[] }> {
-    const res = await postThreadAction('archive-all', { thread_ids: threadIds });
+    const res = await postThreadAction('archive-all', { thread_ids: threadIds, parent_thread_id: parentThreadId });
     return res.json();
 }
 
@@ -514,6 +519,8 @@ export type ThreadEventRow = {
  *  string means the event stamped none. */
 export type PairStamp = {
   sequence: number;
+  event_type?: string;
+  request_event_id?: string | null;
   model: string;
   reasoning_effort: string;
   provider: string;

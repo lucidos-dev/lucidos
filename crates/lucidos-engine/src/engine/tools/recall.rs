@@ -335,11 +335,11 @@ async fn judge_batch(
     let judgment = match bounded.judge(judge, state, questions).await {
         Ok(judgment) => judgment,
         Err(e) if e.is::<tokio::time::error::Elapsed>() => {
-            log!("[Recall] A find batch ran out of time, so its lines read as no");
+            log_legacy!("[Recall] A find batch ran out of time, so its lines read as no");
             return Vec::new();
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Recall] A find batch failed, so its lines read as no: {}",
                 e
             );

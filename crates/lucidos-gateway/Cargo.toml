@@ -19,6 +19,7 @@ name = "lucidos-gateway"
 path = "src/main.rs"
 
 [dependencies]
+lucidos-diagnostic-log = { path = "../lucidos-diagnostic-log" }
 lucidos-secret-store = { path = "../lucidos-secret-store" }
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-home = { path = "../lucidos-home" }
@@ -28,17 +29,19 @@ lucidos-local-token = { path = "../lucidos-local-token" }
 lucidos-engine-socket = { path = "../lucidos-engine-socket" }
 lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 lucidos-frame-capability = { path = "../lucidos-frame-capability" }
+lucidos-gateway-stamp = { path = "../lucidos-gateway-stamp" }
 lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
 lucidos-pg-url = { path = "../lucidos-pg-url" }
 lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
 # Enumerating the machine's Lucidos installs, shared with `lucidos-app` so the
 # control plane and the client cannot describe one machine two ways.
 lucidos-installs = { path = "../lucidos-installs" }
-lucidos-update-address = { path = "../lucidos-update-address" }
+lucidos-update-channel = { path = "../lucidos-update-channel" }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zstd = "0.13"
 toml = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"

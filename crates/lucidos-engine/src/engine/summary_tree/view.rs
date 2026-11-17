@@ -283,7 +283,7 @@ impl ViewSnapshots {
         }
 
         let snapshot = self.fold_snapshot(pool, budget - recent_cap).await?;
-        log!(
+        log_legacy!(
             "[SummaryTree] Workspace view snapshot epoch {} at {} leaves, {} bytes (budget {})",
             snapshot.epoch,
             snapshot.end,

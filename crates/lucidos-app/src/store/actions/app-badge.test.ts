@@ -45,6 +45,7 @@ const {
   syncWorkspaceAppBadge,
   refreshOtherWorkspacesUnread,
   crossWorkspaceUnreadTotal,
+  notificationsMenuUnreadTotal,
   peerWorkspaces,
   remotePeerWorkspaces,
 } = await import('./app-badge');
@@ -346,5 +347,37 @@ describe('why the badge needs an explicit re-assert', () => {
     servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(1) };
     expect(runs).toBe(2);
     dispose();
+  });
+});
+
+describe('header notification total', () => {
+  it('sums reachable menu rows while preserving the origin icon total', () => {
+    mocks.workspaceId = 'myws';
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    peerWorkspaces.value = [workspace('myws', 99), workspace('notes', 3), workspace('stopped')];
+    remotePeerWorkspaces.value = [
+      { gateway: 'lab', unreachable: null, workspaces: [workspace('notes', 7), workspace('stopped')] },
+      { gateway: 'office', unreachable: null, workspaces: [workspace('notes', 4)] },
+      { gateway: 'offline', unreachable: 'timed out', workspaces: [workspace('notes', 50)] },
+    ];
+    expect(notificationsMenuUnreadTotal.value).toBe(16);
+    expect(crossWorkspaceUnreadTotal.value).toBe(5);
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    expect(notificationsMenuUnreadTotal.value).toBe(14);
+    remotePeerWorkspaces.value = [];
+    expect(notificationsMenuUnreadTotal.value).toBe(3);
+  });
+
+  it('replaces the current remote route with live unreads exactly once', () => {
+    mocks.workspaceId = 'notes@lab';
+    servedUnreadNotifications.value = { status: 'loaded', data: makeUnread(2) };
+    peerWorkspaces.value = [workspace('notes', 3)];
+    remotePeerWorkspaces.value = [
+      { gateway: 'lab', unreachable: null, workspaces: [workspace('notes', 99)] },
+      { gateway: 'office', unreachable: null, workspaces: [workspace('notes', 4)] },
+    ];
+    expect(notificationsMenuUnreadTotal.value).toBe(9);
+    servedUnreadNotifications.value = { status: 'loaded', data: [] };
+    expect(notificationsMenuUnreadTotal.value).toBe(7);
   });
 });

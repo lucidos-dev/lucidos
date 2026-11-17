@@ -50,32 +50,11 @@ pub(super) fn run(
     let thread = std::env::var("LUCIDOS_THREAD_ID")
         .map_err(|_| "snapshot_restore_caller_unverified")?
         .parse::<uuid::Uuid>()?;
-    let origin = std::env::var("LUCIDOS_AGENT_ORIGIN_TOKEN")
+    std::env::var("LUCIDOS_AGENT_ORIGIN_TOKEN")
         .map_err(|_| "snapshot_restore_caller_unverified")?;
-    let local = lucidos_local_token::read().ok_or("snapshot_restore_caller_unverified")?;
-    let workspace = crate::workspace::resolve_from_env()?;
-    let socket = lucidos_engine_socket::path_for(&workspace.root)?;
-    // Deliberately no basename assertion: the socket and engine-issued proof
-    // establish the source identity, never a directory name supplied by a caller.
-    let client = reqwest::blocking::Client::builder()
-        .unix_socket(socket)
-        .no_proxy()
-        .retry(reqwest::retry::never())
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-    let response = client
-        .get("http://localhost/api/v1/snapshots/restore-caller")
-        .header(crate::http::HEADER_AGENT_ORIGIN_TOKEN, &origin)
-        .header(lucidos_local_token::HEADER_LOCAL_TOKEN, &local)
-        .send()
-        .map_err(|_| "snapshot_restore_caller_unverified")?;
-    if !response.status().is_success() {
-        return Err("snapshot_restore_caller_unverified".into());
-    }
-    let proof: Value = response
-        .json()
-        .map_err(|_| "snapshot_restore_caller_unverified")?;
+    let client = crate::http::client()?;
+    let engine = crate::workspace::resolve_from_env()?.base_url();
+    let proof = caller_proof(&client, &engine)?;
     let source = verified_source(&proof, thread, target)?;
     // Self-restore is refused before even probing a gateway.
     let base = crate::gateway::the_gateway(
@@ -83,7 +62,6 @@ pub(super) fn run(
         port,
         "Pass --port to name the gateway that owns the target workspace.",
     )?;
-    let client = crate::http::client()?;
     let (mut code, mut result) = send_once(&client, &base, &path, target, source, reason)?;
     if wait && code == 0 {
         let id = result["restore_id"]
@@ -105,6 +83,23 @@ pub(super) fn run(
         println!("{}", serde_json::to_string_pretty(&result)?);
     }
     Ok(code)
+}
+
+/// Asks this workspace's own engine to vouch for the calling thread.
+///
+/// The client carries the origin token. The engine checks it with its own key,
+/// so the agent needs no socket or local token, which the sandbox denies it.
+fn caller_proof(client: &reqwest::blocking::Client, engine: &str) -> Result<Value, BoxError> {
+    let response = client
+        .get(format!("{engine}/api/v1/snapshots/restore-caller"))
+        .send()
+        .map_err(|_| "snapshot_restore_caller_unverified")?;
+    if !response.status().is_success() {
+        return Err("snapshot_restore_caller_unverified".into());
+    }
+    response
+        .json()
+        .map_err(|_| "snapshot_restore_caller_unverified".into())
 }
 
 fn wait_restore(
@@ -243,6 +238,49 @@ mod tests {
                 listener.accept().unwrap_err().kind(),
                 std::io::ErrorKind::WouldBlock
             );
+        }
+    }
+
+    #[test]
+    fn the_caller_proof_comes_from_the_engine_over_http() {
+        for (status, proved) in [(200, true), (403, false)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let engine = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let mut bytes = [0; 4096];
+                    let n = stream.read(&mut bytes).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&bytes[..n]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert_eq!(
+                    request.lines().next().unwrap(),
+                    "GET /api/v1/snapshots/restore-caller HTTP/1.1"
+                );
+                let body = r#"{"workspace_id":"source"}"#;
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            });
+            let client = reqwest::blocking::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap();
+            let proof = caller_proof(&client, &engine);
+            server.join().unwrap();
+            if proved {
+                assert_eq!(proof.unwrap()["workspace_id"], "source");
+            } else {
+                assert_eq!(
+                    proof.unwrap_err().to_string(),
+                    "snapshot_restore_caller_unverified"
+                );
+            }
         }
     }
 

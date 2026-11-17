@@ -120,7 +120,7 @@ pub(in crate::api) async fn mark_thread_reply_seen(
         thread_uuid,
         body.summary_version,
         actor.clone(),
-        &crate::gateway_operators::Reader::of(Some(&actor), &crate::gateway_operators::current()),
+        &crate::gateway_users::Reader::of(Some(&actor), &crate::gateway_users::current()),
     )
     .await
     .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

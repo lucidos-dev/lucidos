@@ -42,6 +42,12 @@ export interface HealthInfo {
    *  free pooled connection. Only ever true while `database_reachable` is
    *  false. Absent on older engines, which reads as false. ADR 0301. */
   database_pool_exhausted?: boolean;
+  /** Why this machine cannot sandbox agent-steered processes, or null when it
+   *  can. Absent on older engines, which reads as able. ADR 0645. */
+  agent_sandbox_unavailable?: string | null;
+  /** True when the sandbox runs but cannot stop an agent emptying a protected
+   *  file: Linux below Landlock ABI 3. Absent on older engines. ADR 0645. */
+  agent_sandbox_truncation_unguarded?: boolean;
 }
 
 /** What a health probe found: the engine's answer, a failure, or the gateway
@@ -112,7 +118,7 @@ export async function submitChat(body: ChatRequestBody): Promise<ChatSubmitAck> 
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(SUBMIT_CHAT_TIMEOUT_MS),
+    timeoutMs: SUBMIT_CHAT_TIMEOUT_MS,
   });
   await throwIfNotOk(res);
   return res.json();
@@ -131,23 +137,38 @@ async function parseCanceled(res: Response): Promise<boolean> {
   return true;
 }
 
-/** Cancel a running Lucidos Agent (chat) turn. Returns whether the server
- *  actually canceled something: `false` when nothing was running (the client's
- *  optimistic "canceling" state is stale and must be reconciled). */
-export async function cancelChat(threadId?: string): Promise<boolean> {
-  const params = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : '';
-  const res = await mutatingFetchIdempotent(`${API}/chat/cancel${params}`, { method: 'POST' });
-  await throwIfNotOk(res);
-  return parseCanceled(res);
+export interface ChatCancelResponse {
+  canceled: boolean;
+  taken_back_messages: Array<{ thread_id: string; id: string; text: string; image_hashes: string[]; compose: ComposeReportWire }>;
+  failed_take_back_ids: string[];
 }
 
-export async function removeQueuedMessage(threadId: string, messageId: string): Promise<void> {
+/** Stop takes back unread inputs before canceling live work. Content comes
+ *  from the engine so restoration also works before the local timeline loads. */
+export async function cancelChat(threadId?: string): Promise<ChatCancelResponse> {
+  const params = threadId ? `?thread_id=${encodeURIComponent(threadId)}` : '';
+  const res = await mutatingFetch(`${API}/chat/cancel${params}`, { method: 'POST' });
+  await throwIfNotOk(res);
+  // Keep the legacy empty response, but never hide a truncated or invalid
+  // content-bearing response: its taken-back text must not disappear silently.
+  const text = await res.text();
+  const body = text.trim() ? JSON.parse(text) : null;
+  return {
+    canceled: typeof body?.canceled === 'boolean' ? body.canceled : true,
+    taken_back_messages: body?.taken_back_messages ?? [],
+    failed_take_back_ids: body?.failed_take_back_ids ?? [],
+  };
+}
+
+export async function removeQueuedMessage(threadId: string, messageId: string): Promise<ComposeReportWire | null> {
   const res = await mutatingFetch(`${API}/chat/queued-message/remove`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ thread_id: threadId, message_id: messageId }),
   });
   await throwIfNotOk(res);
+  const text = await res.text();
+  return text.trim() ? (JSON.parse(text).compose ?? null) : null;
 }
 
 export interface ChatSettingsPick {
@@ -397,6 +418,7 @@ export interface AnswerPlacement {
   event_id: string;
   input_chain: string;
   input_seq: number;
+  compose_epoch?: number;
 }
 
 /** Answer a pending question card on a thread. The backend emits
@@ -417,14 +439,24 @@ export async function answerThreadQuestion(
   toolUseId: string,
   answer: AnswerKind,
   placement: AnswerPlacement,
+  acceptedCompose?: (report: ComposeReportWire | null | undefined) => void,
 ): Promise<boolean> {
   const res = await mutatingFetch(`${API}/threads/${encodeURIComponent(threadId)}/answer-question`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ tool_use_id: toolUseId, answer, ...placement }),
-    signal: AbortSignal.timeout(SUBMIT_CHAT_TIMEOUT_MS),
+    timeoutMs: SUBMIT_CHAT_TIMEOUT_MS,
   });
-  if (res.ok) return true;
+  if (res.ok) {
+    if (acceptedCompose) acceptedCompose((await res.json() as { compose?: ComposeReportWire | null }).compose);
+    return true;
+  }
+  if (res.status === 409) {
+    const refusal = await res.clone().json() as { reason?: string };
+    if (['compose_snapshot_stale', 'compose_fence_required', 'overtaken'].includes(refusal.reason ?? '')) {
+      await throwIfNotOk(res);
+    }
+  }
   if (res.status === 409) return false; // already answered or no pending question
   await throwIfNotOk(res);
   throw new Error('unreachable');

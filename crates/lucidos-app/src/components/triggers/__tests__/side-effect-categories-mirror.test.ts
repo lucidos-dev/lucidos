@@ -1,11 +1,11 @@
 /**
- * The grantable side-effect categories are materialised in four places, and
- * this pins the three TypeScript ones to the Rust enum.
+ * The grantable side-effect categories are materialised in three places, and
+ * this pins the two hand-written TypeScript ones to the Rust enum.
  *
  * Rust owns the wire values (`SideEffectCategory`, serialized snake_case) and
- * the user-facing labels (`label()`). TypeScript restates the values as a union
- * twice, in `store/types.ts` and in the SDK's `triggers.ts`. It restates the
- * value and label pairs once more in this folder's `TriggerDetails.tsx`.
+ * the user-facing labels (`label()`). The app's union is generated from the
+ * enum. The SDK's `triggers.ts` restates it by hand, and this folder's
+ * `TriggerDetails.tsx` restates the value and label pairs.
  *
  * Nothing enforced any of it. Add a sixth category in Rust and the trigger
  * editor renders no checkbox for it. A user cannot grant it, the trigger
@@ -27,7 +27,6 @@ const here = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(here, '../../../../../..');
 const COMMAND_GUARD = 'crates/lucidos-engine/src/engine/command_guard.rs';
 const TRIGGER_DETAILS = 'crates/lucidos-app/src/components/triggers/TriggerDetails.tsx';
-const STORE_TYPES = 'crates/lucidos-app/src/store/types.ts';
 const SDK_TRIGGERS = 'packages/lucidos-sdk/src/triggers.ts';
 
 function source(file: string): string {
@@ -102,20 +101,16 @@ function unionMembers(file: string): string[] {
 }
 
 describe('every copy of the side-effect categories names the same five', () => {
-  it('parses a non-empty list from each of the four sources', () => {
+  it('parses a non-empty list from each of the three sources', () => {
     // A regex that quietly matches nothing reports green for ever, so each
     // parser is checked before the comparisons that rest on it.
     expect(rustValues().length).toBeGreaterThan(0);
     expect(editorChoices().length).toBeGreaterThan(0);
-    expect(unionMembers(STORE_TYPES).length).toBeGreaterThan(0);
     expect(unionMembers(SDK_TRIGGERS).length).toBeGreaterThan(0);
   });
 
-  it.each([
-    ['the store union', STORE_TYPES],
-    ['the SDK union', SDK_TRIGGERS],
-  ])('%s carries exactly the enum variants', (_label, file) => {
-    expect(unionMembers(file).sort()).toEqual([...rustValues()].sort());
+  it('the SDK union carries exactly the enum variants', () => {
+    expect(unionMembers(SDK_TRIGGERS).sort()).toEqual([...rustValues()].sort());
   });
 
   it('offers a checkbox for every category and no other', () => {

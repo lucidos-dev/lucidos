@@ -945,6 +945,23 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     //    that lives on the ResizeObserver / event listeners.
     window.addEventListener('resize', refreshHeight);
     window.visualViewport?.addEventListener('resize', refreshHeight);
+    // Suspension can miss resize delivery. Reconcile the sticky anchor when
+    // returning, holding the reader's row and the bars' intent.
+    function onResume() {
+      if (document.visibilityState !== 'visible') return;
+      const scroller = threadScroller;
+      const top = scroller?.scrollTop ?? 0;
+      const before = spacerHeightPx({ cachedHeight, controlsTop: cachedControlsTop, keyboardOpen, disabled }) + titleBarHeight;
+      refreshHeight();
+      updateTitleBarHeightVar();
+      refreshPromptHeight();
+      const after = spacerHeightPx({ cachedHeight, controlsTop: cachedControlsTop, keyboardOpen, disabled }) + titleBarHeight;
+      if (scroller && top > 0 && after !== before) {
+        holdAcrossRelayout(scroller as HTMLElement, Math.max(0, top + after - before));
+      }
+    }
+    window.addEventListener('pageshow', onResume);
+    document.addEventListener('visibilitychange', onResume);
     let coldStartPollFrames = 30; // ~500ms at 60fps
     let coldStartPollId: number | null = null;
     function coldStartPoll() {
@@ -1058,6 +1075,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       window.removeEventListener('message', onAppMessage);
       window.removeEventListener('resize', refreshHeight);
       window.visualViewport?.removeEventListener('resize', refreshHeight);
+      window.removeEventListener('pageshow', onResume);
+      document.removeEventListener('visibilitychange', onResume);
       if (coldStartPollId !== null) cancelAnimationFrame(coldStartPollId);
       if (mutationRafId !== null) cancelAnimationFrame(mutationRafId);
       if (rebaseSettleRaf !== null) cancelAnimationFrame(rebaseSettleRaf);

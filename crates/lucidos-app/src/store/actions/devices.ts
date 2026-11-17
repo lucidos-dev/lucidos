@@ -59,12 +59,13 @@ export const devices = signal<Loadable<DeviceInfo[]>>({ status: 'not-loaded' });
  *
  * Empty until both lists land, rather than flashing a lesser name first.
  */
-export function turnDeviceName(deviceId: string): string {
+export function turnDeviceName(deviceId: string, options?: { knownOnly?: boolean }): string {
   const pending = (s: string) => s === 'not-loaded' || s === 'loading';
   const list = devices.value;
   if (pending(list.status) || pending(pairedDevices.value.status)) return '';
   const device = list.status === 'loaded' ? list.data.find((d) => d.id === deviceId) : undefined;
   const paired = pairedRows(pairedDevices.value)?.find((p) => p.id === deviceId);
+  if (options?.knownOnly && !device && !paired) return '';
   const name = deviceName(deviceId, device, paired);
   return deviceId === getDeviceId() ? `${name} (this device)` : name;
 }

@@ -95,6 +95,14 @@ impl AuxProvider {
 
 #[async_trait]
 impl LlmProvider for AuxProvider {
+    fn resolved_provider_kind(
+        &self,
+        selection: &ModelSelection<'_>,
+    ) -> Result<Option<crate::llm::ProviderKind>, Box<dyn std::error::Error + Send + Sync>> {
+        self.inner
+            .resolved_provider_kind(&self.pinned(self.current_model(), *selection))
+    }
+
     async fn chat(
         &self,
         messages: Vec<Message>,

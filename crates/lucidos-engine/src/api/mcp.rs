@@ -1,11 +1,12 @@
 use super::error::ApiError;
 use super::settings::{AllowlistRequest, AllowlistResponse};
 use super::*;
-use crate::core::grants::{self, GrantFile};
+use crate::core::grants::GrantFile;
 use crate::core::mcp_servers::validate_server_id;
 use crate::core::{McpServer, McpServerStore};
 use crate::engine::cc_permission::resolve_coding_agent_permission;
 use crate::engine::claude_code::AllowScope;
+use crate::engine::permission::tool_grants::AnsweredBy;
 use crate::engine::thread_events::{EventMeta, McpEnablementSource};
 use crate::mcp::{McpCostTotals, McpStartOutcome, McpStopOutcome};
 use axum::routing::patch;
@@ -17,13 +18,12 @@ pub(super) struct McpConsentResponse {
     /// When `Some(_)` and `allowed == true`, the engine derives a pattern
     /// from the original prompt's tool_name + input and remembers it so
     /// future identical-pattern requests skip the prompt. Where the pattern
-    /// is recorded depends on scope:
-    ///   * `narrow` / `broad`: appended to `<workspace>/.lucidos/cc-allowed-tools`,
-    ///     handed to CC via `--allowedTools` on every spawn AND read by the
-    ///     engine's own gate on every prompt.
-    ///   * `session`: inserted into the engine's in-memory per-thread allow
-    ///     set, and rehydrated from the resolution events after a restart. The
-    ///     one scope reaching tools and paths CC never auto-approves.
+    /// is recorded as a *tool grant* depends on scope:
+    ///   * `narrow` / `broad`: a standing grant, handed to CC via
+    ///     `--allowedTools` on every spawn AND read by the engine's own gate
+    ///     on every prompt.
+    ///   * `session`: a grant the thread holds. The one scope reaching tools
+    ///     and paths CC never auto-approves.
     ///
     /// Absent (the Allow-once path) records nothing. Unknown wire values
     /// cause a 4xx via serde — match the engine's typed enum exactly.
@@ -69,7 +69,7 @@ pub(super) async fn submit_mcp_consent(
         body.request_id,
         body.allowed,
         body.persist_scope,
-        actor,
+        AnsweredBy::tap(actor),
         "[MCP] CodingAgentPermissionResolved",
     )
     .await;
@@ -99,7 +99,7 @@ pub(super) async fn set_mcp_auto_approve(
     headers: HeaderMap,
     Json(body): Json<McpAutoApproveRequest>,
 ) -> impl IntoResponse {
-    if let Err(refusal) = super::thread_reach::refuse_agent_permission_grant(&headers) {
+    if let Err(refusal) = super::thread_reach::require_owner_for_permission_grant(&headers) {
         return refusal.into_response();
     }
     let actor = super::actor::user_actor(&headers, None);
@@ -211,7 +211,10 @@ async fn approve_launch_by_owner_click(
     headers: &HeaderMap,
     server: &McpServer,
 ) -> Result<(), ApiError> {
-    let Ok(owner) = super::actor::require_owner_device(headers, pool).await else {
+    let Ok(owner) =
+        super::actor::require_owner_device(headers, pool, super::owner_door::OnUnattested::Refuse)
+            .await
+    else {
         return Ok(());
     };
     manager
@@ -412,21 +415,19 @@ pub(super) async fn set_mcp_disabled_tools(
     Ok(Json(serde_json::json!({ "disabled_tools": stored })))
 }
 
-/// GET /api/v1/mcp-allowed-tools: this workspace's raw `mcp-allowed-tools`, the
-/// chat MCP permission allowlist. The MCP counterpart of the
-/// `cc-allowed-tools` pair in `api/settings.rs`; a missing file returns the
-/// seeded header.
+/// GET /api/v1/mcp-allowed-tools: this workspace's standing chat MCP grants.
+/// The MCP counterpart of the `cc-allowed-tools` pair in `api/settings.rs`.
 pub(super) async fn get_mcp_allowed_tools(
     State(state): State<AppState>,
 ) -> Result<Json<AllowlistResponse>, ApiError> {
-    let dir = state.engine.grants_dir();
-    let contents = grants::read_raw(&dir, GrantFile::McpTools)
-        .map_err(|e| ApiError::internal(format!("Failed to read mcp-allowed-tools: {e}")))?;
-    Ok(Json(AllowlistResponse { contents }))
+    super::settings::read_grant_file(&state, GrantFile::McpTools)
+        .await
+        .map_err(|(status, message)| ApiError::new(status, message))
 }
 
-/// PUT /api/v1/mcp-allowed-tools: overwrite the file (atomic). The gate reads
-/// it fresh on each prompt, so an edit takes effect on the next gated MCP call.
+/// PUT /api/v1/mcp-allowed-tools: replace the standing MCP grants. The gate
+/// reads them fresh on each prompt, so an edit takes effect on the next gated
+/// MCP call.
 pub(super) async fn put_mcp_allowed_tools(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -509,8 +510,17 @@ mod tests {
             .unwrap();
         assert!(!manager.is_launch_approved(&server).await.unwrap());
 
-        let mut owner = HeaderMap::new();
-        owner.insert(HEADER_DEVICE_ID, "owner-phone".parse().unwrap());
+        let mut typed = HeaderMap::new();
+        typed.insert(HEADER_DEVICE_ID, "owner-phone".parse().unwrap());
+        approve_launch_by_owner_click(&manager, &pool, &typed, &server)
+            .await
+            .unwrap();
+        assert!(
+            !manager.is_launch_approved(&server).await.unwrap(),
+            "a typed device id with no gateway stamp is not the owner's click"
+        );
+
+        let owner = crate::api::gateway_stamp::test_support::stamped_device_headers("owner-phone");
         approve_launch_by_owner_click(&manager, &pool, &owner, &server)
             .await
             .unwrap();

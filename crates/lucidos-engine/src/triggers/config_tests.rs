@@ -1803,3 +1803,60 @@ fn a_created_payload_reads_back_to_the_same_config_by_create_and_by_update() {
     updated.apply_update(&payload);
     assert_eq!(json!(updated), json!(config));
 }
+
+/// The definition digest hashes what a trigger runs and when: `run`, `on`, the
+/// cron, its MCP servers and its app (I17). Key and server order never move
+/// it, and neither do its name, pause or grants.
+#[test]
+fn the_definition_digest_binds_what_runs_and_nothing_else() {
+    let base = || {
+        TriggerConfig::from_created_payload(&json!({
+            "trigger_id": "t1", "name": "Digest", "schedule": ["0 0 8 * * *"],
+            "timezone": "UTC",
+            "run": { "type": "intent", "intent": "Summarise the inbox." },
+            "on": [{ "event_type": "X", "condition": { "a": 1, "b": { "c": 2, "d": 3 } } }],
+            "mcp_servers": ["slack", "github"],
+            "app_id": "habit-tracker",
+        }))
+        .unwrap()
+    };
+    let digest = base().definition_digest();
+    assert_eq!(digest.len(), 64, "a hex SHA-256: {digest}");
+    assert_eq!(digest, base().definition_digest(), "stable across reads");
+
+    let mut same = base();
+    same.mcp_servers.reverse();
+    same.on[0].condition = Some(json!({ "b": { "d": 3, "c": 2 }, "a": 1 }));
+    same.name = "Renamed".into();
+    same.paused = true;
+    same.coding_agent_grant = true;
+    same.side_effect_grant = vec![SideEffectCategory::Email];
+    same.model = Some("mock".into());
+    assert_eq!(
+        same.definition_digest(),
+        digest,
+        "only the definition counts"
+    );
+
+    type Edit = fn(&mut TriggerConfig);
+    let edits: [(&str, Edit); 5] = [
+        ("run", |c| {
+            c.run = TriggerRun::Intent {
+                intent: "Delete the inbox.".into(),
+            }
+        }),
+        ("on", |c| c.on[0].event_type = "Y".into()),
+        ("cron", |c| c.schedule = vec!["0 0 9 * * *".into()]),
+        ("mcp", |c| c.mcp_servers.push("gmail".into())),
+        ("app", |c| c.app_id = None),
+    ];
+    for (what, edit) in edits {
+        let mut changed = base();
+        edit(&mut changed);
+        assert_ne!(
+            changed.definition_digest(),
+            digest,
+            "{what} is in the digest"
+        );
+    }
+}

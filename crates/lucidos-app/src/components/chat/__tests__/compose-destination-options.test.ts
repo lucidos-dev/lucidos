@@ -17,7 +17,7 @@ function inputs(over: Partial<DestinationOptionInputs> = {}): DestinationOptionI
     listsPending: false,
     reposError: null,
     appsError: null,
-    people: [],
+    users: [],
     ...over,
   };
 }
@@ -107,19 +107,19 @@ describe('buildDestinationOptions — loading / error / unavailable rows', () =>
 
 describe('buildDestinationOptions — teammates (ADR 0649)', () => {
   it('offers no teammate row off a team gateway', () => {
-    expect(values(buildDestinationOptions(inputs()))).not.toContain('__hdr-people');
+    expect(values(buildDestinationOptions(inputs()))).not.toContain('__hdr-users');
   });
 
   it('lists each teammate under its own header, and says when no push reaches one', () => {
     const opts = buildDestinationOptions(inputs({
-      people: [{ id: 'op-2', name: 'Kim', has_device: true }, { id: 'op-3', name: 'Alex', has_device: false }],
+      users: [{ id: 'op-2', name: 'Kim', has_device: true }, { id: 'op-3', name: 'Alex', has_device: false }],
     }));
-    expect(values(opts).slice(0, 4)).toEqual(['agent', '__hdr-people', 'person:op-2', 'person:op-3']);
-    expect(opts.find(o => o.value === 'person:op-3')?.description).toMatch(/no push/i);
+    expect(values(opts).slice(0, 4)).toEqual(['agent', '__hdr-users', 'user:op-2', 'user:op-3']);
+    expect(opts.find(o => o.value === 'user:op-3')?.description).toMatch(/no push/i);
   });
 
-  it('marks a teammate destination unavailable once that person is gone', () => {
-    const opts = buildDestinationOptions(inputs({ dest: { kind: 'person', personId: 'op-gone' } }));
-    expect(opts.find(o => o.value === 'person:op-gone')?.label).toBe('That teammate · unavailable');
+  it('marks a teammate destination unavailable once that user is gone', () => {
+    const opts = buildDestinationOptions(inputs({ dest: { kind: 'user', userId: 'op-gone' } }));
+    expect(opts.find(o => o.value === 'user:op-gone')?.label).toBe('That teammate · unavailable');
   });
 });

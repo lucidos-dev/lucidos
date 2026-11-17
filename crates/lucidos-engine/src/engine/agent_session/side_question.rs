@@ -1,6 +1,6 @@
 //! Side questions: a quick question answered from a thread's context,
 //! beside any running turn, with no tools. A Claude Code thread asks a copy of
-//! its session. A Lucidos Agent thread asks its own model once
+//! its session; a Codex thread asks an ephemeral fork. A Lucidos Agent thread asks its own model once
 //! (`chat::process::side_question`).
 //!
 //! Each ask is recorded as side-question thread events, so its card survives a
@@ -30,19 +30,19 @@ pub(crate) enum SideQuestionFailure {
     AlreadyAsked,
     /// Nothing asked with this id on the thread, so there is nothing to dismiss.
     NotAsked,
-    /// Claude Code could not answer. The text says what went wrong.
+    /// The agent could not answer. The text says what went wrong.
     Failed(String),
 }
 
-/// How long a side question may take, on either agent. A Claude Code copy
+/// How long a side question may take, on any agent. A Claude Code copy
 /// resumes the whole transcript before its model call starts.
 pub(crate) const SIDE_QUESTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
-/// Model turns a side question may take, on either agent. A refused tool call
+/// Model turns a side question may take, on any agent. A refused tool call
 /// costs one, so this leaves room to answer after a stray attempt.
 pub(crate) const SIDE_QUESTION_MAX_TURNS: usize = 3;
 
-/// What the model reads before the question, on either agent. The Claude Code
+/// What the model reads before the question, on any agent. The Claude Code
 /// copy resumes a saved transcript, whose running step reads as interrupted.
 pub(crate) const SIDE_QUESTION_INSTRUCTIONS: &str = "This is a side question from the user, \
 asked beside the main conversation. Answer it directly in one reply, from what you already \
@@ -51,7 +51,7 @@ and do not promise any action. If the answer needs a tool, say so. Then suggest 
 main conversation. The main task may still be running: a last step that reads as interrupted \
 was not stopped.";
 
-/// What the model reads when it calls a tool anyway, on either agent.
+/// What the model reads when it calls a tool anyway, on any agent.
 pub(crate) const SIDE_QUESTION_TOOL_REFUSAL: &str =
     "Side questions cannot use tools. Answer from what you already know.";
 
@@ -73,10 +73,8 @@ pub(crate) const INTERRUPTED_BY_RESTART: &str = "Interrupted by a restart. Ask a
 
 pub(crate) const EMPTY_QUESTION: &str = "Type the side question first.";
 pub(crate) const NO_SUCH_THREAD: &str = "Side questions work once this thread has started.";
-pub(crate) const CODEX_UNSUPPORTED: &str =
-    "Side questions are not available in Codex threads. Send it as a normal message instead.";
 const NO_SESSION_YET: &str =
-    "This thread has no Claude Code session yet. Wait for its first reply, then ask again.";
+    "This thread has no coding-agent session yet. Wait for its first reply, then ask again.";
 
 /// How many Claude Code spawn prompts the engine remembers. Each is a whole
 /// appended system prompt, so the cap bounds memory on a long-running engine.
@@ -90,6 +88,7 @@ static ASK_ADMISSION: Mutex<()> = Mutex::const_new(());
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SideQuestionAgent {
     ClaudeCode,
+    Codex,
     Lucidos,
 }
 
@@ -105,7 +104,7 @@ fn agent_for(row: Option<ThreadRow>) -> Result<SideQuestionAgent, &'static str> 
         Some((source, coding_agent, _)) if source == "claude_code" => {
             match CodingAgent::parse(coding_agent.as_deref().unwrap_or_default()) {
                 CodingAgent::ClaudeCode => Ok(SideQuestionAgent::ClaudeCode),
-                CodingAgent::Codex => Err(CODEX_UNSUPPORTED),
+                CodingAgent::Codex => Ok(SideQuestionAgent::Codex),
             }
         }
         Some(_) => Ok(SideQuestionAgent::Lucidos),
@@ -172,9 +171,11 @@ pub(crate) struct SessionCopy {
     effort: Option<String>,
     allowed_tools: String,
     user_env: Vec<(String, String)>,
+    build_slot_class: lucidos_build_slot::SlotClass,
     binary_override: Option<String>,
     permission_mode: Option<String>,
     additional_directories: Vec<PathBuf>,
+    sandbox: crate::runtime::agent_sandbox::Sandbox,
 }
 
 impl SessionCopy {
@@ -204,6 +205,7 @@ impl SessionCopy {
             spawning_event_id: None,
             repo_name: None,
             interactive: false,
+            build_slot_class: self.build_slot_class,
             user_env_vars: &self.user_env,
             account_pin: self.account_pin.as_ref(),
             binary_override: self.binary_override.as_deref(),
@@ -212,6 +214,7 @@ impl SessionCopy {
             auto_compact: None,
             keep_alive: false,
             agent_run: crate::runtime::agent_run_marker::AgentRun::unrecorded(),
+            sandbox: self.sandbox.clone(),
         }
     }
 
@@ -344,7 +347,7 @@ pub(crate) async fn fail_unsettled_side_questions(
             Uuid::parse_str(&thread_id),
             Uuid::parse_str(&side_question_id),
         ) else {
-            crate::log!(
+            crate::log_legacy!(
                 "[SideQuestion] Skipping an unsettled side question with a malformed id: thread {thread_id:?}, id {side_question_id:?}"
             );
             continue;
@@ -355,7 +358,7 @@ pub(crate) async fn fail_unsettled_side_questions(
         };
         match record(bus, thread_id, event, EventMeta::NONE).await {
             Ok(()) => failed += 1,
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[SideQuestion] Could not fail interrupted side question {side_question_id} on thread {thread_id}: {e:?}"
             ),
         }
@@ -381,7 +384,7 @@ impl LucidosEngine {
         }
         let agent = check_thread(self.pool(), thread_id).await?;
         check_images(self.workspace_path(), image_hashes)?;
-        if agent == SideQuestionAgent::ClaudeCode && !self.has_session(thread_id).await? {
+        if agent != SideQuestionAgent::Lucidos && !self.has_session(thread_id, agent).await? {
             return Err(SideQuestionFailure::Refused(NO_SESSION_YET));
         }
         {
@@ -405,26 +408,46 @@ impl LucidosEngine {
             .await?;
         }
         let deadline = tokio::time::Instant::now() + SIDE_QUESTION_TIMEOUT;
-        let outcome = match load_images(self.workspace_path(), image_hashes) {
-            Err(failure) => Err(failure),
-            Ok(images) => match agent {
-                SideQuestionAgent::ClaudeCode => {
-                    self.answer_claude_code_side_question(thread_id, question, &images, deadline)
+        let outcome = if agent == SideQuestionAgent::Codex {
+            self.answer_codex_side_question(thread_id, question, image_hashes, deadline)
+                .await
+        } else {
+            match load_images(self.workspace_path(), image_hashes) {
+                Err(failure) => Err(failure),
+                Ok(images) => {
+                    if agent == SideQuestionAgent::ClaudeCode {
+                        self.answer_claude_code_side_question(
+                            thread_id, question, &images, deadline,
+                        )
                         .await
+                    } else {
+                        self.answer_lucidos_side_question(thread_id, question, &images, deadline)
+                            .await
+                            .map_err(SideQuestionFailure::Failed)
+                    }
                 }
-                SideQuestionAgent::Lucidos => self
-                    .answer_lucidos_side_question(thread_id, question, &images, deadline)
-                    .await
-                    .map_err(SideQuestionFailure::Failed),
-            },
+            }
         };
         let settled = settled_event(side_question_id, &outcome);
         record(&self.event_bus, thread_id, settled, EventMeta::NONE).await?;
         outcome
     }
 
-    /// Whether the thread has a saved Claude Code session a copy can resume.
-    async fn has_session(&self, thread_id: Uuid) -> Result<bool, SideQuestionFailure> {
+    /// Whether the thread has a saved session for its coding agent.
+    async fn has_session(
+        &self,
+        thread_id: Uuid,
+        agent: SideQuestionAgent,
+    ) -> Result<bool, SideQuestionFailure> {
+        if agent == SideQuestionAgent::Codex {
+            return Ok(super::resume::lookup_latest_session_id_for_agent(
+                self.pool(),
+                thread_id,
+                CodingAgent::Codex,
+            )
+            .await
+            .is_some());
+        }
         let pool = self.pool();
         let recorded_pin = super::lookup_pinned_cc_config_dir(pool, thread_id)
             .await
@@ -467,11 +490,11 @@ impl LucidosEngine {
     pub async fn recover_unsettled_side_questions(&self) {
         match fail_unsettled_side_questions(self.pool(), &self.event_bus).await {
             Ok(0) => {}
-            Ok(failed) => log!(
+            Ok(failed) => log_legacy!(
                 "[SideQuestion] Failed {} side questions a restart interrupted",
                 failed
             ),
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[SideQuestion] Could not recover unsettled side questions: {}",
                 e
             ),
@@ -528,6 +551,48 @@ impl LucidosEngine {
         reply.answer.map_err(SideQuestionFailure::Failed)
     }
 
+    async fn answer_codex_side_question(
+        &self,
+        thread_id: Uuid,
+        question: &str,
+        hashes: &[String],
+        deadline: tokio::time::Instant,
+    ) -> Result<String, SideQuestionFailure> {
+        let copy = self.session_copy_for(thread_id, CodingAgent::Codex).await?;
+        let paths = hashes
+            .iter()
+            .map(|hash| {
+                crate::core::blobs::resolve_blob(self.workspace_path(), hash)
+                    .map(|blob| blob.path)
+                    .ok_or_else(|| {
+                        SideQuestionFailure::Failed(format!(
+                            "Image {hash} was deleted before it was read"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let reply = crate::runtime::codex_side_question::ask_side_question(
+            copy.spawn_args(self.workspace_path(), thread_id),
+            question,
+            &paths,
+            deadline,
+        )
+        .await
+        .map_err(|e| SideQuestionFailure::Failed(e.to_string()))?;
+        crate::engine::AuxCapture::new(
+            &self.event_bus,
+            thread_id,
+            crate::engine::ContextPurpose::SideQuestion,
+        )
+        .record_usage(
+            &copy.model_of(&reply),
+            question.chars().count(),
+            reply.usage,
+        )
+        .await;
+        reply.answer.map_err(SideQuestionFailure::Failed)
+    }
+
     /// Resolve the thread's session the way a follow-up spawn would.
     ///
     /// The cwd is the thread's worktree while it exists. Claude Code finds a
@@ -537,20 +602,42 @@ impl LucidosEngine {
         &self,
         thread_id: Uuid,
     ) -> Result<SessionCopy, SideQuestionFailure> {
+        self.session_copy_for(thread_id, CodingAgent::ClaudeCode)
+            .await
+    }
+
+    async fn session_copy_for(
+        &self,
+        thread_id: Uuid,
+        coding_agent: CodingAgent,
+    ) -> Result<SessionCopy, SideQuestionFailure> {
         let pool = self.pool();
-        let recorded_pin = super::lookup_pinned_cc_config_dir(pool, thread_id)
-            .await
-            .map_err(|e| SideQuestionFailure::Failed(format!("Could not read the thread: {e}")))?;
+        let recorded_pin = if coding_agent == CodingAgent::ClaudeCode {
+            super::lookup_pinned_cc_config_dir(pool, thread_id)
+                .await
+                .map_err(|e| {
+                    SideQuestionFailure::Failed(format!("Could not read the thread: {e}"))
+                })?
+        } else {
+            None
+        };
         let pinned_dir = recorded_pin.as_ref().map(|pin| pin.dir.as_str());
-        let session_id = super::resume::resume_sid_for_account(pool, thread_id, pinned_dir)
-            .await
-            .ok_or(SideQuestionFailure::Refused(NO_SESSION_YET))?;
+        let session_id = match coding_agent {
+            CodingAgent::ClaudeCode => {
+                super::resume::resume_sid_for_account(pool, thread_id, pinned_dir).await
+            }
+            CodingAgent::Codex => {
+                super::resume::lookup_latest_session_id_for_agent(pool, thread_id, coding_agent)
+                    .await
+            }
+        }
+        .ok_or(SideQuestionFailure::Refused(NO_SESSION_YET))?;
         let worktree = super::resume::lookup_latest_worktree_path(pool, thread_id).await;
         let cwd = match worktree {
             Some(path) if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir()) => path,
             _ => self.workspace_path().to_path_buf(),
         };
-        let (model, effort) = self.cc_thread_settings(thread_id).await;
+        let (model, effort) = self.cc_thread_settings_on(thread_id, coding_agent).await;
         let system_prompt = self
             .cc_system_prompts
             .lock()
@@ -563,22 +650,41 @@ impl LucidosEngine {
         // the same directories and share one prompt prefix.
         let additional_directories =
             crate::engine::repo_directory_grants::resolve(&cwd, self.workspace_path()).await;
+        let sandbox = crate::runtime::agent_sandbox::Sandbox::resolve(pool, self.workspace_path())
+            .await
+            .map_err(|e| SideQuestionFailure::Failed(e.to_string()))?;
+        let build_slot_class = crate::engine::main_check::repair_build_class(pool, thread_id)
+            .await
+            .map_err(|error| {
+                SideQuestionFailure::Failed(format!("Could not read repair build class: {error}"))
+            })?;
         Ok(SessionCopy {
+            build_slot_class,
             cwd,
             session_id,
             system_prompt,
             account_pin: recorded_pin.map(|pin| pin.resolve(&user_env)),
             model,
             effort,
-            allowed_tools: crate::engine::claude_code::cc_allowed_tools(&self.grants_dir()),
+            allowed_tools: crate::engine::claude_code::cc_allowed_tools(
+                &self.event_bus,
+                &self.grants_dir(),
+            )
+            .await,
             user_env,
-            binary_override: crate::core::prefs::CODING_AGENT_CLAUDE_PATH
-                .read(pool)
-                .await,
+            binary_override: match coding_agent {
+                CodingAgent::ClaudeCode => {
+                    crate::core::prefs::CODING_AGENT_CLAUDE_PATH
+                        .read(pool)
+                        .await
+                }
+                CodingAgent::Codex => crate::core::prefs::CODING_AGENT_CODEX_PATH.read(pool).await,
+            },
             permission_mode: crate::core::prefs::CODING_AGENT_CLAUDE_PERMISSION_MODE
                 .stored(pool)
                 .await,
             additional_directories,
+            sandbox,
         })
     }
 }

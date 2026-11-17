@@ -4,6 +4,7 @@
 # The main check runs `e2e-github.sh main-check --commit <sha>` and reads its
 # log. These functions turn that log into the protocol the engine reads:
 #   main-check run <url> <branch>  as soon as the workflow run is found
+#   main-check tests-started       once the run's first test job starts
 #   main-check verdict <json>      always the last line
 #
 # Sourced by scripts/main-check.sh. Tested by scripts/lib/main_check_test.sh.
@@ -14,6 +15,7 @@ source "$(dirname "${BASH_SOURCE[0]}")/e2e_flaky.sh"
 source "$(dirname "${BASH_SOURCE[0]}")/e2e_github.sh"
 
 MAIN_CHECK_RUN_PREFIX="main-check run "
+MAIN_CHECK_TESTS_STARTED_LINE="main-check tests-started"
 MAIN_CHECK_VERDICT_PREFIX="main-check verdict "
 # How much failure output the verdict carries. The full log stays on disk.
 MAIN_CHECK_TAIL_LINES_PER_PHASE=25
@@ -43,7 +45,8 @@ main_check_exit() {
 }
 
 # main_check_follow <log>: copy the driver's output into <log>, and print the
-# run line the moment the driver names its run. It ignores SIGTERM and SIGUSR2
+# run line the moment the driver names its run, and the tests-started line the
+# moment its first test job starts. It ignores SIGTERM and SIGUSR2
 # and reads until the driver closes its output: engine shutdown signals the
 # whole group, and the driver's cleanup still writes to this pipe.
 main_check_follow() {
@@ -53,6 +56,7 @@ main_check_follow() {
         printf '%s\n' "$line" >>"$log"
         case "$line" in
             "$E2E_GITHUB_LINKED_MARK"*) printf '%s%s\n' "$MAIN_CHECK_RUN_PREFIX" "${line#"$E2E_GITHUB_LINKED_MARK"}" ;;
+            "$E2E_GITHUB_TESTS_STARTED_MARK") printf '%s\n' "$MAIN_CHECK_TESTS_STARTED_LINE" ;;
         esac
     done
 }

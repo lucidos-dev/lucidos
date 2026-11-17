@@ -3,8 +3,8 @@
  *
  * Every window of a workspace on this device shares one device id, so a
  * device-scoped engine event reaches all of them. The windows tell each other
- * what they show over a `BroadcastChannel`, and each one computes the same
- * winner for an event. So exactly one window acts.
+ * what they show over a `BroadcastChannel`. Cached elections serve captures
+ * and renderer targeting; interactive delivery uses a shared journal and lock.
  *
  * A window announces itself on boot and on every change, answers a newcomer's
  * hello, and says goodbye on `pagehide`. Each page load is an INSTANCE, which
@@ -15,6 +15,7 @@
  * `sessionStorage`. The younger instance then takes a new id.
  */
 
+import { startNativeWindowShownTracking } from '../utils/nativeWindow';
 import { WORKSPACE_ID } from '../utils/basePath';
 import { generateUuid } from '../utils/uuid';
 import { reassignWindowId, touchWindowSeen, windowId } from '../utils/windowStorage';
@@ -22,6 +23,8 @@ import { reassignWindowId, touchWindowSeen, windowId } from '../utils/windowStor
 /** What a window shows, as its peers see it. */
 export interface PeerState {
   id: string;
+  /** Native hide/show intent. Absent for browsers and older peer protocols. */
+  nativeShown?: boolean;
   focusedThreadId: string | null;
   appId: string | null;
   /** The OAuth authorization this window opened and is still waiting on, with
@@ -81,6 +84,24 @@ let readSelf: () => Omit<PeerState, 'id' | 'activeAt'> = () => ({
   focusedThreadId: null, appId: null, authorizing: null,
 });
 let activeAt = 0;
+let nativeShown: boolean | undefined;
+type NativeShownState =
+  | { status: 'initializing'; ready: Promise<void> }
+  | { status: 'supported' | 'unsupported' }
+  | { status: 'failed'; error: unknown };
+let nativeShownState: NativeShownState = { status: 'unsupported' };
+let initializeNativeShown: () => Promise<void> = async () => {};
+
+/** Initial native visibility must settle before delivery opens a transaction. */
+export function waitForNativeWindowShown(): Promise<void> { return initializeNativeShown(); }
+
+/** Unknown visibility is eligible only when the shell lacks the protocol. */
+export function assertNativeWindowShownReady(): void {
+  if (nativeShownState.status === 'failed') throw nativeShownState.error;
+  if (nativeShownState.status === 'initializing') {
+    throw new Error('Native window visibility is still initializing. Retry the interactive request.');
+  }
+}
 let channel: BroadcastChannel | null = null;
 let lifetime: AbortController | null = null;
 let announced: PeerState | null = null;
@@ -89,7 +110,20 @@ let selfChangedAt = 0;
 let holdsLifeLock = false;
 
 function selfState(): PeerState {
-  return { id: windowId(), activeAt, ...readSelf() };
+  return { id: windowId(), activeAt, ...readSelf(), nativeShown };
+}
+
+const selfListeners = new Set<() => void>();
+
+/** Local state for transactional interactive routing, independent of delayed
+ * peer announcements. Eligibility uses the current state before view grace. */
+export function currentWindowView() {
+  return { state: selfState(), previous: selfPrevious, changedAt: selfChangedAt };
+}
+
+export function observeWindowState(listener: () => void): () => void {
+  selfListeners.add(listener);
+  return () => { selfListeners.delete(listener); };
 }
 
 /** Whether two states show the same thing. `activeAt` is not what a window
@@ -134,7 +168,13 @@ export function isChosenWindow(qualifies: (window: PeerState) => boolean): boole
 export function isChosenByPreference(
   ...preferences: Array<(window: PeerState) => boolean>
 ): boolean {
-  const windows = knownWindows();
+  return chosenByPreference(knownWindows(), preferences);
+}
+
+function chosenByPreference(
+  windows: PeerState[],
+  preferences: Array<(window: PeerState) => boolean>,
+): boolean {
   for (const qualifies of preferences) {
     const chosen = chooseWindow(windows, qualifiesOrJustDid(qualifies));
     if (chosen !== null) return chosen === windowId();
@@ -142,10 +182,20 @@ export function isChosenByPreference(
   return false;
 }
 
+/** Interactive requests prefer shown native peers before content preferences.
+ * Filter current eligibility before considering previous-view grace. */
+export function isChosenForInteraction(
+  ...preferences: Array<(window: PeerState) => boolean>
+): boolean {
+  const windows = knownWindows();
+  const shown = windows.filter((window) => window.nativeShown !== false);
+  return chosenByPreference(shown.length ? shown : windows, preferences);
+}
+
 /** Does THIS window act on what `threadId` asked for? The window showing that
  *  thread wins, else the window the user touched last. */
 export function isChosenForThread(threadId: string): boolean {
-  return isChosenByPreference((window) => window.focusedThreadId === threadId, () => true);
+  return isChosenForInteraction((window) => window.focusedThreadId === threadId, () => true);
 }
 
 /** Call `listener` once a window with `id` is heard from, now or later.
@@ -178,6 +228,7 @@ export function announceWindow(): void {
     selfChangedAt = Date.now();
   }
   announced = state;
+  for (const listener of selfListeners) listener();
   post('state');
 }
 
@@ -262,6 +313,7 @@ function markActive(event: Event): void {
  *  Returns the teardown. */
 export function installWindowPeers(read: typeof readSelf): () => void {
   readSelf = read;
+  nativeShown = undefined;
   activeAt = document.hasFocus() ? Date.now() : 0;
   if (typeof BroadcastChannel === 'undefined') return () => {};
   lifetime = new AbortController();
@@ -275,7 +327,41 @@ export function installWindowPeers(read: typeof readSelf): () => void {
   window.addEventListener('pagehide', sayBye);
   announced = selfState();
   post('hello');
+  let stopped = false;
+  let stopShown = () => {};
+  const shownLifetime = new AbortController();
+  initializeNativeShown = () => {
+    if (stopped) return Promise.reject(new Error('Native window visibility tracking stopped.'));
+    if (nativeShownState.status === 'initializing') return nativeShownState.ready;
+    if (nativeShownState.status !== 'failed') return Promise.resolve();
+    const ready = startNativeWindowShownTracking((shown) => {
+      if (stopped) return;
+      nativeShown = shown;
+      announceWindow();
+    }, shownLifetime.signal).then((tracking) => {
+      if (stopped) { tracking.stop(); return; }
+      stopShown = tracking.stop;
+      nativeShownState = { status: tracking.status };
+      if (tracking.status === 'unsupported') {
+        nativeShown = undefined;
+        announceWindow();
+      }
+    }).catch((cause) => {
+      const error = new Error(`Could not initialize native window visibility. Retry the interactive request. ${String(cause)}`);
+      if (!stopped) nativeShownState = { status: 'failed', error };
+      throw error;
+    });
+    nativeShownState = { status: 'initializing', ready };
+    return ready;
+  };
+  nativeShownState = { status: 'failed', error: new Error('Native window visibility not initialized.') };
+  // Delivery awaits and surfaces failures. Keep the eager bootstrap handled
+  // even when no interactive request arrives; the next attempt retries it.
+  void initializeNativeShown().catch(() => {});
   return () => {
+    stopped = true;
+    shownLifetime.abort();
+    stopShown();
     sayBye();
     window.removeEventListener('pointerdown', markActive, true);
     window.removeEventListener('keydown', markActive, true);
@@ -288,6 +374,7 @@ export function installWindowPeers(read: typeof readSelf): () => void {
     peers.clear();
     watchedInstances.clear();
     seenListeners.clear();
+    selfListeners.clear();
     announced = null;
     selfPrevious = null;
     holdsLifeLock = false;

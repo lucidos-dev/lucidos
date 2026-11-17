@@ -1,3 +1,4 @@
+import { appsList } from '../../store/store';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
 
 /** Minimal shape needed to name a thread's context. `ThreadMeta` is structurally
@@ -11,15 +12,17 @@ export interface ThreadContextFields {
 }
 
 /** The specific context NAME shown as a chip in the thread row, alongside the
- *  channel/type tag: the repo name (coding-agent), the app id (app thread), or
+ *  channel/type tag: the repo name (coding-agent), the current app name (app thread), or
  *  the trigger name. Undefined for plain chat — the "Chat" type tag already says
  *  everything, and there's no name to add. */
 export function threadContextName(f: ThreadContextFields): string | undefined {
   if (f.channel === 'trigger') return f.triggerName || undefined;
   if (f.channel === 'claude_code') {
-    return f.codingAgentKind === 'app'
-      ? appIdFromFolder(f.codingAgentFolder) ?? undefined
-      : f.repoName || undefined;
+    if (f.codingAgentKind !== 'app') return f.repoName || undefined;
+    const id = appIdFromFolder(f.codingAgentFolder);
+    const apps = appsList.value;
+    return (apps.status === 'loaded' ? apps.data.find(app => app.id === id)?.name : undefined)
+      || id || undefined;
   }
   return undefined;
 }

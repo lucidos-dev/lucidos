@@ -1,5 +1,6 @@
 import { test, expect, Page, Locator } from './fixtures';
 import type { BrowserContext } from '@playwright/test';
+import { stampPageRequests } from './harnessStamp';
 import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, ensureMobileView, ensureOnThreadPane, gotoWithRetry, touchPress, waitForDashboardReady, waitForVisibleInput, waitForWorkspaceReady } from './helpers';
 import { ensureHomeThread, psql, seedChatThread } from './db-helpers';
@@ -292,6 +293,7 @@ test.describe('The dashboard panel on a phone', () => {
         // Playwright fills every other option from the project config.
         for (let attempt = 0; attempt < HOLD_ATTEMPTS && !held; attempt++) {
           const context = await browser.newContext({ serviceWorkers: 'block' });
+          await stampPageRequests(context);
           contexts.push(context);
           // Each attempt has its own flag: a late fetch in an abandoned context
           // must not mark the current page as held.

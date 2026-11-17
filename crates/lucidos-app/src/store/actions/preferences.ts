@@ -1,10 +1,12 @@
+import { PREF_AGENTS_UNSANDBOXED, PREF_AGENT_BRAND_COLOURS, PREF_AUTOCORRECT, PREF_CACHE_CARDS, PREF_CACHE_KEEP_ALIVE_MODE, PREF_CAPTURE_CONTEXT, PREF_CHATGPT_PLAN_WELCOME_SHOWN, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORTS, PREF_CODING_AGENT_AUTO_ANSWER, PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE, PREF_CODING_AGENT_CONTEXT_CEILING, PREF_CODING_AGENT_DEFAULT, PREF_COMMAND_GUARD, PREF_COMMAND_GUARD_JUDGE, PREF_COMPOSER_ENTER_KEY, PREF_EXTERNAL_LINK_TARGET, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL, PREF_MAIN_CHECK_SETTING, PREF_MAX_TOOL_CALLS, PREF_MEMORY_MODULE, PREF_MOBILE_DYNAMIC_BARS, PREF_MODEL_CHANGE_SUMMARY, PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_CONVERSATION_SUMMARY, PREF_MODEL_EXPECTED_WAKE_DECISION, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_PERMISSION_ANSWER, PREF_MODEL_QUERY_CLASSIFICATION, PREF_MODEL_READ_DECISION, PREF_MODEL_SUMMARY_COMPACTION, PREF_MODEL_TITLE, PREF_MODEL_VOICE_TALKER, PREF_MODEL_VOICE_TRANSCRIBER, PREF_MODEL_WAKE_DECISION, PREF_MOTION, PREF_NOTIFICATIONS_FILTER, PREF_NOTIFICATION_TOASTS, PREF_OPENCODE_FREE_ENABLED, PREF_REASONING_CHANGE_SUMMARY, PREF_REASONING_COMMAND_JUDGE, PREF_REASONING_CONVERSATION_SUMMARY, PREF_REASONING_EXPECTED_WAKE_DECISION, PREF_REASONING_IMAGE_DESCRIPTION, PREF_REASONING_MEMORY, PREF_REASONING_PERMISSION_ANSWER, PREF_REASONING_QUERY_CLASSIFICATION, PREF_REASONING_READ_DECISION, PREF_REASONING_SUMMARY_COMPACTION, PREF_REASONING_TITLE, PREF_REASONING_WAKE_DECISION, PREF_RESPONSE_STYLE, PREF_TECHNICAL_LITERACY, PREF_THEME_EFFECTS, PREF_THEME_MODE, PREF_TRIGGER_MODEL, PREF_VERTEX_REGION, PREF_VOICE_ENABLED, PREF_VOICE_RESIDENT_SECTIONS, PREF_VOICE_TALKER_VOICE } from '@lucidos/preference-catalog';
+import { applyCodingAgentDefault } from '../composeSelections';
 import { computed, effect, signal, untracked } from '@preact/signals';
 import { clampDashboardRailWidth } from '../dashboardRail';
-import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, welcomeDismissed, type NotificationsFilter } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, NOTIFICATIONS_FILTER_STORAGE_KEY, currentModel, selectedCodingAgent, clampThreadDrawerWidth, llmConfigured, welcomeDismissed, lastSuccessfulBackup, type NotificationsFilter } from '../store';
 import type { CodingAgent } from '../../api/types';
 import type { ThreadState } from '../thread-events';
-import { failedIfFresh } from '../types';
-import { getPreferences, setPreference, isTransientFetchError, retryTransient, getTheme, ApiError } from '../../api/client';
+import { failedIfFresh, type Loadable } from '../types';
+import { getPreferences, setPreference, isTransientFetchError, retryTransient, getTheme, ApiError, type LastSuccessfulBackupResponse, type MainCheckSetting } from '../../api/client';
 import { resolvedTokenHex } from '../../utils/cssColor';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
@@ -40,7 +42,7 @@ import { motionPreference } from '../../utils/motion';
 import { themeEffectsPreference } from '../../utils/themeEffects';
 import { AUTOCORRECT_STORAGE_KEY } from '@lucidos/text-entry';
 import {
-  parseFlag, PREFERENCE_CATALOG, PREF_FONT_FAMILY, PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
+  parseFlag, type PREFERENCE_CATALOG, PREF_FONT_FAMILY, PREF_PROVIDER_ENABLED_CLOUDFLARE_WORKERS_AI,
   PREF_PROVIDER_ENABLED_OPENAI, PREF_PROVIDER_ENABLED_OPENROUTER,
   PREF_PROVIDER_ENABLED_SYSTEM_ONE_CUSTOM, PREF_PROVIDER_ENABLED_TYPESAFE, PREF_SYSTEM_ONE_CUSTOM_MODEL,
   PREF_SYSTEM_ONE_CUSTOM_URL, PREF_SYSTEM_ONE_OPENROUTER_MODEL, PREF_THEME, PREF_TITLE_STYLE, PREF_UI_SCALE,
@@ -78,6 +80,70 @@ export type ImageModel = PreferenceValues<'image_model'>;
 // preference signal, writing the properties onto <html>, and re-asserting the
 // style-remote overrides afterwards.
 
+// Import only descriptors read by these resolvers. Indexing the complete
+// generated catalog retains unrelated preference metadata on every cold open.
+const READ_PREFERENCES = {
+  'agent-brand-colours': PREF_AGENT_BRAND_COLOURS,
+  'agents_unsandboxed': PREF_AGENTS_UNSANDBOXED,
+  'autocorrect': PREF_AUTOCORRECT,
+  'cache_cards': PREF_CACHE_CARDS,
+  'cache_keep_alive_mode': PREF_CACHE_KEEP_ALIVE_MODE,
+  'capture_context': PREF_CAPTURE_CONTEXT,
+  'chat_model': PREF_CHAT_MODEL,
+  'chat_reasoning_efforts': PREF_CHAT_REASONING_EFFORTS,
+  'chatgpt_plan_welcome_shown': PREF_CHATGPT_PLAN_WELCOME_SHOWN,
+  'coding_agent_auto_answer': PREF_CODING_AGENT_AUTO_ANSWER,
+  'coding_agent_claude_permission_mode': PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE,
+  'coding_agent_context_ceiling': PREF_CODING_AGENT_CONTEXT_CEILING,
+  'coding_agent_default': PREF_CODING_AGENT_DEFAULT,
+  'command_guard': PREF_COMMAND_GUARD,
+  'command_guard_judge': PREF_COMMAND_GUARD_JUDGE,
+  'composer_enter_key': PREF_COMPOSER_ENTER_KEY,
+  'external_link_target': PREF_EXTERNAL_LINK_TARGET,
+  'image_model': PREF_IMAGE_MODEL,
+  'main_check_setting': PREF_MAIN_CHECK_SETTING,
+  'memory_module': PREF_MEMORY_MODULE,
+  'mobile_dynamic_bars': PREF_MOBILE_DYNAMIC_BARS,
+  'model_change_summary': PREF_MODEL_CHANGE_SUMMARY,
+  'model_command_judge': PREF_MODEL_COMMAND_JUDGE,
+  'model_conversation_summary': PREF_MODEL_CONVERSATION_SUMMARY,
+  'model_expected_wake_decision': PREF_MODEL_EXPECTED_WAKE_DECISION,
+  'model_image_description': PREF_MODEL_IMAGE_DESCRIPTION,
+  'model_memory': PREF_MODEL_MEMORY,
+  'model_permission_answer': PREF_MODEL_PERMISSION_ANSWER,
+  'model_query_classification': PREF_MODEL_QUERY_CLASSIFICATION,
+  'model_read_decision': PREF_MODEL_READ_DECISION,
+  'model_summary_compaction': PREF_MODEL_SUMMARY_COMPACTION,
+  'model_title': PREF_MODEL_TITLE,
+  'model_voice_talker': PREF_MODEL_VOICE_TALKER,
+  'model_voice_transcriber': PREF_MODEL_VOICE_TRANSCRIBER,
+  'model_wake_decision': PREF_MODEL_WAKE_DECISION,
+  'motion': PREF_MOTION,
+  'notification_toasts': PREF_NOTIFICATION_TOASTS,
+  'notifications_filter': PREF_NOTIFICATIONS_FILTER,
+  'opencode_free_enabled': PREF_OPENCODE_FREE_ENABLED,
+  'reasoning_change_summary': PREF_REASONING_CHANGE_SUMMARY,
+  'reasoning_command_judge': PREF_REASONING_COMMAND_JUDGE,
+  'reasoning_conversation_summary': PREF_REASONING_CONVERSATION_SUMMARY,
+  'reasoning_expected_wake_decision': PREF_REASONING_EXPECTED_WAKE_DECISION,
+  'reasoning_image_description': PREF_REASONING_IMAGE_DESCRIPTION,
+  'reasoning_memory': PREF_REASONING_MEMORY,
+  'reasoning_permission_answer': PREF_REASONING_PERMISSION_ANSWER,
+  'reasoning_query_classification': PREF_REASONING_QUERY_CLASSIFICATION,
+  'reasoning_read_decision': PREF_REASONING_READ_DECISION,
+  'reasoning_summary_compaction': PREF_REASONING_SUMMARY_COMPACTION,
+  'reasoning_title': PREF_REASONING_TITLE,
+  'reasoning_wake_decision': PREF_REASONING_WAKE_DECISION,
+  'response_style': PREF_RESPONSE_STYLE,
+  'theme-effects': PREF_THEME_EFFECTS,
+  'theme-mode': PREF_THEME_MODE,
+  'trigger_model': PREF_TRIGGER_MODEL,
+  'vertex_region': PREF_VERTEX_REGION,
+  'voice_enabled': PREF_VOICE_ENABLED,
+  'voice_talker_voice': PREF_VOICE_TALKER_VOICE,
+} as const;
+type ReadPreferenceKey = keyof typeof READ_PREFERENCES;
+
 let systemThemeModeQuery: MediaQueryList | null = null;
 // Seeded so loadPreferences can skip a no-op applyThemeMode when unchanged. The
 // matching module-init install of the OS listener sits beside
@@ -110,7 +176,7 @@ type ResolvableKey = {
     type: 'enum' | 'flag' | 'text';
     fallback: string;
   } ? K : never;
-}[PreferenceKey];
+}[PreferenceKey] & ReadPreferenceKey;
 
 /** What a key resolves to: one of its enum values, a flag's two, or text. */
 type ResolvedPreference<K extends ResolvableKey> =
@@ -126,9 +192,9 @@ function flagReading(raw: string): 'true' | 'false' | null {
 }
 
 /** `raw` as a value of `key`, or null when the catalog does not accept it. */
-function acceptedValue(key: PreferenceKey, raw: string | null | undefined): string | null {
+function acceptedValue(key: ReadPreferenceKey, raw: string | null | undefined): string | null {
   if (!raw) return null;
-  const entry: CatalogEntry = PREFERENCE_CATALOG[key];
+  const entry: CatalogEntry = READ_PREFERENCES[key];
   if (entry.values) return entry.values.includes(raw) ? raw : null;
   if (entry.type === 'flag') return flagReading(raw);
   const text = raw.trim();
@@ -147,7 +213,7 @@ function currentPreference<K extends ResolvableKey>(key: K, localStorageKey?: st
     const cached = acceptedValue(key, localStorage.getItem(localStorageKey));
     if (cached !== null) return cached as ResolvedPreference<K>;
   }
-  const entry: CatalogEntry = PREFERENCE_CATALOG[key];
+  const entry: CatalogEntry = READ_PREFERENCES[key];
   if (entry.inherits) return currentPreference(entry.inherits as ResolvableKey) as ResolvedPreference<K>;
   return entry.fallback as ResolvedPreference<K>;
 }
@@ -1079,6 +1145,19 @@ export function setContextCeiling(value: string): Promise<void> {
   return savePreference('coding_agent_context_ceiling', value);
 }
 
+// --- Main check ---
+
+/** The stored *main-check setting*, or null while unset: the engine then
+ *  resolves the default for this checkout (`MainCheck.setting`). */
+export function currentMainCheckSetting(): MainCheckSetting | null {
+  if (preferences.value.status !== 'loaded') return null;
+  return acceptedValue('main_check_setting', preferences.value.data.main_check_setting) as MainCheckSetting | null;
+}
+
+export function setMainCheckSetting(value: MainCheckSetting): Promise<void> {
+  return savePreference('main_check_setting', value);
+}
+
 // --- Autocorrect ---
 
 /** Whether this device's prose fields autocorrect. A stored value wins on any
@@ -1096,6 +1175,31 @@ export function setAutocorrect(enabled: boolean): Promise<void> {
     setProseAutocorrect(enabled);
   }, true);
 }
+
+// --- Agent marks ---
+
+const AGENT_BRAND_COLOURS_STORAGE_KEY = 'lucidos-agent-brand-colours';
+
+export function currentAgentBrandColours(): boolean {
+  return currentPreference('agent-brand-colours', AGENT_BRAND_COLOURS_STORAGE_KEY) === 'true';
+}
+
+export function setAgentBrandColours(enabled: boolean): Promise<void> {
+  return savePreference('agent-brand-colours', String(enabled), () => {
+    localStorage.setItem(AGENT_BRAND_COLOURS_STORAGE_KEY, String(enabled));
+  }, true);
+}
+
+// Preference updates, including SSE refreshes, repaint every shared agent mark.
+effect(() => {
+  if (preferences.value.status === 'loaded') {
+    cacheServedValue('agent-brand-colours', AGENT_BRAND_COLOURS_STORAGE_KEY);
+  }
+  const enabled = currentAgentBrandColours();
+  if (typeof document !== 'undefined') {
+    document.documentElement.setAttribute('data-agent-brand-colours', enabled ? 'on' : 'off');
+  }
+});
 
 // --- Motion ---
 
@@ -1218,12 +1322,12 @@ export function setResponseStyle(id: string): Promise<void> {
 }
 
 /** The value that clears the level, which is also its default. */
-export const TECHNICAL_LITERACY_NOT_SET = PREFERENCE_CATALOG.technical_literacy.fallback;
+export const TECHNICAL_LITERACY_NOT_SET = PREF_TECHNICAL_LITERACY.fallback;
 
 /** The response style's second part: every catalog value but the one that
  *  clears it. */
 export type TechnicalLiteracy = Exclude<PreferenceValues<'technical_literacy'>, typeof TECHNICAL_LITERACY_NOT_SET>;
-export const TECHNICAL_LITERACY_LEVELS: readonly TechnicalLiteracy[] = PREFERENCE_CATALOG.technical_literacy.values
+export const TECHNICAL_LITERACY_LEVELS: readonly TechnicalLiteracy[] = PREF_TECHNICAL_LITERACY.values
   .filter((level): level is TechnicalLiteracy => level !== TECHNICAL_LITERACY_NOT_SET);
 
 /** A retired level that reads as `non-technical`, as it does in the engine. */
@@ -1245,16 +1349,16 @@ export function setTechnicalLiteracy(level: TechnicalLiteracy | null): Promise<v
 
 // --- Max tool calls (the per-turn tool-call cap) ---
 
-export const MAX_TOOL_CALLS_DEFAULT = Number(PREFERENCE_CATALOG.max_tool_calls.fallback);
+export const MAX_TOOL_CALLS_DEFAULT = Number(PREF_MAX_TOOL_CALLS.fallback);
 
 /** The floor rules out only the value that is broken rather than small. The
  *  loop checks `iterations > cap` after incrementing, so a cap of 0 would end
  *  the turn before the first LLM call. */
-export const MAX_TOOL_CALLS_MIN = PREFERENCE_CATALOG.max_tool_calls.min;
+export const MAX_TOOL_CALLS_MIN = PREF_MAX_TOOL_CALLS.min;
 
 /** The largest cap the engine accepts. It sits far below
  *  `Number.MAX_SAFE_INTEGER`, so every cap up to it survives `Number` exactly. */
-export const MAX_TOOL_CALLS_MAX = PREFERENCE_CATALOG.max_tool_calls.max;
+export const MAX_TOOL_CALLS_MAX = PREF_MAX_TOOL_CALLS.max;
 
 /** Roughly how long a turn can run at a given cap, in seconds per tool call.
  *  The LLM round-trip dominates a step: ~15s for a large-context reasoning
@@ -1378,6 +1482,7 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     // A newer call was issued while this one was in flight: its outcome
     // wins, so applying this stale one would overwrite fresher data.
     if (mySeq !== preferencesLoadSeq) return newestPreferencesLoad;
+    const refreshing = preferences.value.status === 'loaded';
     preferences.value = {
       status: 'loaded',
       data: {
@@ -1402,7 +1507,9 @@ async function loadPreferencesAs(mySeq: number): Promise<void> {
     motionPreference.value = currentMotion();
     cacheServedValue('theme-effects', THEME_EFFECTS_STORAGE_KEY);
     themeEffectsPreference.value = currentThemeEffects();
-    selectedCodingAgent.value = currentCodingAgentDefault();
+    // The first read establishes the seed; the boot fallback was never a pick.
+    if (refreshing) applyCodingAgentDefault(currentCodingAgentDefault());
+    else selectedCodingAgent.value = currentCodingAgentDefault();
     refreshActiveThemeIfChanged();
     // LAST, deliberately: the three applies above write properties the remote
     // is allowed to override, so the overrides go on top of them.
@@ -1430,7 +1537,7 @@ export function setVertexRegion(region: string): Promise<void> {
 // --- Local OpenAI-compatible provider base URL ---
 
 // Ollama's OpenAI-compatible endpoint.
-export const DEFAULT_LOCAL_BASE_URL = PREFERENCE_CATALOG.local_base_url.fallback;
+export const DEFAULT_LOCAL_BASE_URL = PREF_LOCAL_BASE_URL.fallback;
 
 export function currentLocalBaseUrl(): string {
   if (preferences.value.status !== 'loaded') return '';
@@ -1668,7 +1775,8 @@ export type BackgroundModelKey =
   | 'model_command_judge'
   | 'model_read_decision'
   | 'model_wake_decision'
-  | 'model_expected_wake_decision';
+  | 'model_expected_wake_decision'
+  | 'model_permission_answer';
 
 /** The reasoning half of each background *model selection*. */
 export type BackgroundReasoningKey =
@@ -1682,7 +1790,8 @@ export type BackgroundReasoningKey =
   | 'reasoning_command_judge'
   | 'reasoning_read_decision'
   | 'reasoning_wake_decision'
-  | 'reasoning_expected_wake_decision';
+  | 'reasoning_expected_wake_decision'
+  | 'reasoning_permission_answer';
 
 /** A background row's stored *model selection*, each half `null` while unset.
  *  The engine resolves an unset half, inheritance and the configured providers
@@ -1748,15 +1857,15 @@ export function setMemoryModule(module: MemoryModule): Promise<void> {
 /** The account default coding agent — the SEED for a fresh compose's backend
  *  chip (via `selectedCodingAgent`, set at `loadPreferences`). Workspace-scoped
  *  (not device-scoped).
- *  Compose picks are per-draft (see `composeSelections`) and deliberately do NOT
- *  write this back (draft-only), so there is no `setCodingAgentDefault`. */
+ *  Explicit composer chip picks remember their choice through
+ *  `selectComposeCodingAgent`, preserving other drafts first. */
 export function currentCodingAgentDefault(): CodingAgent {
   return currentPreference('coding_agent_default');
 }
 
 /** The Claude Code permission modes Lucidos offers. CC has six; the others
  *  are withheld deliberately (see the engine's `CcPermissionMode`). */
-export const CC_PERMISSION_MODES = PREFERENCE_CATALOG.coding_agent_claude_permission_mode.values;
+export const CC_PERMISSION_MODES = PREF_CODING_AGENT_CLAUDE_PERMISSION_MODE.values;
 export type CcPermissionMode = PreferenceValues<'coding_agent_claude_permission_mode'>;
 
 /** Which of Claude Code's own permission modes coding-agent threads run in.
@@ -1819,35 +1928,23 @@ export function retireWelcomeAfterUse(threads: Iterable<ThreadState>): Promise<v
 
 // --- Backup reminder banner ---
 //
-// The banner asks "have you switched backup on?", and the answer is already in
-// this map: `GET /backup/schedule` decides its `schedule` field as
-// `is_schedule_active(cron) && provider.is_some()` (the engine's
-// `api::backup::schedule_response`), and both are ordinary preference rows that
-// `GET /preferences` returns. So the banner needs no endpoint of its own and no
-// poll, and because `set_backup_schedule` writes through `PreferenceStore::set`
-// (which announces `PreferencesChanged` → `loadPreferences`), enabling backup
-// retracts it live on every connected device.
+// The `setup` state asks "have you set up backup?", and the answer is already in
+// this map: `backup_provider` is an ordinary preference row that
+// `GET /preferences` returns. `set_backup_schedule` writes through
+// `PreferenceStore::set`, which announces `PreferencesChanged` →
+// `loadPreferences`. Picking a destination therefore retracts it live on every
+// connected device.
 //
-// Note the asymmetry on the engine side: that response's `provider` field is
-// reported whether or not the schedule is active, because a destination does
-// not stop existing when the cron is off. Only `schedule` needs both halves,
-// which is the half these predicates mirror.
+// Deliberately NOT the schedule: "Manual only" stores `backup_schedule = off`,
+// yet its backups run from "Back up now", so "backup is off" would be false.
 //
-// Deliberately NOT backup *health*: a schedule that exists but whose runs are
-// failing is the Settings health card's job. Keeping this to "is it on?" is what
-// lets one dismissal mean one thing.
+// The `overdue` state adds the engine's verdict on the last successful backup
+// (`lastSuccessfulBackup`). Each state has its own dismissal, so one dismissal
+// means one thing.
 
-/** Mirror of the engine's `core::backup::is_schedule_active`: a schedule counts
- *  as active when it is neither empty nor the literal "off". */
-export function isBackupScheduleActive(schedule: string | undefined): boolean {
-  return !!schedule && schedule !== 'off';
-}
-
-/** Whether automatic backup is switched on, by the same rule the engine's
- *  `GET /backup/schedule` uses: an active cron AND a provider. Either half
- *  missing means off (a provider picked with no schedule backs nothing up). */
-export function backupIsActive(prefs: Record<string, string>): boolean {
-  return isBackupScheduleActive(prefs['backup_schedule']) && !!prefs['backup_provider'];
+/** Whether the user has set up backup: a destination is chosen. */
+export function backupIsConfigured(prefs: Record<string, string>): boolean {
+  return !!prefs['backup_provider'];
 }
 
 /** How long the FIRST dismissal silences the reminder. */
@@ -1886,19 +1983,62 @@ export function backupReminderNextDismissal(value: string | undefined, now: numb
   return dismissedOnce ? BACKUP_REMINDER_FOREVER : new Date(now).toISOString();
 }
 
-/** Pure core of the banner's visibility, over a loaded preference map. */
+/** Whether the `setup` banner is due, over a loaded preference map. */
 export function backupReminderVisibleIn(prefs: Record<string, string>, now: number): boolean {
-  if (backupIsActive(prefs)) return false;
+  if (backupIsConfigured(prefs)) return false;
   return !backupReminderHiddenByDismissal(prefs['backup_reminder_dismissed'], now);
 }
 
-/** Whether the app-shell backup reminder belongs on screen right now. Fails
- *  CLOSED while preferences are unloaded or failed, so it never flashes during
- *  the startup fetch at a user who already silenced it (same reasoning as
- *  `welcomeSuggestionsDismissed`). */
-export function backupReminderVisible(now: number = Date.now()): boolean {
-  if (preferences.value.status !== 'loaded') return false;
-  return backupReminderVisibleIn(preferences.value.data, now);
+/** How long a dismissal silences the `overdue` banner. Never forever: the
+ *  workspace opted in to backup, and a data-loss warning gets no off switch. */
+export const BACKUP_OVERDUE_SNOOZE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Whether the recorded `overdue` dismissal still hides the banner at `now`.
+ *  An unparseable value reads as NOT dismissed, for the reason
+ *  `backupReminderHiddenByDismissal` gives. */
+export function backupOverdueHiddenByDismissal(value: string | undefined, now: number): boolean {
+  if (!value) return false;
+  const at = Date.parse(value);
+  return !Number.isNaN(at) && now - at < BACKUP_OVERDUE_SNOOZE_MS;
+}
+
+/** The backup banner the app shell shows. `setup` while no destination is
+ *  chosen. `overdue` once one is chosen (`provider`) but the engine says the last
+ *  good backup is too old or absent (`lastBackupAt` null). */
+export type BackupBanner =
+  | { state: 'setup' }
+  | { state: 'overdue'; provider: string; lastBackupAt: string | null };
+
+/** Whether the engine's verdict says overdue at `now`. `overdue_at` carries the
+ *  verdict forward in a tab that stays open past it. */
+function backupOverdueAt(verdict: LastSuccessfulBackupResponse, now: number): boolean {
+  return verdict.overdue || (verdict.overdue_at !== null && now > Date.parse(verdict.overdue_at));
+}
+
+/** Which banner is due. One surface, so the two states never stack, and `setup`
+ *  wins.
+ *
+ *  Fails CLOSED: while the engine's verdict is unloaded or failed there is no
+ *  `overdue`. A failed read never claims the backup is overdue. */
+export function backupBannerIn(
+  prefs: Record<string, string>,
+  lastSuccessful: Loadable<LastSuccessfulBackupResponse>,
+  now: number,
+): BackupBanner | null {
+  if (backupReminderVisibleIn(prefs, now)) return { state: 'setup' };
+  const provider = prefs['backup_provider'];
+  if (!provider) return null;
+  if (lastSuccessful.status !== 'loaded' || !backupOverdueAt(lastSuccessful.data, now)) return null;
+  if (backupOverdueHiddenByDismissal(prefs['backup_overdue_reminder_dismissed'], now)) return null;
+  return { state: 'overdue', provider, lastBackupAt: lastSuccessful.data.at };
+}
+
+/** The banner due at this moment. Fails CLOSED while preferences are unloaded
+ *  or failed. The banner then never flashes at a user who already silenced it
+ *  (like `welcomeSuggestionsDismissed`). */
+export function backupBanner(now: number = Date.now()): BackupBanner | null {
+  if (preferences.value.status !== 'loaded') return null;
+  return backupBannerIn(preferences.value.data, lastSuccessfulBackup.value, now);
 }
 
 /** Record a dismissal: snooze on the first, silence for good on the second.
@@ -1911,6 +2051,13 @@ export function dismissBackupReminder(now: number = Date.now()): Promise<void> {
     now,
   );
   return savePreference('backup_reminder_dismissed', next);
+}
+
+/** Record an `overdue` dismissal: a snooze. A no-op while preferences are
+ *  unloaded, which is unreachable from the UI. */
+export function dismissBackupOverdueReminder(now: number = Date.now()): Promise<void> {
+  if (preferences.value.status !== 'loaded') return Promise.resolve();
+  return savePreference('backup_overdue_reminder_dismissed', new Date(now).toISOString());
 }
 
 // --- Command guard (ADR 0002) ---
@@ -1946,6 +2093,16 @@ export function setCodingAgentAutoAnswer(enabled: boolean): Promise<void> {
   return savePreference('coding_agent_auto_answer', enabled ? 'true' : 'false');
 }
 
+/** The owner's opt-out from the agent sandbox (ADR 0645). On, agent-steered
+ *  processes run unsandboxed and the sandbox banner stands. */
+export function currentAgentsUnsandboxed(): boolean {
+  return currentPreference('agents_unsandboxed') === 'true';
+}
+
+export function setAgentsUnsandboxed(enabled: boolean): Promise<void> {
+  return savePreference('agents_unsandboxed', enabled ? 'true' : 'false');
+}
+
 // --- Voice ---
 
 /**
@@ -1967,7 +2124,7 @@ export function setVoiceEnabled(enabled: boolean): Promise<void> {
  *  NOT a chat-model registry row, so it is a typed id rather than a pick from
  *  `backgroundModelChoices()`: a realtime model cannot serve an ordinary turn
  *  and never appears in that registry. */
-export const DEFAULT_VOICE_TALKER_MODEL = PREFERENCE_CATALOG.model_voice_talker.fallback;
+export const DEFAULT_VOICE_TALKER_MODEL = PREF_MODEL_VOICE_TALKER.fallback;
 
 /**
  * What is STORED, which is empty until somebody sets it.
@@ -1994,7 +2151,7 @@ export function setVoiceTalkerModel(model: string): Promise<void> {
 /** The model that turns the caller's speech into text inside the talker's
  *  socket. The second and last model in the voice loop: nothing translates and
  *  nothing summarises. */
-export const DEFAULT_VOICE_TRANSCRIBER_MODEL = PREFERENCE_CATALOG.model_voice_transcriber.fallback;
+export const DEFAULT_VOICE_TRANSCRIBER_MODEL = PREF_MODEL_VOICE_TRANSCRIBER.fallback;
 
 export function storedVoiceTranscriberModel(): string {
   if (preferences.value.status !== 'loaded') return '';
@@ -2011,7 +2168,7 @@ export function setVoiceTranscriberModel(model: string): Promise<void> {
 
 /** The voice a call is spoken in, as the provider's own name for one. Not a
  *  model, and not the language. */
-export const DEFAULT_VOICE_TALKER_VOICE = PREFERENCE_CATALOG.voice_talker_voice.fallback;
+export const DEFAULT_VOICE_TALKER_VOICE = PREF_VOICE_TALKER_VOICE.fallback;
 
 export function storedVoiceTalkerVoice(): string {
   if (preferences.value.status !== 'loaded') return '';
@@ -2040,7 +2197,7 @@ export { VOICE_RESIDENT_SECTIONS };
 
 /** The ids a call opens with while nothing is stored. */
 export const DEFAULT_VOICE_RESIDENT_SECTIONS: readonly string[] =
-  PREFERENCE_CATALOG.voice_resident_sections.fallback.split(',');
+  PREF_VOICE_RESIDENT_SECTIONS.fallback.split(',');
 
 /** Write the whole list. Only {@link setVoiceSectionEnabled} calls it: the one
  *  place that knows what turning a single toggle does to the rest. */

@@ -451,7 +451,7 @@ pub(crate) fn build_claude_request(
     // this layer doesn't reach `up` into `engine::*`.
     let stubs = crate::llm::validate::validate_tool_use_pairing(&mut messages);
     if stubs > 0 {
-        crate::log!(
+        crate::log_legacy!(
             "[{}] WARNING: pre-flight injected {} stub tool_result block(s) before Claude API call (model={})",
             provider_tag,
             stubs,
@@ -465,7 +465,7 @@ pub(crate) fn build_claude_request(
     // way, including the one asking what broke. Reaching here means an
     // upstream layer built a name it should not have.
     for name in crate::llm::validate::drop_unsafe_tool_names(&mut tools) {
-        crate::log!(
+        crate::log_legacy!(
             "[{}] WARNING: dropped tool {:?} before Claude API call: name is not \
              ^[a-zA-Z0-9_-]{{1,128}}$ (model={})",
             provider_tag,
@@ -641,9 +641,8 @@ pub(crate) async fn parse_claude_stream(
                     })
                     .sum();
                 let stopped_block =
-                    process_sse_data(data_str, &mut blocks, &mut turn_meta, provider_tag).map_err(
-                        |e| crate::llm::stream_failure(e.to_string(), rendered_any, provider_tag),
-                    )?;
+                    process_sse_data(data_str, &mut blocks, &mut turn_meta, provider_tag)
+                        .map_err(|e| crate::llm::stream_failure(e, rendered_any, provider_tag))?;
                 let finished_note = stopped_block
                     .filter(|&index| settle_progress_note(&mut blocks, index, display));
                 if let Some(cb) = on_token {
@@ -1006,7 +1005,7 @@ fn process_sse_data(
                 },
                 other => {
                     meta.unknown_sse_dropped = meta.unknown_sse_dropped.saturating_add(1);
-                    crate::log!(
+                    crate::log_legacy!(
                         "[{}] WARNING: unknown content_block_start type '{}' at index {}; content lost (parser needs update)",
                         provider_tag,
                         other,
@@ -1059,7 +1058,7 @@ fn process_sse_data(
                             AccumulatedBlock::Dropped => "dropped",
                         };
                         meta.unknown_sse_dropped = meta.unknown_sse_dropped.saturating_add(1);
-                        crate::log!(
+                        crate::log_legacy!(
                             "[{}] WARNING: unknown content_block_delta type '{}' for {} block at index {}; content lost (parser needs update)",
                             provider_tag,
                             other,
@@ -1092,11 +1091,9 @@ fn process_sse_data(
             }
         }
         "error" => {
-            let error_type = data["error"]["type"].as_str().unwrap_or("unknown");
-            let error_msg = data["error"]["message"]
-                .as_str()
-                .unwrap_or("Unknown streaming error");
-            return Err(format!("Claude streaming error [{}]: {}", error_type, error_msg).into());
+            return Err(
+                crate::llm::ProviderError::from_stream_error(provider_tag, &data["error"]).into(),
+            );
         }
         // message_stop, ping: nothing to record.
         _ => {}
@@ -3489,6 +3486,33 @@ mod tests {
             crate::llm::is_retryable_error(&msg),
             "nothing reached the user, so the overload must retry, got: {msg}"
         );
+    }
+
+    /// The turn that failed on its first attempt: Anthropic's `api_error` frame
+    /// with nothing rendered. It must reach the retry path, and its message
+    /// must carry the raw code and what the code means.
+    #[tokio::test]
+    async fn an_api_error_frame_with_nothing_rendered_retries_and_explains_itself() {
+        const BODY: &str = concat!(
+            r#"data: {"type":"error","error":{"type":"api_error","message":"upstream error"}}"#,
+            "\n\n"
+        );
+        let err = parse_claude_stream(
+            sse_response(BODY),
+            &None,
+            ThinkingDisplay::Hidden,
+            "Anthropic",
+        )
+        .await
+        .expect_err("an error frame fails the parse");
+
+        assert!(
+            crate::llm::error_is_retryable(&*err),
+            "an api_error is Anthropic's internal error and must retry, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("[api_error]: upstream error"), "{msg}");
+        assert!(msg.contains("internal error"), "{msg}");
     }
 
     /// A connection that drops after text has streamed is the same case.

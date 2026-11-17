@@ -15,7 +15,7 @@ import {
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
 import { homeThreadId } from '../../store/actions/homeThread';
 import { anchorSpacer, setAnchorSpacer, splitAnchorCorrection } from './anchorCorrection';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
+import { awayFromBottom, showScrollToBottom, notAtTop, scrollToBottom, scrollToTop, setActiveScrollElement, getActiveScrollElement, makeScrollObservers, honourAnchoredMutation, isOtherNavigationScroll, markAnchorScroll, readerGestureSince } from './scrollState';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { ChatExchange } from './ChatExchange';
 import type { ProposedChangeSeed } from './ChatExchange';
@@ -731,7 +731,7 @@ export function CreateThreadView() {
   const threadId = focusedThreadId.value || '';
   const loaded = threadsLoaded.value;
   const areaRef = useRef<HTMLDivElement>(null);
-  const isUp = awayFromBottom.value;
+  const isUp = showScrollToBottom.value;
   const isNotAtTop = notAtTop.value;
 
   // Subscribe to the prompt's FLIP move (ThreadPane): the welcome's entrance is

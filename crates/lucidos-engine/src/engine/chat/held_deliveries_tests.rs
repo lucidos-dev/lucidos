@@ -42,6 +42,8 @@ async fn ask(bus: &EventBus, thread_id: Uuid, tool_use_id: &str) {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
     )
     .await;
@@ -241,6 +243,7 @@ async fn a_delivery_is_not_held_without_an_active_question() {
         &bus,
         thread_id,
         ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: QUESTION.into(),
             quiet: false,
             answer: AnswerKind::FreeText {
@@ -299,6 +302,7 @@ async fn the_resume_collects_every_delivery_held_since_the_question() {
         &bus,
         thread_id,
         ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: QUESTION.into(),
             quiet: false,
             answer: AnswerKind::FreeText {

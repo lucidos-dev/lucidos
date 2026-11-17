@@ -176,7 +176,7 @@ impl BuiltSdkFile {
     /// The answer when the file is not built. A boot script has no usable
     /// stand-in, so this is an error the engine log names, never a stub.
     pub(super) fn missing(&self) -> Response {
-        crate::log!(
+        crate::log_legacy!(
             "[SDK] {} is not built, so it cannot be served. Run: ./scripts/codegen.sh",
             self.name
         );
@@ -201,7 +201,7 @@ fn read_sdk_dist(name: &str) -> Option<String> {
             // LUCIDOS_SDK_DIR is set (packaged) but the file is missing or
             // unreadable: a real staging defect. Log it SERVER-side so it is
             // never invisible, then try the checkout layouts below.
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[SDK] LUCIDOS_SDK_DIR is set but {} is unreadable: {e}",
                 path.display()
             ),
@@ -290,7 +290,7 @@ pub(super) async fn ui_navigate(
             .into_response();
     }
     let payload = payload;
-    log!(
+    log_legacy!(
         @sdk,
         "ui.navigate target={:?} app_id={:?} id={:?} (app-iframe, nil thread)",
         payload.get("target").and_then(|v| v.as_str()),
@@ -311,7 +311,7 @@ pub(super) async fn ui_navigate(
         })
         .await
     {
-        log!(@sdk, "Failed to emit NavigationRequested: {}", e);
+        log_legacy!(@sdk, "Failed to emit NavigationRequested: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": format!("Failed to emit navigation event: {}", e) })),
@@ -344,30 +344,6 @@ mod tests {
             file.missing().status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
-    }
-
-    /// The release scripts cannot read these names, so a pin holds the copy.
-    #[test]
-    fn served_sdk_files_are_staged() {
-        let script = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../scripts/lib/stage_runtime.sh"),
-        )
-        .expect("stage_runtime.sh exists");
-        let list = script
-            .lines()
-            .find(|l| l.starts_with("STAGE_RUNTIME_SERVED_SDK_FILES=("))
-            .expect("stage_runtime.sh lists the served SDK files");
-        for name in [
-            super::SDK_JS_FILE,
-            super::APPEARANCE_BOOT_FILE,
-            super::SSE_WORKER_FILE,
-        ] {
-            assert!(
-                list.split(['(', ' ', ')']).any(|w| w == name),
-                "release staging does not check {name}: {list}"
-            );
-        }
     }
 
     use super::*;
@@ -524,5 +500,31 @@ mod tests {
             from = at + needle.len();
         }
         None
+    }
+
+    mod guard_tests {
+        /// The release scripts cannot read these names, so a pin holds the copy.
+        #[test]
+        fn served_sdk_files_are_staged() {
+            let script = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../scripts/lib/stage_runtime.sh"),
+            )
+            .expect("stage_runtime.sh exists");
+            let list = script
+                .lines()
+                .find(|l| l.starts_with("STAGE_RUNTIME_SERVED_SDK_FILES=("))
+                .expect("stage_runtime.sh lists the served SDK files");
+            for name in [
+                super::SDK_JS_FILE,
+                super::APPEARANCE_BOOT_FILE,
+                super::SSE_WORKER_FILE,
+            ] {
+                assert!(
+                    list.split(['(', ' ', ')']).any(|w| w == name),
+                    "release staging does not check {name}: {list}"
+                );
+            }
+        }
     }
 }

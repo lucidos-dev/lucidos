@@ -8,15 +8,17 @@
  * one frame carrying a credential request was dropped, and no form ever
  * appeared.
  */
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { activeInlineForm, panelOverlay } from '../store';
 import type { CredentialRequest } from '../types';
 import type { FormRequestEvent } from '../thread-events/thread-event-types';
 import type { PendingFormRequest } from '../../api/client/settings';
 
 const listPendingFormRequests = vi.fn<() => Promise<PendingFormRequest[]>>();
+const listResolvedFormRequests = vi.fn(async (_ids: string[]) => [] as string[]);
 vi.mock('../../api/client/settings', () => ({
   listPendingFormRequests: () => listPendingFormRequests(),
+  listResolvedFormRequests: (ids: string[]) => listResolvedFormRequests(ids),
   cancelFormRequest: vi.fn(),
 }));
 
@@ -33,10 +35,10 @@ vi.mock('./email-confirm', () => ({ openEmailConfirmRequest: vi.fn() }));
 const THIS_DEVICE = 'device-here';
 vi.mock('./devices', () => ({ getDeviceId: () => THIS_DEVICE }));
 
-const routeThreadNavigation = vi.fn();
+const presentThreadNavigation = vi.fn();
 const handleNavigationRequest = vi.fn();
 vi.mock('./navigation-request', () => ({
-  routeThreadNavigation,
+  presentThreadNavigation,
   handleNavigationRequest,
 }));
 vi.mock('./thread-label', () => ({ formatThreadLabel: (id: string) => `thread ${id}` }));
@@ -44,10 +46,19 @@ vi.mock('./thread-label', () => ({ formatThreadLabel: (id: string) => `thread ${
 const {
   closeResolvedFormRequest,
   openFormRequest,
+  presentFormRequest,
   resetOfferedFormRequests,
   syncPendingFormRequests,
 } = await import('./form-requests');
 
+// Unit tests accept the delivery boundary immediately; browser tests cover claims.
+const submitInteractiveRequest = vi.fn((request, _id?: string) => {
+  presentFormRequest(request.payload.threadId, request.payload.event);
+});
+const resolveInteractiveForm = vi.fn();
+const reconcileInteractiveForms = vi.fn();
+const snapshotInteractiveForms = vi.fn(async () => [] as string[]);
+vi.mock('../interactiveDeliveryService', () => ({ synchronizeInteractiveForms: (body: () => Promise<void>) => body(), submitInteractiveRequest: (...args: Parameters<typeof submitInteractiveRequest>) => submitInteractiveRequest(...args), resolveInteractiveForm: (id: string) => resolveInteractiveForm(id), reconcileInteractiveForms: (...args: string[][]) => reconcileInteractiveForms(...args), snapshotInteractiveForms: () => snapshotInteractiveForms() }));
 const THREAD = 'thread-1';
 
 function credentialRequest(requestId: string, service = 'weather'): FormRequestEvent {
@@ -75,9 +86,13 @@ beforeEach(() => {
   panelOverlay.value = null;
   resetOfferedFormRequests();
   listPendingFormRequests.mockReset();
+  listResolvedFormRequests.mockReset().mockResolvedValue([]);
   openCredentialRequest.mockClear();
-  routeThreadNavigation.mockClear();
+  presentThreadNavigation.mockClear();
   handleNavigationRequest.mockClear();
+  snapshotInteractiveForms.mockReset().mockResolvedValue([]);
+  resolveInteractiveForm.mockClear();
+  reconcileInteractiveForms.mockClear();
 });
 
 describe('a reconnect between emit and render', () => {
@@ -185,7 +200,7 @@ describe('an open request the user walked away from', () => {
     expect(openCredentialRequest).toHaveBeenCalledTimes(2);
   });
 
-  it('is offered again after a reload', async () => {
+  it('resubmits after local state resets so the journal can deduplicate', async () => {
     const request = credentialRequest('req-1');
     openFormRequest(THREAD, request);
     panelOverlay.value = null;
@@ -194,96 +209,53 @@ describe('an open request the user walked away from', () => {
 
     await syncPendingFormRequests();
 
-    expect(openCredentialRequest).toHaveBeenCalledTimes(2);
+    expect(submitInteractiveRequest).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'form' }), 'form:req-1');
   });
 });
 
-describe('with a second window on this device', () => {
-  let other: BroadcastChannel;
-  let stop: () => void;
-  let shownHere: string | null;
+describe('the automatic delivery boundary', () => {
+  it('queues older forms even when the newest already has a shared receipt', async () => {
+    const before = submitInteractiveRequest.mock.calls.length;
+    submitInteractiveRequest.mockImplementationOnce(() => {}).mockImplementationOnce(() => {});
+    listPendingFormRequests.mockResolvedValue([pending(credentialRequest('older')), pending(credentialRequest('newest'))]);
+    await syncPendingFormRequests();
+    expect(submitInteractiveRequest.mock.calls.slice(before).map((call) => call[1])).toEqual(['form:newest', 'form:older']);
+  });
 
-  /** The other window reports what it shows, touched after this one. */
-  function otherShows(focusedThreadId: string | null): Promise<void> {
-    other.postMessage({
-      type: 'state',
-      state: {
-        id: 'other-window', focusedThreadId, appId: null, authorizing: null,
-        activeAt: Date.now() + 1000,
-      },
+  it('resolves only journal forms observed before the authoritative pending read', async () => {
+    snapshotInteractiveForms.mockResolvedValue(['offline-resolved', 'still-open']);
+    listResolvedFormRequests.mockResolvedValue(['offline-resolved']);
+    listPendingFormRequests.mockImplementation(async () => {
+      snapshotInteractiveForms.mockResolvedValue(['new-live-form']);
+      return [pending(credentialRequest('still-open'))];
     });
-    return new Promise((resolve) => setTimeout(resolve, 20));
-  }
-
-  beforeEach(async () => {
-    shownHere = null;
-    const { installWindowPeers } = await import('../windowPeers');
-    const { WORKSPACE_ID } = await import('../../utils/basePath');
-    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
-    stop = installWindowPeers(() => ({ focusedThreadId: shownHere, appId: null, authorizing: null }));
-  });
-  afterEach(() => {
-    stop();
-    other.close();
-  });
-
-  it('leaves a live form to the window showing its thread', async () => {
-    await otherShows(THREAD);
-    openFormRequest(THREAD, credentialRequest('req-1'));
-    expect(openCredentialRequest).not.toHaveBeenCalled();
-  });
-
-  it('opens a live form here when only this window shows its thread', async () => {
-    shownHere = THREAD;
-    await otherShows('thread-elsewhere');
-    openFormRequest(THREAD, credentialRequest('req-1'));
-    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
-  });
-
-  it('leaves a form for an unseen thread to the window touched last', async () => {
-    await otherShows('thread-elsewhere');
-    openFormRequest(THREAD, credentialRequest('req-1'));
-    expect(openCredentialRequest).not.toHaveBeenCalled();
-  });
-
-  it('does not reopen a form the other window has, on a stream open here', async () => {
-    await otherShows(THREAD);
-    listPendingFormRequests.mockResolvedValue([pending(credentialRequest('req-1'))]);
     await syncPendingFormRequests();
-    expect(openCredentialRequest).not.toHaveBeenCalled();
+    expect(reconcileInteractiveForms.mock.calls).toEqual([[['offline-resolved', 'still-open'], ['still-open'], ['offline-resolved']]]);
   });
 
-  it('does not pop a live form here later, once the other window moves on', async () => {
-    await otherShows(THREAD);
-    const request = credentialRequest('req-1');
-    openFormRequest(THREAD, request);
-    shownHere = THREAD;
-    await otherShows('thread-elsewhere');
-    const { PEER_CHANGE_GRACE_MS } = await import('../windowPeers');
-    const later = Date.now() + PEER_CHANGE_GRACE_MS;
-    const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
-    listPendingFormRequests.mockResolvedValue([pending(request)]);
+  it('keeps archived unresolved forms eligible when their thread returns', async () => {
+    snapshotInteractiveForms.mockResolvedValue(['archived']);
+    listPendingFormRequests.mockResolvedValue([]);
     await syncPendingFormRequests();
-    clock.mockRestore();
-    expect(openCredentialRequest).not.toHaveBeenCalled();
-  });
-
-  it('opens the older request this window shows, past a newer one it leaves', async () => {
-    shownHere = THREAD;
-    await otherShows('thread-elsewhere');
-    listPendingFormRequests.mockResolvedValue([
-      pending(credentialRequest('older', 'maps')),
-      { ...pending(credentialRequest('newer', 'weather')), thread_id: 'thread-elsewhere' },
-    ]);
+    expect(listResolvedFormRequests).toHaveBeenCalledWith(['archived']);
+    expect(reconcileInteractiveForms).toHaveBeenLastCalledWith(['archived'], [], []);
+    listPendingFormRequests.mockResolvedValue([pending(credentialRequest('archived'))]);
     await syncPendingFormRequests();
-    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
-    expect(openCredentialRequest.mock.calls[0][0].form_request_id).toBe('older');
+    expect(submitInteractiveRequest).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'form' }), 'form:archived');
   });
 
-  it('still opens here when the user presses Open', async () => {
-    await otherShows(THREAD);
-    openFormRequest(THREAD, credentialRequest('req-1'), { byUser: true });
-    expect(openCredentialRequest).toHaveBeenCalledTimes(1);
+  it('queues the same identity from live and pending sync without electing locally', async () => {
+    submitInteractiveRequest.mockImplementationOnce(() => {});
+    openFormRequest(THREAD, credentialRequest('queued'));
+    expect(openCredentialRequest).not.toHaveBeenCalled();
+    submitInteractiveRequest.mockImplementationOnce(() => {});
+    listPendingFormRequests.mockResolvedValue([pending(credentialRequest('queued'))]);
+    await syncPendingFormRequests();
+    expect(submitInteractiveRequest.mock.calls.slice(-2).map((call) => call[1])).toEqual(['form:queued', 'form:queued']);
+  });
+  it('records resolution even when the answering device keeps its form', () => {
+    closeResolvedFormRequest('resolved', 'completed', { kind: 'device', device_id: THIS_DEVICE });
+    expect(resolveInteractiveForm).toHaveBeenCalledWith('resolved');
   });
 });
 
@@ -293,7 +265,7 @@ describe('an authorization page', () => {
 
     await syncPendingFormRequests();
 
-    expect(routeThreadNavigation).not.toHaveBeenCalled();
+    expect(presentThreadNavigation).not.toHaveBeenCalled();
     expect(handleNavigationRequest).not.toHaveBeenCalled();
   });
 
@@ -303,9 +275,8 @@ describe('an authorization page', () => {
 
     await syncPendingFormRequests();
 
-    expect(routeThreadNavigation).toHaveBeenCalledWith(
+    expect(presentThreadNavigation).toHaveBeenCalledWith(
       expect.objectContaining({ purpose: 'oauth' }),
-      request.actor,
       THREAD,
     );
   });

@@ -1,6 +1,7 @@
 pub mod agent_role;
 pub mod announced_surfaces;
 pub mod apps;
+pub mod artifact_writer;
 pub mod artifacts;
 pub mod aux_context_backfill;
 pub mod backup;
@@ -13,6 +14,7 @@ pub mod data_prefixes;
 pub mod db_retry;
 pub mod device_presence;
 pub mod devices;
+pub mod draft_submission;
 pub mod email;
 pub mod environment_variables;
 pub mod event_subscription;
@@ -74,12 +76,87 @@ use std::borrow::Cow;
 /// `environment_variables::apply_to_process_env` copies the user's variables
 /// into the process env. A user variable named `DATABASE_URL` for a project
 /// script must not move later readers, such as `pg_dump`, to another database.
+///
+/// A gateway URL names a `passfile` rather than a password, since any
+/// same-user process reads another's environment on macOS (ADR 0645). This
+/// URL holds the password the file gives, so it stays in memory.
 pub fn database_url() -> String {
-    static BOOT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-        std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://lucidos@localhost:5432/lucidos".to_string())
-    });
-    BOOT.clone()
+    boot_database().url.clone()
+}
+
+/// The password file the boot URL named, for a client tool the engine runs.
+pub fn database_passfile() -> Option<&'static std::path::Path> {
+    boot_database().passfile.as_deref()
+}
+
+/// Point `url` at the boot password file when it signs in with the boot
+/// password. A client tool then reads the file, and its environment holds no
+/// password.
+pub fn use_boot_passfile(url: &mut lucidos_pg_url::PgUrl) {
+    let Some(passfile) = database_passfile() else {
+        return;
+    };
+    let boot_password = lucidos_pg_url::PgUrl::parse(&database_url())
+        .ok()
+        .and_then(|boot| boot.password);
+    if url.password.is_some() && url.password == boot_password && url.passfile().is_none() {
+        let path = urlencoding::encode(&passfile.to_string_lossy()).into_owned();
+        url.params
+            .push((lucidos_pg_url::PASSFILE_PARAM.to_string(), path));
+    }
+}
+
+struct BootDatabase {
+    url: String,
+    passfile: Option<std::path::PathBuf>,
+    managed: bool,
+}
+
+/// Gateway-only provenance, pinned with the database before user environment overlays.
+pub const MANAGED_DATABASE_ENV: &str = "LUCIDOS_MANAGED_DATABASE";
+
+pub fn database_is_gateway_managed() -> bool {
+    boot_database().managed
+}
+
+impl BootDatabase {
+    fn from_env() -> Self {
+        let managed = std::env::var(MANAGED_DATABASE_ENV).as_deref() == Ok("1");
+        let raw = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://lucidos@localhost:5432/lucidos".to_string());
+        match lucidos_pg_url::inline_passfile(&raw) {
+            Ok((url, passfile)) => Self {
+                url,
+                passfile,
+                managed,
+            },
+            Err(e) => {
+                crate::log_legacy!("[Startup] DATABASE_URL names no usable password: {e}");
+                Self {
+                    url: raw,
+                    passfile: None,
+                    managed: false,
+                }
+            }
+        }
+    }
+}
+
+fn boot_database() -> &'static BootDatabase {
+    static BOOT: std::sync::LazyLock<BootDatabase> =
+        std::sync::LazyLock::new(BootDatabase::from_env);
+    &BOOT
+}
+
+/// Load project settings without letting dotenv grant gateway provenance.
+pub fn load_database_environment() {
+    let managed = std::env::var_os(MANAGED_DATABASE_ENV);
+    let _ = dotenvy::dotenv();
+    match managed {
+        Some(value) => std::env::set_var(MANAGED_DATABASE_ENV, value),
+        None => std::env::remove_var(MANAGED_DATABASE_ENV),
+    }
+    scrub_database_url_from_process_env();
 }
 
 /// Pin [`database_url`], then remove `DATABASE_URL` from the engine's own
@@ -91,6 +168,7 @@ pub fn database_url() -> String {
 pub fn scrub_database_url_from_process_env() {
     database_url();
     std::env::remove_var("DATABASE_URL");
+    std::env::remove_var(MANAGED_DATABASE_ENV);
 }
 
 /// The engine-owned variable naming the workspace database, read-only by
@@ -146,17 +224,7 @@ pub fn env_var_segment(name: &str) -> String {
         .collect()
 }
 
-/// Mask the password segment of any `postgres(ql)://user:password@host…` URL
-/// in `s`. A best-effort safety net for wherever the env-var injection did not
-/// take: a hardcoded URI in a script, a URL pasted into a curl call. Applied at
-/// the spawn-side log line and where a tool call's `args` are persisted.
-pub fn redact_postgres_secrets(s: &str) -> String {
-    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(postgres(?:ql)?://[^:@/?\s]+):[^@/?\s]+@")
-            .expect("postgres redaction regex must compile")
-    });
-    RE.replace_all(s, "$1:***@").into_owned()
-}
+pub use lucidos_diagnostic_log::redaction::redact_postgres_secrets;
 
 /// Recursively apply `redact_postgres_secrets` to every string inside a
 /// `serde_json::Value`. Scrubs a tool call's `args` before they reach the event
@@ -190,73 +258,9 @@ pub fn redact_postgres_secrets_in_json(value: &mut serde_json::Value) {
     }
 }
 
-/// Shortest secret value we bother scrubbing. Below this, a "secret" is too
-/// generic (a 1-char password, "GET", an index) to redact without nuking
-/// legitimate text everywhere it appears. Auth tokens and real credentials are
-/// far longer, so this never weakens redaction of actual secrets.
-pub const MIN_REDACTABLE_SECRET_LEN: usize = 4;
-
-/// What a redacted secret value reads as.
-pub const REDACTED_MARKER: &str = "[REDACTED]";
-
-/// Replace every occurrence of each known secret value in `text` with
-/// [`REDACTED_MARKER`]. Keeps credential material out of logs and error
-/// messages that untrusted code could otherwise echo.
-pub fn redact_secret_values(text: &str, secrets: &[String]) -> String {
-    match redact_secret_bytes(text.as_bytes(), secrets) {
-        // A UTF-8 secret matches only on character boundaries, and the marker
-        // is ASCII, so the result stays UTF-8.
-        Some(redacted) => String::from_utf8(redacted)
-            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        None => text.to_string(),
-    }
-}
-
-/// [`redact_secret_values`] over raw bytes, for a body that need not be text.
-/// Returns `None` when no secret occurs, so the caller keeps its own bytes.
-/// Longest secrets are scrubbed first, so a secret that is a substring of
-/// another leaves no partial match behind.
-pub fn redact_secret_bytes(bytes: &[u8], secrets: &[String]) -> Option<Vec<u8>> {
-    let mut ordered: Vec<&[u8]> = secrets
-        .iter()
-        .map(|s| s.as_bytes())
-        .filter(|s| s.len() >= MIN_REDACTABLE_SECRET_LEN)
-        .collect();
-    ordered.sort_by_key(|s| std::cmp::Reverse(s.len()));
-    let mut out: Option<Vec<u8>> = None;
-    for secret in ordered {
-        let current = out.as_deref().unwrap_or(bytes);
-        if let Some(replaced) = replace_all_bytes(current, secret, REDACTED_MARKER.as_bytes()) {
-            out = Some(replaced);
-        }
-    }
-    out
-}
-
-/// Every non-overlapping `needle` in `haystack` replaced by `with`, or `None`
-/// when `needle` does not occur. `needle` must not be empty.
-fn replace_all_bytes(haystack: &[u8], needle: &[u8], with: &[u8]) -> Option<Vec<u8>> {
-    let find = |from: usize| {
-        haystack[from..]
-            .windows(needle.len())
-            .position(|window| window == needle)
-            .map(|at| from + at)
-    };
-    let mut at = find(0)?;
-    let mut out = Vec::with_capacity(haystack.len());
-    let mut copied = 0;
-    loop {
-        out.extend_from_slice(&haystack[copied..at]);
-        out.extend_from_slice(with);
-        copied = at + needle.len();
-        match find(copied) {
-            Some(next) => at = next,
-            None => break,
-        }
-    }
-    out.extend_from_slice(&haystack[copied..]);
-    Some(out)
-}
+pub use lucidos_diagnostic_log::redaction::{
+    redact_secret_bytes, redact_secret_values, MIN_REDACTABLE_SECRET_LEN, REDACTED_MARKER,
+};
 
 /// Directory structure within workspace/data/
 pub const DATA_DIR: &str = "data";
@@ -346,7 +350,7 @@ pub use system_widgets::{resolve_system_widgets_dir, BUILT_IN_WIDGET_PREFIX};
 /// - `data/apps/*/prompts/` → renamed to `data/apps/*/intents/`
 /// - `data/apps/*/triggers/` left as-is (already correct)
 pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
-    log!("[Migration] Checking for legacy prompts/ directories...");
+    log_legacy!("[Migration] Checking for legacy prompts/ directories...");
     let data_dir = workspace.join(DATA_DIR);
 
     // Top-level prompts become standalone triggers (each .md gets its own dir)
@@ -366,19 +370,23 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
                             continue;
                         }
                         if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                            log!("[Migration] Failed to create {}: {}", dest_dir.display(), e);
+                            log_legacy!(
+                                "[Migration] Failed to create {}: {}",
+                                dest_dir.display(),
+                                e
+                            );
                             continue;
                         }
                         let dest = dest_dir.join(entry.file_name());
                         if let Err(e) = std::fs::rename(&path, &dest) {
-                            log!(
+                            log_legacy!(
                                 "[Migration] Failed to move {} → {}: {}",
                                 path.display(),
                                 dest.display(),
                                 e
                             );
                         } else {
-                            log!(
+                            log_legacy!(
                                 "[Migration] Moved prompt {} → {}",
                                 path.display(),
                                 dest.display()
@@ -387,7 +395,7 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
                     }
                 }
             }
-            Err(e) => log!(
+            Err(e) => log_legacy!(
                 "[Migration] Failed to read {}: {}",
                 top_prompts.display(),
                 e
@@ -398,9 +406,9 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
             .unwrap_or(false)
         {
             if let Err(e) = std::fs::remove_dir(&top_prompts) {
-                log!("[Migration] Failed to remove empty data/prompts/: {}", e);
+                log_legacy!("[Migration] Failed to remove empty data/prompts/: {}", e);
             } else {
-                log!("[Migration] Removed empty data/prompts/");
+                log_legacy!("[Migration] Removed empty data/prompts/");
             }
         }
     }
@@ -415,13 +423,13 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
                     let app_intents = entry.path().join("intents");
                     if app_prompts.is_dir() && !app_intents.exists() {
                         if let Err(e) = std::fs::rename(&app_prompts, &app_intents) {
-                            log!(
+                            log_legacy!(
                                 "[Migration] Failed to rename {}/prompts → intents: {}",
                                 entry.file_name().to_string_lossy(),
                                 e
                             );
                         } else {
-                            log!(
+                            log_legacy!(
                                 "[Migration] Renamed {}/prompts → intents",
                                 entry.file_name().to_string_lossy()
                             );
@@ -429,7 +437,7 @@ pub fn migrate_prompts_to_intents(workspace: &std::path::Path) {
                     }
                 }
             }
-            Err(e) => log!("[Migration] Failed to read {}: {}", apps_dir.display(), e),
+            Err(e) => log_legacy!("[Migration] Failed to read {}: {}", apps_dir.display(), e),
         }
     }
 }
@@ -930,7 +938,7 @@ pub(crate) fn add_path_unless_ignored(
 ) -> Result<(), git2::Error> {
     let path = std::path::Path::new(repo_path);
     if repo.is_path_ignored(path)? && index.get_path(path, 0).is_none() {
-        crate::log!("[Git] not committing {repo_path}: git ignores it and it is untracked");
+        crate::log_legacy!("[Git] not committing {repo_path}: git ignores it and it is untracked");
         return Ok(());
     }
     index.add_path(path)
@@ -1057,6 +1065,83 @@ mod database_url_tests {
 
     /// Both tests set and restore `DATABASE_URL`, so they must not interleave.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dotenv_cannot_grant_managed_database_provenance() {
+        const CHILD: &str = "LUCIDOS_TEST_DOTENV_PROVENANCE";
+        if let Ok(expected) = std::env::var(CHILD) {
+            super::load_database_environment();
+            assert_eq!(super::database_is_gateway_managed(), expected == "1");
+            assert!(database_url().contains("dotenv_fixture"));
+            assert!(std::env::var_os(super::MANAGED_DATABASE_ENV).is_none());
+            return;
+        }
+        for managed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join(".env"),
+                "DATABASE_URL=postgres:///dotenv_fixture?host=/tmp/fixture&user=admin\nLUCIDOS_MANAGED_DATABASE=1\n",
+            )
+            .unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "core::database_url_tests::dotenv_cannot_grant_managed_database_provenance",
+                    "--nocapture",
+                ])
+                .current_dir(root.path())
+                .env(CHILD, if managed { "1" } else { "0" })
+                .env_remove("DATABASE_URL")
+                .env_remove(super::MANAGED_DATABASE_ENV);
+            if managed {
+                command.env(super::MANAGED_DATABASE_ENV, "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_provenance_is_bound_at_boot_and_never_inherited_by_children() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        database_url();
+        let prior = std::env::var_os("DATABASE_URL");
+        let prior_marker = std::env::var_os(super::MANAGED_DATABASE_ENV);
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres:///boot?host=/tmp/fixture&user=admin",
+        );
+        std::env::remove_var(super::MANAGED_DATABASE_ENV);
+        let external = super::BootDatabase::from_env();
+        std::env::set_var(super::MANAGED_DATABASE_ENV, "1");
+        let managed = super::BootDatabase::from_env();
+        std::env::set_var(
+            "DATABASE_URL",
+            "postgres:///external?host=/tmp/other&user=admin",
+        );
+        assert!(!external.managed, "a later overlay cannot grant provenance");
+        assert!(managed.managed);
+        assert_eq!(
+            managed.url, external.url,
+            "the guarantee belongs to the boot database"
+        );
+        scrub_database_url_from_process_env();
+        let child = std::process::Command::new("/usr/bin/env").output().unwrap();
+        assert!(!String::from_utf8(child.stdout)
+            .unwrap()
+            .lines()
+            .any(|l| l.starts_with("LUCIDOS_MANAGED_DATABASE=")));
+        restore_database_url(prior);
+        if let Some(value) = prior_marker {
+            std::env::set_var(super::MANAGED_DATABASE_ENV, value);
+        }
+    }
 
     fn restore_database_url(prior: Option<std::ffi::OsString>) {
         match prior {
@@ -1511,6 +1596,9 @@ fn drafts_label(args: &serde_json::Value) -> String {
 /// flat alias.
 const CONTEXT_CEILING_LABEL: &str = "Setting a context ceiling...";
 
+/// The step label of the `threads` tool's `submit_draft` action and its alias.
+const SUBMIT_DRAFT_LABEL: &str = "Submitting the saved draft...";
+
 /// The step label for the per-thread cache keep-alive switch.
 fn keep_alive_switch_label(args: &serde_json::Value) -> String {
     match args["state"].as_str() {
@@ -1689,14 +1777,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "list_apps" => "Listing apps...".to_string(),
         "list_intents" => "Listing intents...".to_string(),
         "list_knowhow" => "Listing know-how...".to_string(),
-        "load_knowhow" => format!(
-            "Loading know-how '{}'...",
-            args["id"].as_str().unwrap_or("knowhow")
-        ),
-        "unload_knowhow" => format!(
-            "Unloading know-how '{}'...",
-            args["id"].as_str().unwrap_or("knowhow")
-        ),
+        "load_knowhow" => match args["id"].as_str() {
+            Some(id) => format!("Loading know-how '{id}'..."),
+            None => "Loading know-how...".to_string(),
+        },
+        "unload_knowhow" => match args["id"].as_str() {
+            Some(id) => format!("Unloading know-how '{id}'..."),
+            None => "Unloading know-how...".to_string(),
+        },
         // Retired: the dispatch refuses it and names `load_knowhow` instead.
         "execute_intent" => "Refusing the retired intent tool...".to_string(),
         "refresh_app" => format!(
@@ -1904,6 +1992,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
         "count_threads" => "Counting threads...".to_string(),
         "search_threads" => search_label("Searching past conversations", args),
         "list_drafts" => drafts_label(args),
+        "submit_saved_draft" => SUBMIT_DRAFT_LABEL.to_string(),
         "list_held_messages" => "Listing held messages...".to_string(),
         "detach_child_thread" => "Moving a child thread to top level...".to_string(),
         "archive_thread" => "Archiving a thread...".to_string(),
@@ -2107,6 +2196,7 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             Some("count") => "Counting threads...".to_string(),
             Some("search") => search_label("Searching past conversations", args),
             Some("drafts") => drafts_label(args),
+            Some("submit_draft") => SUBMIT_DRAFT_LABEL.to_string(),
             Some("held_messages") => "Listing held messages...".to_string(),
             Some("detach_child") => "Moving a child thread to top level...".to_string(),
             Some("archive") => "Archiving a thread...".to_string(),

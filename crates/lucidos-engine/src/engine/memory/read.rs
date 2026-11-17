@@ -125,14 +125,14 @@ impl LucidosEngine {
                         }
                     }
                     Err(e) => {
-                        crate::log!(@Memory, "search: semantic arm failed: {}", e);
+                        crate::log_legacy!(@Memory, "search: semantic arm failed: {}", e);
                         degraded.push("semantic");
                     }
                 },
                 None => degraded.push("semantic"),
             },
             Err(e) => {
-                crate::log!(@Memory, "search: embedding failed, keyword only: {}", e);
+                crate::log_legacy!(@Memory, "search: embedding failed, keyword only: {}", e);
                 degraded.push("semantic");
             }
         }
@@ -185,7 +185,7 @@ impl LucidosEngine {
                     }
                 }
                 Err(e) => {
-                    crate::log!(@Memory, "search: keyword arm failed: {}", e);
+                    crate::log_legacy!(@Memory, "search: keyword arm failed: {}", e);
                     keyword_failed = true;
                 }
             }

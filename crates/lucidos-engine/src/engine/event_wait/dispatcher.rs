@@ -101,7 +101,7 @@ async fn dispatcher_step(
             // The ends come first, so no wait on an archived thread is left
             // for the rescan to deliver. The rescan then covers the matches:
             // each wait scans from its own watermark, which never moves.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] EventBus subscriber lagged by {} events, replaying archives \
                  and re-scanning every live wait",
                 n
@@ -178,7 +178,7 @@ impl LucidosEngine {
                     engine.catch_up_all_event_waits().await;
                 }
             }
-            crate::log!("[EventWait] EventBus closed, stopping wait dispatcher");
+            crate::log_legacy!("[EventWait] EventBus closed, stopping wait dispatcher");
         });
 
         let engine = self.clone();
@@ -216,7 +216,7 @@ impl LucidosEngine {
         if !self.is_shutting_down() {
             return false;
         }
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Engine shutting down, not resolving waits from the {} path. \
              They stay armed, and the next engine's catch-up scan delivers them",
             site
@@ -348,7 +348,7 @@ impl LucidosEngine {
         payload: &Value,
         matched_index: usize,
     ) {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Delivering {} to thread {} (wait {}, entry {})",
             event_type,
             wait.thread_id,
@@ -396,7 +396,7 @@ impl LucidosEngine {
                 never_seen.push(sub.event_type.clone());
             }
         }
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] Wait {} on thread {} timed out",
             wait.wait_id,
             wait.thread_id,
@@ -420,7 +420,7 @@ impl LucidosEngine {
         what: &str,
         error: Box<dyn std::error::Error + Send + Sync>,
     ) {
-        crate::log!(
+        crate::log_legacy!(
             "[EventWait] {} emit failed for wait {} on thread {}: {}. Re-arming: \
              nothing was persisted, so the wait is still live",
             what,
@@ -442,7 +442,7 @@ impl LucidosEngine {
             .wait_reentry_tx
             .send(WaitReentryRequest { thread_id, reentry })
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Re-entry channel closed, thread {} will not resume: {}",
                 thread_id,
                 e
@@ -455,7 +455,7 @@ impl LucidosEngine {
     pub fn start_wait_reentry_consumer(self: &Arc<Self>) {
         let rx = crate::engine::WAIT_REENTRY_RX.with(|cell| cell.borrow_mut().take());
         let Some(mut rx) = rx else {
-            crate::log!("[EventWait] Re-entry receiver missing, consumer not started");
+            crate::log_legacy!("[EventWait] Re-entry receiver missing, consumer not started");
             return;
         };
         let engine = self.clone();
@@ -468,7 +468,7 @@ impl LucidosEngine {
                 let engine = engine.clone();
                 tokio::spawn(async move { engine.reenter_from_wait(req).await });
             }
-            crate::log!("[EventWait] Re-entry channel closed, consumer exiting");
+            crate::log_legacy!("[EventWait] Re-entry channel closed, consumer exiting");
         });
     }
 
@@ -482,29 +482,57 @@ impl LucidosEngine {
     ///
     /// **A coding-agent thread is re-entered through the coding-agent lane**, which
     /// is what makes `await_event` available to Claude Code and Codex at all.
-    /// Passing `is_coding_agent` here picks the `msg_tx` route into a live
-    /// session, or a fresh `--resume` when there is none, exactly as the
-    /// child-completion fan-in does. An unreadable row answers `false`: re-entering a
-    /// coding-agent thread down the chat lane wastes a turn and is recoverable,
-    /// while re-entering a chat thread down the coding-agent lane would try to spawn
-    /// a session for a thread that has no worktree.
+    /// The thread's `source` picks the `msg_tx` route into a live session, or a
+    /// fresh `--resume` when there is none, exactly as the child-completion
+    /// fan-in does. An unreadable row refuses the re-entry with a visible
+    /// failure, and never falls back to the chat lane (ADR 0678).
     async fn reenter_from_wait(&self, req: WaitReentryRequest) {
         let WaitReentryRequest { thread_id, reentry } = req;
-        let is_coding_agent: bool =
-            sqlx::query_scalar("SELECT is_coding_agent FROM thread_summaries WHERE thread_id = $1")
-                .bind(thread_id)
-                .fetch_optional(&self.pool)
+        let is_coding_agent = match crate::engine::thread_agent(&self.pool, thread_id).await {
+            Ok(agent) => agent == Some(crate::engine::ThreadAgent::CodingAgent),
+            Err(e) => {
+                crate::log_legacy!(
+                    "[EventWait] Could not read which agent runs thread {thread_id}: {e}"
+                );
+                if let Err(e) = crate::engine::emit_routing_failure(
+                    &self.event_bus,
+                    thread_id,
+                    "Lucidos could not tell which agent runs this thread, so a wait it was on did not wake it.",
+                )
                 .await
-                .unwrap_or_else(|e| {
-                    crate::log!(
-                        "[EventWait] Could not read is_coding_agent for thread {}: {} \
-                 (re-entering through the chat lane)",
-                        thread_id,
-                        e
-                    );
-                    None
-                })
-                .unwrap_or(false);
+                {
+                    crate::log_legacy!("[EventWait] Could not record the refused re-entry on thread {thread_id}: {e}");
+                }
+                return;
+            }
+        };
+        // Stop holds silently; an automation pause asks. The unread anchor
+        // stays available for the owner's resume or grant.
+        if crate::engine::automation_pause::ask_before_step(
+            &self.event_bus,
+            thread_id,
+            crate::engine::permission::Action::ReadWaitingReports,
+        )
+        .await
+            != crate::engine::automation_pause::StepVerdict::Run
+        {
+            crate::log_legacy!(
+                "[EventWait] Thread {} holds its automatic wait re-entry for the owner",
+                thread_id
+            );
+            return;
+        }
+        self.run_wait_reentry(thread_id, reentry, is_coding_agent)
+            .await;
+    }
+
+    /// Run one wait re-entry's turn on `thread_id`.
+    pub(crate) async fn run_wait_reentry(
+        &self,
+        thread_id: Uuid,
+        reentry: WaitReentry,
+        is_coding_agent: bool,
+    ) {
         if let Err(e) = self
             .process_message_with_steps(
                 &reentry.text,
@@ -542,7 +570,7 @@ impl LucidosEngine {
             // the loop's safety net now settle the exchange themselves. The
             // terminator this site used to add carried no anchor, so the
             // idempotency gate could not see it was a duplicate.
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Re-entry turn failed for thread {}: {}",
                 thread_id,
                 e
@@ -601,7 +629,7 @@ impl LucidosEngine {
         let hit = match catch_up_from_watermark(&self.pool, wait).await {
             Ok(hit) => hit,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Catch-up scan failed for wait {} on thread {}: {}",
                     wait.wait_id,
                     wait.thread_id,
@@ -647,7 +675,7 @@ impl LucidosEngine {
         let loaded = match rebuild_live_waits(&self.pool, &self.live_waits).await {
             Ok(n) => n,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Live-wait rebuild failed: {}. Parked threads will not \
                      resume until the next restart",
                     e
@@ -656,7 +684,7 @@ impl LucidosEngine {
             }
         };
         if loaded > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Rebuilt {} live wait(s) from the event store",
                 loaded
             );
@@ -682,7 +710,7 @@ impl LucidosEngine {
         let lost = match super::lost_wait_reentries(&self.pool).await {
             Ok(rows) => rows,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[EventWait] Lost-re-entry query failed: {}. Skipping the recovery \
                      sweep this boot",
                     e
@@ -691,14 +719,14 @@ impl LucidosEngine {
             }
         };
         for lost_reentry in &lost {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Re-driving a re-entry lost to restart on thread {}",
                 lost_reentry.thread_id
             );
             self.queue_wait_reentry(lost_reentry.thread_id, lost_reentry.reentry.clone());
         }
         if !lost.is_empty() {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Re-drove {} event-wait re-entry(s) lost to engine restart",
                 lost.len()
             );
@@ -827,7 +855,7 @@ impl LucidosEngine {
             canceled += 1;
         }
         if canceled > 0 {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventWait] Canceled {} live wait(s) on thread {} ({}, {:?})",
                 canceled,
                 thread_id,

@@ -33,8 +33,9 @@ the e2e workspace at the engine's port, or it clears both
 
 `LUCIDOS_E2E_GATEWAY` picks the gateway:
 
-- `auto`, the default, uses a gateway already running. On a dev machine that is
-  the dev gateway, which lists `e2e-test` once a launch has registered it.
+- `none`, the default, gives the engine no gateway. ADR 0661 replaced `auto`,
+  which used a gateway already running: a local run's workspace now sits in the
+  e2e root, which the dev gateway never registers.
 - `own`, which GitHub API and browser shards set, starts a session-scoped gateway. It
   has its own data dir inside the e2e workspace, its own loopback port, and no
   hook socket. Its registry lists the workspace at the engine's port with

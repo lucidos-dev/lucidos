@@ -99,7 +99,8 @@ SCORE_POINTS_PER_STEP = 2
 # that is not retired, at the tiers `llm::reasoning::supported_efforts` gives
 # it on any route.
 MODELS = {
-    "claude-fable-5-2": ("Claude Fable 5.2", {"chat": CODING_EFFORTS}),
+    "claude-fable-5-2": ("Claude Fable 5.2", {
+        "chat": CODING_EFFORTS, "claude_code": CODING_EFFORTS}),
     "gemini-4-argon": ("Gemini 4 Argon", {"chat": ["low", "medium", "high"]}),
     "gemini-4-carbon": ("Gemini 4 Carbon", {"chat": ["low", "medium", "high"]}),
     "claude-haiku-5-5": ("Claude Haiku 5.5", {
@@ -260,8 +261,18 @@ def output_prices_today():
 
 
 class IndependentView:
-    """The non-AA estimate. It fits against AA across FIT_MODELS, never
-    against a single pair's figure."""
+    """The non-AA estimate uses aggregate fits, not a single pair's figure.
+
+    FIT_MODELS anchors shared calibration. Input cost uses a separate linear
+    fit per model across measured coding efforts, against log output tokens.
+    Log tokens give multiplicative changes in work equal spacing, so the
+    largest run cannot dominate the fit at cheaper efforts. Fit
+    raw residuals after estimated output cost, then floor predictions at zero.
+    Fewer than three distinct token counts use the mean residual, avoiding
+    exact interpolation of two observations. One row necessarily gives a constant.
+    Sparse coverage cannot establish an effort trend. Adding another model
+    changes neither this fit nor the shared anchors.
+    """
 
     def __init__(self, inputs):
         self.inputs = inputs
@@ -298,10 +309,14 @@ class IndependentView:
         return self.mean_aa + self.aa_per_eci * (eci - self.mean_eci) - self.effort_gap[effort]
 
     def cost(self, model, effort):
-        input_cost = statistics.median(
-            max(0.0, r["cost_usd"] - self.output_cost(model, e))
-            for e, r in self.inputs.fit_rows(model).items() if r["cost_usd"] is not None)
-        return input_cost + self.output_cost(model, effort)
+        measured = [(math.log(self.inputs.tokens(model, e)), r["cost_usd"] - self.output_cost(model, e))
+                    for e, r in self.inputs.fit_rows(model).items()
+                    if r["cost_usd"] is not None and r["output_tokens_m"] is not None]
+        xs, ys = zip(*measured)
+        per_log_token = slope(xs, ys) if len(set(xs)) >= 3 else 0.0
+        input_cost = (statistics.mean(ys)
+                      + per_log_token * (math.log(self.inputs.tokens(model, effort)) - statistics.mean(xs)))
+        return max(0.0, input_cost) + self.output_cost(model, effort)
 
     def time(self, model, effort):
         speed = self.inputs.speed.get(model) or self.inputs.aa_speed(model, effort)

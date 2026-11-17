@@ -48,7 +48,15 @@ pub async fn resolve_pending_question_as_canceled(
     thread_id: Uuid,
     actor: Option<MessageOrigin>,
 ) -> bool {
-    resolve_pending_question_as(engine, thread_id, AnswerKind::Canceled, actor, "canceled").await
+    resolve_pending_question_as(
+        engine,
+        thread_id,
+        PENDING_QUESTION_SQL,
+        AnswerKind::Canceled,
+        actor,
+        "canceled",
+    )
+    .await
 }
 
 /// Resolve any pending `UserQuestionAsked` for `thread_id` as `Superseded`,
@@ -67,6 +75,9 @@ pub async fn resolve_pending_question_as_canceled(
 /// the agent already overtook parks the same call the same way. That is the
 /// parallel-tool-call race, and the narrow "active" lookup walks straight past
 /// it. See `docs/adr/0082-a-followup-supersedes-the-open-question.md`.
+///
+/// A permission request stays open. No agent call is parked on it, and the
+/// owner's words in this very follow-up may answer it (ADR 0664).
 pub async fn resolve_pending_question_as_superseded(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
@@ -75,6 +86,7 @@ pub async fn resolve_pending_question_as_superseded(
     resolve_pending_question_as(
         engine,
         thread_id,
+        SUPERSEDABLE_QUESTION_SQL,
         AnswerKind::Superseded,
         actor,
         "superseded",
@@ -88,18 +100,22 @@ pub async fn resolve_pending_question_as_superseded(
 async fn resolve_pending_question_as(
     engine: &Arc<LucidosEngine>,
     thread_id: Uuid,
+    lookup_sql: &str,
     kind: AnswerKind,
     actor: Option<MessageOrigin>,
     label: &str,
 ) -> bool {
-    let Some(tool_use_id) = lookup_pending_question_tool_use_id(engine.pool(), thread_id).await
-    else {
+    let result = sqlx::query_as::<_, (String,)>(lookup_sql)
+        .bind(thread_id)
+        .fetch_optional(engine.pool())
+        .await;
+    let Some(tool_use_id) = unwrap_tool_use_id_row(result, thread_id) else {
         return false;
     };
     match answer_pending_question(engine, thread_id, tool_use_id, kind, actor).await {
         AnswerResult::Resumed => true,
         AnswerResult::Conflict(msg) => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] resolve_pending_question_as_{}({}): {}",
                 label,
                 thread_id,
@@ -110,13 +126,30 @@ async fn resolve_pending_question_as(
     }
 }
 
-const PENDING_QUESTION_SQL: &str = "SELECT q.payload->>'tool_use_id' \
-     FROM events q \
-     LEFT JOIN events a ON a.thread_id = q.thread_id \
-          AND a.event_type = 'UserQuestionAnswered' \
-          AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
-     WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
-     ORDER BY q.sequence DESC LIMIT 1";
+/// The newest unanswered card on `$1`, narrowed by `$filter`.
+macro_rules! pending_question_sql {
+    ($filter:literal) => {
+        concat!(
+            "SELECT q.payload->>'tool_use_id' \
+             FROM events q \
+             LEFT JOIN events a ON a.thread_id = q.thread_id \
+                  AND a.event_type = 'UserQuestionAnswered' \
+                  AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
+             WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL ",
+            $filter,
+            " ORDER BY q.sequence DESC LIMIT 1"
+        )
+    };
+}
+
+const PENDING_QUESTION_SQL: &str = pending_question_sql!("");
+
+/// A permission request the engine raised itself stays open past a follow-up.
+/// One the agent prepared parks the agent's call, so a follow-up supersedes it.
+const SUPERSEDABLE_QUESTION_SQL: &str = pending_question_sql!(
+    "AND NOT (q.payload ? 'permission_request' \
+              AND NOT q.payload->'permission_request' ? 'prepared')"
+);
 
 static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     format!(
@@ -126,6 +159,9 @@ static ACTIVE_QUESTION_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::n
               AND a.event_type = 'UserQuestionAnswered' \
               AND a.payload->>'tool_use_id' = q.payload->>'tool_use_id' \
          WHERE q.thread_id = $1 AND q.event_type = 'UserQuestionAsked' AND a.id IS NULL \
+           AND NOT q.payload ? 'unattested_act' \
+           AND NOT (q.payload ? 'permission_request' \
+                    AND NOT q.payload->'permission_request' ? 'prepared') \
            AND NOT EXISTS ( \
              SELECT 1 FROM events t \
              WHERE t.thread_id = q.thread_id \
@@ -147,7 +183,7 @@ fn unwrap_tool_use_id_row(
             // Don't silently treat a DB outage as "no pending question" —
             // that would let the user's free-form text spawn a brand-new CC
             // turn over the unanswered one.
-            log!(
+            log_legacy!(
                 "[CCQuestion] DB lookup failed for pending question on {}: {}",
                 thread_id,
                 e
@@ -314,8 +350,8 @@ pub(crate) struct QuestionAsker {
     /// The Claude Code session to resume. Empty for chat and Codex.
     pub(crate) cc_session_id: String,
     pub(crate) channel: crate::engine::thread_events::EventChannel,
-    /// Set only when the batch is an *owner approval card* (ADR 0387).
-    pub(crate) owner_approval: Option<crate::engine::thread_events::OwnerApproval>,
+    /// Set only when the batch is a permission request the agent prepared.
+    pub(crate) permission_request: Option<crate::engine::permission::PermissionRequest>,
 }
 
 /// Refuse a batch whose option carries a widget that cannot draw: a
@@ -454,7 +490,7 @@ impl LucidosEngine {
         let QuestionAsker {
             cc_session_id,
             channel,
-            owner_approval,
+            permission_request,
         } = asker;
         let parser_input = serde_json::json!({ "questions": questions });
         let mut parsed =
@@ -544,26 +580,31 @@ impl LucidosEngine {
                 Ok(None) => {}
                 Err(e) => {
                     self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] prior-answer lookup failed {thread_id}/{sub_id}: {e}");
+                    log_legacy!(
+                        "[QuestionWalk] prior-answer lookup failed {thread_id}/{sub_id}: {e}"
+                    );
                     return Err(format!("DB lookup for question state failed: {e}").into());
                 }
             }
 
-            let already_asked = match user_question_already_asked(self.pool(), thread_id, &sub_id)
-                .await
-            {
-                Ok(b) => b,
-                Err(e) => {
-                    self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}");
-                    return Err(format!("DB lookup for question state failed: {e}").into());
-                }
-            };
+            let already_asked =
+                match user_question_already_asked(self.pool(), thread_id, &sub_id).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        self.question_wait_registry.forget(&sub_id).await;
+                        log_legacy!(
+                            "[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}"
+                        );
+                        return Err(format!("DB lookup for question state failed: {e}").into());
+                    }
+                };
             if !already_asked {
                 if let Some(message) = message.as_ref().filter(|_| i == 0) {
                     if let Err(e) = emit_card_message(&self.event_bus, thread_id, message).await {
                         self.question_wait_registry.forget(&sub_id).await;
-                        log!("[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}");
+                        log_legacy!(
+                            "[QuestionWalk] emit card message failed {thread_id}/{sub_id}: {e}"
+                        );
                         return Err(format!("Failed to persist the card's message: {e}").into());
                     }
                 }
@@ -582,7 +623,9 @@ impl LucidosEngine {
                                 .collect(),
                             worktree_path: None,
                             multi_select: q.multi_select,
-                            owner_approval: owner_approval.clone(),
+                            owner_approval: None,
+                            unattested_act: None,
+                            permission_request: permission_request.clone(),
                         },
                         meta: EventMeta {
                             channel: Some(channel),
@@ -592,7 +635,9 @@ impl LucidosEngine {
                     .await
                 {
                     self.question_wait_registry.forget(&sub_id).await;
-                    log!("[QuestionWalk] emit UserQuestionAsked failed {thread_id}/{sub_id}: {e}");
+                    log_legacy!(
+                        "[QuestionWalk] emit UserQuestionAsked failed {thread_id}/{sub_id}: {e}"
+                    );
                     return Err(format!("Failed to persist UserQuestionAsked: {e}").into());
                 }
             }
@@ -639,6 +684,7 @@ impl LucidosEngine {
                         BusEvent::Thread {
                             thread_id,
                             event: ThreadEvent::UserQuestionAnswered {
+                                compose: None,
                                 tool_use_id: remaining_sub,
                                 answer: ending_kind.clone(),
                                 quiet: false,
@@ -662,19 +708,19 @@ impl LucidosEngine {
     }
 }
 
-/// Is this card an *owner approval card* (ADR 0387)? `Err` when the read
-/// failed, so a caller deciding who may answer it can fail closed.
-pub(crate) async fn is_owner_approval_card(
+/// Did the engine word this card, as a *permission request*? `Err` when the
+/// read failed, so a caller deciding who may answer it can fail closed.
+pub(crate) async fn is_engine_card(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
     tool_use_id: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM events \
-           WHERE aggregate_id = $1 AND event_type = 'UserQuestionAsked' \
-             AND payload->>'tool_use_id' = $2 \
-             AND payload ? 'owner_approval')",
-    )
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (SELECT 1 FROM events q \
+           WHERE q.aggregate_id = $1 AND q.event_type = 'UserQuestionAsked' \
+             AND q.payload->>'tool_use_id' = $2 AND {})",
+        crate::engine::permission::engine_card_sql("q"),
+    ))
     .bind(thread_id.to_string())
     .bind(tool_use_id)
     .fetch_one(pool)
@@ -711,7 +757,7 @@ pub(crate) async fn lookup_question_channel(
     ) {
         Ok(channel) => Ok(Some(channel)),
         Err(_) => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] UserQuestionAsked payload->>'channel' = {:?} did not parse as EventChannel for {}/{}; defaulting to CC resume behaviour",
                 channel_str,
                 thread_id,
@@ -1158,7 +1204,7 @@ pub(crate) async fn answered_question_recap(
     .unwrap_or_else(|e| {
         // A DB error is not "this thread has no answer": say so, and fall
         // through to the bare continue message rather than inventing silence.
-        log!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
+        log_legacy!("[CCQuestion] newest-answer lookup failed for {thread_id}: {e}");
         None
     })
     .flatten()
@@ -1179,7 +1225,7 @@ pub(crate) async fn answered_question_recap(
         .fetch_all(pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
+            log_legacy!("[CCQuestion] answered-batch lookup failed for {thread_id}: {e}");
             Vec::new()
         });
     if rows.is_empty() {
@@ -1238,7 +1284,7 @@ pub(crate) fn build_hook_answers(
             .unwrap_or("(unknown question)")
             .to_string();
         let key = if map.contains_key(&raw_text) {
-            crate::log!(
+            crate::log_legacy!(
                 "[AskUserQuestion] duplicate question text in tool input — disambiguating with suffix: {raw_text:?}"
             );
             format!("{raw_text} (#{})", i + 1)
@@ -1398,6 +1444,72 @@ pub async fn answer_pending_question_with_event_id(
     actor: Option<MessageOrigin>,
     event_id: Option<Uuid>,
 ) -> AnswerResult {
+    answer_pending_question_placed(
+        engine,
+        thread_id,
+        tool_use_id,
+        answer,
+        actor,
+        event_id,
+        None,
+        crate::engine::permission::PickedBy::Tap,
+    )
+    .await
+}
+
+/// [`answer_pending_question_with_event_id`], saying how the owner picked the
+/// option. Only a permission request reads `picked_by`, for its grant receipt.
+pub(crate) async fn answer_pending_question_picked_by(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+    event_id: Option<Uuid>,
+    picked_by: crate::engine::permission::PickedBy,
+) -> AnswerResult {
+    answer_pending_question_placed(
+        engine,
+        thread_id,
+        tool_use_id,
+        answer,
+        actor,
+        event_id,
+        None,
+        picked_by,
+    )
+    .await
+}
+
+/// The composer content an answer submitted, or `None` for one that carried
+/// none (an option click). Multi-select folds the prompt's text and images in
+/// beside the toggled options.
+pub(crate) fn composer_submission(
+    answer: &crate::engine::thread_events::AnswerKind,
+) -> Option<(String, Vec<String>)> {
+    use crate::engine::thread_events::AnswerKind;
+    let text = match answer {
+        AnswerKind::FreeText { text, .. } => text.clone(),
+        AnswerKind::MultiSelected { text, .. } => text.clone().unwrap_or_default(),
+        _ => return None,
+    };
+    let image_hashes = answer.image_hashes().to_vec();
+    (!text.trim().is_empty() || !image_hashes.is_empty()).then_some((text, image_hashes))
+}
+
+/// HTTP card answers use one atomic urgent append for placement and compose.
+/// `picked_by` says how the owner picked, for a permission request's receipt.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_pending_question_placed(
+    engine: &Arc<LucidosEngine>,
+    thread_id: Uuid,
+    tool_use_id: String,
+    answer: AnswerKind,
+    actor: Option<MessageOrigin>,
+    event_id: Option<Uuid>,
+    placement: Option<(Option<crate::engine::InputPosition>, Option<i64>)>,
+    picked_by: crate::engine::permission::PickedBy,
+) -> AnswerResult {
     match find_pending_question(engine, thread_id, &tool_use_id).await {
         Ok(Some(false)) => {}
         Ok(Some(true)) => {
@@ -1413,7 +1525,7 @@ pub async fn answer_pending_question_with_event_id(
             ));
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] DB lookup failed for {}/{}: {}",
                 thread_id,
                 tool_use_id,
@@ -1446,7 +1558,7 @@ pub async fn answer_pending_question_with_event_id(
                 ));
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[CCQuestion] DB lookup for question options failed {}/{}: {}",
                     thread_id,
                     tool_use_id,
@@ -1465,7 +1577,7 @@ pub async fn answer_pending_question_with_event_id(
         match lookup_question_channel(engine.pool(), thread_id, &tool_use_id).await {
             Ok(ch) => ch,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
                     thread_id,
                     tool_use_id,
@@ -1475,29 +1587,70 @@ pub async fn answer_pending_question_with_event_id(
             }
         };
     let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
+    // The engine raised an unattested caller's card or a permission request,
+    // so no agent waits on it. An unattested Allow runs its act through
+    // `api::owner_door`; a permission pick resolves below. A request the agent
+    // prepared also resolves below, and then wakes the agent like any card.
+    let pool = engine.pool();
+    let card_kinds = tokio::try_join!(
+        async {
+            crate::engine::unattested_act::card_act(pool, thread_id, &tool_use_id)
+                .await
+                .map(|act| act.is_some())
+        },
+        crate::engine::permission::card_request(pool, thread_id, &tool_use_id),
+    );
+    let (permission_request, engine_card) = match card_kinds {
+        Ok((unattested, request)) => {
+            let engine_card = unattested || request.as_ref().is_some_and(|r| r.prepared.is_none());
+            (request, engine_card)
+        }
+        Err(e) => {
+            log_legacy!(
+                "[CCQuestion] Card lookup failed {}/{}: {}",
+                thread_id,
+                tool_use_id,
+                e
+            );
+            return AnswerResult::Conflict("Database lookup failed".into());
+        }
+    };
     // A delivery held behind a chat card needs the agent, so the pick wakes it.
-    let quiet = quiet
-        && (should_emit_cc_resume_side_effects(original_channel)
-            || !has_held_deliveries(engine, thread_id, &tool_use_id).await);
+    let quiet = engine_card
+        || (quiet
+            && (should_emit_cc_resume_side_effects(original_channel)
+                || !has_held_deliveries(engine, thread_id, &tool_use_id).await));
 
-    if let Err(e) = engine
-        .event_bus
-        .emit(BusEvent::Thread {
-            thread_id,
-            event: ThreadEvent::UserQuestionAnswered {
-                tool_use_id: tool_use_id.clone(),
-                answer: answer.clone(),
-                quiet,
-            },
-            meta: EventMeta {
-                event_id,
-                channel: Some(answer_channel),
-                actor: actor.clone(),
-                ..EventMeta::NONE
-            },
-        })
-        .await
-    {
+    let event = ThreadEvent::UserQuestionAnswered {
+        compose: None,
+        tool_use_id: tool_use_id.clone(),
+        answer: answer.clone(),
+        quiet,
+    };
+    let meta = EventMeta {
+        event_id,
+        channel: Some(answer_channel),
+        actor: actor.clone(),
+        ..EventMeta::NONE
+    };
+    let recorded = if let Some((position, epoch)) = placement {
+        engine
+            .event_bus
+            .emit_question_answer(thread_id, event, meta, position, epoch)
+            .await
+            .map(|_| ())
+    } else {
+        engine
+            .event_bus
+            .emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            })
+            .await
+            .map(|_| ())
+    };
+    if let Err(e) = recorded {
         if crate::engine::event_bus::violates_unique_index(
             &*e,
             "events_user_question_answered_unique",
@@ -1507,7 +1660,7 @@ pub async fn answer_pending_question_with_event_id(
                 tool_use_id, thread_id
             ));
         }
-        log!(
+        log_legacy!(
             "[CCQuestion] Failed to emit UserQuestionAnswered for {}/{}: {}",
             thread_id,
             tool_use_id,
@@ -1515,11 +1668,49 @@ pub async fn answer_pending_question_with_event_id(
         );
         return AnswerResult::Conflict(format!("Failed to persist answer: {}", e));
     }
+    if let Some(request) = permission_request {
+        // The answer stands either way, so a failed grant only logs.
+        match crate::engine::permission::resolve_answer(
+            &engine.event_bus,
+            &engine.grants_dir(),
+            thread_id,
+            &tool_use_id,
+            &request,
+            &answer,
+            actor.as_ref(),
+            picked_by,
+        )
+        .await
+        {
+            Ok(resolution) => {
+                engine
+                    .act_on_step_answer(thread_id, &request, &resolution, actor.clone())
+                    .await;
+                // A confirmed batch answers other cards, so it runs after this
+                // answer returns rather than inside it.
+                if request.batch.is_some() {
+                    tokio::spawn(crate::engine::permission::batch::run_batch(
+                        engine.clone(),
+                        thread_id,
+                        request,
+                        resolution,
+                        actor.clone(),
+                    ));
+                }
+            }
+            Err(e) => log_legacy!(
+                "[CCQuestion] Permission request {tool_use_id} on {thread_id} did not resolve: {e}"
+            ),
+        }
+    }
+    if engine_card {
+        return AnswerResult::Resumed;
+    }
 
     // The answer stands either way, so a failed driver take only logs.
     if let (Some(answerer), true) = (actor.as_ref(), answer.is_a_reply()) {
-        use crate::engine::thread_people::{notify, take_on_answer, PeopleNotice};
-        let snapshot = crate::gateway_operators::current();
+        use crate::engine::thread_users::{notify, take_on_answer, UserNotice};
+        let snapshot = crate::gateway_users::current();
         let taken = match take_on_answer(
             engine.pool(),
             &engine.event_bus,
@@ -1531,7 +1722,7 @@ pub async fn answer_pending_question_with_event_id(
         {
             Ok(taken) => taken,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[CCQuestion] Could not make the answerer of {}/{} the driver: {}",
                     thread_id,
                     tool_use_id,
@@ -1544,18 +1735,12 @@ pub async fn answer_pending_question_with_event_id(
             let notified =
                 match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
                     Ok(root) => {
-                        notify(
-                            engine,
-                            root,
-                            PeopleNotice::GateAnswered(takeover),
-                            &snapshot,
-                        )
-                        .await
+                        notify(engine, root, UserNotice::GateAnswered(takeover), &snapshot).await
                     }
                     Err(e) => Err(e.into()),
                 };
             if let Err(e) = notified {
-                log!(
+                log_legacy!(
                     "[CCQuestion] Could not tell the driver of {} about the answer: {}",
                     thread_id,
                     e
@@ -1737,7 +1922,7 @@ pub(crate) async fn lookup_interrupted_ask(
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
+        log_legacy!("[CCQuestion] ask_user_question call lookup failed for {thread_id}: {e}");
         None
     })
 }
@@ -1760,7 +1945,7 @@ pub(crate) fn resume_anchor_for_ask(
     match ask.and_then(|a| a.request_event_id) {
         Some(request_event_id) => ChatResumeAnchor::ExistingTurn(request_event_id),
         None => {
-            log!(
+            log_legacy!(
                 "[CCQuestion] no interrupted turn to continue for thread {} — resuming with a Continue boundary",
                 thread_id
             );
@@ -1839,7 +2024,7 @@ async fn resume_chat_after_answer(
         .spawn_chat_resume(thread_id, note, channel, actor, anchor)
         .await
     {
-        log!(
+        log_legacy!(
             "[CCQuestion] chat resume-after-answer failed for thread {}: {}",
             thread_id,
             e
@@ -1945,7 +2130,7 @@ async fn emit_restart_orphaned_ask_result(
                 // Nothing above can retry (this path returns `()`), so stop and say
                 // so loudly rather than mislabel the answers silently.
                 Err(e) => {
-                    log!(
+                    log_legacy!(
                         "[Question] Sub-answer lookup failed for {} at index {}: {}. \
                          Resuming with the {} answer(s) found so far; any later \
                          question will read as (canceled) to the model",

@@ -16,9 +16,9 @@ use super::super::{
 };
 use super::propagation::{
     detach_child_from_parent, hold_parent_recount_lock, load_blocking_sample,
-    mark_parent_callback_pending, mark_stopped_child, propagate_blocking_change,
-    reconcile_blocking_descendant_count_for_ancestors, reconcile_parent_active_children_count,
-    reconcile_parent_waiting_children_count, reconcile_proposal_lifecycle_end,
+    mark_parent_callback_pending, mark_stopped_child, parent_of, propagate_blocking_change,
+    reconcile_awaited_from, reconcile_descendant_counts_from,
+    reconcile_parent_active_children_count, reconcile_proposal_lifecycle_end,
     reincrement_parent_active_count_if_revived, settle_parent_callback,
 };
 use crate::core::store::{
@@ -84,6 +84,7 @@ async fn a_call_makes_the_thread_real(
              compose_images = '[]'::jsonb, \
              compose_mode = NULL, \
              compose_selection = NULL, \
+             compose_restorations = '[]'::jsonb, \
              compose_epoch = compose_epoch + 1 \
          WHERE thread_id = $1 AND state = 'composing' \
          RETURNING {COMPOSE_REPORT_COLS}"
@@ -246,6 +247,9 @@ impl EventBus {
         // `propagate_blocking_change` doesn't double-subtract on top of
         // the recompute.
         let mut skip_blocking_propagate = false;
+        // Rows whose descendant counts, and every ancestor's, an arm wants
+        // recomputed. The recompute runs after the awaited climb, below.
+        let mut descendant_recount_anchors: Vec<Uuid> = Vec::new();
 
         // Step 1: Run metadata updates
         let match_side_effects: Vec<BusEvent> = match event {
@@ -331,6 +335,12 @@ impl EventBus {
                                WHEN thread_summaries.state = 'composing' THEN EXCLUDED.source
                                WHEN thread_summaries.source = 'chat' THEN EXCLUDED.source
                                ELSE thread_summaries.source
+                           END,
+                           -- The send decides who started the thread, so an
+                           -- agent's draft the owner sends reads as theirs.
+                           initiator = CASE
+                               WHEN thread_summaries.state = 'composing' THEN EXCLUDED.initiator
+                               ELSE thread_summaries.initiator
                            END
                        -- Defense in depth: refuse to resurrect a discarded thread if a
                        -- stale MessageReceived slips past the API-layer guard.
@@ -680,10 +690,17 @@ impl EventBus {
                     post_merge_sha.as_deref(),
                 )
                 .await?;
+                crate::engine::permission::projection::end_until_plan_lands(tx, thread_id).await?;
                 // Defense in depth: recompute the parent's active count and
                 // every ancestor's descendant counts from ground truth, so a
                 // drift from any earlier missed update ends at the proposal.
-                reconcile_proposal_lifecycle_end(tx, thread_id, &mut extra_ancestors).await?;
+                reconcile_proposal_lifecycle_end(
+                    tx,
+                    thread_id,
+                    &mut extra_ancestors,
+                    &mut descendant_recount_anchors,
+                )
+                .await?;
                 skip_blocking_propagate = true;
                 Vec::new()
             }
@@ -703,7 +720,13 @@ impl EventBus {
                 )
                 .await?;
                 // See ChangeApplied for the defense-in-depth rationale.
-                reconcile_proposal_lifecycle_end(tx, thread_id, &mut extra_ancestors).await?;
+                reconcile_proposal_lifecycle_end(
+                    tx,
+                    thread_id,
+                    &mut extra_ancestors,
+                    &mut descendant_recount_anchors,
+                )
+                .await?;
                 skip_blocking_propagate = true;
                 Vec::new()
             }
@@ -762,7 +785,7 @@ impl EventBus {
             // Title events
             ThreadEvent::ThreadTitleGenerated { title } | ThreadEvent::ThreadTitleRenamed { title } => {
                 if !write_thread_title(tx, thread_id, title).await? {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventBus] Dropped the name {:?} for {}: no thread_summaries row. \
                          A title event has to follow the thread's first MessageReceived \
                          (ADR 0240), and a deleted thread has no row to name.",
@@ -931,24 +954,31 @@ impl EventBus {
                 }
                 Vec::new()
             }
-            ThreadEvent::ThreadStarted { mode, recovered_compose, .. } => {
-                let text = recovered_compose.as_ref().map_or("", |r| r.text.as_str());
-                let images = serde_json::json!(recovered_compose.as_ref().map(|r| &r.image_hashes).cloned().unwrap_or_default());
-                let selection = recovered_compose.as_ref().and_then(|r| r.selection.as_ref());
+            ThreadEvent::ThreadStarted { mode, recovered_compose, agent_draft, .. } => {
+                crate::core::preferences::lock_compose_agent_seed(tx, false).await?;
+                let seed = recovered_compose
+                    .as_ref()
+                    .map(|r| (&r.text, &r.image_hashes, &r.selection))
+                    .or(agent_draft.as_ref().map(|d| (&d.text, &d.image_hashes, &d.selection)));
+                let text = seed.map_or("", |(text, _, _)| text.as_str());
+                let images = serde_json::json!(seed.map(|(_, images, _)| images.clone()).unwrap_or_default());
+                let selection = seed.and_then(|(_, _, selection)| selection.as_ref());
                 // Compose-time thread creation — the row appears in
                 // `thread_summaries` with `state='composing'` so the frontend
-                // can render it as a draft via cross-device SSE. Default
-                // initiator is `user` since only humans open compose. Source
-                // mirrors the user's chosen mode so a draft that auto-archives
+                // can render it as a draft via cross-device SSE. A person opens
+                // compose as `user`, and an agent's draft is `system`. Source
+                // mirrors the chosen mode so a draft that auto-archives
                 // before being sent still surfaces with the correct channel
                 // pill. Send events later re-assert source via the
                 // `source = 'chat'`-keyed CASE in MessageReceived.
                 let source = if mode == "claude_code" { "claude_code" } else { "chat" };
+                let initiator = if agent_draft.is_some() { "system" } else { "user" };
                 sqlx::query(&format!(
                     r#"INSERT INTO thread_summaries
                         (thread_id, initiator, source, created_at, last_activity, message_count,
-                         state, compose_mode, status, compose_text, compose_images, compose_selection, compose_updated_at)
-                       VALUES ($1, 'user', $3, NOW(), NOW(), 0, 'composing', $2, {IDLE}, $4, $5, $6, CASE WHEN $7 THEN NOW() ELSE NULL END)
+                         state, compose_mode, status, compose_text, compose_images, compose_selection, compose_updated_at,
+                         drafted_by_thread_id)
+                       VALUES ($1, $8, $3, NOW(), NOW(), 0, 'composing', $2, {IDLE}, $4, $5, $6, CASE WHEN $7 THEN NOW() ELSE NULL END, $9)
                        ON CONFLICT (thread_id) DO NOTHING"#
                 ))
                 .bind(thread_id)
@@ -957,7 +987,9 @@ impl EventBus {
                 .bind(text)
                 .bind(images)
                 .bind(selection)
-                .bind(recovered_compose.is_some())
+                .bind(seed.is_some())
+                .bind(initiator)
+                .bind(agent_draft.as_ref().map(|d| d.drafted_by_thread_id))
                 .execute(&mut **tx)
                 .await?;
                 Vec::new()
@@ -1054,6 +1086,43 @@ impl EventBus {
                     mark_stopped_child(tx, thread_id).await?;
                 }
                 // See ResponseGenerated for the IN-TX broadcast rationale.
+                if let Some(pid) =
+                    reconcile_parent_active_children_count(tx, thread_id).await?
+                {
+                    extra_ancestors.push(pid);
+                }
+                Vec::new()
+            }
+            // A chat message recorded as the next turn's starter set
+            // 'running'. Taken back before its turn stamped, nothing runs, so
+            // the thread settles unless another turn has begun since the last
+            // terminal. A coding agent's withdrawal is settled by its holder.
+            ThreadEvent::QueuedMessageRemoved { removed_message_id, compose, .. } => {
+                if let Some(report) = compose {
+                    sqlx::query("UPDATE thread_summaries SET compose_text=$2, compose_images=$3, compose_mode=$4, compose_selection=$5, compose_epoch=$6, compose_restorations=$7 WHERE thread_id=$1 AND compose_epoch < $6")
+                        .bind(thread_id).bind(&report.text).bind(serde_json::json!(report.image_hashes))
+                        .bind(&report.mode).bind(&report.selection).bind(report.compose_epoch).bind(serde_json::json!(report.restorations))
+                        .execute(&mut **tx).await?;
+                }
+                sqlx::query(&format!(
+                    "UPDATE thread_summaries SET status = {IDLE} \
+                     WHERE thread_id = $1 AND status = {RUNNING} AND source <> $3 \
+                       AND NOT EXISTS (SELECT 1 FROM events e WHERE e.thread_id = $1 \
+                         AND e.event_type IN ('MessageReceived', 'ChatTurnSettingsResolved') \
+                         AND e.sequence > COALESCE((SELECT t.sequence FROM events t \
+                           WHERE t.thread_id = $1 AND t.event_type IN ('ResponseGenerated', \
+                             'ResponseCanceled', 'ResponseAborted', 'ResponseFailed') \
+                           ORDER BY t.sequence DESC LIMIT 1), 0) \
+                         AND NOT (e.event_type = 'MessageReceived' AND (e.id = $2 OR EXISTS ( \
+                           SELECT 1 FROM events r WHERE r.thread_id = $1 \
+                             AND r.event_type = 'QueuedMessageRemoved' \
+                             AND r.payload->>'removed_message_id' = e.id::text))))",
+                ))
+                .bind(thread_id)
+                .bind(removed_message_id)
+                .bind(crate::engine::thread_lifecycle::CODING_AGENT_SOURCE)
+                .execute(&mut **tx)
+                .await?;
                 if let Some(pid) =
                     reconcile_parent_active_children_count(tx, thread_id).await?
                 {
@@ -1474,13 +1543,13 @@ impl EventBus {
             // rather than as finished. That has to hold on a drawer row whose
             // events were never loaded, and across a reload. The count is read
             // as `count > 0` by the frontend's `resolveVisualStatus`; the list
-            // is the waiting indicator's subscriptions section. No backend
-            // predicate consumes either, so a subscribed thread stays
+            // is the waiting indicator's subscriptions section. No blocking or
+            // attention predicate consumes either, so a subscribed thread stays
             // non-blocking, non-attention-needing and archivable (ADR 0049).
             //
-            // Each arm also recounts the parent's `waiting_children_count`, since
-            // a child idling on a wait has not finished (ADR 0254). That count is
-            // frontend-only too, and a moved count rebroadcasts the parent.
+            // The count feeds `awaited_by_parent`, since a child idling on a
+            // wait has not finished (ADR 0254, 0672). The end of this function
+            // climbs it to every ancestor.
             //
             // See `event_wait_sql` for why the two move as one.
             ThreadEvent::EventWaitStarted {
@@ -1502,8 +1571,6 @@ impl EventBus {
                     .bind(sqlx::types::Json(&entry))
                     .execute(&mut **tx)
                     .await?;
-                extra_ancestors
-                    .extend(reconcile_parent_waiting_children_count(tx, thread_id).await?);
                 Vec::new()
             }
             // **No resolution moves the status.** A subscription never held the
@@ -1529,8 +1596,6 @@ impl EventBus {
                     .bind(wait_id.to_string())
                     .execute(&mut **tx)
                     .await?;
-                extra_ancestors
-                    .extend(reconcile_parent_waiting_children_count(tx, thread_id).await?);
                 Vec::new()
             }
             // The keep-alive tick's status. It moves no recency and no status,
@@ -1580,8 +1645,6 @@ impl EventBus {
                     .bind(wait_id.to_string())
                     .execute(&mut **tx)
                     .await?;
-                extra_ancestors
-                    .extend(reconcile_parent_waiting_children_count(tx, thread_id).await?);
                 Vec::new()
             }
             // A question answer can RESUME a session that already idled: answering
@@ -1592,7 +1655,13 @@ impl EventBus {
             //
             // The card ends the reply, so a human answer reads it and clears a
             // read request, as a human message does (ADR 0409).
-            ThreadEvent::UserQuestionAnswered { quiet, .. } => {
+            ThreadEvent::UserQuestionAnswered { quiet, compose, .. } => {
+                if let Some(report) = compose {
+                    sqlx::query("UPDATE thread_summaries SET compose_text=$2, compose_images=$3, compose_mode=$4, compose_selection=$5, compose_epoch=$6, compose_restorations=$7 WHERE thread_id=$1 AND compose_epoch < $6")
+                        .bind(thread_id).bind(&report.text).bind(serde_json::json!(report.image_hashes))
+                        .bind(&report.mode).bind(&report.selection).bind(report.compose_epoch).bind(serde_json::json!(report.restorations))
+                        .execute(&mut **tx).await?;
+                }
                 let status = if *quiet {
                     IDLE.to_string()
                 } else {
@@ -1609,9 +1678,6 @@ impl EventBus {
                 .bind(human)
                 .execute(&mut **tx)
                 .await?;
-                // The compose fields are not touched: an answer typed into
-                // the composer consumed the compose slot when the engine
-                // accepted it (ADR 0450).
                 Vec::new()
             }
             // A permission resolution only ever unblocks an in-memory broadcast
@@ -1774,7 +1840,8 @@ impl EventBus {
             //
             // The same write settles a stopped child. It lands on the child's
             // row, outside this event's own attention sample. So the child's
-            // ancestors are reconciled here, and its aggregate is rebroadcast.
+            // ancestors are reconciled after the climb, and its aggregate is
+            // rebroadcast.
             //
             // A filed report settles the child the same way. It writes nothing
             // on the parent's own row: the parent does not wake.
@@ -1786,10 +1853,7 @@ impl EventBus {
             } => {
                 if settle_parent_callback(tx, *child_thread_id).await? {
                     extra_ancestors.push(*child_thread_id);
-                    extra_ancestors.extend(
-                        reconcile_blocking_descendant_count_for_ancestors(tx, *child_thread_id)
-                            .await?,
-                    );
+                    descendant_recount_anchors.extend(parent_of(tx, *child_thread_id).await?);
                 }
                 Vec::new()
             }
@@ -1797,14 +1861,15 @@ impl EventBus {
             // carries the state, and the parent does not wake (ADR 0252).
             ThreadEvent::ChildThreadStopped { .. } => Vec::new(),
             // The edge to a child is cut on the child's row, inside the former
-            // parent's event (ADR 0278). The helper recounts the parent and its
-            // ancestors itself, and names every row to rebroadcast, the child
-            // included, so the drawer un-nests it live.
+            // parent's event (ADR 0278). The helper recounts the parent's child
+            // counts and names every row to rebroadcast, the child included, so
+            // the drawer un-nests it live. Descendant counts follow the climb.
             ThreadEvent::ChildThreadDetached {
                 child_thread_id, ..
             } => {
                 extra_ancestors
                     .extend(detach_child_from_parent(tx, thread_id, *child_thread_id).await?);
+                descendant_recount_anchors.push(thread_id);
                 Vec::new()
             }
             // Recency, and nothing else. Placing a call is a user action on
@@ -1865,13 +1930,13 @@ impl EventBus {
                 .await?;
                 a_call_makes_the_thread_real(tx, thread_id).await?
             }
-            // A people-only message starts no turn, so it moves no column a
+            // A user-only message starts no turn, so it moves no column a
             // turn owns. It is still a person writing in the thread, so it
             // carries recency and lists the thread like a typed message does.
             //
             // It can be a thread's first event: a thread started with a
             // teammate. So it upserts, and it makes a draft a real chat thread.
-            ThreadEvent::PeopleMessagePosted { text, .. } => {
+            ThreadEvent::UserOnlyMessagePosted { text, .. } => {
                 sqlx::query(&format!(
                     r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, last_user_action, message_count, status, state, has_response)
                        VALUES ($1, $2, 'chat', 'user', NOW(), NOW(), NOW(), 0, {IDLE}, 'active', TRUE)
@@ -1891,20 +1956,64 @@ impl EventBus {
                 Vec::new()
             }
             // Events that don't affect thread_summaries metadata or status.
+            ThreadEvent::PermissionGranted {
+                permission_id,
+                action,
+                breadth,
+                lifetime,
+                holder,
+                request_tool_use_id,
+                pattern,
+                picked_by,
+            } => {
+                crate::engine::permission::projection::write_granted(
+                    tx,
+                    thread_id,
+                    crate::engine::permission::projection::Granted {
+                        permission_id: *permission_id,
+                        action: *action,
+                        breadth: breadth.as_deref(),
+                        lifetime: *lifetime,
+                        holder,
+                        request_tool_use_id,
+                        pattern: pattern.as_deref(),
+                        picked_by,
+                    },
+                )
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::PermissionSpent { permission_id } => {
+                crate::engine::permission::projection::write_spent(tx, *permission_id).await?;
+                Vec::new()
+            }
+            ThreadEvent::PermissionRestored { spent, restored } => {
+                crate::engine::permission::projection::write_restored(tx, thread_id, *spent, *restored).await?;
+                Vec::new()
+            }
+            ThreadEvent::PermissionRevoked { permission_id } => {
+                crate::engine::permission::projection::write_ended(tx, *permission_id, "revoked")
+                    .await?;
+                Vec::new()
+            }
             // Exhaustive match — adding a new ThreadEvent variant forces you to decide
             // whether it needs a projection update. Never use `_ =>` here.
             // A form request changes no status or section. The turn that asked
             // has ended, and the pending list plus the transcript row are
             // how the user finds an open one.
             ThreadEvent::CredentialRequested { .. }
+            // A batch receipt: each item's own events moved its target thread.
+            | ThreadEvent::BatchItemRan { .. }
+            // A prepared request grants nothing, and its card moves the thread.
+            | ThreadEvent::PermissionRequestPrepared { .. }
             | ThreadEvent::PluginInstallRequested { .. }
             | ThreadEvent::PluginUninstallRequested { .. }
             | ThreadEvent::EmailConfirmRequested { .. }
             | ThreadEvent::OAuthAuthorizationRequested { .. }
             | ThreadEvent::FormRequestResolved { .. }
             | ThreadEvent::McpConsentRequested { .. }
-            // Thread people resolve operators at read time, so no summary
-            // column can hold them (`engine::thread_people`).
+            // Thread users resolve users at read time, so no summary
+            // column can hold them (`engine::thread_users`).
             | ThreadEvent::WorkItemDriverTaken
             | ThreadEvent::WorkItemDriverReleased
             | ThreadEvent::WorkItemGateEscalated { .. }
@@ -1913,6 +2022,9 @@ impl EventBus {
             // The pause folds from events at read time (`engine::agent_pause`).
             | ThreadEvent::AgentPaused { .. }
             | ThreadEvent::AgentResumed { .. }
+            // The automation pause folds the same way (`engine::automation_pause`).
+            | ThreadEvent::AutomationPaused { .. }
+            | ThreadEvent::AutomationUnpaused { .. }
             // Transient events (never persisted, never reach this function)
             | ThreadEvent::CumulativeTextUpdated { .. }
             | ThreadEvent::LlmCallRetried { .. }
@@ -1928,6 +2040,7 @@ impl EventBus {
             | ThreadEvent::MissingHardeningDetected { .. }
             | ThreadEvent::CodingAgentSettingsChanged { .. }
             | ThreadEvent::ChatSettingsChanged { .. }
+            | ThreadEvent::ChatTurnSettingsResolved { .. }
             // Passive bookkeeping for the background cleanup worker
             // (Phase 10.2). Persisted to the events stream for audit /
             // debugging but produces no projection side effects.
@@ -1939,9 +2052,14 @@ impl EventBus {
             | ThreadEvent::ImageUploaded { .. }
             | ThreadEvent::ContextCaptured { .. }
             | ThreadEvent::ModelCallFailed { .. }
-            // A compaction step changes no status; the turn around it does.
+            // A compaction or substitution step changes no status; the turn
+            // around it does.
             | ThreadEvent::CodingAgentCompacted { .. }
+            | ThreadEvent::CodingAgentModelSubstituted { .. }
             // A checkpoint run is history for the handoff estimate only.
+            | ThreadEvent::PlanProposed { .. }
+            | ThreadEvent::PlanApproved { .. }
+            | ThreadEvent::PlanStarted { .. }
             | ThreadEvent::HandoffCheckpointReached { .. }
             // A decline is read back by the Successor card's context reading.
             | ThreadEvent::SuccessorOfferDeclined { .. }
@@ -1956,11 +2074,6 @@ impl EventBus {
             | ThreadEvent::SessionHandedOff { .. }
             // A withdrawal ends a pending handoff in the same read.
             | ThreadEvent::SessionHandoffWithdrawn
-            // User removed a queued prompt before ingestion. Pure marker:
-            // the original MessageReceived remains in history, and the
-            // renderer/agentic loop consult this row without changing the
-            // thread summary projection.
-            | ThreadEvent::QueuedMessageRemoved { .. }
             // A side question is a card beside the thread, never a turn, so
             // it moves no column (ADR 0320).
             | ThreadEvent::SideQuestionAsked { .. }
@@ -1992,11 +2105,16 @@ impl EventBus {
             // the event-store fallback in `bash_output`.
             | ThreadEvent::BackgroundBashStarted { .. }
             | ThreadEvent::BackgroundBashCompleted { .. }
-            // An owner approval asked for, then spent. The request is the
-            // card's wording, the spend is the single-use key, and the card
-            // and the act project on their own.
+            // The engine's record of a confinement run it started, read back
+            // as evidence. It moves no status or activity.
+            | ThreadEvent::ConfinementRunStarted { .. }
+            // The retired single-use card, asked for, then spent. History
+            // only: the card and the act project on their own.
             | ThreadEvent::OwnerApprovalRequested { .. }
             | ThreadEvent::OwnerApprovalSpent { .. }
+            | ThreadEvent::UnattestedActSpent { .. }
+            // A broker act on the agent's own workspace: a record, not a turn.
+            | ThreadEvent::MachineMadeWorkspaceChanged { .. }
             // Engine-internal Flash enrichment of a prior MessageReceived's
             // attached images. Persisted for history projection / title
             // generation lookup by source_event_id; doesn't bump activity or
@@ -2043,7 +2161,10 @@ impl EventBus {
             // thread. The `changes` table carries both.
             | ThreadEvent::MergeConflictDetected { .. }
             | ThreadEvent::ChangeApplyFailed { .. }
-            | ThreadEvent::TriggerRunInterrupted { .. } => Vec::new(),
+            | ThreadEvent::TriggerRunInterrupted { .. }
+            // Billing evidence is append-only audit data; captures carry the
+            // usage, and no thread-summary column derives from this observation.
+            | ThreadEvent::CodingAgentBillingObserved { .. } => Vec::new(),
         };
 
         // Step 2: Validate and apply section transition via the lifecycle contract.
@@ -2135,9 +2256,29 @@ impl EventBus {
                 Self::apply_transition(tx, thread_id, &transition).await?;
             }
             Err(v) => {
-                crate::log!("[EventBus] {}", v);
+                crate::log_legacy!("[EventBus] {}", v);
                 return Err(Box::new(v));
             }
+        }
+
+        // Any event can move an input of `awaited_by_parent`, so every one
+        // refreshes it and climbs (ADR 0672). Streaming events only keep a
+        // running thread running, so they skip it as they skip the sample.
+        if !skip_blocking_sample {
+            extra_ancestors.extend(
+                reconcile_awaited_from(tx, thread_id)
+                    .await?
+                    .into_iter()
+                    .filter(|id| *id != thread_id),
+            );
+        }
+
+        // Every walk that writes ancestor rows without their recount lock runs
+        // after the climb. The climb takes each lock before its row, as a
+        // sibling's recount does. An earlier walk would leave the climb waiting
+        // on a lock while holding the row that sibling waits on: a deadlock.
+        for anchor in descendant_recount_anchors {
+            extra_ancestors.extend(reconcile_descendant_counts_from(tx, anchor).await?);
         }
 
         // Sample is_blocking-relevant state AFTER both the metadata match and

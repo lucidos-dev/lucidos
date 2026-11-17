@@ -290,7 +290,7 @@ impl crate::engine::LucidosEngine {
         else {
             return;
         };
-        log!(
+        log_legacy!(
             "[AgentSession] Redelivering {} follow-up(s) the previous session never read on thread {}",
             stranded.len(),
             thread_id

@@ -169,7 +169,7 @@ async fn an_archived_thread_offers_no_form() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = seed_thread(&bus).await;
-    let (_, event) = credential_request("weather");
+    let (request_id, event) = credential_request("weather");
     seed_thread_event(&bus, thread_id, event).await;
 
     sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
@@ -178,6 +178,20 @@ async fn an_archived_thread_offers_no_form() {
         .await
         .unwrap();
     assert!(pending_ids(&pool).await.is_empty());
+
+    let unknown = Uuid::new_v4();
+    assert!(resolved_ids(&pool, &[request_id, unknown])
+        .await
+        .unwrap()
+        .is_empty());
+    resolve(&pool, &bus, request_id, FormRequestOutcome::Completed, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolved_ids(&pool, &[request_id, unknown]).await.unwrap(),
+        [request_id]
+    );
+    assert!(resolved_ids(&pool, &[unknown]).await.unwrap().is_empty());
 
     pool.close().await;
     teardown_test_db(&db_name).await;

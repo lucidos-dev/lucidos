@@ -193,3 +193,20 @@
     color: var(--text-muted);
     cursor: default;
 }
+
+/* The asterisk is visible on both faces; full pairs live in the popover. */
+.rung-next-turn {
+    color: var(--accent);
+    flex-shrink: 0;
+}
+
+.rung-turn-summary {
+    padding: var(--space-md);
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+.rung-turn-summary > :last-child {
+    color: var(--accent);
+    margin-top: var(--space-xs);
+}

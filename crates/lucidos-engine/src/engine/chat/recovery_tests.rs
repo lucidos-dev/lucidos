@@ -145,6 +145,8 @@ async fn emit_unanswered_question(bus: &EventBus, thread_id: Uuid, tool_use_id: 
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -455,6 +457,7 @@ async fn orphan_threads_query_recovers_answered_then_interrupted_thread() {
     bus.emit(BusEvent::Thread {
         thread_id: answered_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "toolu_answered".into(),
             quiet: false,
             answer: crate::engine::thread_events::AnswerKind::Selected {
@@ -812,11 +815,9 @@ mod switch_resume {
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
 
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            crate::api::actor::HEADER_DEVICE_ID,
-            axum::http::HeaderValue::from_static("picker-device"),
-        );
+        // The gateway stamps the device it names, and only a stamped id is one.
+        let headers =
+            crate::api::gateway_stamp::test_support::stamped_device_headers("picker-device");
         let actor = crate::api::actor::user_actor(&headers, None);
         assert!(
             matches!(actor, Some(MessageOrigin::Device { .. })),

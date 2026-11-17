@@ -11,6 +11,10 @@
  *  shell instead of growing the shell chunk. Its pointerdown cover sample must
  *  run before any overlay's listener, so that part installs here at once. */
 
+import './store/effects';
+import { installAppBridge } from './store/actions/app-bridge';
+import { installPaneFocusTracking } from './components/layout/paneFocus';
+
 import { installPressCoverWatch } from './components/chat/pressCover';
 import { installDeadKeystrokeProbe } from './components/chat/deadKeystrokeProbe';
 import { installToastPressProbe } from './components/shared/toastPressProbe';
@@ -21,6 +25,7 @@ import { installAppFrameMessages } from './store/actions/app-frame-messages';
 import { installPendingUploadRestore } from './store/actions/pendingUploadRestore';
 import { installUnsentMessageRestore } from './store/actions/unsentMessageRestore';
 import { installScaleWheel } from './components/shared/scaleWheelListener';
+import { installGlobalClick } from './store/globalClick';
 import { installSeenTargetWatch } from './store/actions/seen-target';
 import { installViewMenu } from './store/actions/view-menu';
 import { startPageHealthLog } from './utils/pageHealthLog.report';
@@ -63,6 +68,11 @@ export function startShell(): () => void {
   // See actions/seen-target.ts and system-knowhow/notifications.md §4.
   installSeenTargetWatch();
   const stops = [
+    // Both listeners are ready before the first iframe or pane can mount.
+    installAppBridge(),
+    installPaneFocusTracking(),
+    // Thread links, inline images, copy buttons and external URLs.
+    installGlobalClick(),
     installAppKeybindingsSync(),
     installAppExternalLinksSync(),
     installAppFocusedThreadSync(),

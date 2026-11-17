@@ -4,7 +4,8 @@ import { installDirectRequestAdmission } from '@lucidos/restore-generation';
 import { bindSourceGeneration, observeSourceGeneration, sourceGeneration } from '../utils/restoreSourceGeneration';
 import { WORKSPACE_ID } from '../utils/basePath';
 import { generateUuid } from '../utils/uuid';
-import { installRestoreAdmission, preserveRestoreSources, queuedRestoreSourceId, restoreAdmissionChanged, waitForRestoreAdmission } from '../utils/restoreAdmission';
+import { installRestoreAdmission, preserveRestoreSources, queuedRestoreSourceId, restoreAdmissionChanged, waitForRestoreAdmission,
+  type RestoreAdmissionPhase } from '../utils/restoreAdmission';
 import { createRecoveredDraft } from '../api/client/threads';
 import { queuedUploadSends } from './uploadSendIntents';
 import { pendingUploads } from './pendingUploads';
@@ -19,9 +20,20 @@ import { createRestoreGenerationStore } from './restoreGenerationRecords';
 import { captureHistoricalSources } from './restoreHistoricalSources';
 import { captureRestoreIntent } from './restoreIntentCapture';
 import { recoverRestoreDrafts } from './restoreDraftRecovery';
-import { copyRestoreSourceForReview, readRestoreSourceReview, type RestoreSourceReference } from './restoreSourceActions';
+import type { RestoreSourceReference } from './restoreSourceActions';
+import { lazyModule } from '../utils/lazyComponent';
 
 let runtime: ReturnType<typeof createRuntime> | undefined;
+
+// Review is an explicit Settings action, never startup, so its code loads on
+// demand and stays out of the entry chunk.
+const sourceActions = lazyModule(() => import('./restoreSourceActions'));
+
+/** The loader already reloaded to a new build or told the user it failed. */
+async function loadSourceActions() {
+  if (!await sourceActions.preload()) throw new Error('Restore review could not load');
+  return sourceActions.get();
+}
 
 function createRuntime() {
   installDirectRequestAdmission(() => {
@@ -37,7 +49,10 @@ function createRuntime() {
   holdPageOwnerLock();
   const store = createRestoreGenerationStore(WORKSPACE_ID, pageOwnerId);
   let ready = false;
+  /** Set for good at the first admission, which closes provisional reads. */
+  let everAdmitted = false;
   let epoch = 0;
+  let phase: RestoreAdmissionPhase = 'awaiting-hello';
   let waiters: Array<() => void> = [];
   const barrier = new RestoreGenerationBarrier(store, {
     capture: async () => {
@@ -72,12 +87,14 @@ function createRuntime() {
     },
     reload: () => window.location.reload(),
   });
-  installRestoreAdmission({ ready: () => ready, wait: async () => {
+  installRestoreAdmission({ ready: () => ready, phase: () => phase, provisional: () => !everAdmitted, wait: async () => {
     while (!ready) await new Promise<void>((resolve) => { waiters.push(resolve); });
   } });
+  // Each review action reads its lease before loading its code.
   return {
     async reviewSources() {
       const connection = epoch;
+      const { readRestoreSourceReview } = await loadSourceActions();
       return readRestoreSourceReview(store, {
         isCurrent: () => ready && epoch === connection && barrier.isReady(connection),
         readLiveOwners: liveOwnerIds,
@@ -87,15 +104,25 @@ function createRuntime() {
       const connection = epoch;
       const generation = sourceGeneration();
       if (!ready || generation === null) throw new Error('Restore review is not ready');
+      const { copyRestoreSourceForReview } = await loadSourceActions();
       return copyRestoreSourceForReview(store, generation, reference, {
         allocateId: generateUuid,
         isCurrent: () => ready && epoch === connection && barrier.isReady(connection),
         createDraftIfAbsent: (id, source) => createRecoveredDraft(id, generation, source),
       });
     },
-    begin() { ready = false; epoch = barrier.beginConnection(); restoreAdmissionChanged(); return epoch; },
+    begin() {
+      ready = false;
+      epoch = barrier.beginConnection();
+      phase = 'awaiting-hello';
+      restoreAdmissionChanged();
+      return epoch;
+    },
     async hello(connection: number, generation: RestoreGeneration): Promise<boolean> {
+      // A stale connection's hello must not relabel the current one.
+      const enter = (next: RestoreAdmissionPhase) => { if (connection === epoch) phase = next; };
       let admission;
+      enter('generation');
       try {
         admission = await barrier.acceptHello(connection, generation);
       } catch (error) {
@@ -105,18 +132,23 @@ function createRuntime() {
       }
       if (admission !== 'ready') return false;
       const current = () => connection === epoch && barrier.isReady(connection);
+      enter('local-records');
       const [pending, unsent] = await Promise.all([readPendingUploadStore(true), readUnsentMessageStore()]);
       if (!current()) return false;
+      enter('historical-sources');
       const historical = await captureHistoricalSources(generation, pending, unsent);
       if (!current()) return false;
+      enter('journal');
       await store.journalHistorical(generation, historical, generateUuid());
       if (!current()) return false;
+      enter('recoveries');
       const records = await store.readRecoveries();
       if (!current()) return false;
       preserveRestoreSources(records.flatMap((r) => r.intent.drafts.flatMap((d) => d.uploads?.map((u) => u.localId) ?? [])),
         records.flatMap((r) => r.intent.unsentMessages?.map((s) => s.eventId) ?? []),
         records.flatMap((r) => r.intent.queuedUploadSends?.map(queuedRestoreSourceId) ?? []));
       if (generation !== null) {
+        enter('draft-recovery');
         const result = await recoverRestoreDrafts(store, generation, { allocateId: generateUuid, isCurrent: current, readLiveOwners: liveOwnerIds,
           createDraftIfAbsent: (id, source) => createRecoveredDraft(id, generation, source) });
         if (result.status !== 'ready') return false;
@@ -124,6 +156,8 @@ function createRuntime() {
       if (!current()) return false;
       observeSourceGeneration(generation, barrier.baselineFromPageLoad);
       ready = true;
+      everAdmitted = true;
+      phase = 'admitted';
       restoreAdmissionChanged();
       const released = waiters;
       waiters = [];

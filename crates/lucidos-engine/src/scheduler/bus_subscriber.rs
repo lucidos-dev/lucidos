@@ -24,18 +24,16 @@ use uuid::Uuid;
 use super::task_runner::{
     fire_matching_triggers, handle_trigger_event, rearm_after_lag, TrackedTask,
 };
-use super::{
-    handle_trigger_group_event, reload_backup_schedule, trigger_dispatch, BackupArm, BackupRunner,
-};
+use super::TriggerDispatch;
 use super::{load_trigger_groups, stored_trigger_dispatch, StoredTriggerCarrier};
-use super::{TriggerDispatch, TriggerGroup};
+use super::{reload_backup_schedule, trigger_dispatch, BackupArm, BackupRunner};
 use crate::api::SharedEngine;
 use crate::core::prefs;
 use crate::engine::event_bus::{
     BusEvent, EmittedEvent, EventBus, LagReplay, ReplayWindow, SystemEvent,
 };
 use crate::engine::thread_queue::ThreadQueueKind;
-use crate::triggers::TriggerConfig;
+use crate::triggers::{TriggerConfig, TriggerGroupEventRow, TriggerGroupProjection};
 
 /// Rows a replay reads per query.
 const REPLAY_PAGE: i64 = 500;
@@ -44,7 +42,7 @@ const REPLAY_PAGE: i64 = 500;
 pub(super) type TriggerConfigs = Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>;
 
 /// The trigger-group registry, shared with the engine.
-pub(super) type TriggerGroups = Arc<std::sync::RwLock<HashMap<String, TriggerGroup>>>;
+pub(super) type TriggerGroups = Arc<std::sync::RwLock<TriggerGroupProjection>>;
 
 /// What the subscriber asks of the engine.
 #[async_trait]
@@ -156,7 +154,7 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
                 ControlFlow::Continue(())
             }
             Err(RecvError::Lagged(n)) => {
-                crate::log!("[Scheduler] EventBus subscriber lagged by {} events", n);
+                crate::log_legacy!("[Scheduler] EventBus subscriber lagged by {} events", n);
                 self.effects.rearm_cron_after_lag().await;
                 self.effects.reload_backup_schedule().await;
                 self.refresh_trigger_groups().await;
@@ -164,7 +162,7 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
                 ControlFlow::Continue(())
             }
             Err(RecvError::Closed) => {
-                crate::log!("[Scheduler] EventBus closed, stopping trigger subscriber");
+                crate::log_legacy!("[Scheduler] EventBus closed, stopping trigger subscriber");
                 ControlFlow::Break(())
             }
         }
@@ -184,24 +182,21 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
                         .apply_trigger_lifecycle(se.event_type(), trigger_id)
                         .await;
                 }
-                SystemEvent::TriggerGroupCreated {
-                    group_id, payload, ..
-                }
-                | SystemEvent::TriggerGroupRenamed {
-                    group_id, payload, ..
-                }
-                | SystemEvent::TriggerGroupReordered {
-                    group_id, payload, ..
-                }
-                | SystemEvent::TriggerGroupDeleted {
-                    group_id, payload, ..
-                } => {
-                    handle_trigger_group_event(
-                        se.event_type(),
-                        group_id,
-                        payload,
-                        &self.trigger_groups,
-                    );
+                SystemEvent::TriggerGroupCreated { payload, .. }
+                | SystemEvent::TriggerGroupRenamed { payload, .. }
+                | SystemEvent::TriggerGroupReordered { payload, .. }
+                | SystemEvent::TriggerGroupDeleted { payload, .. } => {
+                    if let Some(seq) = emitted.seq {
+                        self.trigger_groups
+                            .write()
+                            .unwrap()
+                            .apply(&TriggerGroupEventRow {
+                                seq,
+                                event_type: se.event_type().to_owned(),
+                                payload: payload.clone(),
+                                created: emitted.created,
+                            });
+                    }
                 }
                 // Re-arm the backup loop when the user's timezone changes, so
                 // the next fire is resolved in the new zone.
@@ -234,12 +229,12 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
         }
     }
 
-    /// Rebuild the group registry, its only live writer having missed events.
+    /// Merge persisted group state after missing subscriber events.
     /// A failed read keeps the registry: stale beats empty.
     async fn refresh_trigger_groups(&self) {
         match load_trigger_groups(self.bus.pool()).await {
-            Ok(groups) => *self.trigger_groups.write().unwrap() = groups,
-            Err(e) => crate::log!(
+            Ok(groups) => self.trigger_groups.write().unwrap().merge(groups),
+            Err(e) => crate::log_legacy!(
                 "[Scheduler] Lag repair could not re-read trigger groups, keeping them: {}",
                 e
             ),
@@ -256,14 +251,14 @@ impl<E: SchedulerEffects> BusSubscriber<E> {
         match self.replay_window(&window, &mut offered_through).await {
             Ok(offered) => {
                 self.lag_replay.covered(&window);
-                crate::log!(
+                crate::log_legacy!(
                     "[Scheduler] Lag repair offered {} missed event(s) to the trigger matcher",
                     offered
                 );
             }
             Err(e) => {
                 self.lag_replay.covered(&window.up_to(offered_through));
-                crate::log!(
+                crate::log_legacy!(
                     "[Scheduler] Lag repair could not read the missed events after {}, so \
                      the next lag replays them: {}",
                     offered_through,

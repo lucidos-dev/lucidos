@@ -1,4 +1,4 @@
-use crate::support::{base_url, http_client, register_device};
+use crate::support::{as_stamped_device, base_url, http_client, register_device};
 
 /// The device both accepted-shaped calls name.
 const DEVICE: &str = "e2e-restart-intent-device";
@@ -53,12 +53,10 @@ async fn restart_intent_requires_a_device_and_refuses_a_proxied_caller() {
         "a request carrying the gateway's forwarded prefix must be refused"
     );
 
-    // The real call: direct to the engine's own port, naming a device. The only
+    // The real call: direct to the engine's own port, naming a stamped device. The only
     // effect is an in-memory stash the next teardown reads, so on this
     // disposable workspace it changes nothing any later test observes.
-    let accepted = client
-        .post(&url)
-        .header("x-lucidos-device-id", DEVICE)
+    let accepted = as_stamped_device(client.post(&url), DEVICE)
         .send()
         .await
         .expect("request to /api/v1/internal/restart-intent failed");

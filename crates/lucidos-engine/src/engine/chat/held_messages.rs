@@ -182,7 +182,7 @@ fn held_origin(id: Uuid, payload: &serde_json::Value) -> Option<MessageOrigin> {
     match serde_json::from_value::<MessageOrigin>(raw.clone()) {
         Ok(origin) => Some(origin),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[HeldMessages] held message {} has an origin that no longer decodes, \
                  releasing it unattributed: {}",
                 id,
@@ -224,7 +224,7 @@ pub(crate) async fn message_is_held(
     match waiting {
         Ok(held) => held,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[HeldMessages] hold lookup failed on thread {}: {}; delivering",
                 thread_id,
                 e
@@ -272,7 +272,7 @@ pub(crate) async fn claim_next_held_message(
         let oldest = match unreleased_held_messages(pool, workspace, thread_id).await {
             Ok(held) => held.into_iter().next()?,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[HeldMessages] read failed on thread {}: {}; they stay held",
                     thread_id,
                     e
@@ -281,7 +281,7 @@ pub(crate) async fn claim_next_held_message(
             }
         };
         if refused == Some(oldest.id) {
-            crate::log!(
+            crate::log_legacy!(
                 "[HeldMessages] release of {} on thread {} keeps failing; it stays held",
                 oldest.id,
                 thread_id
@@ -329,7 +329,7 @@ pub(crate) async fn claim_next_held_message(
                 })
             }
             outcome => {
-                crate::log!(
+                crate::log_legacy!(
                     "[HeldMessages] release of {} on thread {} refused: {:?}",
                     oldest.id,
                     thread_id,
@@ -452,7 +452,7 @@ impl LucidosEngine {
                 )
                 .await;
             if let Err(e) = delivered {
-                crate::log!(
+                crate::log_legacy!(
                     "[HeldMessages] delivery of {} on thread {} failed: {}",
                     held_id,
                     thread_id,
@@ -489,7 +489,7 @@ impl LucidosEngine {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(e) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[HeldMessages] backlog lookup failed on thread {}: {}; they stay held",
                         thread_id,
                         e

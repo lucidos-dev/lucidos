@@ -21,6 +21,12 @@ use crate::workspace::BoxError;
 pub(crate) const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 
+/// Does this process hold its thread's origin token, as a Lucidos-spawned
+/// subprocess does?
+pub(crate) fn has_origin_token() -> bool {
+    std::env::var(ENV_AGENT_ORIGIN_TOKEN).is_ok_and(|token| !token.is_empty())
+}
+
 /// The *target workspace assertion*: which workspace this request is meant for.
 /// Mirrors `api::actor::HEADER_TARGET_WORKSPACE` under the same lockstep rule as
 /// the origin token above. The engine refuses with 409 when it names a
@@ -343,6 +349,17 @@ pub(crate) fn send_expect_success(
     url: &str,
     req: reqwest::blocking::RequestBuilder,
 ) -> Result<String, BoxError> {
+    send_or_refusal(method, url, req)?
+}
+
+/// [`send_expect_success`], with a 4xx answer as the inner `Err`. The server
+/// read that request and refused it, so it did not land. The outer `Err` is a
+/// failure whose outcome is unknown.
+pub(crate) fn send_or_refusal(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<Result<String, BoxError>, BoxError> {
     let start = Instant::now();
     let resp = req
         .send_with_connect_retry()
@@ -355,10 +372,15 @@ pub(crate) fn send_expect_success(
     let text = resp
         .text()
         .map_err(|e| format!("Failed to read response body: {}", e))?;
-    if !status.is_success() {
-        return Err(format!("{} {} returned {}: {}", method, url, status, text).into());
+    if status.is_success() {
+        return Ok(Ok(text));
     }
-    Ok(text)
+    let error: BoxError = format!("{} {} returned {}: {}", method, url, status, text).into();
+    if status.is_client_error() {
+        Ok(Err(error))
+    } else {
+        Err(error)
+    }
 }
 
 /// [`send_expect_success`], then parse the body as JSON.
@@ -549,6 +571,34 @@ mod tests {
             );
         });
         (port, rx)
+    }
+
+    /// Accept one request and answer it with `status_line`.
+    fn spawn_status_server(status_line: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                format!("HTTP/1.1 {status_line}\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes(),
+            );
+        });
+        port
+    }
+
+    /// A 4xx is a refusal the server read, so it is the inner error. A 5xx
+    /// leaves the outcome unknown, so it is the outer one.
+    #[test]
+    fn a_client_error_is_a_refusal_and_a_server_error_is_unknown() {
+        let send = |status_line| {
+            let url = format!("http://127.0.0.1:{}/x", spawn_status_server(status_line));
+            send_or_refusal("POST", &url, reqwest::blocking::Client::new().post(&url))
+        };
+        assert_eq!(send("200 OK").unwrap().unwrap(), "{}");
+        assert!(send("409 Conflict").unwrap().is_err());
+        assert!(send("500 Internal Server Error").is_err());
     }
 
     /// The deadline-carrying constructor sends the SAME two headers as the

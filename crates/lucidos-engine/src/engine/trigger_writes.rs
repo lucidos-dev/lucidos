@@ -264,7 +264,7 @@ impl TriggerRegistryWriter<'_> {
         module: &str,
     ) {
         if let Err(e) = self.write(write, trigger_id, payload, actor).await {
-            crate::log!(
+            crate::log_legacy!(
                 "[EventBus] {} {} emit failed: {}",
                 module,
                 write.event_type(),
@@ -474,42 +474,46 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
-    /// Source-scan tripwire, in the repo's existing idiom (see
-    /// `core::announced_surfaces_tests`). A new emitter that builds a trigger
-    /// lifecycle event and hands it straight to the bus compiles cleanly,
-    /// passes review, and reintroduces the stale-read race, because nothing
-    /// about the call site looks wrong. The only reliable guard is mechanical:
-    /// the constructors live here, and nowhere else.
-    #[test]
-    fn only_the_chokepoint_constructs_a_trigger_lifecycle_event() {
-        use crate::test_support::source_scan::production_sources;
+    mod guard_tests {
+        use super::*;
 
-        // The subscriber has to name the variants to *destructure* them off the
-        // broadcast; it never builds one.
-        const ALLOWED: [&str; 2] = ["engine/trigger_writes.rs", "scheduler/bus_subscriber.rs"];
+        /// Source-scan tripwire, in the repo's existing idiom (see
+        /// `core::announced_surfaces_tests`). A new emitter that hands a trigger
+        /// lifecycle event straight to the bus compiles cleanly and passes review.
+        /// It reintroduces the stale-read race, and nothing at the call site looks
+        /// wrong. The only reliable guard is mechanical: the constructors live
+        /// here, and nowhere else.
+        #[test]
+        fn only_the_chokepoint_constructs_a_trigger_lifecycle_event() {
+            use crate::test_support::source_scan::production_sources;
 
-        let mut offenders: Vec<String> = Vec::new();
-        for (rel, text) in production_sources() {
-            if ALLOWED.contains(&rel.as_str()) {
-                continue;
-            }
-            for event in TRIGGER_LIFECYCLE_EVENTS {
-                // `SystemEvent::TriggerX {` is construction; a match arm spells
-                // `SystemEvent::TriggerX { .. }` and carries no field.
-                let ctor = format!("SystemEvent::{} {{", event);
-                if text.contains(&ctor) && !text.contains(&format!("{} .. }}", ctor)) {
-                    offenders.push(format!("{rel}: {event}"));
+            // The subscriber has to name the variants to *destructure* them off the
+            // broadcast; it never builds one.
+            const ALLOWED: [&str; 2] = ["engine/trigger_writes.rs", "scheduler/bus_subscriber.rs"];
+
+            let mut offenders: Vec<String> = Vec::new();
+            for (rel, text) in production_sources() {
+                if ALLOWED.contains(&rel.as_str()) {
+                    continue;
+                }
+                for event in TRIGGER_LIFECYCLE_EVENTS {
+                    // `SystemEvent::TriggerX {` is construction; a match arm spells
+                    // `SystemEvent::TriggerX { .. }` and carries no field.
+                    let ctor = format!("SystemEvent::{} {{", event);
+                    if text.contains(&ctor) && !text.contains(&format!("{} .. }}", ctor)) {
+                        offenders.push(format!("{rel}: {event}"));
+                    }
                 }
             }
-        }
-        offenders.sort();
-        assert!(
-            offenders.is_empty(),
-            "a trigger lifecycle event must be written through \
+            offenders.sort();
+            assert!(
+                offenders.is_empty(),
+                "a trigger lifecycle event must be written through \
              LucidosEngine::emit_trigger_write (or the free emit_trigger_write), \
              so the registry is consistent before the caller's next read. \
              Constructed outside the chokepoint in:\n  {}",
-            offenders.join("\n  ")
-        );
+                offenders.join("\n  ")
+            );
+        }
     }
 }

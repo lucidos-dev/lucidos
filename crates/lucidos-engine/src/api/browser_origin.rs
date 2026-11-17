@@ -190,7 +190,7 @@ pub async fn enforce(req: axum::extract::Request, next: axum::middleware::Next) 
     // A silent 403 in front of every route is undebuggable from the client
     // side: a refused SSE stream just never connects. Say which request and
     // what it presented, since all three values are the whole decision.
-    crate::log!(
+    crate::log_legacy!(
         "[API] refused a cross-origin browser request to {} (sec-fetch-site: {:?}, origin: {:?})",
         req.uri().path(),
         req.headers().get("sec-fetch-site"),

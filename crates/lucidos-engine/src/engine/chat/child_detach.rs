@@ -193,7 +193,7 @@ impl crate::engine::LucidosEngine {
             return Err(ChildDetachError::NotAChild(target));
         }
 
-        crate::log!(
+        crate::log_legacy!(
             "[ChildDetach] Moved {} out of {} to top level",
             target,
             former_parent_id

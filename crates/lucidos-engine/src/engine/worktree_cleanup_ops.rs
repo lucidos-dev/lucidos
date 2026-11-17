@@ -225,7 +225,7 @@ pub(super) async fn measure_on_blocking_pool(path: &Path, walk: fn(&Path) -> u64
     match tokio::task::spawn_blocking(move || walk(&walk_path)).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] size walk of {} failed: {}",
                 path.display(),
                 e
@@ -308,7 +308,7 @@ pub(crate) async fn is_finished_worktree(
         Ok(pending) if pending.is_empty() => {}
         Ok(_) => return false,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] pending_for_thread({}) failed: {}; not finished",
                 thread_id,
                 e
@@ -394,7 +394,7 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
         Ok(Some(true)) => return true,
         Ok(_) => {}
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] children lookup failed for thread {}: {}; keeping worktree",
                 thread_id,
                 e
@@ -423,7 +423,7 @@ pub(crate) async fn has_pending_fan_in(pool: &PgPool, thread_id: Uuid) -> bool {
         Ok(Some(event_type)) => event_type == "ChildThreadCompleted",
         Ok(None) => false,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] latest-event lookup failed for thread {}: {}; keeping worktree",
                 thread_id,
                 e
@@ -510,7 +510,7 @@ pub(crate) async fn remove_stranded_worktree(
     pre_size: u64,
 ) -> Option<u64> {
     if !is_safe_subpath(worktrees_dir, worktree) {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] refusing stranded removal outside worktrees dir: {}",
             worktree.display()
         );
@@ -519,7 +519,7 @@ pub(crate) async fn remove_stranded_worktree(
     match tokio::fs::remove_dir_all(worktree).await {
         Ok(()) => Some(pre_size),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] stranded remove_dir_all failed for {}: {}",
                 worktree.display(),
                 e
@@ -601,7 +601,7 @@ pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
                 pruned.push(sub);
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[WorktreeCleanup] prune failed for {}: {}",
                     target.display(),
                     e
@@ -612,7 +612,7 @@ pub(crate) async fn prune_build_artifacts(worktree: &Path) -> Option<u64> {
     if pruned.is_empty() {
         None
     } else {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] pruned build artifacts in {}: {:?} ({} bytes)",
             worktree.display(),
             pruned,
@@ -633,14 +633,14 @@ pub(crate) async fn prunable_artifact_dirs(worktree: &Path) -> Vec<&'static str>
             continue;
         }
         if !is_safe_subpath(worktree, &target) {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] refusing prune of suspicious path {}",
                 target.display()
             );
             continue;
         }
         if holds_tracked_files(worktree, sub).await {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] not pruning {}: it holds tracked files, or git could not say",
                 target.display()
             );
@@ -679,7 +679,7 @@ pub(crate) async fn move_worktree_aside(worktree: &Path, repo_root: &Path) -> Op
         return None;
     }
     if let Err(e) = tokio::fs::rename(worktree, &aside).await {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] could not move {} aside: {}",
             worktree.display(),
             e
@@ -697,7 +697,7 @@ pub(crate) async fn remove_reclaiming_dir(dir: &Path) -> bool {
         Ok(()) => true,
         Err(_) if !dir.exists() => true,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] remove_dir_all failed for {}: {}; the next pass retries",
                 dir.display(),
                 e
@@ -739,7 +739,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
     let repo_root = match resolve_repo_root_from_worktree(worktree).await {
         Some(p) => p,
         None => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot resolve repo root from worktree {}",
                 worktree.display()
             );
@@ -774,7 +774,7 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
                 None
             };
         if let Some(reason) = kept_because {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] preserving branch {}: {}",
                 branch_name,
                 reason
@@ -783,18 +783,18 @@ pub(crate) async fn remove_worktree_and_optionally_delete_branch(
             match git_cmd(&["branch", "-D", branch_name], &repo_root).await {
                 Ok(o) if o.status.success() => {
                     branch_deleted = true;
-                    log!(
+                    log_legacy!(
                         "[WorktreeCleanup] deleted branch {} ({:?})",
                         branch_name,
                         disposal
                     );
                 }
-                Ok(o) => log!(
+                Ok(o) => log_legacy!(
                     "[WorktreeCleanup] git branch -D {} failed: {}",
                     branch_name,
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[WorktreeCleanup] git branch -D {} errored: {}",
                     branch_name,
                     e
@@ -855,7 +855,7 @@ pub(crate) async fn inventory_worktrees(
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot read worktrees dir {}: {}",
                 dir.display(),
                 e
@@ -915,7 +915,7 @@ async fn inventory_row(
         active_threads.is_active(thread_id),
     );
     let size = size.unwrap_or_else(|e| {
-        log!(
+        log_legacy!(
             "[WorktreeCleanup] size walk of {} failed: {}",
             path.display(),
             e
@@ -981,7 +981,7 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] cannot resolve thread for short id {}: {}. \
                  Treating as unknown, never as an orphan",
                 short,
@@ -994,7 +994,7 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
         0 => ShortThreadLookup::NotFound,
         1 => ShortThreadLookup::Found(rows[0].0),
         _ => {
-            log!(
+            log_legacy!(
                 "[WorktreeCleanup] short id {} matches more than one thread, skipping",
                 short
             );

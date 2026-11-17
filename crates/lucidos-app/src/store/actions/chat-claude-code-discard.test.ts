@@ -30,7 +30,9 @@ vi.mock('./changeToast', () => ({ changeToastMessage }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./send-probe', () => ({ probeStreamAfterSend: vi.fn() }));
 
-const { handleDiscardCCChanges } = await import('./chat-claude-code');
+vi.mock('../composeSync', () => ({ knownComposeEpoch: vi.fn(), parseComposeReport: vi.fn(), acceptComposeReport: vi.fn() }));
+
+const { handleDiscardCCChanges } = await import('./codingAgentChanges');
 
 describe('handleDiscardCCChanges', () => {
   beforeEach(() => {

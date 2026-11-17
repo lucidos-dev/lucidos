@@ -47,7 +47,7 @@ impl UserProfileCache {
     pub(crate) fn load_from_workspace(workspace_path: &Path) -> Self {
         let content = read_from_disk(workspace_path);
         if !content.is_empty() {
-            log!("[Memory] Loaded user profile ({} chars)", content.len());
+            log_legacy!("[Memory] Loaded user profile ({} chars)", content.len());
         }
         Self {
             content: RwLock::new(content),

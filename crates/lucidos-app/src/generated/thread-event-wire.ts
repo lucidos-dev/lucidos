@@ -27,6 +27,49 @@ export type AbortCause =
   | 'snapshot_restored'
   | 'unknown';
 
+/** One action. As a clause-4 verb it names what a caller attempted. A refusal
+ *  reads "you cannot cancel that thread", so the agent knows what it just tried.
+ *  Full reasoning is on the Rust variant. */
+export type Action =
+  | 'archive'
+  | 'cancel'
+  | 'control'
+  | 'submit-draft'
+  | 'ask-side-question'
+  | 'dismiss-side-question'
+  | 'apply'
+  | 'restore-snapshot'
+  | 'create-workspace'
+  | 'stop-workspace'
+  | 'start-workspace'
+  | 'set-workspace-autostart'
+  | 'rename-workspace'
+  | 'delete-workspace'
+  | 'restore-workspace'
+  | 'grant-device-session'
+  | 'discard'
+  | 'set-aside'
+  | 'bring-back'
+  | 'revert'
+  | 'answer-question'
+  | 'resolve-permission'
+  | 'continue'
+  | 'harden'
+  | 'set-plan-marker'
+  | 'build-approved-plan'
+  | 'hand-off'
+  | 'read-waiting-reports'
+  | 'run-batch'
+  | 'run-command'
+  | 'use-tool'
+  | 'use-mcp-tool'
+  | 'run-confinement-tests'
+  | 'transfer-host-logs'
+  | 'act-for-unattested-caller'
+  | 'create-top-thread'
+  | 'detach-child'
+  | 'spawn-successor';
+
 /** Who semantically drove this request:
  *  - `Human`: a person clicked/typed (device, API client, or upstream workspace's human)
  *  - `Agent`: an LLM decided (parent thread's agent spawned this, upstream workspace's agent called us)
@@ -36,6 +79,15 @@ export type ActorMode =
   | 'human'
   | 'agent'
   | 'engine';
+
+/** A draft an agent created for the owner (ADR 0665). It seeds the composer
+ *  once, when its thread is created, and never overwrites a later edit. */
+export interface AgentDraft {
+  text: string;
+  image_hashes: string[];
+  selection: unknown;
+  drafted_by_thread_id: string;
+}
 
 /** Which agent authored a thread event, when a thread carries more than one.
  *  Full reasoning is on the Rust variant. */
@@ -147,6 +199,117 @@ export type AutoCompactArm =
   | 'window'
   | 'override';
 
+/** Which owner act ended a thread's *automation pause*. */
+export type AutomationUnpauseCause =
+  | 'unpause'
+  | 'archived';
+
+/** The items a batch carries, and the digest the engine stored when it
+ *  worded them. */
+export interface Batch {
+  items: BatchItem[];
+  /** SHA-256 of the items, in hex. A batch whose items no longer hash to it
+   *  runs nothing. */
+  digest: string;
+}
+
+/** One exact item of a batch. */
+export type BatchItem =
+  /** Pick one option on an open card in a sub-thread. */
+  | {
+      kind: 'card_answer';
+      thread_id: string;
+      tool_use_id: string;
+      option_id: string;
+      option_label: string;
+      /** SHA-256 of the card's question and options when the batch was built. */
+      card_digest: string;
+      /** The plan this pick approves, when the thread waits on one. */
+      plan?: PlanBinding;
+    }
+  /** Pick one button on an open tool-permission card in a sub-thread. The
+   *  card's own resolver stores what the button stores. */
+  | {
+      kind: 'permission_card_answer';
+      thread_id: string;
+      lane: LegacyLane;
+      request_id: string;
+      pick: LegacyPick;
+      option_label: string;
+    }
+  /** Widen one trigger's grants, as long as its definition is unchanged. */
+  | {
+      kind: 'trigger_grant';
+      trigger_id: string;
+      /** The trigger's definition digest when the batch was built. */
+      definition_digest: string;
+      /** The side-effect categories the grant adds. */
+      side_effects: SideEffectCategory[];
+      /** Whether the grant lets the trigger's runs start coding agents. */
+      coding_agents: boolean;
+    }
+  /** Set the origin of a group of unclassified workspaces. Only entries
+   *  still `unknown` move, and the gateway refuses any other. */
+  | {
+      kind: 'workspace_classification';
+      workspaces: string[];
+      origin: ClassifiedOrigin;
+      /** The agent's evidence beyond the names, quoted on the card. */
+      evidence: string;
+    };
+
+/** What running one item did. */
+export type BatchItemOutcome =
+  | { kind: 'applied' }
+  /** Nothing ran for this item. `reason` names what changed. */
+  | {
+      kind: 'skipped';
+      reason: string;
+    }
+  /** Part of the item ran, then a refusal stopped it: some workspaces of a
+   *  classification moved. `reason` says how many, and what stopped it. */
+  | {
+      kind: 'partly_applied';
+      reason: string;
+    };
+
+/** Only allowlisted values survive parsing: no raw response, credential,
+ *  account identifier, email or endpoint is serializable through this type. */
+export type BillingAttribution =
+  | {
+      status: 'known';
+      provider: BillingProvider;
+      source: BillingEvidenceSource;
+    }
+  | {
+      status: 'unresolved';
+      reason: UnresolvedBillingReason;
+      source: BillingEvidenceSource;
+    };
+
+/** The CLI response that supplied this observation. Never an auth file path. */
+export type BillingEvidenceSource =
+  | 'claude-initialize'
+  | 'codex-account'
+  | 'unavailable';
+
+/** The billing basis, without asserting an invoice amount or remaining quota. */
+export type BillingMode =
+  | 'token-metered'
+  | 'plan'
+  | 'unknown';
+
+/** The backend and billing contract, independently of the coding agent/model. */
+export type BillingProvider =
+  | 'claude-gateway'
+  | 'vertex'
+  | 'bedrock'
+  | 'foundry'
+  | 'anthropic'
+  | 'anthropic-subscription'
+  | 'openai'
+  | 'chatgpt-plan';
+
 /** Why a waiting thread gets no keep-alive. */
 export type CacheKeepAliveNotKeptReason =
   | 'codex'
@@ -237,7 +400,7 @@ export type CacheKeepAliveStatus =
       cost_usd: number;
       /** What the warm cache saved the next request: the reread price of the
        *  run's context. Absent unless that request began while the cache was
-       *  still warm. */
+       *  still warm. Zero when the last real request alone kept it warm. */
       saved_usd?: number;
       /** The context the run kept warm. Absent on statuses stored before it. */
       context_tokens?: number;
@@ -311,6 +474,7 @@ export type CancelCause =
   | 'user_action'
   | 'superseded_by_followup'
   | 'effort_restart'
+  | 'refused'
   | 'unknown';
 
 /** *Cap odds*: how this workspace's finished waits of one agent and wait type
@@ -375,6 +539,11 @@ export type CeilingSource =
   | 'thread'
   | 'trigger';
 
+/** Content of the actual proposed or landed diff. Historical events default to code. */
+export type ChangeContent =
+  | 'code'
+  | 'plan-only';
+
 /** How far a flow's work has come at a checkpoint: `done` units of `total`. */
 export interface CheckpointProgress {
   done: number;
@@ -392,6 +561,15 @@ export type ChildCompletionStatus =
   | 'no_changes'
   | 'canceled'
   | 'interrupted';
+
+/** An origin a classification may set. Never `unknown`: that is where every
+ *  entry starts. The gateway's registry is the authority on the full set. */
+export type ClassifiedOrigin =
+  | 'agent'
+  | 'demo'
+  | 'eval'
+  | 'e2e'
+  | 'user';
 
 /** Identifier for the coding-agent backend. The engine maps each kind to a
  *  concrete `AgentRuntime` implementation in its agent registry. */
@@ -418,6 +596,25 @@ export type CodingAgentKind =
   | 'lucidos'
   | 'app'
   | 'external';
+
+export interface ComposeReport {
+  /** The row's `summary_version` right after the statement that produced
+   *  this report. It is the *compose revision*. */
+  summary_version: number;
+  compose_epoch: number;
+  restorations?: ComposeRestoration[];
+  text: string;
+  image_hashes: string[];
+  mode?: string;
+  selection?: unknown;
+}
+
+/** Exact accepted additions. Epoch identifies each restoration within a thread. */
+export interface ComposeRestoration {
+  epoch: number;
+  text: string;
+  image_hashes: string[];
+}
 
 /** CC can't expose its system prompt body or tool schemas via the
  *  stream-json envelope, only their token cost. The frontend uses this
@@ -453,6 +650,7 @@ export type ContextPurpose =
   | 'read_decision'
   | 'wake_decision'
   | 'expected_wake_decision'
+  | 'permission_answer'
   | 'cache_keep_alive'
   | 'prefill_probe';
 
@@ -551,6 +749,10 @@ export type EngineReason =
   /** Engine held a turn-end proposal because the branch's plan marker does
    *  not satisfy the gate, and told the agent how to set one. */
   | { kind: 'missing_plan' }
+  /** The user approved building the plan, and the turn ended with no source
+   *  change, so the engine told the agent to start: the *approved-plan
+   *  re-entry*. */
+  | { kind: 'approved_plan_unstarted' }
   /** The session grew past its *context ceiling*, so the engine asked the
    *  agent to hand off: the *ceiling re-entry* (ADR 0629). */
   | { kind: 'context_ceiling' }
@@ -664,7 +866,39 @@ export type FreshSessionReason =
   | 'session-ended'
   | 'branch-gone'
   | 'resume-failed'
-  | 'no-resumable-session';
+  | 'no-resumable-session'
+  | 'provider-blocked';
+
+/** How far one granting option reaches within its action. */
+export type GrantBreadth =
+  /** The request's own breadth: the exact target it asked about. */
+  | 'asked'
+  /** The whole action, whatever its target. */
+  | 'any'
+  /** Same device and exact lifetime on targets created by this workspace. */
+  | {
+      'device-session': {
+        creator_workspace: string;
+        device_id: string;
+        ttl_secs: number;
+      };
+    };
+
+/** One of the three persisted allowlists. Each gates a different caller, so the
+ *  pattern languages are unrelated and a single merged file would be ambiguous:
+ *  `Bash(git:*)` grants a command head, bare `Bash` grants every command
+ *  after the engine's unconditional floor, and `Mcp(slack:*)` grants MCP tools.
+ *  Full reasoning is on the Rust variant. */
+export type GrantFile =
+  | 'agent-allowed-commands'
+  | 'cc-allowed-tools'
+  | 'mcp-allowed-tools';
+
+/** The grant file lines a review card is about. */
+export interface GrantLines {
+  grant_file: GrantFile;
+  patterns: string[];
+}
 
 /** The grant patterns a permission card offers, one per "Always allow"-style
  *  button. A missing pattern means no such button. The engine stamps it on the
@@ -675,8 +909,10 @@ export interface GrantOffer {
   broad?: string;
   /** "Always allow `<head>` commands": a persisted line such as `Bash(git:*)`. */
   narrow?: string;
-  /** "Allow for this thread": a pattern for this thread's session set. */
+  /** "Allow for this thread": a pattern the thread holds. */
   session?: string;
+  /** Why the card offers no lasting grant at all, which it tells the owner. */
+  withheld?: OfferWithheld;
 }
 
 /** Why a session handed off. Absent on handoffs recorded before the field. */
@@ -705,6 +941,18 @@ export interface HandoffRequest {
   by: MessageOrigin;
 }
 
+/** Who may use a permission. */
+export type Holder =
+  | {
+      kind: 'thread';
+      thread_id: string;
+    }
+  | {
+      kind: 'trigger';
+      trigger_id: string;
+    }
+  | { kind: 'workspace' };
+
 /** The branch an integrated sub-thread hands up to its parent, named on the
  *  child's report. Set only when the child's work is hardened and waits for
  *  the parent's agent to merge it. */
@@ -729,6 +977,27 @@ export interface LegacyArrangedTile {
   hidden?: boolean;
 }
 
+/** Which card raised the request. */
+export type LegacyLane =
+  | 'command'
+  | 'coding_agent'
+  | 'mcp';
+
+/** One of the buttons a tool-permission card draws. */
+export type LegacyPick =
+  | 'once'
+  | 'session'
+  | 'narrow'
+  | 'broad'
+  | 'deny';
+
+/** How long a permission lasts. */
+export type Lifetime =
+  | 'once'
+  | 'this_thread'
+  | 'until_plan_lands'
+  | 'standing';
+
 /** Who enabled or disabled an MCP server in a thread. */
 export type McpEnablementSource =
   | 'agent'
@@ -750,6 +1019,15 @@ export type MemorySource =
 /** Who this thread event is the work of.
  *  Full reasoning is on the Rust variant. */
 export type MessageOrigin =
+  /** Owner-authored saved compose content, submitted by an authenticated
+   *  agent on owner authority (ADR 0651). This is Human content without a
+   *  Device origin: it never opens a fresh owner-authorized turn. The
+   *  acceptance event retains the submitter and authority evidence. */
+  | {
+      kind: 'saved_draft';
+      submission_event_id: string;
+      submitted_by_thread_id: string;
+    }
   /** Mode = Human. Human at a known device. `device_id` is the TEXT primary
    *  key from the `devices` table (not necessarily a UUID).
    *  Full reasoning is on the Rust variant. */
@@ -777,8 +1055,28 @@ export type MessageOrigin =
        *  reads its trigger here. */
       emitting_trigger_id?: string;
     }
+  /** An API caller the engine cannot tie to a signed identity: it carries
+   *  no valid origin token and no gateway stamp. It may read, chat and
+   *  write, under this actor and never the owner's.
+   *  Full reasoning is on the Rust variant. */
+  | {
+      kind: 'unattested_caller';
+      /** The mode the caller claimed. Defaults to Human, as on `Api`. */
+      mode?: ActorMode;
+      user_agent?: string;
+      /** A device id the request named with no valid stamp. */
+      claimed_device_id?: string;
+      /** The request carried the machine-local token, which proves a process
+       *  on this machine and not who runs it (`api::local_auth`). */
+      claimed_local_token?: boolean;
+      /** A `caller_workspace` the request named with no gateway stamp. */
+      claimed_workspace?: string;
+      /** A caller thread named without a gateway stamp. Display only. */
+      claimed_thread_id?: string;
+    }
   /** Mode = Human or Agent (carried in `mode`). HTTP request from another
-   *  Lucidos workspace, identified by the `caller_workspace` body field. */
+   *  Lucidos workspace, named by the `caller_workspace` body field and
+   *  verified by the gateway's stamp over it. */
   | {
       kind: 'workspace';
       workspace: string;
@@ -790,6 +1088,11 @@ export type MessageOrigin =
        *  cross-workspace calls must set this explicitly via the body's `mode`
        *  field. Read by `MessageOrigin::mode()` to derive the request's `ActorMode`. */
       mode?: ActorMode;
+      /** The calling workspace's spawn-gate verdict on its thread, carried
+       *  under a gateway stamp. Every cross-workspace spawn carries one.
+       *  `None` is a row written before stamps, which keeps its old reading,
+       *  or an actor that never starts a thread (a snapshot restore). */
+      verdict?: SpawnVerdict;
     }
   /** Mode = Human, Agent, or Engine (carried in `mode`). Bidirectional link
    *  to another thread in the same workspace. `direction = Parent` means
@@ -859,16 +1162,106 @@ export interface ModalityUsage {
   output_audio_tokens: number;
 }
 
-/** The one clause-4 act an *owner approval card* proposes (ADR 0387).
+/** Why a card offers only Allow once and Deny. */
+export type OfferWithheld =
+  | 'secret-read';
+
+/** The one clause-4 act the retired single-use Allow once card proposed
+ *  (ADR 0387).
  *  Full reasoning is on the Rust variant. */
 export interface OwnerApproval {
-  verb: ThreadReachVerb;
+  verb: Action;
   /** The thread the act aims at. Workspace-scoped snapshot approvals use
    *  explicit workspace and snapshot fields instead. */
   target_thread_id?: string;
   target_workspace_id?: string;
   snapshot_handle?: string;
 }
+
+/** What picking one option of a permission request does. */
+export type PermissionChoice =
+  | {
+      kind: 'grant';
+      lifetime: Lifetime;
+      holder: Holder;
+      /** A card asked before options had a breadth reads as the asked one. */
+      breadth?: GrantBreadth;
+    }
+  /** Ends the thread's automation pause, and so lets the asked step run. */
+  | { kind: 'unpause' }
+  | { kind: 'refuse' }
+  /** Revokes the grant file lines the request lists. */
+  | { kind: 'revoke' };
+
+/** The typed half of a *permission request*: the action it asks for, and what
+ *  each of its options does. */
+export interface PermissionRequest {
+  action: Action;
+  /** The exact target the request asks about, such as a workspace slug or
+   *  a command head. An option at [`GrantBreadth::Asked`] grants this one.
+   *  Absent asks about the whole action. */
+  breadth?: string;
+  /** The id the agent asked its question tool with, when the agent prepared
+   *  this request. Its call waits for the answer. Absent, the engine raised
+   *  the card itself and no agent call waits. */
+  prepared?: string;
+  /** What each option does, keyed by option id. */
+  choices: Record<string, PermissionChoice>;
+  /** The items a *batch* carries. Only a [`Action::RunBatch`] request has
+   *  them. */
+  batch?: Batch;
+  /** The grant file lines a review card is about. A pick that grants imports
+   *  them, and [`PermissionChoice::Revoke`] revokes them. */
+  lines?: GrantLines;
+  /** The parked act an [`Action::ActForUnattestedCaller`] request runs once
+   *  its permission is granted. */
+  unattested_act?: UnattestedAct;
+}
+
+/** How the owner picked a permission request's option: the receipt half of a
+ *  `PermissionGranted`. */
+export type PickedBy =
+  | { kind: 'tap' }
+  /** Words the owner typed, judged to choose the option. */
+  | {
+      kind: 'typed';
+      message_event_id: string;
+    }
+  /** Words the owner said on a call. `message_event_id` names their
+   *  transcript row when the pick was judged from one. A pick the call's
+   *  talker made names none, since its transcript can land after it. */
+  | {
+      kind: 'spoken';
+      message_event_id?: string;
+    }
+  /** The owner confirmed a *batch* that held this pick, spending
+   *  `permission_id`. */
+  | {
+      kind: 'batch';
+      permission_id: string;
+    };
+
+/** The plan text a batch item bound its pick to: the committed plan at the
+ *  marker it saw. */
+export interface PlanBinding {
+  repo_root: string;
+  branch_name: string;
+  plan_path: string;
+  /** When the marker was written. A re-mark moves it, so it needs a new yes. */
+  marked_at: string;
+  /** SHA-256 of the committed plan text, in hex. */
+  digest: string;
+}
+
+/** The purpose of a plan, supplied explicitly when planning starts. */
+export type PlanKind =
+  | 'design'
+  | 'implementation';
+
+/** What the user's plan approval permits. */
+export type PlanScope =
+  | 'implement'
+  | 'plan-only';
 
 /** The expected wake a keep-alive run plans from, as its status shows it. */
 export interface PlannedWake {
@@ -908,6 +1301,28 @@ export type PluginSetupOccasion =
        *  decodes as `InstructionsChanged`, which is what it meant. */
       cause?: PluginSetupCause;
     };
+
+/** The words of a request an agent prepared: what its question tool shows. */
+export interface PreparedCard {
+  question: string;
+  header: string;
+  options: PreparedOption[];
+}
+
+/** One option of a [`PreparedCard`], in the order the card shows it. */
+export interface PreparedOption {
+  label: string;
+  description: string;
+}
+
+/** The structured error code a provider attached to a failed turn, carried on
+ *  `ResponseFailed` so the card can say why. The provider's own words travel in
+ *  `error`, and its extra explanation, when it sends one, in `detail`.
+ *  Full reasoning is on the Rust variant. */
+export interface ProviderError {
+  code: string;
+  detail?: string;
+}
 
 /** One option offered by CC's AskUserQuestion tool. Persisted inside
  *  `UserQuestionAsked` and looked up when the user picks one to send the
@@ -969,6 +1384,13 @@ export type RetrySkipReason =
   | 'request_unavailable'
   | 'already_queued';
 
+/** The resolved sandbox mode recorded for a spawned session. */
+export type SandboxMode =
+  | 'enforced'
+  | 'inherited'
+  | 'owner-opted-out'
+  | 'permitted-outside';
+
 /** A provider's processing tier other than its standard one. */
 export type ServiceTier =
   | 'flex';
@@ -1008,6 +1430,41 @@ export type SessionStart =
   | 'after-this-turn'
   | 'on-next-input';
 
+/** The kind of irreversible real-world side-effect a command may perform. Only
+ *  meaningful for [`RiskLane::IrreversibleDanger`]. The judge tags each
+ *  irreversible command with a category, and the static fallback derives one
+ *  for the shapes it recognises. An unattended *trigger* runs the command only
+ *  when its declared **side-effect grant** contains that category (ADR 0002).
+ *  A chat turn always asks the user, whatever the category.
+ *  Full reasoning is on the Rust variant. */
+export type SideEffectCategory =
+  | 'email'
+  | 'external_api'
+  | 'cloud_cli'
+  | 'out_of_workspace_destruction'
+  | 'other';
+
+/** What the calling workspace's spawn gate says about the thread that made a
+ *  cross-workspace call. The receiving workspace honors it and never upgrades
+ *  it, since only the caller can read the caller's provenance. */
+export type SpawnVerdict =
+  /** The caller's gate would start a coding agent for this thread. */
+  | { kind: 'allowed' }
+  /** The caller's gate refuses, for `reason`, in the caller's own words. */
+  | {
+      kind: 'refused';
+      reason: string;
+    }
+  /** An unattested caller started the calling thread. */
+  | { kind: 'unattested' };
+
+/** A failed-turn notice; coding-agent notices never start engine holds. */
+export interface SpendCapNotice {
+  provider: string;
+  resets_at: string | null;
+  message: string;
+}
+
 /** One pending change held by a sub-thread of the thread a
  *  `ChildThreadCompleted` reports on: any descendant, not the thread itself.
  *  Full reasoning is on the Rust variant. */
@@ -1027,29 +1484,6 @@ export interface SubThreadPendingChange {
 export type ThreadDirection =
   | 'parent'
   | 'child';
-
-/** Which clause-4 verb was attempted. Carried so the refusal and the log line
- *  name the verb instead of saying "this action": an agent reading "you cannot
- *  cancel that thread" knows what it just tried.
- *  Full reasoning is on the Rust variant. */
-export type ThreadReachVerb =
-  | 'archive'
-  | 'cancel'
-  | 'control'
-  | 'ask-side-question'
-  | 'dismiss-side-question'
-  | 'apply'
-  | 'restore-snapshot'
-  | 'discard'
-  | 'set-aside'
-  | 'bring-back'
-  | 'revert'
-  | 'answer-question'
-  | 'resolve-permission'
-  | 'continue'
-  | 'create-top-thread'
-  | 'detach-child'
-  | 'spawn-successor';
 
 /** The size of any dashboard tile. A widget shows at one of its four
  *  `WidgetSize`s, and an *app shortcut* is always a quarter: half a small
@@ -1110,12 +1544,60 @@ export type TriggerInvocation =
       thread_id?: string;
     };
 
+/** What a coding-agent turn end looked like, stored on `CodingAgentIdled`.
+ *  Read it to tell which path ended a turn that ended early. Codex fills every
+ *  field. The exec driver fills `status` only, and Claude Code sends none. */
+export interface TurnEndFacts {
+  status: TurnEndStatus;
+  /** The turn completed a message that Codex marked as its final answer. */
+  final_answer?: boolean;
+  /** The count of agent messages the turn completed. */
+  agent_messages?: number;
+  /** The count of follow-up inputs Codex accepted into this turn as steers. */
+  steered_inputs?: number;
+  /** The type of the last item the turn completed, in Codex's own words. */
+  last_item?: string;
+}
+
+/** How the coding agent ended its turn, as its driver saw it. */
+export type TurnEndStatus =
+  | 'completed'
+  | 'interrupted'
+  | 'failed'
+  | 'synthesized';
+
+/** An owner-only act an *unattested caller* asked for, parked on a permission
+ *  request until the owner answers it (`api::owner_door`).
+ *  Full reasoning is on the Rust variant. */
+export interface UnattestedAct {
+  /** Who asked: always an `UnattestedCaller`. The replayed act runs as it. */
+  caller: MessageOrigin;
+  request: UnattestedRequest;
+}
+
+/** What an [`UnattestedAct`] runs on Allow once. */
+export type UnattestedRequest =
+  /** A request to an owner-only route, replayed as it arrived. `path`
+   *  carries its query and is relative to `/api/v1`. */
+  | {
+      kind: 'http';
+      method: string;
+      path: string;
+      body?: string;
+      /** The restore generation the caller sent, so a replay after a
+       *  snapshot restore is fenced as the live request would be. */
+      restore_generation?: string;
+    }
+  /** One coding-agent run in the card's own thread. */
+  | { kind: 'start_coding_agent' };
+
 /** Why a turn end left work on its branch unproposed (ADR 0400). The hold
  *  variants are [`ProposalHold`]'s, mapped by the exhaustive `From` below, so a
  *  new hold cannot compile without a wire name. */
 export type UnproposedReason =
   | 'plan_missing'
   | 'plan_awaiting_approval'
+  | 'plan_only_code'
   | 'outside_bound'
   | 'hardening_missing'
   | 'turn_incomplete'
@@ -1130,6 +1612,13 @@ export type UnqueueReason =
   | 'removed'
   | 'batch_failed'
   | 'landing_failed';
+
+export type UnresolvedBillingReason =
+  | 'missing-evidence'
+  | 'unsupported-backend'
+  | 'unknown-auth-method'
+  | 'unknown-endpoint'
+  | 'conflicting-evidence';
 
 /** Why a voice session ended.
  *  Full reasoning is on the Rust variant. */
@@ -1244,6 +1733,10 @@ export type ThreadEvent =
   | {
       type: 'QueuedMessageRemoved';
       removed_message_id: string;
+      /** Stop requests atomic restoration; trash and coding-agent withdrawals do not. */
+      restore_to_compose?: boolean;
+      /** Result of atomic restoration, retained for projection replay. */
+      compose?: ComposeReport;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1367,11 +1860,16 @@ export type ThreadEvent =
        *  means another model answered: a provider reroute, or the router
        *  sending a retired model's successor (ADR 0418). */
       served_model?: string;
-      /** The backend that served the call, as the router resolved its route
-       *  (`claude-gateway`, `vertex`, ...). Absent when no router chose one,
-       *  as for a coding agent's own call, and on every row written before
-       *  the field existed. The gateway telemetry exporter selects on it. */
+      /** The backend the router chose or the coding agent reported
+       *  (`claude-gateway`, `vertex`, ...). Coding-agent calls use `unknown`
+       *  when unresolved; `CodingAgentBillingObserved` preserves why.
+       *  Absent on older captures without provider attribution. Gateway
+       *  telemetry selects engine-owned producers as well as this field. */
       provider?: string;
+      /** The caller ran in a CLI process that owns its telemetry. Engine
+       *  exporters must leave this capture to that process. Defaults false
+       *  for older captures; producer-based exclusions still apply. */
+      telemetry_owned_by_cli?: boolean;
       /** Time to the first content delta of the stream that answered, from
        *  the same start as `duration_ms`, so never above it. Absent when
        *  no delta arrived or the provider's send loop does not trace it,
@@ -1387,6 +1885,23 @@ export type ThreadEvent =
       session?: number;
       /** Server dropped `sections` and `tools` here. The modal lazy-fetches them. */
       sections_stripped?: boolean;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Secret-free billing evidence observed from a coding-agent process.
+   *  Scoped to this launch, never a pin to replay as current auth on resume. */
+  | {
+      type: 'CodingAgentBillingObserved';
+      coding_agent: CodingAgent;
+      /** Correlates observations from one spawned process, independently of
+       *  backend session ids that a resume may reuse. */
+      launch_id: string;
+      attribution: BillingAttribution;
+      billing_mode?: BillingMode;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1562,6 +2077,23 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The engine started a *confinement run* as background task `task_id`,
+   *  under permission `permission_id`. `revision` is the worktree's `HEAD`
+   *  when the tree was clean, and absent when it was dirty. The paired
+   *  `BackgroundBashCompleted` carries the result. A passing run certifies
+   *  its own clean revision for a later harden retry. */
+  | {
+      type: 'ConfinementRunStarted';
+      task_id: string;
+      permission_id: string;
+      revision?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'ResponseGenerated';
       text?: string;
@@ -1606,10 +2138,15 @@ export type ThreadEvent =
   | {
       type: 'ResponseFailed';
       error: string;
+      spend_cap?: SpendCapNotice;
       /** Set when the coding agent's process ended on its own and took the
        *  turn with it. Absent on every other failure, and on stored events
        *  from before it existed. */
       agent_exit?: CodingAgentExit;
+      /** The structured code the provider attached to the failed turn. A
+       *  policy block is never resumed. Absent when the provider sent no
+       *  code, and on stored events from before it existed. */
+      provider_error?: ProviderError;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -1647,6 +2184,8 @@ export type ThreadEvent =
     }
   | {
       type: 'SessionStarted';
+      /** The mode resolved for the spawned process. Absent on legacy rows. */
+      sandbox?: SandboxMode;
       session_id: string;
       branch?: string;
       /** External repository ID this session is bound to.
@@ -1738,6 +2277,8 @@ export type ThreadEvent =
    *  session's `SessionStarted`. */
   | {
       type: 'SessionHandedOff';
+      /** The repository-scoped branch marker at the handoff. */
+      plan_path?: string;
       cause?: HandoffCause;
       starts?: SessionStart;
       /** The ceiling the session crossed, on a `context-ceiling` handoff. */
@@ -1835,12 +2376,12 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The session grew past its context ceiling, and the engine sent the
-   *  *ceiling re-entry* (ADR 0629). Once per session, at the turn end that
-   *  crossed it. */
+  /** A live main-session capture crossed the context ceiling (ADR 0701).
+   *  Recorded once per session; re-entry waits for a safe boundary.
+   *  A session whose first capture already exceeds its ceiling is exempt. */
   | {
       type: 'ContextCeilingReached';
-      /** The session's context size at that turn end, in tokens. */
+      /** The session's context size at the crossing, in tokens. */
       context_tokens: number;
       /** The effective ceiling it crossed, in tokens. */
       ceiling: number;
@@ -1877,6 +2418,23 @@ export type ThreadEvent =
       /** The context size after compacting, when Claude Code reports it. */
       post_tokens?: number;
       coding_agent?: CodingAgent;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The coding agent ran another model than the pinned one the turn asked
+   *  for, because the account may not run it. Read off the agent's Init
+   *  line. The thread's current model is the served one from here on. */
+  | {
+      type: 'CodingAgentModelSubstituted';
+      /** The model id the spawn asked for. */
+      requested: string;
+      /** The model id the agent reported running. */
+      served: string;
+      coding_agent: CodingAgent;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2117,6 +2675,10 @@ export type ThreadEvent =
        *  `spawn_bash_completion_watcher`. Kept on the event so the timeline
        *  still records that an idle overlapped a background task. */
       bg_bash_pending?: boolean;
+      /** How the agent ended the turn this idle closes, as its driver saw it.
+       *  `None` from Claude Code, for an idle no agent turn closed, and on
+       *  rows written before the field existed. */
+      turn_end?: TurnEndFacts;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2302,8 +2864,8 @@ export type ThreadEvent =
     }
   /** Someone became the *driver* of this thread's family (ADR 0623), on its
    *  root. The actor names them: a device, or a trigger fire whose
-   *  actor email an operator holds. Recorded by Take, Take over, and by
-   *  answering a gate. Projects nothing: `engine::thread_people` folds it. */
+   *  actor email a user holds. Recorded by Take, Take over, and by
+   *  answering a gate. Projects nothing: `engine::thread_users` folds it. */
   | {
       type: 'WorkItemDriverTaken';
       /** Links this event back to the request that opened the turn. */
@@ -2343,9 +2905,9 @@ export type ThreadEvent =
    *  beside the driver. Recorded on the family root. */
   | {
       type: 'WorkItemWatched';
-      /** The person a *person mention* made a watcher (ADR 0649). Absent
+      /** The person a *user mention* made a watcher (ADR 0649). Absent
        *  means the actor's own person, who tapped Watch. */
-      operator_id?: string;
+      user_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2364,19 +2926,19 @@ export type ThreadEvent =
       actor?: MessageOrigin;
     }
   /** A person wrote to the other people in this thread, not to its agent: a
-   *  *people-only message* (ADR 0649). The meta actor names the sender.
+   *  *user-only message* (ADR 0649). The meta actor names the sender.
    *  Full reasoning is on the Rust variant. */
   | {
-      type: 'PeopleMessagePosted';
+      type: 'UserOnlyMessagePosted';
       text: string;
       /** Blob hashes of attached images, as on `MessageReceived`. */
       user_image_hashes?: string[];
       /** The device the message came from, by id only. */
       device_id?: string;
-      /** The operators the message mentions. An operator id, because that is
-       *  the only stable handle for a person. A removed operator's id
+      /** The users the message mentions. A user id, because that is
+       *  the only stable handle for a person. A removed user's id
        *  resolves to nobody. */
-      mentioned_operator_ids?: string[];
+      mentioned_user_ids?: string[];
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2407,6 +2969,121 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** The engine's automatic steps on this thread now ask the owner first:
+   *  the *automation pause*. A running turn carries on, and messages still
+   *  deliver. The meta actor names who paused it. */
+  | {
+      type: 'AutomationPaused';
+      reason: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** An owner act ended the automation pause: *unpause*. */
+  | {
+      type: 'AutomationUnpaused';
+      cause: AutomationUnpauseCause;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The owner's pick on a *permission request* granted a *permission*.
+   *  `request_tool_use_id` names the card, and `picked_by` says whether a tap,
+   *  typed words or spoken words picked it. The meta actor is the owner's
+   *  device. A tool card's "Allow for this thread" carries the grant file
+   *  line it stores as `pattern`, which the lane's own matcher reads. */
+  | {
+      type: 'PermissionGranted';
+      permission_id: string;
+      action: Action;
+      breadth?: string;
+      lifetime: Lifetime;
+      holder: Holder;
+      request_tool_use_id: string;
+      picked_by: PickedBy;
+      pattern?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A once permission covered the action it allowed, so it ended. A unique
+   *  index refuses a second spend. */
+  | {
+      type: 'PermissionSpent';
+      permission_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The gateway explicitly refused without changing anything. Copy the spent
+   *  once grant under a new id, keeping its original request and turn boundary.
+   *  A unique index permits at most one restoration of each spend. */
+  | {
+      type: 'PermissionRestored';
+      spent: string;
+      restored: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** Someone revoked a permission. The meta actor names who. */
+  | {
+      type: 'PermissionRevoked';
+      permission_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** An agent prepared a *permission request* on its own thread, through
+   *  `POST /api/v1/permission-requests`. The engine wrote `card`. It shows
+   *  when the agent asks its question tool with `request_id` as its only
+   *  question. A request grants nothing until the owner picks an option. */
+  | {
+      type: 'PermissionRequestPrepared';
+      request_id: string;
+      request: PermissionRequest;
+      card: PreparedCard;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** One item of a confirmed *batch* ran, or was skipped because its
+   *  source changed. On the thread that raised the batch. `index` counts
+   *  from 0 in the batch's order, and `permission_id` is the spent grant. */
+  | {
+      type: 'BatchItemRan';
+      permission_id: string;
+      index: number;
+      item: BatchItem;
+      outcome: BatchItemOutcome;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   /** A thread was created in `composing` state. Emitted by the first
    *  successful POST /threads (debounced first user input: keystroke,
    *  image attach, or mode toggle on a fresh compose). The thread can
@@ -2414,6 +3091,8 @@ export type ThreadEvent =
   | {
       type: 'ThreadStarted';
       recovered_compose?: RecoveredCompose;
+      /** Set only by the agent-draft service, never beside `recovered_compose`. */
+      agent_draft?: AgentDraft;
       /** Initial mode the user opened compose with. Mutable while the
        *  thread is `Composing`; locked on first `MessageReceived`. */
       mode: string;
@@ -2543,8 +3222,49 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
+  /** Planning began, with an explicit purpose supplied by the planning skill.
+   *  Does not record approval or open the source edit gate. */
+  | {
+      type: 'PlanStarted';
+      kind: PlanKind;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** A committed plan revision was submitted for approval. */
+  | {
+      type: 'PlanProposed';
+      kind: PlanKind;
+      plan_path: string;
+      plan_sha: string;
+      branch_name: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The engine checked the user's approval for this committed revision. */
+  | {
+      type: 'PlanApproved';
+      kind: PlanKind;
+      plan_path: string;
+      plan_sha: string;
+      scope: PlanScope;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
   | {
       type: 'ChangeProposed';
+      content?: ChangeContent;
       change_id?: string;
       description?: string;
       files?: string[];
@@ -2595,6 +3315,7 @@ export type ThreadEvent =
     }
   | {
       type: 'ChangeApplied';
+      content?: ChangeContent;
       change_id?: string;
       requires_restart?: boolean;
       client_update?: boolean;
@@ -2729,6 +3450,11 @@ export type ThreadEvent =
       change_id?: string;
       error?: string;
       actor?: MessageOrigin;
+      /** A merge already landed, but recording its content failed. Retries use
+       *  this range instead of treating the landing as an empty no-op. */
+      pre_merge_sha?: string;
+      post_merge_sha?: string;
+      landing_merge_sha?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -2865,12 +3591,23 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** The user picked a Lucidos Agent thread's model and effort between turns
-   *  (ADR 0544 for the lock). The thread's next turn runs on it, however it
-   *  starts: `last_thread_chat_settings` reads it beside the starters. The
-   *  payload is flat, like a starter's. The actor rides on `EventMeta`. */
+  /** A resolved next-turn user pick, including mid-turn (ADR 0544). */
   | {
       type: 'ChatSettingsChanged';
+      model: string;
+      reasoning_effort?: string;
+      provider?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The resolved pair applied when a Lucidos Agent turn is admitted.
+   *  `EventMeta::request_event_id` identifies its durable turn anchor. */
+  | {
+      type: 'ChatTurnSettingsResolved';
       model: string;
       reasoning_effort?: string;
       provider?: string;
@@ -3000,9 +3737,17 @@ export type ThreadEvent =
       options?: QuestionOption[];
       worktree_path?: string;
       multi_select?: boolean;
-      /** Set only on an *owner approval card* (ADR 0387): the act its
-       *  Allow once authorizes. The engine wrote this card's text. */
+      /** Set only on the retired single-use Allow once card (ADR 0387): the
+       *  act it proposed. History only: nothing sets it now, and an engine
+       *  card carries `permission_request` instead. */
       owner_approval?: OwnerApproval;
+      /** Set only on a card the engine raised for an *unattested caller*
+       *  before that card became a permission request. History only: the
+       *  act now rides in `permission_request.unattested_act`. */
+      unattested_act?: UnattestedAct;
+      /** Set only on a *permission request* the engine raised and worded:
+       *  what each option grants (`engine::permission`). */
+      permission_request?: PermissionRequest;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3012,6 +3757,8 @@ export type ThreadEvent =
     }
   | {
       type: 'UserQuestionAnswered';
+      /** The atomic composer consumption, retained for projection rebuilds. */
+      compose?: ComposeReport;
       tool_use_id: string;
       answer: AnswerKind;
       /** The pick was a *quiet option*, so the turn ends without waking the
@@ -3025,10 +3772,9 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A thread asked for an *owner approval* (ADR 0387), through `POST
-   *  /api/v1/owner-approvals`. `question` is the card the engine wrote. It
-   *  is shown when the thread asks `AskUserQuestion` with `request_id` as
-   *  its question. A request grants nothing until the owner allows the card. */
+  /** A thread asked for the retired single-use Allow once card (ADR 0387).
+   *  History only: nothing emits it now. `PermissionRequestPrepared`
+   *  records the request that replaced it. */
   | {
       type: 'OwnerApprovalRequested';
       request_id: string;
@@ -3041,16 +3787,46 @@ export type ThreadEvent =
       /** Who initiated. Absent when an internal state machine acted. */
       actor?: MessageOrigin;
     }
-  /** A thread spent an *owner approval* on the clause-4 act it names
-   *  (ADR 0387). Emitted only by `api::owner_approval`, before the act's
-   *  handler writes anything. `tool_use_id` names the approval card, and a
-   *  unique index on it refuses a second spend. */
+  /** A thread spent the retired single-use Allow once card on the act it
+   *  names (ADR 0387). History only: nothing emits it now, and
+   *  `PermissionSpent` records the spend that replaced it. */
   | {
       type: 'OwnerApprovalSpent';
       tool_use_id: string;
-      verb: ThreadReachVerb;
+      verb: Action;
       target_thread_id?: string;
       target_workspace_id?: string;
+      snapshot_handle?: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** The owner's Allow once on an *unattested caller*'s card was spent on
+   *  its act. History only: nothing emits it now. That card is a permission
+   *  request, and `PermissionSpent` records the spend. */
+  | {
+      type: 'UnattestedActSpent';
+      tool_use_id: string;
+      /** Links this event back to the request that opened the turn. */
+      request_event_id?: string;
+      /** Source channel. Always set on an origin event. */
+      channel?: EventChannel;
+      /** Who initiated. Absent when an internal state machine acted. */
+      actor?: MessageOrigin;
+    }
+  /** An agent acted on a *machine-made workspace* with no card: the
+   *  workspace is the agent's. A stop, start, rename or autostart change
+   *  comes from `api::workspace_broker`, and a snapshot restore from
+   *  `api::snapshots`, which names the snapshot. Emitted before the act,
+   *  which may still be refused. */
+  | {
+      type: 'MachineMadeWorkspaceChanged';
+      verb: Action;
+      workspace_id: string;
+      reason: string;
       snapshot_handle?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
@@ -3119,6 +3895,9 @@ export type ThreadEvent =
       command: string;
       summary: string;
       grant_head?: string;
+      /** The grants the card offers, which a click stores exactly. Absent on
+       *  a card raised before the engine stamped its offer. */
+      grant_offer?: GrantOffer;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3929,6 +4708,10 @@ export type TransientEvent =
       /** The device that uses `ui_scale`, so the frames' first paint
        *  carries it. Absent when the workspace-wide scale is the largest. */
       scale_device_id?: string;
+      /** Public selection handle, never the renderer credential. Its actor
+       *  is the verified source thread, rather than an impersonated Device. */
+      renderer_session_id?: string;
+      renderer_device_id?: string;
       /** Links this event back to the request that opened the turn. */
       request_event_id?: string;
       /** Source channel. Always set on an origin event. */
@@ -3991,6 +4774,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   TextStreamed: true,
   ThoughtStreamed: true,
   ContextCaptured: true,
+  CodingAgentBillingObserved: true,
   ModelCallFailed: true,
   MemoryRecalled: true,
   ToolCalled: true,
@@ -3998,6 +4782,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   TodoListWritten: true,
   BackgroundBashStarted: true,
   BackgroundBashCompleted: true,
+  ConfinementRunStarted: true,
   ResponseGenerated: true,
   ResponseCanceled: true,
   ResponseAborted: true,
@@ -4014,6 +4799,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ContextCeilingReached: true,
   SessionHandoffWithdrawn: true,
   CodingAgentCompacted: true,
+  CodingAgentModelSubstituted: true,
   CodingAgentTextStreamed: true,
   CodingAgentThoughtStreamed: true,
   CodingAgentToolCalled: true,
@@ -4044,9 +4830,17 @@ const THREAD_EVENT_TYPE_FLAGS = {
   WorkItemGateEscalated: true,
   WorkItemWatched: true,
   WorkItemUnwatched: true,
-  PeopleMessagePosted: true,
+  UserOnlyMessagePosted: true,
   AgentPaused: true,
   AgentResumed: true,
+  AutomationPaused: true,
+  AutomationUnpaused: true,
+  PermissionGranted: true,
+  PermissionSpent: true,
+  PermissionRestored: true,
+  PermissionRevoked: true,
+  PermissionRequestPrepared: true,
+  BatchItemRan: true,
   ThreadStarted: true,
   ThreadDiscarded: true,
   HomeThreadCreated: true,
@@ -4054,6 +4848,9 @@ const THREAD_EVENT_TYPE_FLAGS = {
   TriggerStarted: true,
   TriggerRunInterrupted: true,
   TriggerCompleted: true,
+  PlanStarted: true,
+  PlanProposed: true,
+  PlanApproved: true,
   ChangeProposed: true,
   ChangeApplied: true,
   ChangeDiscarded: true,
@@ -4074,6 +4871,7 @@ const THREAD_EVENT_TYPE_FLAGS = {
   ChangeSummarized: true,
   CodingAgentSettingsChanged: true,
   ChatSettingsChanged: true,
+  ChatTurnSettingsResolved: true,
   PromptInjected: true,
   CredentialRequested: true,
   PluginInstallRequested: true,
@@ -4086,6 +4884,8 @@ const THREAD_EVENT_TYPE_FLAGS = {
   UserQuestionAnswered: true,
   OwnerApprovalRequested: true,
   OwnerApprovalSpent: true,
+  UnattestedActSpent: true,
+  MachineMadeWorkspaceChanged: true,
   CodingAgentPermissionRequest: true,
   CodingAgentPermissionResolved: true,
   CommandPermissionRequested: true,

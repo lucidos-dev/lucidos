@@ -28,12 +28,14 @@
 //! with `plugins.updater.pubkey` from `tauri.conf.json`, so this module never
 //! sets a key of its own.
 
-use lucidos_update_address::{check_bundle_url, UpdateAddress, GATEWAY_STATUS_PATH};
+use lucidos_update_channel::{
+    check_bundle_url, is_upgrade, Channel, UpdateAddress, GATEWAY_STATUS_PATH,
+};
 use serde::Serialize;
 use serde_json::Value;
 #[cfg(target_os = "macos")]
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, Runtime, State};
 use tauri_plugin_updater::{Update, Updater, UpdaterExt};
@@ -366,6 +368,8 @@ enum UpdateSource {
     Published,
     /// The update address set in the gateway.
     Address(UpdateAddress),
+    /// The gateway's authenticated loopback feed and bundle routes.
+    Local(UpdateAddress),
 }
 
 /// Ask the gateway which address this check reads. Fails closed: when the
@@ -381,8 +385,8 @@ async fn update_source() -> Result<UpdateSource, String> {
     let source = resolve_update_source(status.as_deref());
     match &source {
         Ok(UpdateSource::Published) => eprintln!("[updater] checking the published release"),
-        Ok(UpdateSource::Address(address)) => {
-            eprintln!("[updater] update address overridden: checking {address}")
+        Ok(UpdateSource::Address(address) | UpdateSource::Local(address)) => {
+            eprintln!("[updater] checking update channel at {address}")
         }
         Err(e) => eprintln!("[updater] {e}"),
     }
@@ -400,13 +404,44 @@ fn resolve_update_source(status: Option<&str>) -> Result<UpdateSource, String> {
     let status: Value = serde_json::from_str(status)
         .map_err(|e| format!("The update check did not run: unreadable gateway status, {e}"))?;
     let check = &status["release_check"];
-    if let Some(refused) = check["update_address_error"].as_str() {
+    if let Some(refused) = check["channel_error"]
+        .as_str()
+        .or_else(|| check["update_address_error"].as_str())
+    {
         return Err(format!("The update check did not run: {refused}"));
     }
+    let channel = check
+        .get("channel")
+        .map(|raw| {
+            raw.as_str()
+                .ok_or_else(|| "The gateway reported an invalid update channel".to_string())
+                .and_then(Channel::parse)
+        })
+        .transpose()?;
+    if channel == Some(Channel::Nightly) {
+        return Err("The Nightly channel is not published yet".into());
+    }
+    let local = channel == Some(Channel::Local);
     match check.get("update_address") {
+        None | Some(Value::Null) if channel.as_ref().is_some_and(|c| c != &Channel::Stable) => {
+            Err("The update check did not run: the channel has no feed address".into())
+        }
         None | Some(Value::Null) => Ok(UpdateSource::Published),
         Some(Value::String(raw)) => match UpdateAddress::parse(raw) {
+            Ok(Some(address)) if local => {
+                if !matches!(
+                    address.url().host_str(),
+                    Some("localhost" | "127.0.0.1" | "[::1]")
+                ) || address.url().path() != "/~/updates/local/latest.json"
+                {
+                    return Err("The Local channel must use the gateway's loopback feed".into());
+                }
+                Ok(UpdateSource::Local(address))
+            }
             Ok(Some(address)) => Ok(UpdateSource::Address(address)),
+            Ok(None) if channel.as_ref().is_some_and(|c| c != &Channel::Stable) => {
+                Err("The update check did not run: the channel has no feed address".into())
+            }
             Ok(None) => Ok(UpdateSource::Published),
             Err(refused) => Err(format!("The update check did not run: {refused}")),
         },
@@ -418,24 +453,88 @@ fn resolve_update_source(status: Option<&str>) -> Result<UpdateSource, String> {
 
 /// The updater for one check. An address replaces only the endpoints; the
 /// key stays the one `tauri.conf.json` bakes in.
-fn updater_for<R: Runtime>(app: &AppHandle<R>, source: &UpdateSource) -> Result<Updater, String> {
-    let builder = app.updater_builder();
+struct ChannelUpdater {
+    updater: Updater,
+    /// Per-check observation: the plugin returns None for both equal and older
+    /// offers, but the manual check must distinguish ahead from up to date.
+    offered: Arc<Mutex<Option<String>>>,
+    local: Option<UpdateAddress>,
+}
+
+fn updater_for<R: Runtime>(
+    app: &AppHandle<R>,
+    source: &UpdateSource,
+) -> Result<ChannelUpdater, String> {
+    updater_with_token(app, source, lucidos_local_token::read)
+}
+
+fn updater_with_token<R: Runtime>(
+    app: &AppHandle<R>,
+    source: &UpdateSource,
+    read_token: impl FnOnce() -> Option<String>,
+) -> Result<ChannelUpdater, String> {
+    let offered = Arc::new(Mutex::new(None));
+    let observed = offered.clone();
+    let builder = app
+        .updater_builder()
+        .version_comparator(move |_build_id, release| {
+            let version = release.version.to_string();
+            *observed.lock().unwrap() = Some(version.clone());
+            is_upgrade(crate::LUCIDOS_RELEASE, &version)
+        });
     let builder = match source {
         UpdateSource::Published => builder,
-        UpdateSource::Address(address) => builder
+        UpdateSource::Address(address) | UpdateSource::Local(address) => builder
             .endpoints(vec![address.url().clone()])
             .map_err(|e| e.to_string())?,
     };
-    builder.build().map_err(|e| e.to_string())
+    let local = match source {
+        UpdateSource::Local(address) => Some(address.clone()),
+        _ => None,
+    };
+    let builder = if local.is_some() {
+        let token = read_token().ok_or("The Local channel needs the machine-local token")?;
+        // Plugin 2.10 forwards headers AND configure_client to Update::download.
+        // Neither a redirect nor a proxy may receive this credential.
+        builder
+            .header(lucidos_local_token::HEADER_LOCAL_TOKEN, token)
+            .map_err(|e| e.to_string())?
+            .no_proxy()
+            .configure_client(|client| client.redirect(reqwest_updater::redirect::Policy::none()))
+    } else {
+        builder
+    };
+    Ok(ChannelUpdater {
+        updater: builder.build().map_err(|e| e.to_string())?,
+        offered,
+        local,
+    })
 }
 
 /// Ask for an offer, refusing one whose bundle breaks the address's transport
 /// rule. `dangerousInsecureTransportProtocol` would let the plugin fetch a
 /// plain-http bundle from any host, so the check here is what limits it.
-async fn check_offer(updater: &Updater) -> Result<Option<Update>, String> {
-    let update = updater.check().await.map_err(|e| e.to_string())?;
+async fn check_offer(updater: &ChannelUpdater) -> Result<Option<Update>, String> {
+    *updater.offered.lock().unwrap() = None;
+    let update = updater.updater.check().await.map_err(|e| e.to_string())?;
     if let Some(update) = &update {
         check_bundle_url(&update.download_url)?;
+        if let Some(local) = &updater.local {
+            if update.download_url.origin() != local.url().origin()
+                || !update.download_url.path().starts_with("/~/updates/local/")
+            {
+                return Err("The Local bundle must stay on the gateway's Local routes".into());
+            }
+        }
+    } else if let Some(version) = updater.offered.lock().unwrap().as_deref() {
+        if is_upgrade(version, crate::LUCIDOS_RELEASE) {
+            // None tells older frontends "up to date". Use the existing error
+            // surface for ahead, preserving the optional-offer wire contract.
+            return Err(format!(
+                "Lucidos {} is ahead of this channel's {version}; keeping the installed build",
+                crate::LUCIDOS_RELEASE
+            ));
+        }
     }
     Ok(update)
 }
@@ -484,7 +583,7 @@ pub async fn check_app_update(app: AppHandle) -> Result<Option<AppUpdateOffer>, 
 /// gets to run cleanup, so the single terminal-phase emit lives in the caller.
 async fn check_and_download(
     narrator: &Narrator,
-    updater: Updater,
+    updater: ChannelUpdater,
 ) -> Result<(Update, Vec<u8>), UpdateFailure> {
     let update = check_offer(&updater)
         .await

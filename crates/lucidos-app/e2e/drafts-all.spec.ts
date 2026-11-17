@@ -1,6 +1,10 @@
 import { test, expect, type Page, type Locator } from './fixtures';
 import { navigateToApp, sendMessage, waitForResponse, uniqueMessage, assertHealthy, newThread, openThreadDrawer, showGrouping, showOngoingGroup, waitForVisibleInput, ensureOnThreadPane, clickVisibleElement, clickThreadRow, threadRowFor, isMobileViewport, composerControl, closeComposerFold } from './helpers';
 import { clearAllThreads, psql } from './db-helpers';
+import { KEEPS_THE_SERVICE_WORKER } from './harnessStamp';
+
+// A thread draft survives a reload on WebKit only with the worker running.
+test.use(KEEPS_THE_SERVICE_WORKER);
 
 /** Send a first message, then click Compose and type a draft. Returns the
  *  prompt-input locator, the original (active) thread id, and the new draft

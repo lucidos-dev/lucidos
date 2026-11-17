@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { describeInitiator } from '../ChatExchange';
+import { actorInitiator, describeInitiator } from '../ChatExchange';
+import { renderOriginSection, renderChannelSection, technicalDetailRows } from '../MessageRoutePanel';
 import { ENGINE_LABEL, LUCIDOS_AGENT_LABEL, SYSTEM_LABEL, type Exchange } from '../../../store/thread-events';
 import type { ComponentChildren, VNode } from 'preact';
 import { vnodeToText } from './vnodeToText';
@@ -100,6 +101,66 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.label).toBe('API caller');
     expect(desc.summary).toBe('API message');
     expect(desc.variant).toBe('system');
+  });
+
+  it('unattested MessageReceived (human mode): never "You", even with a claimed device', () => {
+    // A device id with no gateway stamp is a claim. The chip names the caller
+    // as a claim; the raw id stays in the technical details.
+    const ex = exchangeWith({
+      type: 'MessageReceived',
+      text: 'typed device',
+      mode: 'human',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'human', claimed_device_id: 'owner-phone' },
+    });
+    const desc = describeInitiator(ex, '<p>typed device</p>', [], 'tid');
+    expect(desc.label).toBe('A program that named a device');
+    expect(desc.summary).toBe('Message from a program that named a device');
+    expect(desc.variant).toBe('system');
+  });
+
+  it('unattested caller with the local token: the chip names a local program', () => {
+    const userEvent: Exchange['userEvent'] = {
+      type: 'MessageReceived',
+      text: 'from a terminal',
+      mode: 'engine',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'engine', claimed_local_token: true, user_agent: 'lucidos-cli' },
+    };
+    const desc = describeInitiator(exchangeWith(userEvent), '<p>from a terminal</p>', [], 'tid');
+    expect(desc.label).toBe('A program on this computer');
+    expect(technicalDetailRows(userEvent, userEvent.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Claimed credential', 'Machine-local token'],
+      ['Client', 'lucidos-cli'],
+    ]);
+  });
+
+  it('a call from another workspace: its claim or its verdict is in the technical details', () => {
+    const unstamped: Exchange['userEvent'] = {
+      type: 'MessageReceived',
+      text: 'spawn',
+      mode: 'agent',
+      channel: 'chat',
+      origin: { kind: 'unattested_caller', mode: 'agent', claimed_workspace: 'work2' },
+    };
+    expect(technicalDetailRows(unstamped, unstamped.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Claimed workspace', 'work2'],
+    ]);
+    const refused: Exchange['userEvent'] = {
+      ...unstamped,
+      origin: {
+        kind: 'workspace',
+        workspace: 'work2',
+        mode: 'agent',
+        verdict: { kind: 'refused', reason: 'No grant.' },
+      },
+    };
+    expect(technicalDetailRows(refused, refused.origin)).toEqual([
+      ['Event type', 'MessageReceived'],
+      ['Its gate said', 'Refused: No grant.'],
+    ]);
   });
 
   it('ContinuationStarted (no actor): label falls back to engine, summary "Resumed after engine restart"', () => {
@@ -624,5 +685,37 @@ describe('describeInitiator — divider header reflects the QUESTION, not the tu
     const desc = describeInitiator(ex, '', [], 'tid', /*responseTerminated*/ true, /*threadIsCC*/ true);
     expect(textOf(desc.status)).toContain('Unresolved');
     expect(textOf(desc.status)).not.toContain('Canceled');
+  });
+});
+
+describe('unsigned caller disclosure', () => {
+  it('names the workspace claim outside Technical details and offers pairing', () => {
+    const origin = { kind: 'unattested_caller' as const, mode: 'agent' as const, claimed_workspace: 'studio' };
+    const exchange = exchangeWith({ type: 'MessageReceived', text: 'hello', channel: 'chat', mode: 'agent', origin });
+    const desc = describeInitiator(exchange, '<p>hello</p>', [], 'tid');
+    expect(desc.label).toBe('Workspace "studio"');
+    expect(desc.summary).toBe('Message from workspace "studio", by its own account');
+    expect(actorInitiator(origin).icon).toBeNull();
+    const channel = vnodeToText(renderChannelSection(origin));
+    expect(channel).toContain('Sent from');
+    expect(channel).toContain('Workspace "studio", by its own account');
+    const section = renderOriginSection(exchange, undefined, () => undefined);
+    const children = (section.props.children as ComponentChildren[]).filter(child =>
+      !child || typeof child !== 'object' || Array.isArray(child)
+      || (child as AnyVNode).props?.class !== 'route-technical');
+    const body = vnodeToText(children);
+    expect(body).toContain('How Lucidos can check it');
+    expect(body).toContain('Pair a gateway in Settings');
+    expect(body).toContain('If the workspaces use separate gateways, pair them first.');
+    expect(body).toContain('calls sent by a thread through its gateway');
+    expect(body).not.toMatch(/unattested|not verified|unconfirmed/i);
+  });
+
+  it('keeps unknown callers unknown and device names explicitly claimed', () => {
+    expect(actorInitiator({ kind: 'unattested_caller' }).label).toBe('An unknown caller');
+    expect(vnodeToText(renderChannelSection({ kind: 'unattested_caller', claimed_local_token: true })))
+      .toContain('A program on this computer');
+    expect(actorInitiator({ kind: 'unattested_caller', claimed_device_id: 'typed-id' }).label)
+      .toContain('A program that named');
   });
 });

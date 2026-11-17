@@ -8,12 +8,14 @@ fn read_only_database_url(url: &str) -> Option<String> {
 }
 
 /// The handle is the agent role's URL that boot recorded, never the engine's.
+/// A test that built a whole engine may have recorded first, so the test reads
+/// the recorded value rather than the test constant.
 #[test]
 fn the_handle_is_the_agent_role_url_boot_recorded() {
     crate::test_support::install_agent_database_url();
     let (name, url) = lucidos_database_url_env().expect("boot recorded one");
     assert_eq!(name, LUCIDOS_DATABASE_URL);
-    assert_eq!(url, crate::test_support::AGENT_DATABASE_URL);
+    assert_eq!(Some(&url), AGENT_DATABASE_URL.get());
     assert_ne!(read_only_database_url(&database_url()), Some(url));
 }
 
@@ -23,18 +25,52 @@ fn the_handle_is_the_agent_role_url_boot_recorded() {
 fn sqlx_reads_the_packaged_socket_url_as_a_socket() {
     use std::str::FromStr as _;
     let options = sqlx::postgres::PgConnectOptions::from_str(
-        "postgres:///lucidos_myws?host=%2FUsers%2Fme%20x%2F.lucidos%2Frun%2Fpg-0123&port=5432&user=lucidos",
+        "postgres:///lucidos_myws?host=%2FUsers%2Fme%20x%2F.lucidos%2Fprivate%2Frun%2Fpg-0123&port=5432&user=lucidos&password=s3cr%26t",
     )
     .unwrap();
     assert_eq!(
         options.get_socket(),
         Some(&std::path::PathBuf::from(
-            "/Users/me x/.lucidos/run/pg-0123"
+            "/Users/me x/.lucidos/private/run/pg-0123"
         ))
     );
     assert_eq!(options.get_port(), 5432);
     assert_eq!(options.get_username(), "lucidos");
     assert_eq!(options.get_database(), Some("lucidos_myws"));
+}
+
+/// A packaged engine boots with a URL naming a `passfile`. Inlined, sqlx
+/// reads it as the same socket with no unknown parameter left.
+#[test]
+fn sqlx_reads_the_inlined_passfile_url() {
+    use std::str::FromStr as _;
+    let dir = tempfile::tempdir().unwrap();
+    let passfile = dir.path().join("superuser.pgpass");
+    std::fs::write(
+        &passfile,
+        lucidos_pg_url::passfile_line("lucidos", "s3cr&t"),
+    )
+    .unwrap();
+    let url = format!(
+        "postgres:///lucidos_myws?host=%2Frun%2Fpg-0123&port=5432&user=lucidos&passfile={}",
+        urlencoding::encode(&passfile.to_string_lossy())
+    );
+    let (inlined, named) = lucidos_pg_url::inline_passfile(&url).unwrap();
+    assert_eq!(named.as_deref(), Some(passfile.as_path()));
+    assert!(!inlined.contains("passfile"), "{inlined}");
+    let options = sqlx::postgres::PgConnectOptions::from_str(&inlined).unwrap();
+    assert_eq!(
+        options.get_socket(),
+        Some(&std::path::PathBuf::from("/run/pg-0123"))
+    );
+    assert_eq!(options.get_username(), "lucidos");
+    assert_eq!(
+        lucidos_pg_url::PgUrl::parse(&inlined)
+            .unwrap()
+            .password
+            .as_deref(),
+        Some("s3cr&t")
+    );
 }
 
 /// A Rust script would read the handle through sqlx. It must reach the socket
@@ -217,6 +253,20 @@ fn test_describe_tool_ask_user_question_falls_back_to_header() {
     assert_eq!(
         describe_tool("ask_user_question", &args),
         "Asking: Approach"
+    );
+}
+
+#[test]
+fn test_describe_tool_knowhow_without_an_id_names_no_id() {
+    let empty = serde_json::json!({});
+    assert_eq!(describe_tool("load_knowhow", &empty), "Loading know-how...");
+    assert_eq!(
+        describe_tool("unload_knowhow", &empty),
+        "Unloading know-how..."
+    );
+    assert_eq!(
+        describe_tool("load_knowhow", &serde_json::json!({"id": "ops/x"})),
+        "Loading know-how 'ops/x'..."
     );
 }
 

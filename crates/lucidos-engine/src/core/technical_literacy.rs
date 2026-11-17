@@ -158,7 +158,7 @@ pub async fn read(pool: &PgPool) -> Option<TechnicalLiteracy> {
     }
     let level = TechnicalLiteracy::parse(&raw);
     if level.is_none() {
-        log!(
+        log_legacy!(
             "[TechnicalLiteracy] '{}' holds unknown level '{}'. Leaving it unset",
             prefs::TECHNICAL_LITERACY.key(),
             raw
@@ -296,30 +296,6 @@ mod tests {
         }
     }
 
-    /// The setup interview stores what its literacy card returns. A value the
-    /// knowhow names but this list lacks is refused by `set_preference`, and
-    /// the interview then runs on with nothing stored.
-    #[test]
-    fn the_setup_interview_offers_exactly_the_levels_the_engine_reads() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let knowhow = std::fs::read_to_string(repo.join("system-knowhow/setup-interview.md"))
-            .expect("the setup interview knowhow ships");
-        assert!(knowhow.contains(prefs::TECHNICAL_LITERACY.key()));
-        for level in TechnicalLiteracy::ALL {
-            let row = format!(
-                "| {} | {} | `{}` |",
-                level.card_label(),
-                level.card_line(),
-                level.id()
-            );
-            assert!(
-                knowhow.contains(&row),
-                "the literacy card lacks the row {row}"
-            );
-        }
-        assert!(!knowhow.contains(&format!("`{MERGED_EVERYDAY_ID}`")));
-    }
-
     #[tokio::test]
     async fn read_resolves_levels_and_degrades_every_bad_row_to_unset() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
@@ -353,5 +329,33 @@ mod tests {
 
         pool.close().await;
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The setup interview stores what its literacy card returns. A value the
+        /// knowhow names but this list lacks is refused by `set_preference`, and
+        /// the interview then runs on with nothing stored.
+        #[test]
+        fn the_setup_interview_offers_exactly_the_levels_the_engine_reads() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let knowhow = std::fs::read_to_string(repo.join("system-knowhow/setup-interview.md"))
+                .expect("the setup interview knowhow ships");
+            assert!(knowhow.contains(prefs::TECHNICAL_LITERACY.key()));
+            for level in TechnicalLiteracy::ALL {
+                let row = format!(
+                    "| {} | {} | `{}` |",
+                    level.card_label(),
+                    level.card_line(),
+                    level.id()
+                );
+                assert!(
+                    knowhow.contains(&row),
+                    "the literacy card lacks the row {row}"
+                );
+            }
+            assert!(!knowhow.contains(&format!("`{MERGED_EVERYDAY_ID}`")));
+        }
     }
 }

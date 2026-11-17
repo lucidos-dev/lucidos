@@ -164,8 +164,10 @@ pub(super) async fn revoke(auth: AuthServer, client_id: String, token: String) {
         .map(|resp| resp.status());
     match outcome {
         Ok(status) if status.is_success() => {}
-        Ok(status) => crate::log!("[ChatGptPlan] Revoking the refresh token answered {status}"),
-        Err(e) => crate::log!("[ChatGptPlan] Could not revoke the refresh token: {e}"),
+        Ok(status) => {
+            crate::log_legacy!("[ChatGptPlan] Revoking the refresh token answered {status}")
+        }
+        Err(e) => crate::log_legacy!("[ChatGptPlan] Could not revoke the refresh token: {e}"),
     }
 }
 

@@ -1,3 +1,4 @@
+import { loadSpendCapHolds } from './spendCapHolds';
 /**
  * EntityReferenceManager — independent SSE consumer that keeps entity references
  * (recents, nav stack, pinned apps, active overlay) in sync when entities change.
@@ -37,7 +38,8 @@ import { loadWebhookRefusals } from './webhookRefusals';
 import { pruneNavHistory, type NavEntry } from './navigation';
 import { clearAppStorage } from './app-bridge';
 
-export const RECENTS_KEY = 'lucidos-search-recents';
+import { RECENTS_KEY, pruneRecents } from './searchRecents';
+export { RECENTS_KEY, pruneRecents } from './searchRecents';
 
 /** An app was created, changed or deleted. Its by-id read and the filter
  *  facets both carry its label (ADR 0404), so each is read afresh. */
@@ -169,7 +171,7 @@ export const PROVIDER_PREFERENCE_KEYS: ReadonlySet<string> = new Set([
  *  the loader). `void` is the explicit fire-and-forget marker so the loader's
  *  failure path is the single source of truth and we don't double-toast from
  *  here. */
-export function processSSEForReferences(type: string, data: Record<string, unknown>): void {
+export function processSSEForReferences(type: string, data: Record<string, unknown>, eventId?: string): void {
   switch (type) {
     // Trigger events — only Created / Updated / Deleted can change a trigger's
     // group_id and thus the member_count badge on the section header. Enabled /
@@ -190,6 +192,8 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // queue + active set only) so a full refetch per event stays cheap.
     // ThreadQueueChanged is the transient signal for in-memory-only
     // user-initiated slot moves (which carry no persisted ThreadQueue* event).
+    case 'DraftSubmissionAccepted':
+    case 'OrdinarySubmissionAccepted':
     case 'ThreadQueued':
     case 'ThreadQueueAdmitted':
     case 'ThreadQueueDropped':
@@ -407,6 +411,10 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // A Claude gateway sign-in or sign-out installs or drops the engine's
     // gateway provider, as a credential change does, so it takes the same
     // re-probe. Settings also shows the account.
+    case 'ModelSpendCapReached':
+    case 'ModelSpendCapHoldEnded':
+      void loadSpendCapHolds();
+      break;
     case 'ClaudeGatewaySignedIn':
     case 'ClaudeGatewaySignedOut':
       refreshLlmConfigured();
@@ -513,7 +521,7 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
         provider?: string;
         email?: string | null;
         actor?: { kind?: string; device_id?: string } | null;
-      });
+      }, eventId);
       break;
     case 'OAuthAccountDeleted':
       if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();
@@ -572,19 +580,6 @@ function handleThreadTitleEvent(data: Record<string, unknown>): void {
   if (!title) return;
 
   patchRecentsMetadata(threadId, 'threads', title);
-}
-
-/** Drop one Search Everywhere recent, for an entity the source of truth deleted. */
-export function pruneRecents(id: string, category: string): void {
-  try {
-    const raw = localStorage.getItem(RECENTS_KEY);
-    if (!raw) return;
-    const recents: Array<{ id: string; category: string }> = JSON.parse(raw);
-    const filtered = recents.filter(r => !(r.id === id && r.category === category));
-    if (filtered.length < recents.length) {
-      localStorage.setItem(RECENTS_KEY, JSON.stringify(filtered));
-    }
-  } catch { /* corrupted localStorage */ }
 }
 
 function patchRecentsMetadata(id: string, category: string, name: string): void {

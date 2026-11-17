@@ -15,12 +15,14 @@
  * It orders each by its *compose revision* and lays this device's pending
  * edits over it (ADR 0437).
  */
+import { savePreference } from './preferences';
+import type { CodingAgent } from '../../api/types';
 import { restoreAdmissionReady } from '../../utils/restoreAdmission';
 import { requestGenerationGuard } from '../../api/client/_core';
 
 import { effect } from '@preact/signals';
 import { retainSendingImageHashes } from '../pendingUploadRecords';
-import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, removeToast, setFocusedThread, selectedScope, selectedCodingAgent, preferences, repositories, type Scope } from '../store';
 import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
 import {
@@ -31,9 +33,10 @@ import {
   clearComposeSelection,
   seedComposeSelection,
   takePendingComposeSelection,
-  resolvePerson,
+  resolveUser,
   resolveScope,
   resolveCodingAgent,
+  applyCodingAgentDefault,
   resolveModel,
   resolveReasoningEffort,
   resolveProvider,
@@ -55,15 +58,14 @@ import {
   sameHashes,
   serverComposeOf,
   _resetComposeSyncForTesting,
-  type ComposeReport,
+  type ParsedComposeReport,
 } from '../composeSync';
 import { errorDetail } from '../../utils/errorDetail';
 import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { createFailureCounter } from '../../utils/failureCounter';
-import { appendMessagesToCompose, sendMessage } from './chat';
+import { sendMessage } from './chatSend';
 import { refreshRepositories } from './repositoriesLoader';
-// Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
-// this is a function declaration called at runtime, never at module init.
+// Cycle-safe: this is a function declaration called at runtime, never at module init.
 import { forgetThreadEventsFailures } from './thread-loading';
 // Same shape of cycle (`compose -> threads -> thread-loading -> compose`), same
 // reason it is safe: called at runtime, never at module init.
@@ -71,10 +73,6 @@ import { changeRows, focusThread, unfocusThread, versionsBeyondCurrent } from '.
 import { abandonRowIntent, acknowledgeRowIntent, holdRowIntent } from '../rowIntents';
 import { homeThreadId } from './homeThread';
 import type { ChatContext } from './chatContext';
-// Not a new edge at all: `./chat` above already imports this same function, so
-// `compose -> pane` was in the graph before this line. The property to re-check
-// is that nothing `pane` reaches comes back to `compose`. Its direct import list
-// is not that check: it pulls in 25 action modules through the drawer.
 import { revealThreadPane } from './pane';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { requestPromptCaretToEnd } from '../../components/chat/promptValueSync';
@@ -99,7 +97,7 @@ function scopeEquals(a: Scope, b: Scope): boolean {
  *  active, the channel is locked server-side and the picker is hidden. */
 export function applyDestination(threadId: string | null, d: ComposeDestination): void {
   const mode: ComposeMode = d.kind === 'coding' ? 'claude_code' : 'lucidos';
-  const person = d.kind === 'person' ? d.personId : null;
+  const user = d.kind === 'user' ? d.userId : null;
   const modeType = mode === 'claude_code' ? 'coding_agent' : 'do';
   if (inputMode.value.type !== modeType) {
     inputMode.value = mode === 'claude_code' ? { type: 'coding_agent' } : { type: 'do' };
@@ -131,8 +129,8 @@ export function applyDestination(threadId: string | null, d: ComposeDestination)
       }
     }
   }
-  if (resolvePerson(threadId) !== person) {
-    patchComposeSelection(threadId, { person });
+  if (resolveUser(threadId) !== user) {
+    patchComposeSelection(threadId, { user });
     if (threadId) {
       noteLocalComposeEdit(threadId);
       schedulePush(threadId);
@@ -278,8 +276,8 @@ export function updateCompose(threadId: string, patch: ComposePatch): void {
   schedulePush(threadId);
 }
 
-/** Single entry point for a per-draft dropdown selection change (model,
- *  reasoning, coding agent, coding-agent model and effort).
+/** Patch a per-draft dropdown selection (model, reasoning, agent model and effort).
+ *  Coding-agent chip picks use `selectComposeCodingAgent`.
  *
  *  A real `threadId` patches the keyed override and schedules the debounced
  *  compose PUT. The pick is a pending edit, so no report applies over it until
@@ -296,6 +294,12 @@ export function updateComposeSelection(
     noteLocalComposeEdit(threadId);
     schedulePush(threadId);
   }
+}
+
+/** Remember an explicit chip pick; the server pins inherited legacy choices. */
+export function selectComposeCodingAgent(threadId: string | null, agent: CodingAgent): Promise<void> {
+  updateComposeSelection(threadId, { codingAgent: agent });
+  return savePreference('coding_agent_default', agent, () => applyCodingAgentDefault(agent));
 }
 
 /** Patch one thread's meta with whichever fields are set, returning a new
@@ -566,8 +570,8 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
     : [...draft.image_hashes];
   // Persist the draft's per-draft dropdown selection alongside text/images/mode
   // so a reload rehydrates it. `undefined` (no local selection) omits the field
-  // → backend COALESCE preserves. A present selection replaces the stored one;
-  // re-sending the same object on a plain keystroke PUT is a harmless no-op.
+  // so the backend preserves it. A present selection replaces other picks,
+  // while an omitted codingAgent preserves the stored agent pin.
   const selectionOverride = getComposeSelectionOverride(threadId);
   const selectionForPut: ComposeSelectionOverride | undefined =
     Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
@@ -606,7 +610,7 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
   // An engine one release behind answers without a report. The write still
   // landed, so it says what we sent, at a revision nobody named.
   const held = serverComposeOf(threadId);
-  const report: ComposeReport = result.report ?? {
+  const report: ParsedComposeReport = result.report ?? {
     revision: null,
     epoch: null,
     text: draft.text,
@@ -615,6 +619,7 @@ async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
     selection: selectionForPut ?? held?.selection ?? null,
   };
   acknowledgeComposeEdits(threadId, seq, report);
+  if (composeEditSeq(threadId) > seq) owedComposePushes.add(threadId);
   settleComposeDelivered(threadId);
 }
 
@@ -695,7 +700,7 @@ function startThreadOnEngine(threadId: string, mode: ComposeMode): Promise<void>
   const current = threadStarts.get(threadId);
   if (current?.kind === 'in-flight') return current.promise;
   const promise = (async () => {
-    let started: ComposeReport | null;
+    let started: ParsedComposeReport | null;
     try {
       started = await ensureThreadStarted(threadId, mode);
     } catch (err) {
@@ -784,13 +789,13 @@ export function ensureFocusedComposeThread(): string {
   if (id) return id;
   id = generateUuid();
   setFocusedThread(id);
-  // Seed THIS new draft's own stored selection. Eager-copy the localStorage
-  // last-used scope, so the draft carries a scope in its OWN override, then
-  // overlay any fresh-compose picks from the pending slot. A pending scope pick
-  // wins. The eager copy is required: `resolveScope` no longer falls back to
-  // the shared `selectedScope` for a real draft, which is the leak guard. Other
-  // fields stay unset and resolve to their account defaults.
-  seedComposeSelection(id, { scope: selectedScope.value, ...takePendingComposeSelection() });
+  // Copy last-used seeds into the draft before overlaying pending picks, so
+  // future choices in another composer cannot change this draft's selection.
+  seedComposeSelection(id, {
+    scope: selectedScope.value,
+    ...(preferences.value.status === 'loaded' ? { codingAgent: selectedCodingAgent.value } : {}),
+    ...takePendingComposeSelection(),
+  });
   // Inlined instead of focusThread(): that also fires loadThreadEvents and
   // (on mobile) navigateToPane, neither of which the draft path wants.
   pushThreadNavState({ type: 'thread', id });
@@ -1256,7 +1261,7 @@ export async function sendCompose(
   const ccModelOverride = resolveCcModel(threadId);
   const ccReasoningEffortOverride = resolveCcReasoningEffort(threadId);
   // A coding-agent send addresses its agent, never a teammate.
-  const person = opts.useCodingAgent ? null : resolvePerson(threadId);
+  const user = opts.useCodingAgent ? null : resolveUser(threadId);
   // Must run before the draft clear — see `markHashesAsSent`.
   if (wireHashes.length > 0) markHashesAsSent(wireHashes);
   const releaseImages = retainSendingImageHashes(wireHashes);
@@ -1290,7 +1295,7 @@ export async function sendCompose(
       providerOverride,
       ccModelOverride,
       ccReasoningEffortOverride,
-      alsoMention: person ? [person] : undefined,
+      alsoMention: user ? [user] : undefined,
       threadStarted: () => awaitThreadStarted(threadId),
       settlement: { kind: 'first-send', mode, engineDraftAtSend },
     });
@@ -1421,4 +1426,25 @@ export function _flushAllPendingForTesting(): void {
 if (typeof window !== 'undefined') {
   window.addEventListener('beforeunload', flushAllPending);
   window.addEventListener('pagehide', flushAllPending);
+}
+
+/** Append taken-back messages (FIFO) to the thread's compose draft, after any
+ *  existing draft: retracted queued messages, or a refused follow-up. Texts
+ *  join with a blank line, and images go after the draft's own, each hash
+ *  once, as `addAttachedImageHash` keeps it. Forces the prompt input to show
+ *  the text. The compose→textarea sync skips a focused non-empty input, so a
+ *  programmatic append needs the explicit override, as `seedSuggestion` does. */
+export function appendMessagesToCompose(threadId: string, messages: ReadonlyArray<{ text: string; imageHashes: readonly string[] }>): void {
+  const draftImages = getDraft(threadId).image_hashes;
+  const images = [...new Set(messages.flatMap(m => m.imageHashes))].filter(h => !draftImages.includes(h));
+  if (images.length > 0) {
+    updateCompose(threadId, { image_hashes: [...draftImages, ...images] });
+  }
+  const texts = messages.map(m => m.text).filter(t => t.length > 0);
+  if (texts.length === 0) return;
+  const existing = getDraft(threadId).text;
+  const addition = texts.join('\n\n');
+  const combined = existing.trim().length > 0 ? `${existing}\n\n${addition}` : addition;
+  // An append: the draft keeps its prefix, so the caret stays where it was.
+  updateCompose(threadId, { text: combined });
 }

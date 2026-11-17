@@ -164,7 +164,7 @@ fn collect_md_files_within(dir: &Path, levels: usize) -> Vec<PathBuf> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Knowhow] Failed to read directory {}: {}",
                 dir.display(),
                 e
@@ -176,7 +176,7 @@ fn collect_md_files_within(dir: &Path, levels: usize) -> Vec<PathBuf> {
     for entry in entries {
         match entry {
             Ok(e) => sorted.push(e),
-            Err(e) => log!("[Knowhow] Failed to read entry in {}: {}", dir.display(), e),
+            Err(e) => log_legacy!("[Knowhow] Failed to read entry in {}: {}", dir.display(), e),
         }
     }
     sorted.sort_by_key(|e| e.file_name());
@@ -221,7 +221,7 @@ impl KnowhowStore {
             let text = match std::fs::read_to_string(&path) {
                 Ok(t) => t,
                 Err(e) => {
-                    log!("[Knowhow] Failed to read {}: {}", path.display(), e);
+                    log_legacy!("[Knowhow] Failed to read {}: {}", path.display(), e);
                     continue;
                 }
             };
@@ -233,7 +233,7 @@ impl KnowhowStore {
                     description,
                 });
             } else {
-                log!(
+                log_legacy!(
                     "[Knowhow] Missing or invalid frontmatter in {}",
                     path.display()
                 );
@@ -269,7 +269,7 @@ impl KnowhowStore {
         let entries = match std::fs::read_dir(apps_dir) {
             Ok(entries) => entries,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Knowhow] Failed to read apps directory {}: {}",
                     apps_dir.display(),
                     e
@@ -348,7 +348,7 @@ impl KnowhowStore {
     /// The id may contain forward slashes for files in subdirectories (e.g., "weather/api").
     pub fn load(knowhow_dir: &Path, id: &str) -> Option<Knowhow> {
         if !is_safe_id(id) {
-            log!("[Knowhow] Invalid id (path traversal): {}", id);
+            log_legacy!("[Knowhow] Invalid id (path traversal): {}", id);
             return None;
         }
         let path = knowhow_dir.join(format!("{}.md", id));
@@ -363,14 +363,14 @@ fn read_knowhow_file(path: &Path, id: &str) -> Option<Knowhow> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
-            log!("[Knowhow] Failed to read {}: {}", path.display(), e);
+            log_legacy!("[Knowhow] Failed to read {}: {}", path.display(), e);
             return None;
         }
     };
     let (name, description, content) = match parse_frontmatter(&text) {
         Some(parsed) => parsed,
         None => {
-            log!(
+            log_legacy!(
                 "[Knowhow] Missing or invalid frontmatter in {}",
                 path.display()
             );
@@ -459,7 +459,7 @@ pub fn load_knowhow_sections_merged(
     for id in ids {
         if let Some(sys_id) = id.strip_prefix(SYSTEM_KNOWHOW_PREFIX) {
             let Some(dir) = system_dir else {
-                log!(
+                log_legacy!(
                     "[Knowhow] system-knowhow id '{}' requested but system_knowhow_dir is unavailable",
                     id
                 );
@@ -548,14 +548,14 @@ pub fn load_app_knowhow(knowhow_dir: &Path) -> String {
                         name, body
                     ));
                 } else {
-                    log!(
+                    log_legacy!(
                         "[Knowhow] Missing or invalid frontmatter in {}",
                         path.display()
                     );
                 }
             }
             Err(e) => {
-                log!("[Knowhow] Failed to read {}: {}", path.display(), e);
+                log_legacy!("[Knowhow] Failed to read {}: {}", path.display(), e);
             }
         }
     }

@@ -24,6 +24,7 @@ vi.mock('./widgetFit', () => ({
 import {
   LONG_PRESS_DELAY_MS,
   PRESS_MOVE_TOLERANCE_PX,
+  WIDGET_RESOURCES_MESSAGE_TYPE,
   WIDGET_CHANNEL,
   WIDGET_CONTENT_SIZE_MESSAGE_TYPE,
   WIDGET_FIT_MESSAGE_TYPE,
@@ -58,6 +59,7 @@ describe('installWidgetFrame', () => {
   const posted: unknown[] = [];
   const parent = { postMessage: (message: unknown) => posted.push(message) };
   const mark = (data: unknown) => pushHandlers.get(WIDGET_CHANNEL)?.(data);
+  const sizes = () => posted.filter(m => (m as { type?: string }).type === WIDGET_CONTENT_SIZE_MESSAGE_TYPE);
   const menus = () => posted.filter((m) => (m as { type?: string }).type === WIDGET_MENU_MESSAGE_TYPE);
 
   beforeEach(() => {
@@ -81,14 +83,15 @@ describe('installWidgetFrame', () => {
     installWidgetFrame();
     expect(posted).toEqual([]);
     mark({});
-    expect(posted).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 }]);
+    expect(posted).toContainEqual({ type: WIDGET_RESOURCES_MESSAGE_TYPE, videoLoaded: 0, videoPixels: 0, images: 0, imagePixels: 0 });
+    expect(sizes()).toEqual([{ type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 }]);
   });
 
   it('every mark reports, so the host hears the size in a new place', () => {
     installWidgetFrame();
     mark({ place: 'option' });
     mark({ place: 'option' });
-    expect(posted).toEqual([
+    expect(sizes()).toEqual([
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200 },
     ]);
@@ -98,7 +101,7 @@ describe('installWidgetFrame', () => {
     installWidgetFrame();
     mark({ place: 'inline', size: 'medium' });
     mark({ place: 'inline', size: 'large' });
-    expect(posted).toEqual([
+    expect(sizes()).toEqual([
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'medium' },
       { type: WIDGET_CONTENT_SIZE_MESSAGE_TYPE, width: 300, height: 200, size: 'large' },
     ]);

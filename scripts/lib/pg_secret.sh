@@ -25,11 +25,14 @@ source "$(dirname "${BASH_SOURCE[0]}")/workspace_constants.sh"
 # shellcheck source=scripts/lib/storage_root.sh
 source "$(dirname "${BASH_SOURCE[0]}")/storage_root.sh"
 
-# shared_pg_password: print the secret, minting it on first use. The Lucidos
-# home it lives in is a storage root, never open even briefly (ADR 0456).
+# shared_pg_password: print the secret, minting it on first use. It is a
+# private entry (ADR 0645): in the private subtree, or beside the other entries
+# of a home an older release used. Both are storage roots, never open even
+# briefly (ADR 0456).
 shared_pg_password() {
     local dir
-    dir="$(lucidos_home_dir)"
+    dir="$(dirname "$(lucidos_private_entry "$SHARED_PG_PASSWORD_FILE")")"
+    ensure_storage_root "$(lucidos_home_dir)" || return 1
     ensure_storage_root "$dir" || return 1
     perl -MFcntl=:DEFAULT,:flock -e '
         my ($dir, $name, $suffix, $bytes) = @ARGV;

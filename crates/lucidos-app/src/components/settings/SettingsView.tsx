@@ -1,9 +1,10 @@
+import { PREF_EXTERNAL_LINK_TARGET, PREF_IMAGE_MODEL } from '@lucidos/preference-catalog';
 import { useState, useEffect, useCallback, useRef } from 'preact/hooks';
-import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
+import { aliasRetiredSettingsAnchor, currentModel, preferences, showToast, showConfirm, oauthAccounts, credentials, settingsSubview, settingsScrollTarget, settingsLinkedFragment, settingsSubviewLabel, repositories, knownOAuthProviders, oauthConnectPrefill, agentSandboxUnavailable, agentSandboxTruncationUnguarded } from '../../store/store';
 import { devices, getDeviceId, updateDeviceName, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
+import { currentAgentBrandColours, setAgentBrandColours, setImageModel, setThemeMode, setFontFamily, setChatModelSelection, setTriggerModelSelection, currentTriggerModel, accountChatEffort, currentThemeMode, currentFontFamily, currentUiScale, currentImageModel,  currentMemoryModule, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentCodingAgentAutoAnswer, setCodingAgentAutoAnswer, currentAgentsUnsandboxed, setAgentsUnsandboxed, currentNotificationToasts, setNotificationToasts, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_MAX, currentStyleOverrides, clearStyleOverrides, setMotion, setThemeEffects, type ExternalLinkTarget, type ThemeMode, type FontPreference } from '../../store/actions/preferences';
 import { DEFAULT_THEME_MODE, THEME_EFFECTS_PREFS, THEME_MODES, MOTION_PREFS, type ThemeEffectsPref, type MotionPref } from '@lucidos/appearance';
-import { PREFERENCE_CATALOG } from '@lucidos/preference-catalog';
+
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -13,7 +14,6 @@ import {
   grantOAuthScope,
 } from '../../store/actions/oauth';
 import {
-  connectScopes,
   missingScopes,
   prefillLabel,
   providerToSend,
@@ -61,12 +61,15 @@ import { MobileAccessPage } from './MobileAccessPage';
 import { usePairedDevices, revokePaired } from './pairedDevices';
 import { pairedRows, pairingIsKnown } from '../../store/actions/pairedDevices';
 import { SectionHeader } from '../shared/SectionHeader';
-import { DevicePersonPicker, PeopleSection } from './PeopleSection';
+import { DeviceUserPicker, UsersPage } from './UsersSection';
+import { RemoteGatewayDevicesSection, useRemoteGatewayLists } from './remoteGatewaySections';
+import { REMOTE_GATEWAY } from '../../utils/basePath';
 import { buildDeviceRows, isUnusedDevice, deviceRowName, deviceRowSummary, submittedDeviceName, type DeviceRowModel } from './deviceList';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { CodingAgentPermissionSection } from './CodingAgentPermissionSection';
 import { CodingAgentContextCeilingSection } from './CodingAgentContextCeilingSection';
+import { MainCheckSettingSection } from './MainCheckSettingSection';
 import { CacheKeepAlivePointer, CacheKeepAliveSection } from './CacheKeepAliveSection';
 import { IntelligenceLinkRow, IntelligencePage } from './IntelligencePage';
 import { SystemPage } from './SystemPage';
@@ -161,7 +164,7 @@ const EXTERNAL_LINK_TARGET_LABELS: Record<ExternalLinkTarget, string> = {
   'in-app': 'In-app view',
 };
 
-const EXTERNAL_LINK_TARGET_OPTIONS = PREFERENCE_CATALOG.external_link_target.values
+const EXTERNAL_LINK_TARGET_OPTIONS = PREF_EXTERNAL_LINK_TARGET.values
   .map((target) => ({ value: target, label: EXTERNAL_LINK_TARGET_LABELS[target] }));
 
 // Presets for the per-turn tool-call cap. The dropdown is `freeText`, so these
@@ -187,7 +190,7 @@ const IMAGE_MODEL_LABELS: Record<ImageModel, string> = {
 
 /** Image generation has no reasoning tiers at all, so its picker renders the
  *  model alone. The empty list is what decides that, not a prop. */
-const IMAGE_MODEL_CHOICES: ModelChoice[] = PREFERENCE_CATALOG.image_model.values.map((model) => ({
+const IMAGE_MODEL_CHOICES: ModelChoice[] = PREF_IMAGE_MODEL.values.map((model) => ({
   value: model,
   label: IMAGE_MODEL_LABELS[model],
   reasoningEfforts: [],
@@ -302,7 +305,7 @@ function DeviceRow({ row, editingId, setEditingId, onRevoke, gatewayAnswered }: 
         </SkText>
       </div>
       <div class="list-row-actions">
-        {!sk && row?.paired && <DevicePersonPicker deviceId={row.paired.id} />}
+        {!sk && row?.paired && <DeviceUserPicker deviceId={row.paired.id} />}
         {/* Push is per WORKSPACE, so it hangs off the engine row. A device that
             only paired has none yet, and the toggle STILL renders, off and
             disabled: leaving it out asks the reader why this one row has no
@@ -499,9 +502,11 @@ export function SettingsView() {
   // cannot be called from inside the Devices branch alone. It costs one local
   // request, which resolves to "no gateway" everywhere else.
   const paired = usePairedDevices();
+  useRemoteGatewayLists(settingsSubview.value === 'devices' || settingsSubview.value === 'users');
   const background = useBackgroundModels();
   usePanelRefresh('background models', background.refresh);
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [changingAgentSandbox, setChangingAgentSandbox] = useState(false);
   const [unusedDevicesOpen, setUnusedDevicesOpen] = useState(false);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
@@ -628,7 +633,7 @@ export function SettingsView() {
       // `oauthPurpose` is what a deep link said this connection is FOR. Requesting
       // it here is what makes one consent screen enough when the user arrived
       // from Backup.
-      await grantOAuthScope(provider, connectScopes(oauthPurpose));
+      await grantOAuthScope(provider, oauthPurpose?.trim() ?? '', true);
       setOauthProvider('');
       setOauthPurpose(null);
     } finally {
@@ -841,53 +846,65 @@ export function SettingsView() {
       });
     }
     return (
+      <div class="list-rows" data-search-anchor="devices:list">
+        {/* A gateway that broke is not a deployment that never had one, so it
+            says so instead of silently dropping the pairing column. The engine
+            half below still renders: push and preferences are unaffected. */}
+        {paired.paired.status === 'failed' && (
+          <LoadableError noun="paired devices" error={paired.paired.error} />
+        )}
+        <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
+          {loadable.status === 'loaded'
+            ? (() => {
+                const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
+                if (rows.length === 0) {
+                  return <div class="empty-state">No devices registered</div>;
+                }
+                const unused = rows.filter(isUnusedDevice);
+                const drawRow = (row: DeviceRowModel) => (
+                  <DeviceRow
+                    key={row.id}
+                    row={row}
+                    editingId={editingId}
+                    setEditingId={setEditingId}
+                    onRevoke={revoke}
+                    gatewayAnswered={pairingIsKnown(paired.paired)}
+                  />
+                );
+                return (
+                  <>
+                    {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
+                    {unused.length > 0 && (
+                      <>
+                        <SectionHeader
+                          title="Unused devices"
+                          count={unused.length}
+                          collapsed={!unusedDevicesOpen}
+                          onToggle={() => setUnusedDevicesOpen((open) => !open)}
+                        />
+                        <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
+                      </>
+                    )}
+                  </>
+                );
+              })()
+            : null}
+        </LoadingFade>
+      </div>
+    );
+  }
+
+  /** Devices: in a remote workspace, the remote gateway's paired devices
+   *  first, then the devices that use this workspace. */
+  function devicesPage() {
+    if (REMOTE_GATEWAY === null) return devicesSection();
+    return (
       <>
-        <div class="list-rows" data-search-anchor="devices:list">
-          {/* A gateway that broke is not a deployment that never had one, so it
-              says so instead of silently dropping the pairing column. The engine
-              half below still renders: push and preferences are unaffected. */}
-          {paired.paired.status === 'failed' && (
-            <LoadableError noun="paired devices" error={paired.paired.error} />
-          )}
-          <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <DeviceRow />} />}>
-            {loadable.status === 'loaded'
-              ? (() => {
-                  const rows = buildDeviceRows(loadable.data, rowsPaired, getDeviceId());
-                  if (rows.length === 0) {
-                    return <div class="empty-state">No devices registered</div>;
-                  }
-                  const unused = rows.filter(isUnusedDevice);
-                  const drawRow = (row: DeviceRowModel) => (
-                    <DeviceRow
-                      key={row.id}
-                      row={row}
-                      editingId={editingId}
-                      setEditingId={setEditingId}
-                      onRevoke={revoke}
-                      gatewayAnswered={pairingIsKnown(paired.paired)}
-                    />
-                  );
-                  return (
-                    <>
-                      {rows.filter((row) => !isUnusedDevice(row)).map(drawRow)}
-                      {unused.length > 0 && (
-                        <>
-                          <SectionHeader
-                            title="Unused devices"
-                            count={unused.length}
-                            collapsed={!unusedDevicesOpen}
-                            onToggle={() => setUnusedDevicesOpen((open) => !open)}
-                          />
-                          <Disclosure open={unusedDevicesOpen}>{unused.map(drawRow)}</Disclosure>
-                        </>
-                      )}
-                    </>
-                  );
-                })()
-              : null}
-          </LoadingFade>
+        <RemoteGatewayDevicesSection gateway={REMOTE_GATEWAY} />
+        <div class="settings-section">
+          <div class="settings-section-title">In this workspace</div>
+          {devicesSection()}
         </div>
-        <PeopleSection />
       </>
     );
   }
@@ -959,6 +976,7 @@ export function SettingsView() {
         <CodingAgentBinariesSection />
         <CodingAgentPermissionSection />
         <CodingAgentContextCeilingSection />
+        <MainCheckSettingSection />
         <CacheKeepAlivePointer />
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="coding-agents:intelligence">Intelligence ladders</div>
@@ -1113,11 +1131,82 @@ export function SettingsView() {
     );
   }
 
-  /** Permissions subview: the command safety guard plus the two per-agent
-   *  command/tool allowlists, each an editable + deletable list. */
+  /** The owner's opt-out from the agent sandbox (ADR 0645). Turning it on asks
+   *  first, since it hands every agent Lucidos's own secrets. */
+  async function changeAgentsUnsandboxed(on: boolean) {
+    if (on) {
+      const ok = await showConfirm(
+        'Agents will run without the sandbox. Any command, script or coding agent can then read Lucidos\'s own secrets on this machine. These include its sign-in tokens and database password.\n\nTurn Sandbox agents off only where the sandbox cannot run and you accept that.',
+        'Run unsandboxed',
+        { variant: 'default' },
+      );
+      if (!ok) return;
+    }
+    await setAgentsUnsandboxed(on);
+  }
+
+  function agentSandboxSection() {
+    const loaded = preferences.value.status === 'loaded';
+    const unavailable = agentSandboxUnavailable.value;
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="agent-sandbox">
+          Agent sandbox
+          <Explainer title="Agent sandbox">
+            <p>
+              With Sandbox agents on, an OS sandbox protects every process an agent runs.
+              This covers the Lucidos Agent's commands and scripts, triggers, coding
+              agents, background tasks and MCP servers. The sandbox hides Lucidos's own secrets, such as its sign-in tokens
+              and database password, and keeps each workspace's permission lists read-only.
+              The rest of your files stay as reachable as before.
+            </p>
+            <p>
+              Where this machine cannot apply the sandbox, those processes do not start.
+              Turn Sandbox agents off to let them start without that protection.
+            </p>
+          </Explainer>
+        </div>
+        {unavailable !== null && (
+          <div class="settings-row">
+            <span class="settings-row-label">
+              This machine cannot sandbox agents: {unavailable}
+            </span>
+          </div>
+        )}
+        {agentSandboxTruncationUnguarded.value && (
+          <div class="settings-row">
+            <span class="settings-row-label">
+              On this system the sandbox cannot stop an agent from emptying a protected
+              file. It still stops reading, changing and replacing one. Linux 6.2 or later
+              closes this gap.
+            </span>
+          </div>
+        )}
+        <div class="settings-row" data-search-anchor="agent-sandbox:unsandboxed">
+          <span class="settings-row-label">Sandbox agents</span>
+          <LoadableToggle
+            loaded={loaded}
+            checked={!currentAgentsUnsandboxed()}
+            ariaLabel="Sandbox agents"
+            disabled={changingAgentSandbox}
+            onChange={(c) => {
+              setChangingAgentSandbox(true);
+              changeAgentsUnsandboxed(!c).catch((e: unknown) => {
+                showToast(`Could not change the agent sandbox: ${e instanceof Error ? e.message : String(e)}`, 'error');
+              }).finally(() => setChangingAgentSandbox(false));
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  /** Permissions subview: the agent sandbox, the command safety guard, and the
+   *  two per-agent command/tool allowlists, each an editable + deletable list. */
   function permissionsSection() {
     return (
       <>
+        {agentSandboxSection()}
         {commandSafetySection()}
         <AllowlistEditor
           title="Lucidos Agent permissions"
@@ -1399,6 +1488,14 @@ export function SettingsView() {
             nested
             background={background}
           />
+          {/* Reads the owner's typed or spoken words against an open
+              permission request. The System One rows are among its models. */}
+          <JudgmentModelRow
+            site="permission-answer"
+            label="Permission answer"
+            anchor="models:permission-answer"
+            background={background}
+          />
           {/* The compactor runs only under Tree, so the row shows only then. */}
           <Disclosure open={currentMemoryModule() === 'tree'}>
             <BackgroundModelRow
@@ -1462,6 +1559,21 @@ export function SettingsView() {
             </div>
           </div>
           <ThemePicker />
+          <div class="settings-row" data-search-anchor="appearance:agent-brand-colours">
+            <span class="settings-row-label">Agent brand colours</span>
+            <div class="segmented-control" role="group" aria-label="Agent brand colours">
+              {[true, false].map(enabled => (
+                <button
+                  type="button"
+                  aria-pressed={currentAgentBrandColours() === enabled}
+                  class={`segmented-btn ${currentAgentBrandColours() === enabled ? 'active' : ''}`}
+                  onClick={() => void setAgentBrandColours(enabled)}
+                >
+                  {enabled ? 'On' : 'Off'}
+                </button>
+              ))}
+            </div>
+          </div>
           <div class="settings-row" data-search-anchor="appearance:theme-effects">
             <span class="settings-row-label">
               Effects
@@ -1782,7 +1894,8 @@ export function SettingsView() {
       case 'intelligence': return <IntelligencePage />;
       case 'appearance': return appearanceSection();
       case 'memory': return <SystemPage panel="memory" />;
-      case 'devices': return devicesSection();
+      case 'devices': return devicesPage();
+      case 'users': return <UsersPage />;
       case 'accounts': return accountsSection();
       case 'backup': return <SystemPage panel="backup" />;
       case 'coding-agents': return codingAgentsSection();

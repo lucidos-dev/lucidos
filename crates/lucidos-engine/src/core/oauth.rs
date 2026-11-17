@@ -273,6 +273,58 @@ pub fn missing_flow_fields(auth_value: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// True when the credential's trimmed `client_secret` equals its trimmed
+/// `client_id`.
+///
+/// A client ID is public, so a secret equal to it was pasted into the wrong
+/// field. A provider answers it with a bare `invalid_client`, so the flow is
+/// refused before it reaches one.
+pub fn client_secret_repeats_client_id(client_config: &serde_json::Value) -> bool {
+    let trimmed = |key: &str| client_config[key].as_str().map(str::trim);
+    match (trimmed("client_id"), trimmed("client_secret")) {
+        (Some(id), Some(secret)) => !id.is_empty() && id == secret,
+        _ => false,
+    }
+}
+
+/// The refusal for a credential [`client_secret_repeats_client_id`] flags. It
+/// names the two fixes and never the value.
+pub fn repeated_secret_message(provider: &str) -> String {
+    format!(
+        "The client secret saved for {provider} is identical to its client ID, so {provider} \
+         would refuse it. Re-enter the client secret from the provider's console, or clear the \
+         field to connect as a public client with PKCE where the provider allows it."
+    )
+}
+
+/// What a bare Connect requests when the provider's registry row names no
+/// *sign-in scopes* of its own.
+const DEFAULT_SIGN_IN_SCOPES: &str = "openid email profile";
+
+/// The *sign-in scopes* for the provider behind `credential_value`.
+///
+/// `named_row`, the registry row the provider's own name resolves to, decides
+/// first, so a hand-typed `auth_url` on another host cannot lose its scopes.
+/// Otherwise the row whose authorization host matches the credential's
+/// `auth_url` decides, so a *derived provider* on the same endpoints gets the
+/// same answer. A row without `sign_in_scopes`, and a credential no row
+/// matches, get [`DEFAULT_SIGN_IN_SCOPES`].
+pub fn sign_in_scopes_for(
+    named_row: Option<&crate::core::oauth_registry::OAuthProviderRow>,
+    credential_value: &str,
+    rows: &[crate::core::oauth_registry::OAuthProviderRow],
+) -> String {
+    named_row
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(credential_value)
+                .ok()
+                .and_then(|v| v["auth_url"].as_str().map(str::to_string))
+                .and_then(|auth_url| crate::core::oauth_registry::row_for_auth_url(rows, &auth_url))
+        })
+        .and_then(|row| row.sign_in_scopes.clone())
+        .unwrap_or_else(|| DEFAULT_SIGN_IN_SCOPES.to_string())
+}
+
 /// The credential request that REPAIRS an existing `oauth_client` rather than
 /// creating one.
 ///
@@ -306,6 +358,25 @@ pub fn oauth_client_repair_request(
     }
     request
 }
+
+/// The repair request for a credential whose client secret repeats its client
+/// ID. `missing` names `client_secret` so the form reopens on it.
+pub fn oauth_client_secret_repair_request(
+    provider: &str,
+    overrides: &OAuthClientOverrides,
+    credential_id: Uuid,
+    client_id: Option<&str>,
+) -> serde_json::Value {
+    let mut request =
+        oauth_client_repair_request(provider, overrides, credential_id, client_id, &[]);
+    request["missing"] = serde_json::json!([REPEATED_SECRET_FIELD]);
+    request["prompt"] = serde_json::json!(repeated_secret_message(provider));
+    request
+}
+
+/// The `missing` entry that says "the client secret is wrong", not absent. The
+/// credential form words it (`describeMissingFields`).
+pub const REPEATED_SECRET_FIELD: &str = "client_secret";
 
 /// "a" / "a and b" / "a, b and c".
 fn join_human(items: &[&str]) -> String {
@@ -763,7 +834,7 @@ pub async fn get_account_with_fresh_token(
 /// cannot vouch for that token, and the provider's bare 401 names no cause.
 pub async fn refresh_or_reconnect(pool: &PgPool, account: &mut OAuthAccount) -> Result<(), String> {
     refresh_oauth_if_needed(pool, account).await.map_err(|e| {
-        crate::log!(
+        crate::log_legacy!(
             "[OAuth] Token refresh failed for {} ({}): {}",
             account.provider,
             account.id,
@@ -806,7 +877,7 @@ pub async fn linked_account_token(
             ))
         }
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[OAuth] Linked account lookup failed for {}: {}",
                 oauth_id,
                 e
@@ -1379,12 +1450,25 @@ const MAX_ERROR_BODY_CHARS: usize = 2000;
 /// `operation` names the leg ("Token exchange" / "Token refresh"), so the
 /// caller must NOT re-wrap the result: a second prefix reads as "Token exchange
 /// failed: Token exchange failed (400)".
-fn describe_token_error(operation: &str, status: reqwest::StatusCode, body: &str) -> String {
+///
+/// `invalid_client_hint` follows the provider's `error` when that is
+/// `invalid_client`: it says how the request authenticated, which a bare
+/// "Invalid client_id or client_secret" does not. It comes before the
+/// provider's description, so a clamped error toast still shows the fix.
+fn describe_token_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    invalid_client_hint: Option<&str>,
+) -> String {
     let body = body.trim();
     let mut parts: Vec<String> = Vec::new();
     if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(error) = json["error"].as_str() {
             parts.push(error.to_string());
+        }
+        if let Some(hint) = invalid_client_hint.filter(|_| json["error"] == "invalid_client") {
+            parts.push(hint.to_string());
         }
         if let Some(description) = json["error_description"].as_str() {
             parts.push(description.to_string());
@@ -1431,6 +1515,7 @@ async fn post_token_request(
     credential: &str,
     token_url: &str,
     form: &[(&str, &str)],
+    invalid_client_hint: Option<&str>,
 ) -> Result<TokenResponse, BoxError> {
     require_secure_endpoint(credential, "token_url", token_url)?;
     let client = bounded_http_client();
@@ -1445,7 +1530,7 @@ async fn post_token_request(
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(describe_token_error(operation, status, &body).into());
+        return Err(describe_token_error(operation, status, &body, invalid_client_hint).into());
     }
 
     let token: TokenResponse = resp.json().await?;
@@ -1495,6 +1580,35 @@ fn refresh_form<'a>(
     form
 }
 
+/// What an `invalid_client` refusal leaves unsaid: the fix for how the request
+/// authenticated, then what could be malformed. Counts only, never the values.
+///
+/// The fix comes first and stays short: it is what an error toast has room for.
+fn invalid_client_hint(client_id: &str, auth: &ClientAuth, redirect_uri: &str) -> String {
+    let not_visible_ascii = |value: &str| value.chars().filter(|c| !c.is_ascii_graphic()).count();
+    let id_chars = not_visible_ascii(client_id);
+    let id_shape = format!(
+        "{id_chars} {} outside visible ASCII in the client ID",
+        if id_chars == 1 {
+            "character"
+        } else {
+            "characters"
+        },
+    );
+    match auth.client_secret() {
+        Some(secret) => format!(
+            "Re-enter the client secret from the provider's console, or clear it to use PKCE \
+             where the provider allows it. Lucidos sent a client secret and redirect URI \
+             {redirect_uri}. It found {id_shape} and {} in the client secret.",
+            not_visible_ascii(secret)
+        ),
+        None => format!(
+            "No client secret was sent (PKCE). If the provider requires one, add it from the \
+             provider's console. Lucidos sent redirect URI {redirect_uri}. It found {id_shape}."
+        ),
+    }
+}
+
 /// Exchange an authorization code for tokens.
 async fn exchange_code(
     credential: &str,
@@ -1505,7 +1619,8 @@ async fn exchange_code(
     redirect_uri: &str,
 ) -> Result<TokenResponse, BoxError> {
     let form = exchange_form(code, client_id, redirect_uri, auth);
-    post_token_request("Token exchange", credential, token_url, &form).await
+    let hint = invalid_client_hint(client_id, auth, redirect_uri);
+    post_token_request("Token exchange", credential, token_url, &form, Some(&hint)).await
 }
 
 /// Refresh an access token using a refresh token.
@@ -1517,7 +1632,7 @@ async fn refresh_access_token(
     refresh_token: &str,
 ) -> Result<TokenResponse, BoxError> {
     let form = refresh_form(refresh_token, client_id, client_secret);
-    post_token_request("Token refresh", credential, token_url, &form).await
+    post_token_request("Token refresh", credential, token_url, &form, None).await
 }
 
 /// Returns true if the account's token needs refreshing (expired, expiring
@@ -1569,7 +1684,7 @@ pub async fn refresh_oauth_if_needed(
         .ok_or_else(|| format!("Missing token_url in {} credentials", cred_service))?
         .to_string();
 
-    crate::log!(
+    crate::log_legacy!(
         "[OAuth] Refreshing {} token for {}",
         account.provider,
         account.email.as_deref().unwrap_or("unknown")
@@ -1590,7 +1705,7 @@ pub async fn refresh_oauth_if_needed(
     }
     account.access_token = new_tokens.access_token;
     account.token_expiry = new_expiry;
-    crate::log!(
+    crate::log_legacy!(
         "[OAuth] Successfully refreshed {} token, expires in {}s",
         account.provider,
         new_tokens.expires_in.unwrap_or(0)
@@ -1610,7 +1725,7 @@ pub async fn force_refresh_oauth(
 }
 
 /// Merge two space-separated scope strings, deduplicating.
-fn merge_scopes(existing: &str, requested: &str) -> String {
+pub fn merge_scopes(existing: &str, requested: &str) -> String {
     let mut all: Vec<&str> = existing.split_whitespace().collect();
     for scope in requested.split_whitespace() {
         if !all.contains(&scope) {
@@ -1698,7 +1813,7 @@ impl CallbackListener {
         let mut listeners = vec![v4];
         match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
             Ok(v6) => listeners.push(v6),
-            Err(e) => crate::log!(
+            Err(e) => crate::log_legacy!(
                 "[OAuth] IPv6 loopback [::1]:{} unavailable, listening on IPv4 only: {}",
                 port,
                 e
@@ -1915,7 +2030,7 @@ pub struct AuthorizationGrant {
 /// A denial arrives as `?error=…&error_description=…` with no `code`. Reporting
 /// that as "no authorization code" hides the one piece of information the user
 /// needs (OAuth 2.0 §4.1.2.1).
-fn parse_callback_query(query: &str) -> Result<AuthorizationGrant, BoxError> {
+pub(crate) fn parse_callback_query(query: &str) -> Result<AuthorizationGrant, BoxError> {
     if let Some(code) = query_param(query, "code", false).filter(|c| !c.is_empty()) {
         let client_id = query_param(query, "client_id", false).filter(|c| !c.is_empty());
         return Ok(AuthorizationGrant { code, client_id });
@@ -1954,11 +2069,82 @@ async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, bo
         stream.shutdown().await
     };
     if let Err(e) = write.await {
-        crate::log!(
+        crate::log_legacy!(
             "[OAuth] Failed to write callback response to browser: {}",
             e
         );
     }
+}
+
+/// How far a flow got when its callback page was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallbackPageState {
+    /// The code was exchanged and the account stored.
+    Connected,
+    /// The callback arrived and the flow has not finished within the wait.
+    Pending,
+    /// The code exchange or the account store failed.
+    Failed,
+    /// The provider refused, or the callback was not this flow's.
+    Refused,
+}
+
+impl CallbackPageState {
+    pub fn is_error(self) -> bool {
+        matches!(self, Self::Failed | Self::Refused)
+    }
+}
+
+/// How long the browser's callback request waits for the flow's outcome.
+///
+/// Shorter than the gateway's wait for the engine, so the engine always answers
+/// first and a slow exchange degrades to [`CallbackPageState::Pending`].
+pub(crate) const PAGE_SETTLE_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(lucidos_engine_socket::OAUTH_CALLBACK_HOP_TIMEOUT.as_secs() - 2);
+
+/// The flow's end of the browser's open callback request.
+///
+/// A flow that drops it without settling leaves the page at
+/// [`CallbackPageState::Pending`], never at a guess.
+#[derive(Debug)]
+pub(crate) struct PageReply(tokio::sync::oneshot::Sender<CallbackPageState>);
+
+/// The delivery side of a [`PageReply`].
+pub(crate) struct PageSettled(tokio::sync::oneshot::Receiver<CallbackPageState>);
+
+impl PageReply {
+    pub(crate) fn pair() -> (Self, PageSettled) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (Self(tx), PageSettled(rx))
+    }
+
+    /// Report how the flow ended. `connected` is true once the account is stored.
+    pub(crate) fn settle(self, connected: bool) {
+        let state = if connected {
+            CallbackPageState::Connected
+        } else {
+            CallbackPageState::Failed
+        };
+        // The browser may have left or the wait elapsed. Nothing to tell.
+        let _ = self.0.send(state);
+    }
+}
+
+impl PageSettled {
+    /// The flow's outcome, or `Pending` when it does not settle within the wait.
+    pub(crate) async fn state(self) -> CallbackPageState {
+        match tokio::time::timeout(PAGE_SETTLE_WAIT, self.0).await {
+            Ok(Ok(state)) => state,
+            _ => CallbackPageState::Pending,
+        }
+    }
+}
+
+/// A callback that granted access, with the reply that settles its page.
+#[derive(Debug)]
+pub(crate) struct ReceivedGrant {
+    pub grant: AuthorizationGrant,
+    pub reply: PageReply,
 }
 
 /// The Lucidos mark, baked in from the one file that defines it.
@@ -1987,21 +2173,30 @@ const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg")
 /// query. Echoing an attacker-controllable `error_description` here would be an
 /// injection sink for no benefit, so the real reason goes to the engine.
 ///
-/// Written at callback receipt, BEFORE the code is exchanged, so it cannot
-/// claim the account is connected.
-pub(crate) fn callback_page(provider: &str, ok: bool) -> String {
-    let (heading, detail, provider_label) = if ok {
-        (
-            "Authorization complete",
-            "Lucidos is finishing the connection. You can close this tab.",
+/// The state says how far the flow got when the page was written. `Connected`
+/// is only ever written after the account was stored.
+pub(crate) fn callback_page(provider: &str, state: CallbackPageState) -> String {
+    let (heading, detail, provider_label) = match state {
+        CallbackPageState::Connected => (
+            "Connected",
+            "Lucidos is connected to this account. You can close this tab.",
+            "Connected to",
+        ),
+        CallbackPageState::Pending => (
+            "Authorization received",
+            "Lucidos is still finishing the connection. Return to Lucidos for the result.",
             "Authorized with",
-        )
-    } else {
-        (
+        ),
+        CallbackPageState::Failed => (
+            "Connection failed",
+            "Nothing was connected. Return to Lucidos for the details.",
+            "Tried to connect",
+        ),
+        CallbackPageState::Refused => (
             "Authorization failed",
             "Nothing was connected. Return to Lucidos for the details.",
             "Tried to connect",
-        )
+        ),
     };
     // `provider` is a bare identifier (`dropbox`, `ghealth`), but escape it
     // anyway so this stays safe if a caller ever passes something richer.
@@ -2067,7 +2262,7 @@ async fn wait_for_oauth_callback(
     listener: CallbackListener,
     provider: &str,
     expected_state: &str,
-) -> Result<String, BoxError> {
+) -> Result<ReceivedGrant, BoxError> {
     loop {
         let mut stream = listener.accept().await?;
         // A misbehaving connection is discarded, never fatal: a reset or idle
@@ -2077,11 +2272,11 @@ async fn wait_for_oauth_callback(
             {
                 Ok(Ok(line)) => line,
                 Ok(Err(e)) => {
-                    crate::log!("[OAuth] Discarding unreadable callback connection: {}", e);
+                    crate::log_legacy!("[OAuth] Discarding unreadable callback connection: {}", e);
                     continue;
                 }
                 Err(_) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[OAuth] Callback connection sent nothing within {}s, discarding",
                         CALLBACK_READ_TIMEOUT.as_secs()
                     );
@@ -2106,40 +2301,37 @@ async fn wait_for_oauth_callback(
         // Nothing from the query is rendered, so the page's injection contract
         // is unchanged.
         if !callback_state_matches(query, expected_state) {
-            crate::log!(
+            crate::log_legacy!(
                 "[OAuth] Ignoring a {} callback that did not carry this flow's state",
                 provider
             );
-            let body = callback_page(provider, false);
+            let body = callback_page(provider, CallbackPageState::Refused);
             respond_to_browser(&mut stream, "400 Bad Request", &body).await;
             continue;
         }
 
-        let received = callback_received(provider, query);
-        let status = if received.grant.is_ok() {
-            "200 OK"
-        } else {
-            "400 Bad Request"
+        let grant = match parse_callback_query(query) {
+            Ok(grant) => grant,
+            Err(refusal) => {
+                let body = callback_page(provider, CallbackPageState::Refused);
+                respond_to_browser(&mut stream, "400 Bad Request", &body).await;
+                return Err(refusal);
+            }
         };
-        respond_to_browser(&mut stream, status, &received.page).await;
-        return received.grant.map(|grant| grant.code);
+        // The browser's request stays open until the flow stores the account.
+        let (reply, settled) = PageReply::pair();
+        let provider = provider.to_string();
+        tokio::spawn(async move {
+            let state = settled.state().await;
+            let status = if state.is_error() {
+                "400 Bad Request"
+            } else {
+                "200 OK"
+            };
+            respond_to_browser(&mut stream, status, &callback_page(&provider, state)).await;
+        });
+        return Ok(ReceivedGrant { grant, reply });
     }
-}
-
-/// A callback that carried this flow's `state`: the grant, and the browser page.
-pub(crate) struct ReceivedCallback {
-    pub grant: Result<AuthorizationGrant, BoxError>,
-    pub page: String,
-}
-
-/// The one step both delivery paths end in, once `state` has matched a flow.
-///
-/// The provider's own reason goes to the engine, never into the page. See
-/// [`callback_page`] for why nothing from `query` is rendered.
-pub(crate) fn callback_received(provider: &str, query: &str) -> ReceivedCallback {
-    let grant = parse_callback_query(query);
-    let page = callback_page(provider, grant.is_ok());
-    ReceivedCallback { grant, page }
 }
 
 /// What a flow waits on for its callback.
@@ -2151,10 +2343,10 @@ enum CallbackWait {
 }
 
 impl CallbackWait {
-    async fn code(self, provider: &str, state: &str) -> Result<String, BoxError> {
+    async fn received(self, provider: &str, state: &str) -> Result<ReceivedGrant, BoxError> {
         match self {
             Self::Listener(listener) => wait_for_oauth_callback(listener, provider, state).await,
-            Self::Gateway(pending) => pending.received().await.map(|grant| grant.code),
+            Self::Gateway(pending) => pending.received().await,
         }
     }
 }
@@ -2262,6 +2454,9 @@ pub async fn prepare_oauth_flow(
         .filter(|s| !s.is_empty())
         .ok_or("Missing client_id in OAuth credentials")?
         .to_string();
+    if client_secret_repeats_client_id(&client_config) {
+        return Err(repeated_secret_message(&provider).into());
+    }
     // A blank or absent client_secret is not an error: it is how a *public*
     // client is expressed (see `ClientAuth`).
     let auth = ClientAuth::from_secret(client_config["client_secret"].as_str());
@@ -2319,7 +2514,7 @@ pub async fn prepare_oauth_flow(
         &authorize_params,
     );
 
-    crate::log!(
+    crate::log_legacy!(
         "[OAuth] Prepared {} authorization URL ({} client, {}), redirect_uri {}",
         provider,
         auth.kind(),
@@ -2339,10 +2534,12 @@ pub async fn prepare_oauth_flow(
     let task_holds_port = holds_port.clone();
 
     let task = tokio::spawn(async move {
+        // Set once the callback lands, and settled after the exchange and store.
+        let mut page_reply: Option<PageReply> = None;
         let result = async {
             let waited = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
-                wait.code(&provider, &state),
+                wait.received(&provider, &state),
             )
             .await;
 
@@ -2363,9 +2560,11 @@ pub async fn prepare_oauth_flow(
             )
             .await;
 
-            let code = waited
+            let received = waited
                 .map_err(|_| OAUTH_TIMEOUT_MSG.to_string())?
                 .map_err(|e| format!("OAuth callback error: {}", e))?;
+            let code = received.grant.code;
+            page_reply = Some(received.reply);
 
             // `exchange_code` already names the leg and carries the provider's
             // own error text, so it is NOT re-wrapped.
@@ -2409,7 +2608,7 @@ pub async fn prepare_oauth_flow(
             .await
             .map_err(|e| format!("Failed to store OAuth account: {}", e))?;
 
-            crate::log!(
+            crate::log_legacy!(
                 "[OAuth] Connected {} account: {} (scopes: {})",
                 provider,
                 email.as_deref().unwrap_or("unknown"),
@@ -2432,6 +2631,9 @@ pub async fn prepare_oauth_flow(
         }
         .await;
 
+        if let Some(reply) = page_reply {
+            reply.settle(result.is_ok());
+        }
         let _ = result_tx.send(result);
     });
 
@@ -2470,7 +2672,7 @@ async fn bind_own_listener(
 > {
     let mut active_flow = ACTIVE_CALLBACK_FLOW.lock().await;
     if let Some(superseded) = release_callback_port(&mut active_flow).await {
-        crate::log!(
+        crate::log_legacy!(
             "[OAuth] Superseded an authorization still waiting on port {}",
             CALLBACK_PORT
         );
@@ -2512,7 +2714,7 @@ where
 {
     let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes, initiator, route).await?;
 
-    crate::log!(
+    crate::log_legacy!(
         "[OAuth] Handing {} authorization URL to the client to open",
         provider
     );
@@ -2611,20 +2813,20 @@ async fn fetch_userinfo(
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!(@OAuth, "Userinfo fetch failed: {}", e);
+            crate::log_legacy!(@OAuth, "Userinfo fetch failed: {}", e);
             return (None, None);
         }
     };
 
     if !resp.status().is_success() {
-        crate::log!(@OAuth, "Userinfo returned status {}", resp.status());
+        crate::log_legacy!(@OAuth, "Userinfo returned status {}", resp.status());
         return (None, None);
     }
 
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
-            crate::log!(@OAuth, "Userinfo parse failed: {}", e);
+            crate::log_legacy!(@OAuth, "Userinfo parse failed: {}", e);
             return (None, None);
         }
     };

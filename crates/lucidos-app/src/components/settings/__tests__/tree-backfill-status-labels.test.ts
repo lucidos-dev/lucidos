@@ -136,6 +136,20 @@ describe('the Tree backfill row', () => {
     expect(labels(host)).toEqual(['Ready. some-model is not answering, retrying: pick another model']);
   });
 
+  it('shows a live spend-cap hold after the backfill finished', async () => {
+    const { h, render } = await import('preact');
+    const { TreeBackfillStatus } = await import('../TreeBackfillStatus');
+    treeBackfill.value = {
+      status: 'loaded',
+      data: { state: 'ready', filling: { ...LAST_TREE, done: 15, ready: true,
+        spend_cap_held_until: '2030-01-01T12:00:00Z', spend_cap_resets_at: null } },
+    };
+    render(h(TreeBackfillStatus, { onPickModel: () => {}, onSwitchToClassic: () => {} }), host);
+    unmount = () => render(null, host);
+    expect(labels(host)).toEqual(['Waiting for the spend cap to reset. Reset time not supplied.']);
+    expect(host.querySelector('[data-role="tree-backfill"]')?.hasAttribute('data-working')).toBe(false);
+  });
+
   it('puts a missing model before a retry, and stops looking busy', async () => {
     unmount = await mount(host, { ...LAST_TREE, retrying: true, waiting_for_model: true });
     expect(labels(host)).toEqual(['Waiting for a background model. Pick one']);

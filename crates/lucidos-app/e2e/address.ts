@@ -13,8 +13,11 @@ import { resolve } from 'path';
  * Every reader of the address comes through here, so no caller can pick up the
  * port and miss the protocol.
  */
+// The e2e scripts always export E2E_WORKSPACE. The fallback mirrors
+// E2E_DEFAULT_WORKSPACE in scripts/lib/e2e_root.sh, for a direct Playwright run.
 export const E2E_WORKSPACE = resolve(
-  process.env.E2E_WORKSPACE ?? `${process.env.HOME}/workspaces/e2e-test`,
+  process.env.E2E_WORKSPACE
+    ?? `${process.env.LUCIDOS_E2E_ROOT ?? `${process.env.HOME}/.lucidos/e2e-root`}/workspaces/e2e-test`,
 );
 
 export function readAddress(): { port: number; proto: string } {

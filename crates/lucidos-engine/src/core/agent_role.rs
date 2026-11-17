@@ -1,8 +1,10 @@
 //! The agent role: the database role behind `LUCIDOS_DATABASE_URL` (ADR 0509).
 //!
 //! Agents, scripts and triggers sign in as their workspace's agent role, never
-//! as the engine. It reads and writes every table except the secret columns,
-//! which it cannot select at all, and it can connect to no other database.
+//! as the engine. It reads metadata but cannot read secret columns or raw
+//! diagnostic inbox payloads (which require a bounded query), and can connect
+//! to no other database. Writes use an allow-list unless the gateway marks
+//! the workspace as machine-made.
 //! The engine sets it up at every boot, so a new table or secret column gets
 //! the right grants on the next start.
 
@@ -16,13 +18,29 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 /// backup recipient could seal every later backup to a key of its own. One
 /// that could write a mailbox's hosts could send its password to a server of
 /// its own at the next login. One that could clear the restore boundary could
-/// spend an owner approval the restore expired (ADR 0612).
+/// spend a permission the restore expired (ADR 0612).
 const READ_ONLY_TABLES: &[&str] = &[
     "_sqlx_migrations",
     "backup_recipient",
+    "diagnostic_bundles",
     "email_accounts",
     "snapshot_restore_boundary",
 ];
+
+/// Content and UI state that grant no authority. New tables fail closed.
+const AGENT_WRITABLE_TABLES: &[&str] = &[
+    "preferences",
+    "memory_entries",
+    "summary_tree_nodes",
+    "summary_tree_scopes",
+    "notification_reads",
+    "pinned_apps",
+    "browser_logins",
+];
+
+fn is_machine_made(origin: Option<&str>) -> bool {
+    matches!(origin, Some("agent" | "demo" | "eval" | "e2e"))
+}
 
 /// A role, database, table or column name, quoted for SQL. Postgres cannot
 /// bind an identifier. A workspace database name holds a hyphen, so quoting,
@@ -36,7 +54,11 @@ fn ident(name: &str) -> Result<String, BoxError> {
 
 /// Create or refresh the agent role for the database `database_url` names,
 /// with a new password, and return the read-only URL that signs in as it.
-pub async fn provision(pool: &PgPool, database_url: &str) -> Result<String, BoxError> {
+pub async fn provision(
+    pool: &PgPool,
+    database_url: &str,
+    origin: Option<&str>,
+) -> Result<String, BoxError> {
     let mut url = lucidos_pg_url::PgUrl::parse(database_url)?;
     let role = lucidos_pg_url::agent_role(&url.database);
     let password = lucidos_local_token::mint_hex(32)?;
@@ -69,7 +91,7 @@ pub async fn provision(pool: &PgPool, database_url: &str) -> Result<String, BoxE
     ] {
         sqlx::query(&statement).execute(pool).await?;
     }
-    grant_tables(pool, &role_ident).await?;
+    grant_tables(pool, &role_ident, is_machine_made(origin)).await?;
     guard_human_only_preferences(pool, &role).await?;
 
     url.user = Some(role);
@@ -117,9 +139,10 @@ fn scram_verifier(password: &str) -> String {
     )
 }
 
-/// Grant every table, leaving the secret columns out. A table holding one
-/// gets column grants for reading its other columns, and nothing else.
-async fn grant_tables(pool: &PgPool, role: &str) -> Result<(), BoxError> {
+/// Read every table, leaving secrets and bounded-query-only payloads out.
+/// Writes follow the workspace origin and allow-list. Tables holding hidden
+/// columns get only column-level reads.
+async fn grant_tables(pool: &PgPool, role: &str, machine_made: bool) -> Result<(), BoxError> {
     let tables: Vec<(String, String)> = sqlx::query_as(
         "SELECT table_name::text, table_type::text FROM information_schema.tables \
          WHERE table_schema = 'public'",
@@ -139,6 +162,7 @@ async fn grant_tables(pool: &PgPool, role: &str) -> Result<(), BoxError> {
             .chain(MOVED_SECRET_COLUMNS)
             .filter(|spec| spec.table == table)
             .map(|spec| spec.column)
+            .chain((table == "diagnostic_bundles").then_some("payload"))
             .collect();
         let columns: Vec<String> = if secret.is_empty() {
             Vec::new()
@@ -165,7 +189,10 @@ async fn grant_tables(pool: &PgPool, role: &str) -> Result<(), BoxError> {
                 "GRANT SELECT ({}) ON {table_ident} TO {role}",
                 idents(&readable)?
             )
-        } else if kind != "BASE TABLE" || READ_ONLY_TABLES.contains(&table.as_str()) {
+        } else if kind != "BASE TABLE"
+            || READ_ONLY_TABLES.contains(&table.as_str())
+            || (!machine_made && !AGENT_WRITABLE_TABLES.contains(&table.as_str()))
+        {
             format!("GRANT SELECT ON {table_ident} TO {role}")
         } else {
             format!("GRANT SELECT, INSERT, UPDATE, DELETE ON {table_ident} TO {role}")

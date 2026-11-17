@@ -178,6 +178,9 @@
 
 # shellcheck source=proc_tree.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/proc_tree.sh"
+# For E2E_DEFAULT_WORKSPACE.
+# shellcheck source=e2e_root.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/e2e_root.sh"
 # For `engine_live_pid`: the e2e engine's pid counts only while it owns its lock.
 # shellcheck source=flock.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/flock.sh"
@@ -563,11 +566,11 @@ _host_mem_worse_of() {
 HOST_MEMORY_SAMPLER_PID="${HOST_MEMORY_SAMPLER_PID:-}"
 
 _host_mem_samples_file() {
-    printf '%s' "${HOST_MEMORY_SAMPLES_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-samples}"
+    printf '%s' "${HOST_MEMORY_SAMPLES_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-samples}"
 }
 
 _host_mem_sampler_pidfile() {
-    printf '%s' "${HOST_MEMORY_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-sampler.pid}"
+    printf '%s' "${HOST_MEMORY_SAMPLER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-sampler.pid}"
 }
 
 # One tick: append "<level> <compressor> <available> <swap>" and echo the
@@ -704,11 +707,11 @@ stop_host_memory_sampler() {
 # Plan: docs/plans/2026-09-24-host-memory-watch-and-in-chunk-stop.md.
 
 _host_mem_trip_file() {
-    printf '%s' "${HOST_MEMORY_TRIP_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-trip}"
+    printf '%s' "${HOST_MEMORY_TRIP_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-trip}"
 }
 
 _host_mem_runner_pidfile() {
-    printf '%s' "${HOST_MEMORY_RUNNER_PIDFILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-runner.pid}"
+    printf '%s' "${HOST_MEMORY_RUNNER_PIDFILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-runner.pid}"
 }
 
 # A positive integer, or the default. Zero would trip on the first sample.
@@ -973,7 +976,7 @@ _host_mem_attr_report() {
     # The e2e engine is the primary suspect, keyed on the disposable workspace's
     # OWN engine so we never confuse it with the user's dev/personal engines.
     local ws engine_pid="" ws_real=""
-    ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    ws="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
     engine_pid="$(engine_live_pid "$ws")"
     ws_real="$(cd "$ws" 2>/dev/null && pwd -P)" || ws_real=""
 
@@ -1480,6 +1483,11 @@ _host_mem_now() {
     date +%s
 }
 
+# Epoch second $1 as local time in format $2. BSD date takes -r, GNU date -d.
+_host_mem_clock() { # <epoch> <format>
+    date -r "$1" "$2" 2>/dev/null || date -d "@$1" "$2" 2>/dev/null
+}
+
 _host_mem_gate_wait() {
     sleep "$1"
 }
@@ -1626,7 +1634,7 @@ host_memory_build_gate() {
 HOST_MEMORY_CEILING_PID=""
 
 _host_mem_ceiling_file() {
-    printf '%s' "${HOST_MEMORY_CEILING_FILE:-${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}/.lucidos/host-memory-ceiling}"
+    printf '%s' "${HOST_MEMORY_CEILING_FILE:-${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}/.lucidos/host-memory-ceiling}"
 }
 
 host_memory_chunk_ceiling_secs() {
@@ -1716,7 +1724,7 @@ _host_mem_epoch_of_local_time() {
     esac
     [ "$((10#$hh))" -le 23 ] || return 0
     now="$(_host_mem_now)"
-    midnight="$(date -r "$now" '+%H %M %S' 2>/dev/null | awk -v n="$now" '{ print n - ($1 * 3600 + $2 * 60 + $3) }')"
+    midnight="$(_host_mem_clock "$now" '+%H %M %S' | awk -v n="$now" '{ print n - ($1 * 3600 + $2 * 60 + $3) }')"
     [ -n "$midnight" ] || return 0
     printf '%s' "$((midnight + 10#$hh * 3600 + 10#$mm * 60))"
 }
@@ -1770,7 +1778,7 @@ host_memory_wait_for_recovery() {
     local deadline start now good=0 reasons
     start="$(_host_mem_now)"
     deadline="$(_host_mem_recovery_deadline)"
-    echo "[e2e-resume] waiting for the host to recover, until $(date -r "$deadline" '+%H:%M' 2>/dev/null || echo "$deadline"): $HOST_MEMORY_RECOVERY_POLLS clean readings in a row, ${HOST_MEMORY_RECOVERY_POLL_SECS}s apart."
+    echo "[e2e-resume] waiting for the host to recover, until $(_host_mem_clock "$deadline" '+%H:%M' || echo "$deadline"): $HOST_MEMORY_RECOVERY_POLLS clean readings in a row, ${HOST_MEMORY_RECOVERY_POLL_SECS}s apart."
     while :; do
         if reasons="$(_host_mem_recovery_reading)"; then
             good=$((good + 1))
@@ -1848,7 +1856,7 @@ _host_mem_workspace_counts() {
 _host_mem_left_behind_report() {
     local where="$1" tag="$HOST_MEMORY_ATTR_TAG" ws engine_pid counts apps files commits
     local agents_now="" pid started n=0 engine_part="e2e engine unmeasured"
-    ws="${E2E_WORKSPACE:-$HOME/workspaces/e2e-test}"
+    ws="${E2E_WORKSPACE:-$E2E_DEFAULT_WORKSPACE}"
     engine_pid="$(engine_live_pid "$ws")"
 
     if [ -n "$HOST_MEMORY_ENGINE_MB_NOW" ]; then

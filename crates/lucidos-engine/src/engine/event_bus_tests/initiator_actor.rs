@@ -346,6 +346,7 @@ async fn initiator_preserved_on_session_started_upsert() {
     bus.emit(BusEvent::Thread {
         thread_id: cc_thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "s-1".into(),
             branch: String::new(),

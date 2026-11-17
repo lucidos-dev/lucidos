@@ -90,6 +90,17 @@ fn write(update: impl FnOnce(&mut CallTrace)) {
     let _ = TRACE.try_with(|shared| update(&mut shared.lock().unwrap_or_else(|p| p.into_inner())));
 }
 
+/// A fallback backend starts with no facts from the backend before it.
+/// Preserve total HTTP attempts across the chain.
+pub(crate) fn backend_began() {
+    write(|trace| {
+        *trace = CallTrace {
+            attempts: trace.attempts,
+            ..Default::default()
+        };
+    });
+}
+
 /// An HTTP send begins. It clears the last attempt's facts, a first delta
 /// included, so a retry never reports the attempt before it. Each send is
 /// followed by at most one stream.

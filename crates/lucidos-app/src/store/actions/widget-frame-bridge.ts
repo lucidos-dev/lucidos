@@ -1,4 +1,5 @@
 import {
+  WIDGET_RESOURCES_MESSAGE_TYPE,
   FIT_EDGES,
   FIT_KINDS,
   MAX_FIT_FINDINGS,
@@ -10,6 +11,7 @@ import {
   type WidgetSize,
 } from '@lucidos/widget-frame';
 import { WIDGET_SIZES } from '@lucidos/engine-constants';
+import { noteFrameResources } from '../../utils/frameResources';
 import { appFrameFor } from '../../utils/appFrame';
 import { topPanelOverlay } from '../overlayStack';
 import { notePressOwesClick } from '../../utils/pointerPress';
@@ -86,7 +88,10 @@ export function handleWidgetFrameMessage(event: MessageEvent): void {
     type?: unknown; width?: unknown; height?: unknown; size?: unknown; at?: unknown; held?: unknown;
   } | null;
   if (!data || typeof data !== 'object') return;
-  if (data.type === WIDGET_CONTENT_SIZE_MESSAGE_TYPE) {
+  if (data.type === WIDGET_RESOURCES_MESSAGE_TYPE) {
+    const frame = appFrameFor(event.source);
+    if (frame) noteFrameResources(frame, data as Record<string, unknown>);
+  } else if (data.type === WIDGET_CONTENT_SIZE_MESSAGE_TYPE) {
     if (!isLength(data.height)) return;
     const size: ContentSize = { height: Math.min(data.height, MAX_REPORTED_PX) };
     if (isLength(data.width)) size.width = Math.min(data.width, MAX_REPORTED_PX);

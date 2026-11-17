@@ -1,4 +1,5 @@
 import type { CacheKeepAliveStatus, CeilingCrossing, HandoffOpening } from '../../generated/thread-event-wire';
+import type { CodingAgent } from '../types';
 import { API, json, mutatingFetch, throwIfNotOk } from './_core';
 
 // --- Successor sessions ---
@@ -55,9 +56,10 @@ export async function fetchThreadContext(threadId: string): Promise<ThreadContex
   return json<ThreadContext>(`${API}/threads/${encodeURIComponent(threadId)}/context`);
 }
 
-/** The model and effort a successor session runs on. A field left out keeps
- *  the current session's. */
+/** The backend, model and effort a successor session runs on. A field left
+ *  out keeps the current session's. */
 export interface SuccessorImplementer {
+  coding_agent?: CodingAgent;
   coding_agent_model?: string;
   reasoning_effort?: string | null;
 }

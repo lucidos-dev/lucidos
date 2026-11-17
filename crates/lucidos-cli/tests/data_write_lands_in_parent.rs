@@ -399,7 +399,7 @@ fn the_documented_theme_command_writes_under_themes() {
 #[test]
 fn a_refused_theme_exits_non_zero_with_the_engines_reason() {
     // The body `write_data` answers for a theme that breaks a rule.
-    const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 120 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
+    const REFUSAL: &str = r#"{"error":"`dark`: the value of --accent is empty, longer than 256 characters, or uses a banned form (url(), ;, braces, @, backslash, a comment)"}"#;
     let (port, requests) = spawn_stub_engine_replying(StatusCode::UNPROCESSABLE_ENTITY, REFUSAL);
 
     let tmp = tempfile::tempdir().unwrap();

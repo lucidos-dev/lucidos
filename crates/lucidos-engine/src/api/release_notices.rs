@@ -46,7 +46,7 @@ async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
             .iter()
             .any(|server| server.dispatchable && !server.launch_approved),
         Err(e) => {
-            log!("[ReleaseNotices] Failed to list MCP servers: {}", e);
+            log_legacy!("[ReleaseNotices] Failed to list MCP servers: {}", e);
             true
         }
     };
@@ -54,7 +54,7 @@ async fn notice_facts(state: &AppState) -> release_notices::NoticeFacts {
     let judge_on = match COMMAND_GUARD_JUDGE.try_read(&state.pool).await {
         Ok(on) => on,
         Err(e) => {
-            log!("[ReleaseNotices] Failed to read the judge switch: {}", e);
+            log_legacy!("[ReleaseNotices] Failed to read the judge switch: {}", e);
             true
         }
     };

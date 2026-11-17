@@ -10,6 +10,7 @@ import { isHistoricalRestoreSource } from '../../utils/restoreSourceGeneration';
 import { effect } from '@preact/signals';
 import { waitForRestoreAdmission, restoreSourcePreserved, queuedRestoreSourceId } from '../../utils/restoreAdmission';
 import { readUnsentMessageStore } from '../unsentMessageRecords';
+import { rerunWhenPageShows } from '../deviceDatabase';
 
 import { queueUploadSend, queuedUploadSends } from '../../components/chat/prompt-input-helpers';
 import { composeDrafts, getDraft } from '../composeDrafts';
@@ -213,6 +214,7 @@ function runRestore(): void {
   restorePendingUploads().then((outcome) => {
     pendingUnresolved = outcome.unresolved > 0;
   }).catch((err) => {
+    if (rerunWhenPageShows(err, runRestore)) return;
     showToast(`Could not bring back images attached before the reload: ${errorDetail(err)}`, 'error');
   });
 }

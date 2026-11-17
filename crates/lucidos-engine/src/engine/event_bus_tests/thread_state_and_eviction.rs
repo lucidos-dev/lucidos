@@ -60,6 +60,7 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -124,6 +125,7 @@ async fn thread_discarded_sets_archive_state_to_archived() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -202,6 +204,7 @@ async fn thread_started_with_claude_code_mode_sets_source_to_claude_code() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -236,6 +239,7 @@ async fn thread_started_with_lucidos_mode_sets_source_to_chat() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -275,6 +279,7 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "claude_code".into(),
             actor: None,
         },
@@ -652,7 +657,9 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
         thread_id: child_id,
         event: ThreadEvent::ResponseFailed {
             error: huge_error,
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: EventMeta::NONE,
     })
@@ -961,6 +968,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent,
                 session_id: format!("{agent}-session"),
                 branch: String::new(),
@@ -1058,6 +1066,7 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: cc_meta(),
         })
@@ -1153,6 +1162,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
     // A change id is workspace-wide, so the two cases below must not share one:
     // the second would land on the first's `changes` row.
     let propose = |thread_id: Uuid| ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: test_change_id(thread_id).to_string(),
         description: Some("Fix".into()),
         files: vec!["src/main.rs".into()],
@@ -1187,6 +1197,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent,
                 session_id: "cc-session".into(),
                 branch: "claude-code/fix".into(),
@@ -1303,6 +1314,7 @@ async fn interrupted_thread_with_a_pending_change_keeps_its_verdict() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: cc_meta(),
         })
@@ -1407,8 +1419,10 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         worktree_path: None,
         worktree_head_sha: None,
         bg_bash_pending: false,
+        turn_end: None,
     };
     let session_started = || ThreadEvent::SessionStarted {
+        sandbox: None,
         coding_agent,
         session_id: "cc-session".into(),
         branch: "claude-code/fix".into(),
@@ -1425,6 +1439,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
     // never ended cleanly. A branch holds one pending change, so each gets
     // its own.
     let propose = |change_id: Uuid| ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: change_id.to_string(),
         description: Some("Fix".into()),
         files: vec!["src/main.rs".into()],
@@ -1455,6 +1470,8 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
     )
     .await;
@@ -1470,7 +1487,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         crate::api::changes::change_action_refusal(
             &pool,
             change_id,
-            crate::engine::thread_lifecycle::Action::Apply,
+            crate::engine::thread_lifecycle::ThreadAction::Apply,
         )
         .await
         .unwrap(),
@@ -1501,7 +1518,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         crate::api::changes::change_action_refusal(
             &pool,
             change_id,
-            crate::engine::thread_lifecycle::Action::Apply,
+            crate::engine::thread_lifecycle::ThreadAction::Apply,
         )
         .await
         .unwrap(),
@@ -1521,6 +1538,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
     emit(
         thread_id,
         ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "tu-open".into(),
             quiet: false,
             answer: AnswerKind::FreeText {
@@ -1548,7 +1566,7 @@ async fn a_proposal_keeps_the_thread_on_its_open_question() {
         crate::api::changes::change_action_refusal(
             &pool,
             later_change,
-            crate::engine::thread_lifecycle::Action::Apply,
+            crate::engine::thread_lifecycle::ThreadAction::Apply,
         )
         .await
         .unwrap(),
@@ -1845,6 +1863,7 @@ async fn thread_discarded_clears_compose_selection() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -1894,6 +1913,7 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -1922,6 +1942,8 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1962,6 +1984,7 @@ async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::UserQuestionAnswered {
+            compose: None,
             tool_use_id: "tu-1".into(),
             quiet: false,
             answer: AnswerKind::FreeText {
@@ -1977,6 +2000,7 @@ async fn a_draft_written_after_the_accept_survives_the_sends_later_events() {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: String::new(),
@@ -2060,6 +2084,7 @@ async fn a_chat_continue_leaves_the_compose_epoch_alone() {
         thread_id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "lucidos".into(),
             actor: None,
         },
@@ -2124,6 +2149,7 @@ async fn restored_draft_is_atomic_and_retry_preserves_newer_edits() {
                 image_hashes: vec![],
                 selection: Some(serde_json::json!({"model": "example-model"})),
             }),
+            agent_draft: None,
         },
         meta: EventMeta::NONE,
     };

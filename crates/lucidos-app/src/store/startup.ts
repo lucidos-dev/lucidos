@@ -1,3 +1,9 @@
+import { noteCrashWorker } from '../utils/crashWorker';
+import { provideReleaseCheck, refreshReleaseCheckIfShown } from './releaseCheckHandle';
+import { startAppUpdateProgress, stopAppUpdateProgress } from './actions/appUpdateProgressEvents';
+import { startDeferredBackgroundChecks } from './deferredBackgroundChecks';
+import { installDeferredInteractiveDelivery } from './interactiveDeliveryStartup';
+import { loadSpendCapHolds } from './actions/spendCapHolds';
 import { pruneClosedWindows, readWindowItem } from '../utils/windowStorage';
 import { installRestoreRuntime } from './restoreRuntime';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from './actions/connection';
@@ -12,58 +18,50 @@ import { loadApps } from './actions/apps';
 import { loadInstalledPlugins } from './actions/plugins';
 import { loadPluginCatalog } from './actions/plugin-marketplaces';
 import { loadCredentials } from './actions/credentials';
+import { loadLastSuccessfulBackup } from './actions/backup';
 import { loadChatLadder, loadChatModels } from './actions/models';
 import { loadDevices, registerCurrentDevice } from './actions/devices';
 import { loadPairedDevices } from './actions/pairedDevices';
-import { loadOperators } from './actions/operators';
+import { loadGatewayUsers } from './actions/gatewayUsers';
 import { loadTriggers, loadHistoricalTriggers } from './actions/triggers';
 import { loadTriggerGroups } from './actions/triggerGroups';
 import { loadThreadQueue } from './actions/threadQueue';
-import { loadRepositories } from './actions/chat';
+import { loadRepositories } from './actions/repositoriesLoader';
 import { reopenDashboardPanelFromHistory } from './actions/thread-navigation';
 import { loadPreferences, flushPendingPreferenceWrites } from './actions/preferences';
 import { loadPinnedApps } from './actions/pinnedApps';
 import { loadReleaseNotices } from './actions/releaseNotices';
 import { loadReaderDevices } from './actions/reader-devices';
-import { loadPeople } from './actions/people';
+import { loadUsers } from './actions/users';
 import { loadWebhookIngress } from './actions/webhookIngress';
 import { loadWebhookRefusals } from './actions/webhookRefusals';
 import { loadWorkspaceDisplayName } from './actions/workspace-label';
-import { connectThreadEvents, disconnectThreadEvents } from './actions/thread-sync';
+import { connectThreadEvents, disconnectThreadEvents } from './actions/thread-stream';
 import { loadAllThreads, loadFilterFacets } from './actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker, unregisterServiceWorker } from './actions/push';
 import { createSwLivenessProbe } from '../utils/swLivenessProbe';
 import { createSwFetchPathProbe } from '../utils/swFetchPathProbe';
 import { setupNativePushTapRouting } from './actions/native-push';
 import { startDevicePresenceTracking } from './actions/device-presence';
-import { startAppUpdateProgress, stopAppUpdateProgress, refreshReleaseCheck, resumeUpdateRelay } from './actions/app-update';
-import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from './actions/engine-update';
-import { refreshSlowness, startSlownessChecks, stopSlownessChecks } from './actions/slowness';
 import {
   loadEmbeddingModelStatus,
   subscribeToTailscaleServeProgress,
   unsubscribeFromTailscaleServeProgress,
 } from './actions/backgroundActivity';
 import { isTauri } from '../utils/platform';
-import { invoke } from '../utils/tauri';
+import { startPageHeartbeat } from '../utils/heartbeat';
 import { refreshChangesState, restoreRestartState } from './actions/chat-changes';
 import { offerWithheldThread, openHomeOnColdStart, releaseWithheldToLiveWindow } from './actions/coldStartHome';
 import { announceWindow, installWindowPeers } from './windowPeers';
 import { oauthAuthFlow } from './actions/oauth';
 import { installRestoreGuard, takeWithheldThread } from './restoreGuard';
 import { installDevWindowFollow } from './actions/dev-window';
-import { restoreRepoSelectionFromStorage } from './actions/repositories';
-import { openThreadAcrossWorkspaces } from './actions/cross-workspace';
-import { routeExternalAnchorClick } from './externalAnchorClick';
-import { inlineMarkdownImage, openImagePopupFromGroup } from './imagePopup';
+import { restoreRepoSelectionFromStorage } from './actions/repoSelectionRestore';
 import { installMarkdownImageRetry } from '../utils/markdownImageRetry';
 import { installMarkdownImageFallback } from '../utils/markdownImageFallback';
-import { CHECK_ICON, COPY_ICON } from '../utils/copyIcons';
-import { clipboardOrReport } from '../utils/clipboard';
 import { effect, untracked } from '@preact/signals';
 import { markBoot } from '../utils/bootTiming';
-import { activeMenuItem, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread, currentApp } from './store';
-import { installPaneFocusTracking } from '../components/layout/paneFocus';
+import { activeMenuItem, backupStatusVersion, connectionStatus, intelligenceLadderVersion, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, focusedThreadId, setFocusedThread, currentApp } from './store';
 import { requestServiceWorkerBuildId } from '../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './actions/client-update';
 import {
@@ -73,16 +71,15 @@ import {
 import { dispatchDeepLink } from './actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from './actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
-import { installLinkPressGuard } from '@lucidos/link-press-guard';
 import { postClientLog } from '../utils/clientLog';
 import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
 import { flushUndeliveredComposeDrafts } from './actions/compose';
-import { installAppBridge } from './actions/app-bridge';
 import {
   startFrameCapabilityRenewal,
   stopFrameCapabilityRenewal,
 } from './actions/frame-capability';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
+import { workspaceServiceWorkerUrl } from '../utils/workspaceServiceWorker';
 import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../utils/devServerBundle';
 
 // Cold-start recovery window. If the very first connect hasn't landed by this
@@ -134,9 +131,12 @@ function visibleOnlyInterval(tick: () => void, everyMs: number): { start: () => 
  *  Returns the teardown. */
 export function startClient(): () => void {
   installRestoreRuntime();
+  startAppUpdateProgress();
+  const backgroundChecks = startDeferredBackgroundChecks();
+  provideReleaseCheck(async () => { backgroundChecks.refreshRelease(); });
   // Diagnostic-only: classify this load (cold / bg_resume / reload_clean /
-  // nav_clean / likely_crash) against the prior heartbeat. POSTs one log
-  // line then starts the heartbeat ticker. See utils/liveness.ts.
+  // nav_clean / likely_crash) against the prior heartbeat. Capture prior
+  // evidence before the ticker starts; recovery logging can load separately.
   reportStartupKind();
   const stopLiveness = startLivenessTracking();
   markBoot('clientStarted');
@@ -145,10 +145,6 @@ export function startClient(): () => void {
     if (threadsLoaded.value) markBoot('threadsLoaded');
   });
 
-  // Answer isolated app frames, which cannot reach the engine or their own
-  // storage. Installed before anything mounts an app, so a frame that asks on
-  // its first line is not answered by silence. See store/actions/app-bridge.ts.
-  const stopAppBridge = installAppBridge();
   // Keep an open frame's URL pass to its own files fresh (ADR 0238). Behind a
   // gateway the engine seeds one per frame, and it lasts an hour. This side
   // re-mints at half-life, because the shell holds the device credential.
@@ -176,6 +172,7 @@ export function startClient(): () => void {
     appId: currentApp.peek()?.id ?? null,
     authorizing: authorizingNow(),
   }));
+  const stopInteractiveDelivery = installDeferredInteractiveDelivery();
   const stopAnnouncingWindow = effect(() => {
     void focusedThreadId.value;
     void currentApp.value;
@@ -205,7 +202,7 @@ export function startClient(): () => void {
   // ...and this page's person, which decides its Review group.
   void loadReaderDevices();
   // ...and the people a message can mention.
-  void loadPeople();
+  void loadUsers();
   // ...and the other workspaces' counts, which the bell never shows but the
   // app ICON does: behind the gateway one installed icon covers every
   // workspace on the origin. A no-op on a direct engine port. See
@@ -238,7 +235,7 @@ export function startClient(): () => void {
     // cold start and linger until the next resume or PreferencesChanged. The
     // engine-switch also derives promptly instead of waiting out a 4s poll.
     void syncClientUpdateFromBuild();
-    void checkEngineVersion();
+    backgroundChecks.refreshEngine();
   }).catch(() => { /* loadPreferences sets Loadable failed internally, and the UI shows the error */ });
   void loadPinnedApps();
   // Every Lucidos Agent rung control draws from these reads, and stays unseen
@@ -247,6 +244,13 @@ export function startClient(): () => void {
   const stopChatLadderReads = effect(() => {
     void intelligenceLadderVersion.value;
     untracked(() => { void loadChatLadder(); });
+  });
+  // The backup banner's overdue verdict. `backupStatusVersion` bumps on both
+  // terminal backup events and on every event gap, so one subscription also
+  // covers the first read.
+  const stopLastBackupReads = effect(() => {
+    void backupStatusVersion.value;
+    untracked(() => { void loadLastSuccessfulBackup(); });
   });
   // What this release needs the user to know or do. Loaded here rather than
   // on a panel open, because the modal has to be able to raise itself. Almost
@@ -296,75 +300,6 @@ export function startClient(): () => void {
     .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
   refreshChangesState();
 
-  // Global click handler for thread links, inline images, external URLs, and
-  // copy buttons
-  function onGlobalClick(e: MouseEvent) {
-    const target = e.target as HTMLElement;
-
-    // An inline markdown image opens the image popup, the only surface that
-    // can zoom it. Delegated here rather than bound per component: a chat turn,
-    // a rendered `.md` preview and a notification body all emit the same
-    // wrapper, and none owns a click handler of its own.
-    const inlineImage = inlineMarkdownImage(target);
-    if (inlineImage) {
-      e.preventDefault();
-      openImagePopupFromGroup(inlineImage.src, inlineImage);
-      return;
-    }
-
-    const threadLink = target.closest('.thread-link') as HTMLElement | null;
-    if (threadLink) {
-      e.preventDefault();
-      const threadId = threadLink.getAttribute('data-thread-id');
-      if (!threadId) return;
-      // Cross-workspace links carry data-thread-workspace; the shared router
-      // hops to that workspace's UI (its thread isn't in our threadMap) and
-      // focuses in place otherwise.
-      const linkWorkspace = threadLink.getAttribute('data-thread-workspace');
-      openThreadAcrossWorkspaces(linkWorkspace ?? undefined, threadId);
-      return;
-    }
-
-    // Copy buttons (copyable blocks and fenced code blocks)
-    const copyBtn = target.closest('.copy-btn') as HTMLElement | null;
-    if (copyBtn) {
-      e.preventDefault();
-      e.stopPropagation();
-      // Only the renderer writes `data-copy-text` and `data-copy-code`, and
-      // content cannot, so a lookalike block copies nothing
-      // (utils/markdownEngine.ts).
-      const text = copyBtn.closest('[data-copy-text]')?.getAttribute('data-copy-text')
-        ?? copyBtn.closest('[data-copy-code]')?.querySelector('pre code')?.textContent
-        ?? null;
-      if (text == null) return;
-      // Guarded rather than called bare: a non-secure origin exposes no
-      // `navigator.clipboard`, so the unguarded call threw before a promise
-      // existed and the `.catch` below never ran. See utils/clipboard.ts.
-      const clipboard = clipboardOrReport();
-      if (!clipboard) return;
-      clipboard.writeText(text).then(() => {
-        copyBtn.innerHTML = CHECK_ICON;
-        copyBtn.classList.add('copy-btn-copied');
-        setTimeout(() => {
-          copyBtn.innerHTML = COPY_ICON;
-          copyBtn.classList.remove('copy-btn-copied');
-        }, 1500);
-      }).catch(() => {
-        showToast('Failed to copy to clipboard', 'error');
-      });
-      return;
-    }
-
-    // External links not handled by component-level handlers
-    routeExternalAnchorClick(e);
-  }
-  document.addEventListener('click', onGlobalClick);
-  // A swipe that starts on a link must not open it. Captured on `window`, so
-  // no click listener on `document` sees the click, the wake-tap guard included.
-  const stopLinkPressGuard = installLinkPressGuard(window, {
-    onSwallowed: (info) => postClientLog('nav', 'link-click-after-swipe', { ...info }),
-  });
-
   // Markdown images are raw `<img>` markup, so they cannot be `<BlobImage>`
   // and would stay half-drawn after a truncated load. One delegated listener
   // gives every markdown surface the same self-healing retry.
@@ -408,9 +343,10 @@ export function startClient(): () => void {
   void loadFilterFacets();
   // Events store a device's id, never its name, so every screen that names a
   // device reads these two lists.
+  void loadSpendCapHolds();
   loadDevices();
   void loadPairedDevices();
-  void loadOperators();
+  void loadGatewayUsers();
 
   // Load data for the restored active menu item (switchMenuItem isn't called on reload)
   const tab = activeMenuItem.value;
@@ -453,11 +389,11 @@ export function startClient(): () => void {
     console.warn(`[Startup] ${DEV_SERVER_SW_REASON}`);
   } else if ('serviceWorker' in navigator) {
     // Base-path aware (ADR 0014): behind the gateway the SW is served at
-    // /<slug>/sw.js and scoped to /<slug>/, so each workspace is an
-    // independent PWA cache + push scope.
-    navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH, updateViaCache: 'none' })
-      .then((reg) => {
-        refreshPushSubscription(reg);
+    // /<slug>/sw.js and scoped to /<slug>/. Remote scopes use A's installed
+    // script for push, without caching or intercepting remote responses.
+    navigator.serviceWorker.register(workspaceServiceWorkerUrl(), { scope: SCOPE_PATH, updateViaCache: 'none' })
+      .then(async () => {
+        await refreshPushSubscription(await navigator.serviceWorker.ready);
       })
       .catch(() => showToast('Service worker registration failed. Push notifications may not work.', 'error'));
 
@@ -471,6 +407,7 @@ export function startClient(): () => void {
     // idempotent (the toast is keyed + dedup-guarded). A fresh first install is
     // naturally a no-op: CLIENT_BUILD_ID equals the served id it just loaded.
     function onUpdateFound(this: ServiceWorkerRegistration) {
+      noteCrashWorker(5);
       const newWorker = this.installing;
       if (!newWorker) return;
       newWorker.addEventListener('statechange', () => {
@@ -494,14 +431,13 @@ export function startClient(): () => void {
     // "did the new build's SW take over?"). Query now, and again whenever a new
     // SW claims the page so the shown id tracks the live worker.
     requestServiceWorkerBuildId();
-    navigator.serviceWorker.addEventListener('controllerchange', requestServiceWorkerBuildId);
+    navigator.serviceWorker.addEventListener('controllerchange', onControllerChange);
 
-    // Light/clear the update badge for THIS load by comparing the running
-    // bundle's build id against the served sw.js. Independent of the SW
-    // build-id reply above (that drives the "Service worker" debug row). This
-    // is the honest "is my loaded code stale?" check, also re-run on resume.
-    void syncClientUpdateFromBuild();
   }
+
+  // Compare the loaded bundle with the installed generation even when this
+  // browser cannot register a worker, including remote pages over plain HTTP.
+  if (!isDevServerBundle()) void syncClientUpdateFromBuild();
 
   let stopped = false;
   // Closure-local so a hot-reload restart starts fresh.
@@ -512,6 +448,7 @@ export function startClient(): () => void {
       controller.postMessage({ type: 'lucidos:ping' });
       return true;
     },
+    onState: noteCrashWorker,
     recover: recoverServiceWorker,
     onRecovered: () => showToast('Notifications repaired: the service worker was unresponsive', 'info'),
   });
@@ -549,8 +486,13 @@ export function startClient(): () => void {
   const bootFetchPathCheck = runSwHealth(() => swFetchPath.check())
     .catch(() => { /* best-effort recovery; the 5s check below probes again */ });
 
+  function onControllerChange() {
+    noteCrashWorker(3);
+    requestServiceWorkerBuildId();
+  }
+
   function onServiceWorkerMessage(event: MessageEvent) {
-    const data = event.data as { type?: unknown; target?: unknown; buildId?: unknown } | null;
+    const data = event.data as { type?: unknown; target?: unknown; buildId?: unknown; instance?: unknown } | null;
     if (!data || typeof data !== 'object') return;
     if (data.type === 'lucidos:deep-link') {
       const target = parseDeepLinkFromSwMessage(data.target);
@@ -559,7 +501,7 @@ export function startClient(): () => void {
       return;
     }
     if (data.type === 'lucidos:pong') {
-      swLiveness.notePong();
+      swLiveness.notePong(data.instance);
       return;
     }
     if (data.type === 'lucidos:build-id') {
@@ -613,24 +555,26 @@ export function startClient(): () => void {
     // Resume is the first moment it can land. No-op when nothing is
     // parked. See store/actions/preferences.ts.
     void flushPendingPreferenceWrites();
-    // Check for SW updates on resume. The iOS PWA never reloads, so this is the
-    // only chance to detect new versions after the initial page load.
-    navigator.serviceWorker?.getRegistration().then(reg => reg?.update()).catch(() => {});
-    // Also re-check the BUILD_ID directly. A frontend build that landed while
-    // we were away then lights the update badge. That holds even when iOS
-    // leaves the browser's own SW update check slow or wedged.
-    void syncClientUpdateFromBuild();
+    // A served build mismatch is the reason to ask the worker to update.
+    void syncClientUpdateFromBuild().then(async stale => {
+      if (!stale) return;
+      const reg = await navigator.serviceWorker?.getRegistration();
+      if (reg) {
+        noteCrashWorker(4);
+        await reg.update();
+      }
+    }).catch(() => {});
     // Reconcile the engine build state too: a PWA suspended for the whole
     // background build missed the transient EngineBuildStateChanged pokes (SSE
     // isn't replayed on reconnect), so re-poll authoritatively on resume. That
     // shows 'ready' if the build finished while away, never a stale spin.
-    void checkEngineVersion();
+    backgroundChecks.refreshEngine();
     // Same reconciliation for the published RELEASE. A client is long-resident
     // and rarely remounts, so without this it kept reporting itself current
     // for the whole interval after a release. This is a loopback read of the
     // gateway, which owns the check (ADR 0108). It re-polls the origin only
     // when its own answer is stale, so constant window focus costs nothing.
-    void refreshReleaseCheck();
+    refreshReleaseCheckIfShown();
     // And the embedding model, for the same reason as the engine build: a
     // suspended PWA missed every transient status frame, so re-read the
     // snapshot rather than trusting the last one seen before backgrounding.
@@ -642,7 +586,7 @@ export function startClient(): () => void {
     // And the refusal state, whose two frames are edge-triggered too.
     void loadWebhookRefusals();
     // And the machine's memory, whose poll skips a hidden window.
-    void refreshSlowness();
+    backgroundChecks.refreshSlowness();
     // And the name the user gave this workspace, which they may have changed
     // in the picker on another device while this one slept. Behind the
     // gateway the in-app switcher re-adopts on every unfold, so this is
@@ -730,41 +674,8 @@ export function startClient(): () => void {
 
   // WKWebView crash recovery: send periodic heartbeats to the Tauri Rust side.
   // If heartbeats stop (content process crashed → white screen), the Rust
-  // watchdog reloads the webview automatically.
-  //
-  // The `catch` is a local no-op, not a swallowed signal: `invoke` reports
-  // every failure to the engine log itself (utils/ipcHealth → `[Client/ipc]`).
-  // There is nothing useful to do here per-beat: the next beat is 15s away
-  // and the Rust watchdog is the recovery path. A toast would be wrong on
-  // a timer the user never started.
-  const heartbeatInterval = isTauri()
-    ? setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000)
-    : null;
-
-  // Narration for an app update the user starts. Tauri-only, and no timer:
-  // the CHECK belongs to the gateway (ADR 0108), which is what stops N open
-  // windows making N polls an hour. See store/actions/app-update.ts.
-  startAppUpdateProgress();
-
-  // Read the machine's release answer at startup, so opening the app after a
-  // gap shows a fresh one rather than waiting out the gateway's backstop.
-  void refreshReleaseCheck();
-  // A relayed update this page asked for before a reload (ADR 0338). The
-  // service restart it causes is what reloads the page, mid-run.
-  resumeUpdateRelay();
-
-  // Dev: poll the engine version-status so a background rebuild (kicked off by
-  // Apply) surfaces "New version available → Switch to new version" once ready.
-  // No-op in packaged (that path uses the release updater above). See
-  // store/actions/engine-update.ts.
-  startEngineUpdateChecks();
-
-  // The gateway's slowness answer (ADRs 0274, 0283), polled while visible.
-  startSlownessChecks();
-
-  // The focused-pane marker follows keyboard focus into a pane, iframes
-  // included, even when no pointer-down reached the pane (paneFocus.ts).
-  const stopPaneFocusTracking = installPaneFocusTracking();
+  // watchdog reloads the webview automatically. See utils/heartbeat.
+  const stopHeartbeat = isTauri() ? startPageHeartbeat() : null;
 
   // A development desktop window moves to a new build with the engine it
   // shows, never ahead of it (ADR 0461). See actions/dev-window.ts.
@@ -777,28 +688,28 @@ export function startClient(): () => void {
     stopLiveness();
     stopBootMarks();
     stopChatLadderReads();
+    stopLastBackupReads();
     stopColdStartHome();
     stopRestoreOffer();
     stopReleasingWithheld();
     stopAnnouncingWindow();
+    stopInteractiveDelivery();
     stopWindowPeers();
     stopRestoreGuard();
     stopDevWindowFollow();
-    stopAppBridge();
     stopFrameCapabilityRenewal();
     clearInterval(connectionInterval);
     clearTimeout(coldStartBounceTimer);
     swProbe.stop();
     crossWorkspaceBadge.stop();
-    if (heartbeatInterval) clearInterval(heartbeatInterval);
+    stopHeartbeat?.();
+    backgroundChecks.stop();
     stopAppUpdateProgress();
     unsubscribeFromTailscaleServeProgress();
-    stopEngineUpdateChecks();
-    stopSlownessChecks();
     clearTimeout(initialHealthCheck);
     stopHashRouting();
     navigator.serviceWorker?.removeEventListener('message', onServiceWorkerMessage);
-    navigator.serviceWorker?.removeEventListener('controllerchange', requestServiceWorkerBuildId);
+    navigator.serviceWorker?.removeEventListener('controllerchange', onControllerChange);
     if (updateFoundReg && updateFoundHandler) {
       updateFoundReg.removeEventListener('updatefound', updateFoundHandler);
     }
@@ -806,13 +717,10 @@ export function startClient(): () => void {
     stopDevicePresence();
     nativeTapCanceled = true;
     stopNativeTap?.();
-    document.removeEventListener('click', onGlobalClick);
-    stopLinkPressGuard();
     stopMarkdownImageRetry();
     stopMarkdownImageFallback();
     document.removeEventListener('visibilitychange', handleVisibilityChange);
     window.removeEventListener('focus', onResumeCoalesced);
     window.removeEventListener('pageshow', onResumeCoalesced);
-    stopPaneFocusTracking();
   };
 }

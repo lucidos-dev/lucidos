@@ -159,6 +159,9 @@ pub enum ThreadQueueRequest {
     /// `use_coding_agent`.
     AgentChat {
         message: String,
+        /// Validated at acceptance; routing and pause reads remain execution-time work.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_addressing: Option<Box<crate::engine::thread_users::UserAddressing>>,
         thread_id: Uuid,
         /// Chain depth, stamped by the queue. See `SubThread::depth`.
         #[serde(default)]
@@ -169,6 +172,16 @@ pub enum ThreadQueueRequest {
         image_hashes: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
+        /// Per-turn context, resolved by the submitting handler and retained
+        /// verbatim across admission waits and restart recovery.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_context: Option<crate::api::AppContext>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file_context: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url_context: Option<Box<crate::api::UrlContext>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        conflict_change_id: Option<Uuid>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -260,15 +273,15 @@ impl ThreadQueueRequest {
 
     /// Record the submitting task's chain depth on a spawn request.
     ///
-    /// Called once, by [`super::ThreadQueue::submit`], because every spawn
-    /// submit is awaited inline from the task that spawns it. Centralising it
+    /// Called once, by [`super::ThreadQueue::submit`] or durable saved-draft
+    /// acceptance, awaited inline from the submitting task. Centralising it
     /// there is what stops a new spawn site shipping without a depth.
     ///
     /// `EventTrigger` is deliberately untouched. It already carries the
     /// dispatcher's `next_depth`. The bus subscriber that submits it has an
     /// ambient depth of 0, which would overwrite the real value with a lie.
     /// `Cron` has no field to write.
-    pub(super) fn stamp_caller_depth(&mut self, caller_depth: u32) {
+    pub(crate) fn stamp_caller_depth(&mut self, caller_depth: u32) {
         match self {
             Self::SubThread { depth, .. }
             | Self::CodingAgent { depth, .. }
@@ -407,12 +420,17 @@ mod tests {
     #[test]
     fn agent_chat_kind_follows_use_coding_agent() {
         let mk = |cc: bool| ThreadQueueRequest::AgentChat {
+            user_addressing: None,
             depth: 0,
             message: "do it".into(),
             thread_id: Uuid::new_v4(),
             event_id: None,
             image_hashes: vec![],
             device_id: None,
+            app_context: None,
+            file_context: None,
+            url_context: None,
+            conflict_change_id: None,
             model: None,
             reasoning_effort: None,
             provider: None,
@@ -452,6 +470,28 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn agent_chat_preserves_all_turn_context_across_persistence() {
+        let context = serde_json::json!({
+            "app_context": {"app_id": "sample-app"},
+            "file_context": "[repo:sample] src/lib.rs:3-8",
+            "url_context": {"url": "https://example.com", "title": "Reference", "content": "Selected page"},
+            "conflict_change_id": Uuid::new_v4(),
+        });
+        let mut row = serde_json::json!({
+            "type": "agent-chat", "message": "use this context",
+            "thread_id": Uuid::new_v4(), "mode": "agent",
+        });
+        for (key, value) in context.as_object().unwrap() {
+            row[key] = value.clone();
+        }
+        let request: ThreadQueueRequest = serde_json::from_value(row).unwrap();
+        let restored = serde_json::to_value(request).unwrap();
+        for (key, expected) in context.as_object().unwrap() {
+            assert_eq!(&restored[key], expected, "queued turn lost {key}");
+        }
     }
 
     #[test]

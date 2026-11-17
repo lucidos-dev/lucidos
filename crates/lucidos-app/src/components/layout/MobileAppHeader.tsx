@@ -15,6 +15,9 @@ import { navigateToPane } from '../../store/actions/pane';
 import { useThreadSearch } from '../../hooks/useThreadSearch';
 import { ThreadFilterButton, ThreadGroupingButton, ThreadsPaneTitle } from './ThreadsHeaderControls';
 import { ThreadTitleMenu } from '../chat/ThreadTitle';
+import { lazyComponent } from '../../utils/lazyComponent';
+
+const ThreadUsersButton = lazyComponent(() => import('../chat/ThreadUsers').then((m) => m.ThreadUsersButton));
 import { threadVisualStatus } from '../shared/threadVisualStatus';
 import { threadDisplayTitle } from '../../utils/threadTitle';
 import { MobileThreadsPane } from './MobileThreadsPane';
@@ -246,6 +249,7 @@ export function MobileThreadTitleBar() {
       data-scroller-pinned
     >
       <ThreadTitleMenu thread={eventThread} title={threadTitle} status={threadVisualStatus(eventThread)} />
+      <ThreadUsersButton threadId={threadId} />
     </div>
   );
 }

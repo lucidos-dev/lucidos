@@ -117,7 +117,7 @@ async fn app_file(
 }
 
 fn refused_outside(file: &str, root: &std::path::Path) -> Response {
-    log!(
+    log_legacy!(
         "[apps] refused {file:?}: it resolves outside {} through a symlink",
         root.display()
     );

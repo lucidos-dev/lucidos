@@ -175,7 +175,7 @@ pub(super) fn settle(
         let job = match settled_job {
             Ok(job) => job,
             Err(error) => {
-                crate::log!("[Snapshot] Skipped job record {id} at boot: {error}");
+                crate::log_legacy!("[Snapshot] Skipped job record {id} at boot: {error}");
                 continue;
             }
         };

@@ -5,11 +5,14 @@
 //! a `MessageOrigin::Workspace` and the route panel can show "from workspace
 //! 'myws'" with traceable IDs back to the source thread / event.
 //!
-//! Note: the receiving engine treats these caller fields as a display hint
-//! only — they are user-controllable and MUST NOT be used for authorization.
+//! The fields alone are claims any process could type. A call goes through
+//! this engine's gateway when it can ([`post_through_gateway`]): the engine
+//! signs the caller, its thread and its spawn-gate verdict, and the gateway
+//! stamps the same claim for the target. Otherwise the call goes straight to
+//! the target's port and lands there as an unattested caller.
 
 use crate::engine::http::workspace_resolver::CrossWorkspaceTarget;
-use crate::engine::thread_events::ActorMode;
+use crate::engine::thread_events::{ActorMode, SpawnVerdict};
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::LazyLock;
@@ -124,6 +127,123 @@ pub async fn workspace_post<B: serde::Serialize>(
         .await?)
 }
 
+/// The target's answer to a call through the gateway, read in full. A
+/// cross-workspace spawn answers with a short JSON body, never a stream.
+#[derive(Debug)]
+pub(crate) struct GatewayReply {
+    pub(crate) status: reqwest::StatusCode,
+    pub(crate) content_type: Option<reqwest::header::HeaderValue>,
+    pub(crate) body: bytes::Bytes,
+}
+
+/// What became of a call through this engine's gateway.
+#[derive(Debug)]
+pub(crate) enum ThroughGateway {
+    /// The gateway carried the call, and this is the answer.
+    Replied(GatewayReply),
+    /// No gateway carries it: `reason` is a `lucidos_gateway_stamp`
+    /// `REASON_*` slug. The caller may post to the target directly.
+    Unavailable { reason: &'static str },
+}
+
+/// POST `body` into `target_workspace`'s `/api/v1/chat/stream` through the
+/// gateway on `gateway_port`, signed with `verdict` for the thread in `ctx`.
+/// Production passes `api::base_path::gateway_port()`.
+///
+/// `ctx.self_workspace` gives way to this workspace's own id, since that is
+/// the name the gateway checks the signature against.
+pub(crate) async fn post_through_gateway(
+    gateway_port: Option<&str>,
+    target_workspace: &str,
+    body: Value,
+    ctx: &WorkspaceCallCtx,
+    verdict: &SpawnVerdict,
+) -> Result<ThroughGateway, String> {
+    let unavailable = ThroughGateway::Unavailable {
+        reason: lucidos_gateway_stamp::REASON_NO_GATEWAY,
+    };
+    let (Some(port), Some(path)) = (
+        gateway_port,
+        lucidos_gateway_stamp::workspace_call_path(target_workspace),
+    ) else {
+        return Ok(unavailable);
+    };
+    let Some(signed) = crate::api::gateway_stamp::sign_workspace_call(
+        target_workspace,
+        ctx.source_thread_id,
+        verdict,
+    ) else {
+        return Ok(unavailable);
+    };
+    let urls: Vec<String> = crate::net_config::gateway_scheme_order()
+        .iter()
+        .map(|scheme| format!("{scheme}://127.0.0.1:{port}/~/api/v1{path}"))
+        .collect();
+    let client = crate::gateway_auth::client_builder()
+        .timeout(CROSS_WORKSPACE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("could not build the gateway client: {e}"))?;
+    post_signed_call(&client, &urls, target_workspace, body, ctx, signed).await
+}
+
+/// [`post_through_gateway`] once the call is signed, trying each URL in turn
+/// until one connects.
+async fn post_signed_call(
+    client: &Client,
+    urls: &[String],
+    target_workspace: &str,
+    body: Value,
+    ctx: &WorkspaceCallCtx,
+    signed: crate::api::gateway_stamp::SignedWorkspaceCall,
+) -> Result<ThroughGateway, String> {
+    let ctx = WorkspaceCallCtx {
+        self_workspace: signed.caller_workspace,
+        ..ctx.clone()
+    };
+    let body = merge_caller_fields(body, &ctx);
+    let mut last_error = String::from("no gateway URL to try");
+    for url in urls {
+        let mut request = client
+            .post(url)
+            .header(crate::api::actor::HEADER_TARGET_WORKSPACE, target_workspace)
+            .json(&body);
+        for (name, value) in &signed.headers {
+            request = request.header(*name, value);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(e) => {
+                last_error = format!("cross-workspace call through {url} failed: {e}");
+                continue;
+            }
+        };
+        let status = response.status();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .cloned();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| format!("reading the answer from {url} failed: {e}"))?;
+        let elsewhere = status == reqwest::StatusCode::NOT_FOUND
+            && serde_json::from_slice::<Value>(&body).is_ok_and(|answer| {
+                answer["reason"] == lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY
+            });
+        if elsewhere {
+            return Ok(ThroughGateway::Unavailable {
+                reason: lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY,
+            });
+        }
+        return Ok(ThroughGateway::Replied(GatewayReply {
+            status,
+            content_type,
+            body,
+        }));
+    }
+    Err(last_error)
+}
+
 /// The user-facing parameters for spawning a coding-agent thread in another
 /// workspace: the prompt plus the optional title / target folder / backend /
 /// model / effort. Grouped because they always travel together from the caller
@@ -191,9 +311,12 @@ pub(crate) fn build_cross_workspace_coding_agent_body(
 /// Spawn a coding-agent thread in another workspace.
 ///
 /// POSTs to the target workspace's `/api/v1/chat/stream` with `use_coding_agent:
-/// true` and the caller_* / mode fields merged in via `workspace_post`.
+/// true` and the caller_* / mode fields merged in, through the gateway with
+/// `verdict` when it can ([`post_through_gateway`]), else via `workspace_post`.
 /// Returns the pre-generated `thread_id` on success so the caller can build
 /// the user-facing link.
+///
+/// `gateway_port` names this engine's gateway, as for [`post_through_gateway`].
 ///
 /// `scheme` is never hardcoded: production passes the TARGET's own
 /// `CrossWorkspaceTarget::proto`, which `workspace_resolver` reads from that
@@ -207,13 +330,11 @@ pub async fn spawn_coding_agent_in_workspace(
     spawn: &CrossWorkspaceSpawn<'_>,
     ctx: &WorkspaceCallCtx,
     scheme: &str,
+    gateway_port: Option<&str>,
+    verdict: &SpawnVerdict,
 ) -> Result<Uuid, String> {
     let cc_thread_id = Uuid::new_v4();
     let body = build_cross_workspace_coding_agent_body(cc_thread_id, spawn);
-    let url = format!(
-        "{}://localhost:{}/api/v1/chat/stream",
-        scheme, target.api_port
-    );
     // Assert the workspace this spawn is FOR, taken from the resolved target's
     // own path rather than from anything the caller typed, so the assertion and
     // the port it was resolved alongside always name the same workspace.
@@ -222,6 +343,27 @@ pub async fn spawn_coding_agent_in_workspace(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    match post_through_gateway(gateway_port, &target_workspace, body.clone(), ctx, verdict).await? {
+        ThroughGateway::Replied(reply) if reply.status.is_success() => return Ok(cc_thread_id),
+        ThroughGateway::Replied(reply) => {
+            return Err(format!(
+                "cross-workspace call to {} through the gateway returned HTTP {}: {}",
+                target_workspace,
+                reply.status,
+                String::from_utf8_lossy(&reply.body)
+            ))
+        }
+        ThroughGateway::Unavailable { reason } => crate::log_legacy!(
+            "[WorkspaceClient] No gateway carries the call to {} ({}): posting directly, \
+             where it lands unattested",
+            target_workspace,
+            reason
+        ),
+    }
+    let url = format!(
+        "{}://localhost:{}/api/v1/chat/stream",
+        scheme, target.api_port
+    );
     // A transport failure names the assumption when the scheme was a guess. A
     // bare "record overflow" is a TLS handshake meeting a plain-http socket.
     // Nothing in it points at the ports file that failed to say so.
@@ -546,6 +688,8 @@ mod tests {
             },
             &ctx,
             "http",
+            None,
+            &SpawnVerdict::Allowed,
         )
         .await
         .expect("cross-workspace spawn must succeed");
@@ -628,6 +772,8 @@ mod tests {
             },
             &ctx,
             "http",
+            None,
+            &SpawnVerdict::Allowed,
         )
         .await
         .expect("cross-workspace spawn must succeed");
@@ -678,6 +824,8 @@ mod tests {
             },
             &ctx(),
             "http",
+            None,
+            &SpawnVerdict::Allowed,
         )
         .await
         .expect_err("4xx must surface as Err");
@@ -744,6 +892,168 @@ mod tests {
             elapsed,
             timeout
         );
+    }
+
+    type Seen = std::sync::Arc<std::sync::Mutex<Option<(axum::http::HeaderMap, Value)>>>;
+
+    /// A stand-in gateway that records the call and answers `status` with
+    /// `answer`. Returns its base URL.
+    async fn stand_in_gateway(status: u16, answer: Value) -> (String, Seen) {
+        let seen: Seen = Default::default();
+        let record = seen.clone();
+        let app = axum::Router::new().fallback(
+            move |headers: axum::http::HeaderMap, body: axum::Json<Value>| {
+                let record = record.clone();
+                let answer = answer.clone();
+                async move {
+                    *record.lock().unwrap() = Some((headers, body.0));
+                    (
+                        axum::http::StatusCode::from_u16(status).unwrap(),
+                        axum::Json(answer),
+                    )
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn signed(thread: Uuid) -> crate::api::gateway_stamp::SignedWorkspaceCall {
+        let _ = crate::api::gateway_stamp::test_support::stamp_for("d1");
+        crate::api::gateway_stamp::sign_workspace_call(
+            "work2",
+            Some(thread),
+            &SpawnVerdict::Allowed,
+        )
+        .expect("the test stamp key is installed")
+    }
+
+    /// The call names this workspace by the id it signed under, carries the
+    /// claim headers, and asserts the target.
+    #[tokio::test]
+    async fn a_signed_call_carries_its_claim_and_the_signing_id() {
+        let (base, seen) = stand_in_gateway(200, serde_json::json!({"ok": true})).await;
+        let thread = Uuid::new_v4();
+        let ctx = WorkspaceCallCtx {
+            self_workspace: "dir-name".into(),
+            source_thread_id: Some(thread),
+            source_event_id: None,
+            mode: ActorMode::Agent,
+        };
+        let outcome = post_signed_call(
+            cross_workspace_http_client(),
+            &[format!("{base}/x")],
+            "work2",
+            serde_json::json!({"message": "hi"}),
+            &ctx,
+            signed(thread),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ThroughGateway::Replied(ref r) if r.status.is_success()),
+            "{outcome:?}"
+        );
+        let (headers, body) = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(body["caller_workspace"], "stamp-test-workspace");
+        assert_eq!(body["caller_thread_id"], thread.to_string());
+        assert_eq!(body["message"], "hi");
+        for name in [
+            lucidos_gateway_stamp::HEADER_CALLER_WORKSPACE,
+            lucidos_gateway_stamp::HEADER_CALLER_THREAD,
+            lucidos_gateway_stamp::HEADER_CALLER_VERDICT,
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+        ] {
+            assert!(headers.contains_key(name), "{name} missing");
+        }
+        assert_eq!(headers[crate::api::actor::HEADER_TARGET_WORKSPACE], "work2");
+    }
+
+    /// A gateway that does not serve the target hands the call back, so the
+    /// caller can post directly. Any other refusal is the target's answer.
+    #[tokio::test]
+    async fn only_a_target_elsewhere_hands_the_call_back() {
+        let thread = Uuid::new_v4();
+        let ctx = ctx();
+        let elsewhere = serde_json::json!({
+            "reason": lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY
+        });
+        let (base, _) = stand_in_gateway(404, elsewhere).await;
+        let outcome = post_signed_call(
+            cross_workspace_http_client(),
+            &[base],
+            "work2",
+            serde_json::json!({}),
+            &ctx,
+            signed(thread),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ThroughGateway::Unavailable {
+                reason: lucidos_gateway_stamp::REASON_WORKSPACE_NOT_ON_THIS_GATEWAY
+            }
+        ));
+        let (base, _) = stand_in_gateway(403, serde_json::json!({"error": "no"})).await;
+        let outcome = post_signed_call(
+            cross_workspace_http_client(),
+            &[base],
+            "work2",
+            serde_json::json!({}),
+            &ctx,
+            signed(thread),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(outcome, ThroughGateway::Replied(ref r) if r.status == 403),
+            "{outcome:?}"
+        );
+    }
+
+    /// The scheme a gateway serves is not known in advance, so a URL that
+    /// does not connect falls through to the next.
+    #[tokio::test]
+    async fn a_url_that_does_not_connect_falls_through_to_the_next() {
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let (live, seen) = stand_in_gateway(200, serde_json::json!({})).await;
+        let thread = Uuid::new_v4();
+        post_signed_call(
+            cross_workspace_http_client(),
+            &[dead, live],
+            "work2",
+            serde_json::json!({}),
+            &ctx(),
+            signed(thread),
+        )
+        .await
+        .unwrap();
+        assert!(seen.lock().unwrap().is_some());
+    }
+
+    /// No gateway port means no gateway: the call is handed back unsent.
+    #[tokio::test]
+    async fn with_no_gateway_the_call_is_handed_back() {
+        let outcome = post_through_gateway(
+            None,
+            "work2",
+            serde_json::json!({}),
+            &ctx(),
+            &SpawnVerdict::Allowed,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            outcome,
+            ThroughGateway::Unavailable {
+                reason: lucidos_gateway_stamp::REASON_NO_GATEWAY
+            }
+        ));
     }
 
     #[test]

@@ -95,6 +95,7 @@ async fn emit_cc_session_started(bus: &EventBus, child_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "test-session".into(),
             branch: "claude-code/test".into(),
@@ -271,6 +272,7 @@ async fn emit_cc_idled(
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -295,6 +297,7 @@ async fn emit_change_proposed(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: test_change_id(thread_id).to_string(),
             description: Some("Test change".into()),
             files: vec!["test.rs".into()],
@@ -328,6 +331,7 @@ async fn emit_change_proposed_per_commit(
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: String::new(),
             commit_sha: Some(commit_sha.into()),
             branch_name: branch.into(),
@@ -510,6 +514,7 @@ async fn emit_cc_recovery_pair(bus: &EventBus, child_id: Uuid) {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -520,6 +525,7 @@ async fn emit_cc_recovery_pair(bus: &EventBus, child_id: Uuid) {
 mod active_children_count;
 mod ancestor_rebroadcast;
 mod atomic_emit;
+mod awaited_children_count;
 mod blocking_attention_counts;
 mod branch_work_and_actor;
 mod change_apply_archive;
@@ -559,6 +565,5 @@ mod thread_state_and_eviction;
 mod trigger_provenance;
 mod voice_session_projection;
 mod waiting_child;
-mod waiting_children_count;
 mod wake_decision;
 mod wake_mode;

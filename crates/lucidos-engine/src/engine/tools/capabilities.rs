@@ -31,7 +31,7 @@ impl LucidosEngine {
         let email_account = match EmailStore::list(&self.pool).await {
             Ok(accounts) => !accounts.is_empty(),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Tools] email account read failed ({}); offering the email tools anyway",
                     e
                 );

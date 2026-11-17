@@ -110,6 +110,7 @@ async fn an_archived_integrated_childs_unmerged_work_is_set_aside() {
     bus.emit(BusEvent::Thread {
         thread_id: child,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: branch.into(),
@@ -190,6 +191,7 @@ async fn child_with_work(
     let child = Uuid::new_v4();
     for event in [
         ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: String::new(),
             branch: branch.into(),
@@ -233,6 +235,7 @@ async fn child_with_work(
 
 fn change_applied() -> ThreadEvent {
     ThreadEvent::ChangeApplied {
+        content: Default::default(),
         change_id: Uuid::new_v4().to_string(),
         requires_restart: false,
         client_update: false,
@@ -464,6 +467,7 @@ async fn the_archive_net_skips_a_lane_threads_integration_branch() {
 
 fn change_proposed(set_aside: bool) -> ThreadEvent {
     ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: Uuid::new_v4().to_string(),
         description: Some("work".into()),
         requires_restart: false,
@@ -640,7 +644,9 @@ async fn held_work_is_released_only_for_an_idle_open_thread_whose_turn_proposes(
         "claude-code/held-failed",
         ThreadEvent::ResponseFailed {
             error: "stream interrupted".into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
     )
     .await;

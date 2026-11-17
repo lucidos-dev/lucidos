@@ -40,6 +40,26 @@ describe('redeemPairingCode', () => {
     );
     await expect(redeemPairingCode('00000000')).rejects.toThrow(/not valid or has expired/);
   });
+
+  it('waits for a paired device\'s Allow, presenting the code again', async () => {
+    vi.useFakeTimers();
+    try {
+      const waiting = () => new Response(JSON.stringify({ awaiting_owner: true }), { status: 202 });
+      const fetchMock = vi.fn()
+        .mockResolvedValueOnce(waiting())
+        .mockResolvedValueOnce(new Response(JSON.stringify({ paired: true }), { status: 200 }));
+      vi.stubGlobal('fetch', fetchMock);
+      const onWaiting = vi.fn();
+      const paired = redeemPairingCode('12345678', 'My iPhone', onWaiting);
+      await vi.runAllTimersAsync();
+      await paired;
+      expect(onWaiting).toHaveBeenCalledTimes(1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).code).toBe('12345678');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('pairDesktopWindow', () => {

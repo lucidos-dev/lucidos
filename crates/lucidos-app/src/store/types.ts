@@ -17,6 +17,7 @@ import type {
   MessageOrigin,
   PluginSetupOccasion,
   RecalledMemory,
+  SideEffectCategory,
 } from '../generated/thread-event-wire';
 import type { Tap } from '@lucidos/sdk';
 
@@ -33,6 +34,7 @@ export type {
   RetrySkipReason,
   ModalityUsage,
   RecalledMemory,
+  SideEffectCategory,
 } from '../generated/thread-event-wire';
 
 // --- Async data loading ---
@@ -548,17 +550,6 @@ export type TriggerRun =
   | { type: 'intent'; intent: string }
   | { type: 'script'; path: string };
 
-/** An irreversible-side-effect category a trigger can be granted (ADR 0002,
- *  Phase 5). Wire form is snake_case, matching the Rust `SideEffectCategory`
- *  enum. Used by the *command guard* to decide whether an unattended trigger
- *  may run an `IrreversibleDanger` command. Keep in sync with
- *  `SIDE_EFFECT_CATEGORIES` (the labelled UI list) and the Rust enum. */
-export type SideEffectCategory =
-  | 'email'
-  | 'external_api'
-  | 'cloud_cli'
-  | 'out_of_workspace_destruction'
-  | 'other';
 
 /** One event a trigger listens for. Re-exported rather than declared again: a
  *  trigger's `on:` entry and a thread's *event wait* are the same shape, run
@@ -1064,9 +1055,9 @@ export interface ToastItem {
    *  never a fabricated bar. Pairs with `spinning`, which stays the "something
    *  is happening" signal while this is the "how far" one. */
   progress?: number | null;
-  /** false = suppress the close (X) button. Used for "Restarting engine…" so
-   *  the user can't dismiss the toast while the dim restart overlay is still
-   *  blocking the UI behind it. Defaults to true (close button shown). */
+  /** false = suppress the close (X) on persistent status toasts, such as
+   *  the status shown while the workspace is unavailable. Timed toasts always
+   *  show the X. Defaults to true. */
   dismissable?: boolean;
   /** true = this toast waits to be answered, with no auto-dismiss timer.
    *
@@ -1075,8 +1066,8 @@ export interface ToastItem {
    *  re-derived, because a re-derivation that drifts from that rule loses a
    *  toast in silence.
    *
-   *  Its one reader is `toastStackUrgency`, which lets an open modal outrank
-   *  the toast layer. A toast on a timer may not be lowered: it would vanish
+   *  Read by `toastHasClose` and `toastStackUrgency`. The latter lets an open
+   *  modal outrank the toast layer. A toast on a timer may not be lowered: it would vanish
    *  behind the modal and the reader would never learn what it said. */
   persistent?: boolean;
   /** How many times this plain toast was raised while it was up, from 2.

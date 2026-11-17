@@ -10,6 +10,12 @@
 //! the six-phase in-emit pipeline (Serialize → Validate → Persist → Project →
 //! CaptureAggregate → PostCommit) and the post-commit subscriber contract.
 
+/// Transaction-bound command work, executed only on a live accepted append.
+type MutationFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), sqlx::Error>> + Send + 'a>>;
+type ThreadMutation =
+    Box<dyn for<'a> FnOnce(&'a mut sqlx::PgConnection) -> MutationFuture<'a> + Send>;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -339,7 +345,7 @@ pub enum BusEvent {
 
 #[path = "../event_bus_system_event.rs"]
 mod system_event;
-pub use system_event::SystemEvent;
+pub use system_event::{ArtifactWriter, SystemEvent};
 
 mod auto_resume_hold;
 pub(crate) use auto_resume_hold::AutoResumeHolds;
@@ -351,8 +357,16 @@ mod parent_callback;
 pub(crate) use parent_callback::{batch_still_working_sql, ChildSettle, Delivery};
 
 mod append_horizon;
+mod diagnostic_bundles;
+mod draft_submission;
+mod internal_faults;
+mod ordinary_submission;
 pub(crate) use append_horizon::committed_event_horizon;
 use append_horizon::Append;
+pub use draft_submission::PreparedDraftSubmission;
+pub use ordinary_submission::{
+    OrdinaryAcceptance, OrdinarySubmissionIntent, OrdinarySubmissionReceipt,
+};
 
 mod append_ticket;
 
@@ -373,9 +387,10 @@ impl EmittedEvent {
 
     /// Convert to SSE-compatible JSON string.
     /// Thread events use `{ "type": "ThreadEvent", "data": { thread_id, seq?, event } }`.
-    /// System events serialize directly via serde `#[serde(tag = "type", content = "data")]`.
+    /// System events serialize via serde `#[serde(tag = "type", content = "data")]`.
+    /// Every envelope carries its emitted `event_id`, separate from payload ids.
     pub fn to_sse_json(&self) -> String {
-        let json = match &self.typed {
+        let mut json = match &self.typed {
             BusEvent::Thread {
                 thread_id,
                 event,
@@ -421,6 +436,7 @@ impl EmittedEvent {
             }
             BusEvent::System(event) => serde_json::to_value(event).unwrap_or_default(),
         };
+        json["event_id"] = serde_json::json!(self.event_id.to_string());
         json.to_string()
     }
 }
@@ -444,7 +460,7 @@ pub struct EmitResult {
 
 /// Whether a failed [`EventBus::emit`] lost at the unique index `index`.
 ///
-/// An index such as `events_owner_approval_spent_unique` is a claim: the emit
+/// An index such as `events_permission_spent_unique` is a claim: the emit
 /// that loses it is a refused caller, not a broken store.
 pub(crate) fn violates_unique_index(
     error: &(dyn std::error::Error + Send + Sync + 'static),
@@ -599,6 +615,10 @@ pub const THREAD_APPEND_LOCK_CLASS: i32 = 0x6170_6e64;
 /// Validate — moving them to a subscriber would break next-emit validation.
 #[derive(Clone)]
 pub struct EventBus {
+    pub(crate) input_order: crate::engine::InputOrder,
+    accepted_input_turns:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, AcceptedInputTurns>>>,
+    spend_cap_holds: std::sync::Arc<tokio::sync::Mutex<crate::llm::spend_cap::SpendCapHolds>>,
     pool: PgPool,
     /// Broadcast channel for the post-commit subscriber contract — every
     /// `subscribe()` returns a `Receiver` cloned from here. Sent to once per
@@ -633,6 +653,39 @@ pub struct EventBus {
     keep_alive_turns: projection::keep_alive::KeepAliveTurns,
 }
 
+/// A provisional runtime turn must exist before its queue row becomes visible.
+/// Failed or canceled acceptance removes it; committed work keeps it until dispatch.
+struct AcceptedInputTurns {
+    thread: Uuid,
+    message: Uuid,
+    turn: Option<crate::engine::InputTurn>,
+    // Joined immediately after `turn`, under the same append lock. Retaining
+    // this barrier makes an unrecorded executor failure block successors even
+    // after the executor drops its own turn. Recording releases the barrier;
+    // its predecessor wait still enforces execution-time routing order.
+    recording_barrier: crate::engine::InputTurn,
+}
+
+struct AcceptedInputRegistration<'a> {
+    bus: &'a EventBus,
+    entry: Uuid,
+    committed: bool,
+}
+
+impl AcceptedInputRegistration<'_> {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AcceptedInputRegistration<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.bus.release_accepted_input(self.entry);
+        }
+    }
+}
+
 impl EventBus {
     pub fn new(pool: PgPool) -> (Self, mpsc::UnboundedReceiver<ParentCallback>) {
         let (event_tx, _) = broadcast::channel(BUS_CAPACITY);
@@ -642,6 +695,9 @@ impl EventBus {
             crate::core::changes_projection::ChangesProjection::new(pool.clone());
         (
             Self {
+                input_order: Default::default(),
+                accepted_input_turns: Default::default(),
+                spend_cap_holds: Default::default(),
                 pool,
                 event_tx,
                 parent_callback_tx,
@@ -660,7 +716,91 @@ impl EventBus {
         )
     }
 
+    /// Runtime ownership only: durable membership lives in the queue projection.
+    /// Register before committing: even a periodic drain must find the turn.
+    fn register_accepted_input_turn(
+        &self,
+        entry: Uuid,
+        thread: Uuid,
+        message: Uuid,
+        turn: crate::engine::InputTurn,
+        order: &crate::engine::InputOrder,
+    ) -> AcceptedInputRegistration<'_> {
+        let recording_barrier = order.join_recording_barrier(&turn);
+        self.accepted_input_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                entry,
+                AcceptedInputTurns {
+                    thread,
+                    message,
+                    turn: Some(turn),
+                    recording_barrier,
+                },
+            );
+        AcceptedInputRegistration {
+            bus: self,
+            entry,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn take_accepted_input_turn(&self, entry: Uuid) -> Option<crate::engine::InputTurn> {
+        self.accepted_input_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&entry)
+            .and_then(|input| input.turn.take())
+    }
+
+    fn release_accepted_input(&self, entry: Uuid) {
+        self.accepted_input_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&entry);
+    }
+
+    /// A predecessor wait must not consume a background capacity reservation.
+    pub(crate) fn accepted_input_has_predecessor(&self, entry: Uuid) -> bool {
+        self.accepted_input_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&entry)
+            .is_some_and(|input| {
+                input
+                    .turn
+                    .as_mut()
+                    .unwrap_or(&mut input.recording_barrier)
+                    .has_input_ahead()
+            })
+    }
+
+    /// Boot calls this in durable acceptance order before dispatch starts.
+    pub(crate) fn restore_accepted_input_turn(&self, entry: Uuid, thread: Uuid, message: Uuid) {
+        self.accepted_input_turns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(entry)
+            .or_insert_with(|| {
+                let turn = self.input_order.join(thread);
+                let recording_barrier = self.input_order.join_recording_barrier(&turn);
+                AcceptedInputTurns {
+                    thread,
+                    message,
+                    turn: Some(turn),
+                    recording_barrier,
+                }
+            });
+    }
+
     /// The database this bus persists to.
+    pub(crate) fn spend_cap_holds(
+        &self,
+    ) -> &tokio::sync::Mutex<crate::llm::spend_cap::SpendCapHolds> {
+        &self.spend_cap_holds
+    }
+
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -686,7 +826,7 @@ impl EventBus {
         for callback in held {
             let child_thread_id = callback.child_thread_id;
             if let Err(e) = self.parent_callback_tx.send(callback) {
-                crate::log!(
+                crate::log_legacy!(
                     "[FanOut] Failed to release the boot-held parent wake for child {}: {}",
                     child_thread_id,
                     e
@@ -707,7 +847,7 @@ impl EventBus {
 
     fn send_spawn_request(&self, request: SpawnRequest) {
         if let Err(e) = self.spawn_request_tx.send(request) {
-            crate::log!("[EventBus] Spawn request has no consumer: {:?}", e.0);
+            crate::log_legacy!("[EventBus] Spawn request has no consumer: {:?}", e.0);
         }
     }
 
@@ -1017,7 +1157,7 @@ impl EventBus {
     /// `ctx` should identify the call site, e.g. `"[ChangeOps] ChangeApplied"`.
     pub async fn emit_or_log(&self, event: BusEvent, ctx: &str) {
         if let Err(e) = self.emit(event).await {
-            log!("[EventBus] {} emit failed: {}", ctx, e);
+            log_legacy!("[EventBus] {} emit failed: {}", ctx, e);
         }
     }
 
@@ -1031,7 +1171,7 @@ impl EventBus {
         emitting_trigger_id: Option<String>,
     ) {
         if let Err(e) = self.emit_as_trigger(event, emitting_trigger_id).await {
-            log!("[EventBus] {} emit failed: {}", ctx, e);
+            log_legacy!("[EventBus] {} emit failed: {}", ctx, e);
         }
     }
 
@@ -1085,6 +1225,14 @@ impl EventBus {
                     .append_thread_events(thread_id, vec![(te, meta)], depth, emitting_trigger_id)
                     .await?;
                 return Ok(appended.and_then(|results| results.into_iter().next()));
+            }
+            BusEvent::System(
+                se @ (SystemEvent::InternalFaultRecorded { .. }
+                | SystemEvent::DiagnosticBundleSent { .. }),
+            ) => {
+                return self
+                    .append_diagnostic_signal(Uuid::new_v4(), se, depth, emitting_trigger_id)
+                    .await;
             }
             BusEvent::System(se) if se.is_persisted() => {
                 // Before the transaction: the lookup reads on its own connection.
@@ -1274,6 +1422,11 @@ impl EventBus {
             emitting_trigger_id,
             ticket,
         } = committed;
+        if let SystemEvent::ThreadQueueDropped { entry_id, .. }
+        | SystemEvent::ThreadQueueCompleted { entry_id } = &event
+        {
+            self.release_accepted_input(*entry_id);
+        }
         ticket.send(
             &self.event_tx,
             EmittedEvent {
@@ -1293,6 +1446,31 @@ impl EventBus {
         }
     }
 
+    /// Commit a live command's durable write with its event. The mutation is
+    /// deliberately outside replayable projections: replaying historical
+    /// approval must never restore permission consumed by a later Apply.
+    pub(crate) async fn emit_with_mutation<F>(
+        &self,
+        thread_id: Uuid,
+        event: ThreadEvent,
+        mutation: F,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: for<'a> FnOnce(&'a mut sqlx::PgConnection) -> MutationFuture<'a> + Send + 'static,
+    {
+        Ok(self
+            .append_thread_events_with_question(
+                thread_id,
+                vec![(event, EventMeta::NONE)],
+                thread_emit_depth(thread_id),
+                current_trigger_id(),
+                None,
+                Some(Box::new(mutation)),
+            )
+            .await?
+            .is_some())
+    }
+
     /// Emit `events` on one thread as one *atomic emit*: one transaction, all
     /// or none, broadcast in order after the commit.
     ///
@@ -1306,6 +1484,18 @@ impl EventBus {
     ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
         // Read before the first `.await`, as `emit` does.
         let emitting_trigger_id = current_trigger_id();
+        self.emit_atomically_as_trigger(thread_id, events, emitting_trigger_id)
+            .await
+    }
+
+    /// Atomic counterpart to `emit_as_trigger`: the caller states whether
+    /// this outcome belongs to a trigger rather than inheriting ambient scope.
+    pub(crate) async fn emit_atomically_as_trigger(
+        &self,
+        thread_id: Uuid,
+        events: Vec<(ThreadEvent, EventMeta)>,
+        emitting_trigger_id: Option<String>,
+    ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
         if let Some((transient, _)) = events.iter().find(|(te, _)| !te.is_persisted()) {
             return Err(format!(
                 "{} is transient, so it cannot join an atomic emit",
@@ -1332,6 +1522,50 @@ impl EventBus {
         depth: u32,
         emitting_trigger_id: Option<String>,
     ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.append_thread_events_with_question(
+            thread_id,
+            events,
+            depth,
+            emitting_trigger_id,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Composer-bearing answers record urgently, without awaiting predecessors.
+    /// Their fence, input placement and consumption share the answer transaction.
+    pub(crate) async fn emit_question_answer(
+        &self,
+        thread_id: Uuid,
+        event: ThreadEvent,
+        meta: EventMeta,
+        position: Option<crate::engine::InputPosition>,
+        expected_epoch: Option<i64>,
+    ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
+        if !matches!(event, ThreadEvent::UserQuestionAnswered { .. }) {
+            return Err("question_answer_required".into());
+        }
+        self.append_thread_events_with_question(
+            thread_id,
+            vec![(event, meta)],
+            thread_emit_depth(thread_id),
+            current_trigger_id(),
+            Some((position, expected_epoch)),
+            None,
+        )
+        .await
+    }
+
+    async fn append_thread_events_with_question(
+        &self,
+        thread_id: Uuid,
+        events: Vec<(ThreadEvent, EventMeta)>,
+        depth: u32,
+        emitting_trigger_id: Option<String>,
+        question: Option<(Option<crate::engine::InputPosition>, Option<i64>)>,
+        mutation: Option<ThreadMutation>,
+    ) -> Result<Option<Vec<EmitResult>>, Box<dyn std::error::Error + Send + Sync>> {
         let Append { mut tx, ticket } = self.begin_append().await?;
 
         // === Phase: Serialize ===
@@ -1347,22 +1581,39 @@ impl EventBus {
             // Pre-INSERT checks on the snapshot Persist will use. `Err` refuses
             // the event, and `Ok(None)` drops a recognised duplicate. Either
             // one drops the whole atomic emit.
-            // Recovery creates its destination once, under the append lock.
-            // Validate generation even for a duplicate so old retries cannot
-            // regain authority after another restore.
+            // A seeded start (recovery or an agent's draft) creates its
+            // destination once, under the append lock, and a retry writes no
+            // event. Validate generation even for a duplicate so old retries
+            // cannot regain authority after another restore.
             if let ThreadEvent::ThreadStarted {
-                recovered_compose: Some(recovered),
+                recovered_compose,
+                agent_draft,
                 ..
             } = &te
             {
-                let generation: Option<Uuid> = sqlx::query_scalar(
-                    "SELECT restore_id FROM snapshot_restore_boundary WHERE singleton FOR SHARE",
-                )
-                .fetch_optional(&mut *tx)
-                .await?;
-                if generation != Some(recovered.generation) {
-                    return Err("snapshot_restore_generation_mismatch".into());
+                if recovered_compose.is_some() && agent_draft.is_some() {
+                    return Err("a thread start carries one compose seed, not two".into());
                 }
+                if let Some(recovered) = recovered_compose {
+                    let generation: Option<Uuid> = sqlx::query_scalar(
+                        "SELECT restore_id FROM snapshot_restore_boundary WHERE singleton FOR SHARE",
+                    )
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    if generation != Some(recovered.generation) {
+                        return Err("snapshot_restore_generation_mismatch".into());
+                    }
+                }
+            }
+            if let ThreadEvent::ThreadStarted {
+                recovered_compose: Some(_),
+                ..
+            }
+            | ThreadEvent::ThreadStarted {
+                agent_draft: Some(_),
+                ..
+            } = &te
+            {
                 let exists: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
                 )
@@ -1385,7 +1636,7 @@ impl EventBus {
                         .await
                         .unwrap_or(false);
                 if !exists {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventBus] WARNING: request_event_id {} does not exist in events table \
                          (event_type={}, thread_id={}). This causes orphaned event references.",
                         req_id,
@@ -1393,6 +1644,25 @@ impl EventBus {
                         thread_id
                     );
                 }
+            }
+
+            // A human message is taken back or consumed, never both.
+            crate::engine::consumption_claim::check(&mut tx, thread_id, &te, &meta).await?;
+
+            if let ThreadEvent::QueuedMessageRemoved {
+                removed_message_id,
+                restore_to_compose: true,
+                compose,
+            } = &mut te
+            {
+                *compose = Some(Box::new(
+                    crate::engine::consumption_claim::restore_accepted_input(
+                        &mut tx,
+                        thread_id,
+                        *removed_message_id,
+                    )
+                    .await?,
+                ));
             }
 
             // A sighting counts only for the request the client saw
@@ -1409,7 +1679,7 @@ impl EventBus {
                 .await?;
                 if row != Some((true, *seen_version)) {
                     tx.rollback().await?;
-                    crate::log!(
+                    crate::log_legacy!(
                         "[EventBus] ThreadReplySeen dropped for {}: the request it \
                          saw is gone or newer",
                         thread_id
@@ -1457,7 +1727,7 @@ impl EventBus {
             };
             if let Some(child_thread_id) = dropped_child {
                 tx.rollback().await?;
-                crate::log!(
+                crate::log_legacy!(
                     "[EventBus] {} suppressed on {}: child {} is not its child",
                     te.event_type(),
                     thread_id,
@@ -1471,6 +1741,48 @@ impl EventBus {
             if let ThreadEvent::ContextCaptured { session, .. } = &mut te {
                 *session =
                     Some(super::session_scope::current_session_ordinal(&mut tx, thread_id).await?);
+            }
+
+            if let Some((position, expected_epoch)) = question {
+                use crate::engine::InputAdmission;
+                let ThreadEvent::UserQuestionAnswered {
+                    answer, compose, ..
+                } = &mut te
+                else {
+                    return Err("question_answer_required".into());
+                };
+                let content = crate::engine::agent_question::composer_submission(answer);
+                if let Some((text, images)) = content {
+                    if let Some(expected) = expected_epoch {
+                        let epoch: Option<i64> = sqlx::query_scalar("SELECT compose_epoch FROM thread_summaries WHERE thread_id=$1 AND state IN ('composing','active') FOR UPDATE").bind(thread_id).fetch_optional(&mut *tx).await?;
+                        if epoch != Some(expected) {
+                            return Err("compose_snapshot_stale".into());
+                        }
+                    } else {
+                        let saved: bool = sqlx::query_scalar(
+                            "SELECT EXISTS(SELECT 1 FROM draft_submissions WHERE thread_id=$1)",
+                        )
+                        .bind(thread_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        if saved {
+                            return Err("compose_fence_required".into());
+                        }
+                    }
+                    *compose = crate::core::store::consume_compose_slot(
+                        &mut *tx, thread_id, &text, &images,
+                    )
+                    .await?
+                    .map(Box::new);
+                }
+                match self
+                    .input_order
+                    .admit_in_transaction(&mut tx, thread_id, position, meta.event_id)
+                    .await?
+                {
+                    InputAdmission::Admitted(turn) => drop(turn),
+                    InputAdmission::Overtaken => return Err("overtaken".into()),
+                }
             }
 
             // === Phase: Persist ===
@@ -1511,7 +1823,7 @@ impl EventBus {
                 match crate::core::store::fetch_thread_aggregate(&mut *tx, thread_id).await {
                     Ok(agg) => agg,
                     Err(e) => {
-                        crate::log!(
+                        crate::log_legacy!(
                             "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
                             thread_id,
                             e
@@ -1525,7 +1837,7 @@ impl EventBus {
                     Ok(Some(agg)) => ancestor_aggregates.push(agg),
                     Ok(None) => {}
                     Err(e) => {
-                        crate::log!(
+                        crate::log_legacy!(
                             "[EventBus] Failed to fetch ancestor ThreadAggregate for {}: {}",
                             ancestor_id,
                             e
@@ -1542,6 +1854,10 @@ impl EventBus {
                 ancestor_aggregates,
                 side_effects,
             });
+        }
+
+        if let Some(mutation) = mutation {
+            mutation(&mut tx).await?;
         }
 
         // === Phase: PostCommit ===
@@ -1562,6 +1878,27 @@ impl EventBus {
             .collect();
         let mut fan_outs = Vec::with_capacity(staged.len());
         for s in staged {
+            // This callback runs only after commit. The event's own identity
+            // covers messages, question answers and coding/people routing;
+            // an acceptance envelope never releases a recording barrier. A
+            // removal releases it too: that input will never record.
+            let settled_input = match &s.event {
+                ThreadEvent::MessageReceived { .. }
+                | ThreadEvent::UserQuestionAnswered { .. }
+                | ThreadEvent::CodingAgentUserMessageSent { .. }
+                | ThreadEvent::PromptInjected { .. }
+                | ThreadEvent::UserOnlyMessagePosted { .. } => Some(s.event_id),
+                ThreadEvent::QueuedMessageRemoved {
+                    removed_message_id, ..
+                } => Some(*removed_message_id),
+                _ => None,
+            };
+            if let Some(message) = settled_input {
+                self.accepted_input_turns
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|_, input| input.thread != thread_id || input.message != message);
+            }
             fan_outs.push((
                 s.event_id,
                 s.event.clone(),
@@ -1596,6 +1933,27 @@ impl EventBus {
             }
         }
         for (event_id, event, actor, ancestor_aggregates, side_effects) in fan_outs {
+            if let ThreadEvent::UserQuestionAnswered {
+                compose: Some(report),
+                ..
+            }
+            | ThreadEvent::QueuedMessageRemoved {
+                compose: Some(report),
+                ..
+            } = &event
+            {
+                let device = match &actor {
+                    Some(crate::engine::thread_events::MessageOrigin::Device { device_id }) => {
+                        Some(device_id.clone())
+                    }
+                    _ => None,
+                };
+                Box::pin(self.emit_or_log(
+                    report.as_ref().clone().broadcast(thread_id, device),
+                    "[Compose] Thread event",
+                ))
+                .await;
+            }
             // Keeps the frontend's `meta.blockingDescendantCount` live, so the
             // thread menu's blocked Archive updates in real time. It rides the
             // `ChildrenCountChanged` transient with the ancestor's snapshot.
@@ -1603,7 +1961,7 @@ impl EventBus {
                 let ancestor_id = match Uuid::parse_str(&ancestor_agg.thread_id) {
                     Ok(id) => id,
                     Err(e) => {
-                        crate::log!(
+                        crate::log_legacy!(
                             "[EventBus] Unparseable ancestor thread_id {:?}: {}, skipping rebroadcast",
                             ancestor_agg.thread_id,
                             e
@@ -1630,7 +1988,7 @@ impl EventBus {
             // are never side effects.
             for effect in side_effects {
                 if let Err(e) = Box::pin(self.emit(effect)).await {
-                    crate::log!("[EventBus] Side-effect emit failed: {}", e);
+                    crate::log_legacy!("[EventBus] Side-effect emit failed: {}", e);
                 }
             }
         }
@@ -1654,7 +2012,9 @@ impl EventBus {
                 // A failed stamp costs an older "last seen". It must not keep
                 // the presence row, which would hold off an OS push.
                 if let Err(e) = crate::core::DeviceStore::mark_seen(&self.pool, device_id).await {
-                    log!("[EventBus] DeviceHidden: last seen stamp failed for {device_id}: {e}");
+                    log_legacy!(
+                        "[EventBus] DeviceHidden: last seen stamp failed for {device_id}: {e}"
+                    );
                 }
                 crate::core::DevicePresenceStore::record_hidden(&self.pool, device_id).await
             }

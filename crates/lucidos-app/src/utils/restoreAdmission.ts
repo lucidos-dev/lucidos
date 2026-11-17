@@ -20,9 +20,24 @@ export function queuedRestoreSourceId(record: QueuedUploadSendRecord): string {
   return JSON.stringify(canonical({ threadId: record.threadId, ownerId: record.ownerId,
     text: record.text, localIds: record.localIds, intent: record.intent }));
 }
+/** Where the current connection's admission is: waiting for the stream's
+ *  hello, then one name per step, so a stall can say which step hung. */
+export type RestoreAdmissionPhase =
+  | 'awaiting-hello'
+  | 'generation'
+  | 'local-records'
+  | 'historical-sources'
+  | 'journal'
+  | 'recoveries'
+  | 'draft-recovery'
+  | 'admitted';
+
 export interface RestoreAdmission {
   wait(): Promise<void>;
   ready(): boolean;
+  phase(): RestoreAdmissionPhase;
+  /** True until this document's first admission. Absent means never. */
+  provisional?(): boolean;
 }
 
 let admission: RestoreAdmission | undefined;
@@ -53,6 +68,15 @@ export function restoreAdmissionReady(): boolean {
   return admission?.ready() ?? true;
 }
 
+export function restoreAdmissionPhase(): RestoreAdmissionPhase {
+  return admission?.phase() ?? 'admitted';
+}
+
+/** True until this document's first admission. A reconnect never reopens it. */
+export function restoreAdmissionProvisional(): boolean {
+  return admission?.provisional?.() ?? false;
+}
+
 export async function waitForRestoreAdmission(): Promise<void> {
   await admission?.wait();
 }
@@ -60,4 +84,25 @@ export async function waitForRestoreAdmission(): Promise<void> {
 /** Bootstrapping identity and health cannot depend on stream admission. */
 export function isRestoreBootstrapRequest(url: string): boolean {
   return /\/(health|devices\/register|internal\/client-log)(\?|$)/.test(url);
+}
+
+const PROVISIONAL_READ = /\/api\/v1\/threads\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(\/events)?(\?|$)/i;
+let provisionalReadApplied = false;
+
+/** A *provisional read*: one thread's summary or events, on a document never
+ *  admitted. It holds no old-generation state a read could overwrite, so a
+ *  notification tap can show its thread while device storage hangs. Why only
+ *  these two: ADR 0704. */
+export function isProvisionalRead(url: string, method: string): boolean {
+  return method === 'GET' && PROVISIONAL_READ.test(url) && restoreAdmissionProvisional();
+}
+
+export function noteProvisionalRead(): void { provisionalReadApplied = true; }
+
+/** Whether a provisional read applied since the last call. Stream frames are
+ *  dropped until admission, so admission must then reconcile the gap. */
+export function consumeProvisionalReads(): boolean {
+  const applied = provisionalReadApplied;
+  provisionalReadApplied = false;
+  return applied;
 }

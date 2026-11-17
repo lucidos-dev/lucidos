@@ -11,9 +11,11 @@ use super::read_decision::{
 use super::wake_decision::{record_wake_decision, OwedReport, WakeDecision};
 use super::*;
 use crate::engine::change_ops::PlanHold;
+use crate::engine::context_ceiling::ContextCeiling;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::model_call::AuxCapture;
 use crate::engine::read_request::ReadDecision;
+use crate::engine::successor::SessionReading;
 use crate::engine::thread_events::{
     ActorMode, AnswerKind, ChildCompletionStatus, EngineReason, EventChannel, EventMeta,
     MessageOrigin, QuestionOption, ThreadEvent,
@@ -35,6 +37,7 @@ fn session(head: &str, held: Option<ProposalHold>) -> SessionFacts {
     SessionFacts {
         head: Some(head.to_string()),
         held,
+        approved_plan_unstarted: false,
     }
 }
 
@@ -100,6 +103,7 @@ fn an_unreadable_head_nudges_once() {
     let held = idle(SessionFacts {
         head: None,
         held: Some(PLAN),
+        approved_plan_unstarted: false,
     });
     assert!(ledger.take_due(&held).is_some());
     assert!(ledger.take_due(&held).is_none());
@@ -162,16 +166,13 @@ fn integrated_work_sends_the_agent_nowhere() {
 
 const K: u64 = 1_000;
 
-/// A later turn of a session at `tokens` in a 1M window, under a 300k ceiling.
+/// An owed crossing in a 1M window, under a 300k ceiling.
 fn past(tokens: u64) -> CeilingFacts {
     CeilingFacts {
-        reading: SessionReading {
+        owed: ContextCeiling::Tokens(300 * K).crossed_by(SessionReading {
             tokens: Some(tokens),
             window: Some(1_000 * K),
-        },
-        ceiling: ContextCeiling::Tokens(300 * K),
-        reached: false,
-        first_turn: false,
+        }),
         busy: false,
     }
 }
@@ -186,67 +187,51 @@ fn ceiling_fires_past_the_effective_ceiling_only() {
             window: Some(1_000 * K),
         })
     );
-    assert_eq!(
-        past(300 * K).crossing(),
-        None,
-        "at the ceiling is not past it"
-    );
+    assert_eq!(past(300 * K).crossing(), None);
     assert_eq!(past(120 * K).crossing(), None);
 }
 
-/// The cap applies before the comparison: a 200k window caps 300k at 150k.
 #[test]
 fn ceiling_fires_at_the_capped_value() {
-    let small_window = CeilingFacts {
-        reading: SessionReading {
-            tokens: Some(160 * K),
-            window: Some(200 * K),
-        },
-        ..past(0)
-    };
-    assert_eq!(small_window.crossing().map(|c| c.ceiling), Some(150 * K));
+    let crossing = ContextCeiling::Tokens(300 * K).crossed_by(SessionReading {
+        tokens: Some(160 * K),
+        window: Some(200 * K),
+    });
+    assert_eq!(crossing.map(|c| c.ceiling), Some(150 * K));
 }
 
 #[test]
 fn ceiling_never_fires_on_an_unknown_reading_or_an_unsized_ceiling() {
-    let unknown = CeilingFacts {
-        reading: SessionReading {
+    assert_eq!(
+        ContextCeiling::Tokens(300 * K).crossed_by(SessionReading {
             tokens: None,
             window: Some(1_000 * K),
-        },
-        ..past(0)
-    };
-    assert_eq!(unknown.crossing(), None);
-    let off = CeilingFacts {
-        ceiling: ContextCeiling::Off,
-        ..past(900 * K)
-    };
-    assert_eq!(off.crossing(), None);
-    let share_without_window = CeilingFacts {
-        reading: SessionReading {
+        }),
+        None
+    );
+    assert_eq!(
+        ContextCeiling::Off.crossed_by(SessionReading {
+            tokens: Some(900 * K),
+            window: Some(1_000 * K),
+        }),
+        None
+    );
+    assert_eq!(
+        ContextCeiling::WindowShare(30).crossed_by(SessionReading {
             tokens: Some(900 * K),
             window: None,
-        },
-        ceiling: ContextCeiling::WindowShare(30),
-        ..past(0)
-    };
-    assert_eq!(share_without_window.crossing(), None);
+        }),
+        None
+    );
 }
 
-/// I2: one `ContextCeilingReached` per session, and none in its first turn,
-/// so a successor never hands off on its own opening.
 #[test]
-fn ceiling_fires_once_per_session_and_not_in_the_first_turn() {
-    let reached = CeilingFacts {
-        reached: true,
-        ..past(400 * K)
+fn ceiling_delivery_needs_a_recorded_crossing() {
+    let facts = CeilingFacts {
+        owed: None,
+        busy: false,
     };
-    assert_eq!(reached.crossing(), None);
-    let opening = CeilingFacts {
-        first_turn: true,
-        ..past(400 * K)
-    };
-    assert_eq!(opening.crossing(), None);
+    assert_eq!(facts.crossing(), None);
 }
 
 /// I1, I16: an unread input, an open card or a pending handoff keeps the
@@ -300,29 +285,36 @@ fn the_ledger_sends_the_ceiling_once_even_with_no_session_facts() {
     assert_eq!(ledger.take_due(&external), None);
 }
 
-/// The evidence shape: captures cross 300k mid-turn, and only the clean turn
-/// end at about 335k reads the measure. Each mid-turn reading is never a turn
-/// end, so the engine never asks; the turn end fires once.
+/// An automation pause asked about the re-entry rather than sending it. The
+/// ledger forgets it, so the next idle asks again, at the same HEAD too.
 #[test]
-fn session_13_shape_hands_off_at_the_first_turn_end() {
+fn an_asked_reentry_comes_due_again() {
+    let crossing = past(400 * K).crossing();
+    let external = TurnEndState::at_session_idle(true, false, SessionFacts::default(), crossing);
+    let mut ledger = ReentryLedger::default();
+    let asked = ledger.take_due(&external).unwrap();
+    ledger.forget(asked);
+    assert_eq!(ledger.take_due(&external), Some(asked));
+
+    let held = idle(session("a1", Some(HARDEN)));
+    let mut ledger = ReentryLedger::default();
+    let asked = ledger.take_due(&held).unwrap();
+    ledger.forget(asked);
+    assert_eq!(ledger.take_due(&held), Some(asked));
+    assert_eq!(ledger.take_due(&held), None, "a sent one still sends once");
+}
+
+#[test]
+fn session_13_shape_delivers_the_recorded_crossing_once() {
     let mut ledger = ReentryLedger::default();
     let turn_end =
-        TurnEndState::at_session_idle(true, true, session("a1", None), past(335 * K).crossing());
-    assert!(matches!(
-        ledger.take_due(&turn_end),
-        Some(DueReentry::Ceiling(CeilingCrossing { context_tokens, .. })) if context_tokens == 335 * K
-    ));
-    let next = TurnEndState::at_session_idle(
-        true,
-        true,
-        session("a1", None),
-        CeilingFacts {
-            reached: true,
-            ..past(360 * K)
-        }
-        .crossing(),
+        TurnEndState::at_session_idle(true, true, session("a1", None), past(301 * K).crossing());
+    assert!(
+        matches!(ledger.take_due(&turn_end), Some(DueReentry::Ceiling(
+        CeilingCrossing { context_tokens, .. }
+    )) if context_tokens == 301 * K)
     );
-    assert_eq!(ledger.take_due(&next), None);
+    assert_eq!(ledger.take_due(&turn_end), None);
 }
 
 // ---- the forced read decision ----
@@ -728,6 +720,7 @@ async fn a_turn_holding_a_change_decides_no_without_a_call() {
     );
 
     let proposed = ThreadEvent::ChangeProposed {
+        content: Default::default(),
         change_id: Uuid::new_v4().to_string(),
         description: Some("Move the widget pills".into()),
         files: vec!["a.rs".into()],
@@ -989,11 +982,14 @@ fn asked(tool_use_id: &str, question: &str, options: &[(&str, &str)]) -> ThreadE
         worktree_path: None,
         multi_select: false,
         owner_approval: None,
+        unattested_act: None,
+        permission_request: None,
     }
 }
 
 fn answered(tool_use_id: &str, answer: AnswerKind) -> ThreadEvent {
     ThreadEvent::UserQuestionAnswered {
+        compose: None,
         tool_use_id: tool_use_id.into(),
         quiet: false,
         answer,
@@ -1373,4 +1369,71 @@ async fn a_chat_turn_reads_only_the_pushes_it_delivered() {
     assert_eq!(turn.pushed, vec![pushed("delivered", "delivered body")]);
 
     teardown_test_db(&db).await;
+}
+
+/// Each re-entry names the step an automation pause asks the owner for.
+#[test]
+fn each_re_entry_names_its_step() {
+    use crate::engine::permission::Action;
+    let crossing = CeilingCrossing {
+        context_tokens: 300_000,
+        ceiling: 200_000,
+        window: None,
+    };
+    assert_eq!(DueReentry::Ceiling(crossing).step(), Action::HandOff);
+    assert_eq!(DueReentry::Hold(HARDEN).step(), Action::Harden);
+    assert_eq!(DueReentry::Hold(PLAN).step(), Action::SetPlanMarker);
+    assert_eq!(DueReentry::ApprovedPlan.step(), Action::BuildApprovedPlan);
+}
+
+fn unstarted(head: &str) -> SessionFacts {
+    SessionFacts {
+        approved_plan_unstarted: true,
+        ..session(head, None)
+    }
+}
+
+/// An approved plan with no source change sends the agent back once per
+/// session, never after a Stop, and an asked one is asked again.
+#[test]
+fn the_approved_plan_re_entry_sends_once_and_only_after_a_completed_turn() {
+    let mut ledger = ReentryLedger::default();
+    let stopped = TurnEndState::at_session_idle(true, false, unstarted("a1"), None);
+    assert_eq!(ledger.take_due(&stopped), None);
+    assert_eq!(
+        ledger.take_due(&idle(unstarted("a1"))),
+        Some(DueReentry::ApprovedPlan)
+    );
+    assert_eq!(ledger.take_due(&idle(unstarted("b2"))), None);
+
+    let mut asked = ReentryLedger::default();
+    let due = asked.take_due(&idle(unstarted("a1"))).unwrap();
+    asked.forget(due);
+    assert_eq!(
+        asked.take_due(&idle(unstarted("a1"))),
+        Some(DueReentry::ApprovedPlan)
+    );
+}
+
+/// The ceiling outranks the approved plan, which outranks a proposal hold.
+#[test]
+fn the_approved_plan_sits_between_the_ceiling_and_the_hold() {
+    let crossing = CeilingCrossing {
+        context_tokens: 300_000,
+        ceiling: 200_000,
+        window: None,
+    };
+    let facts = SessionFacts {
+        held: Some(PLAN),
+        ..unstarted("a1")
+    };
+    let state = TurnEndState::at_session_idle(true, true, facts, Some(crossing));
+    assert_eq!(
+        state.unmet(),
+        vec![
+            TurnEndRequirement::CeilingHandoff(crossing),
+            TurnEndRequirement::StartApprovedPlan,
+            TurnEndRequirement::Reentry(PLAN),
+        ]
+    );
 }

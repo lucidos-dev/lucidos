@@ -64,7 +64,7 @@ impl LucidosEngine {
             }
         }
 
-        log!("[Proxy LLM] {} {}", method.as_str(), name);
+        log_legacy!("[Proxy LLM] {} {}", method.as_str(), name);
         let response = match api_proxy::dispatch_resolved(
             &engine_arc,
             name,

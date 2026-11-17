@@ -509,7 +509,7 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                     memory.get(ptr as u32 as usize..)?.get(..n)
                 });
             if let Some(line) = line {
-                crate::log!("[wasm-signer:{}] {}", state.module_name, line);
+                crate::log_legacy!("[wasm-signer:{}] {}", state.module_name, line);
             }
         },
     )?;

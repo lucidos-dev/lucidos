@@ -110,6 +110,8 @@ account, it shows a red line linking to Settings → Accounts. So:
 A connected account must also carry the scopes the backup uses. The Backup page
 shows a missing scope as its own state (connected but not ready). It offers
 **Grant access**, which re-runs the authorization with the right scopes.
+A manual backup to a provider that is not ready is refused at once: `POST
+/api/v1/backup` answers 409 with reason `provider-not-ready`.
 
 **Both surfaces name the same missing scopes**: the page reads "<provider> is
 missing the `files.metadata.read` permission", and `get_backup_status` lists them

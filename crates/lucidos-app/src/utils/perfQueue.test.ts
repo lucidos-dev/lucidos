@@ -78,7 +78,7 @@ describe('perf queue fire-and-forget', () => {
     expect(ok).toHaveBeenCalledTimes(1);
     const body = JSON.parse(ok.mock.calls[0][1]!.body as string);
     expect(body).toHaveLength(1);
-    expect(body[0]).toMatchObject({ category: 'perf', message: 'open' });
+    expect(body[0]).toMatchObject({ category: 'perf', code: 'open', message: 'open' });
   });
 
   it('flush batches buffered samples into one client-logs request and clears the buffer', () => {
@@ -93,7 +93,7 @@ describe('perf queue fire-and-forget', () => {
     expect(String(url)).toContain('/internal/client-logs');
     const body = JSON.parse(init!.body as string);
     expect(body).toHaveLength(2);
-    expect(body[0]).toMatchObject({ category: 'perf', message: 'open' });
+    expect(body[0]).toMatchObject({ category: 'perf', code: 'open', message: 'open' });
     // Buffer cleared → a second flush sends nothing.
     flushPerfQueue();
     expect(fetchMock).toHaveBeenCalledTimes(1);

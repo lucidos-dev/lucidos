@@ -180,7 +180,7 @@ impl LagReplay {
             Ok(frame) if self.live(&frame) => Some(vec![frame]),
             Ok(_) => Some(Vec::new()),
             Err(RecvError::Lagged(n)) => {
-                log!(
+                log_legacy!(
                     "[LagReplay] Lagged by {} frames, replaying from the events table",
                     n
                 );
@@ -277,7 +277,7 @@ impl LagReplay {
         self.restore_floor = match crate::core::snapshot::boundary::read(pool).await {
             Ok(boundary) => boundary.map_or(0, |b| b.event_sequence),
             Err(error) => {
-                log!(
+                log_legacy!(
                     "[LagReplay] Restore boundary unavailable; refusing replay: {}",
                     error
                 );
@@ -287,7 +287,7 @@ impl LagReplay {
         let top = match horizon(pool, self.scope).await {
             Ok(top) => top,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[LagReplay] Could not read the horizon, so this lag is replayed \
                      with the next one: {}",
                     e
@@ -303,7 +303,7 @@ impl LagReplay {
                     ReplayScope::Thread(_) => match committed_event_horizon(pool).await {
                         Ok(committed) => committed,
                         Err(e) => {
-                            log!(
+                            log_legacy!(
                                 "[LagReplay] Could not read the committed horizon, so this \
                                  lag is replayed with the next one: {}",
                                 e
@@ -445,7 +445,7 @@ impl LagReplay {
         let rows = match self.rows_in(pool, &window).await {
             Ok(rows) => rows,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[LagReplay] Could not read rows {}..={}: {}",
                     window.after + 1,
                     window.through,
@@ -554,7 +554,7 @@ impl ReplayRow {
                 emitting_trigger_id: self.emitting_trigger_id,
             }),
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[LagReplay] Skipping row {} ({}), it does not read back: {}",
                     self.sequence,
                     self.event_type,

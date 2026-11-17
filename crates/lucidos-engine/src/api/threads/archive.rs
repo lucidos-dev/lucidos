@@ -49,7 +49,7 @@ fn reach_rejection(
 /// used elsewhere in the file, but with a JSON body so the cascade handler's
 /// rejections (also JSON) share a consistent error shape.
 fn internal_json<E: std::fmt::Display>(e: E) -> (StatusCode, axum::Json<serde_json::Value>) {
-    log!("[API] archive_thread: {}", e);
+    log_legacy!("[API] archive_thread: {}", e);
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(serde_json::json!({
@@ -217,7 +217,7 @@ pub(in crate::api) async fn archive_thread(
         &state.engine.event_bus,
         &headers,
         Some(thread_uuid),
-        crate::api::thread_reach::ThreadReachVerb::Archive,
+        crate::engine::permission::Action::Archive,
     )
     .await
     .map_err(reach_rejection)?;
@@ -344,19 +344,19 @@ async fn notify_root_done(
     thread_id: Uuid,
     actor: Option<&MessageOrigin>,
 ) {
-    use crate::engine::thread_people::{notify, PeopleNotice};
-    let snapshot = crate::gateway_operators::current();
+    use crate::engine::thread_users::{notify, UserNotice};
+    let snapshot = crate::gateway_users::current();
     let notified = match crate::engine::thread_family::family_root(engine.pool(), thread_id).await {
         Ok(root) if root == thread_id => {
-            let by = actor.and_then(|a| snapshot.operator_of_origin(a));
-            notify(engine, root, PeopleNotice::Completed { by }, &snapshot).await
+            let by = actor.and_then(|a| snapshot.user_of_origin(a));
+            notify(engine, root, UserNotice::Completed { by }, &snapshot).await
         }
         Ok(_) => Ok(()),
         Err(e) => Err(e.into()),
     };
     if let Err(e) = notified {
-        log!(
-            "[API] archive_thread: could not tell {}'s people it is done: {}",
+        log_legacy!(
+            "[API] archive_thread: could not tell {}'s users it is done: {}",
             thread_id,
             e
         );
@@ -425,6 +425,34 @@ pub(crate) async fn archive_family(
     actor: Option<MessageOrigin>,
     pinned: PinnedMembers,
 ) -> Result<ArchiveOutcome, ArchiveRejection> {
+    archive_family_scoped(engine, thread_uuid, actor, pinned, None).await
+}
+
+/// A completed-only archive can take no member outside this counted ceiling.
+pub(crate) async fn archive_completed_family(
+    engine: &std::sync::Arc<LucidosEngine>,
+    thread_uuid: Uuid,
+    actor: MessageOrigin,
+    parent: Uuid,
+    confirmed: &[Uuid],
+) -> Result<ArchiveOutcome, ArchiveRejection> {
+    archive_family_scoped(
+        engine,
+        thread_uuid,
+        Some(actor),
+        PinnedMembers::LeaveOpen,
+        Some((parent, confirmed)),
+    )
+    .await
+}
+
+async fn archive_family_scoped(
+    engine: &std::sync::Arc<LucidosEngine>,
+    thread_uuid: Uuid,
+    actor: Option<MessageOrigin>,
+    pinned: PinnedMembers,
+    completed: Option<(Uuid, &[Uuid])>,
+) -> Result<ArchiveOutcome, ArchiveRejection> {
     // Before the transaction, so a refused target changes nothing. A
     // single-thread archive is exactly this case, and must not answer 200.
     if let Some(holder) = engine.change_claim_holder(thread_uuid).await {
@@ -449,13 +477,56 @@ pub(crate) async fn archive_family(
         .any(|r| r.thread_id == thread_uuid && r.archive_state_enum() == ArchiveState::Archived);
     let leave_pinned = pinned == PinnedMembers::LeaveOpen
         || actor.as_ref().is_some_and(|a| a.mode() == ActorMode::Agent);
-    let plan = match plan_cascade(&family, thread_uuid, leave_pinned) {
+    let mut plan = match plan_cascade(&family, thread_uuid, leave_pinned) {
         Ok(plan) => plan,
         Err(rejection) => {
             let _ = tx.rollback().await;
             return Err(rejection);
         }
     };
+    if let Some((parent, confirmed)) = completed {
+        use crate::engine::thread_triage::{
+            archive_all::refuse_completed,
+            facts::{descendant_ids, load, TriageScope},
+        };
+        // Read after locking the family: changes to its projected state must
+        // wait until this selection finishes. Recheck scope after detach too.
+        let selection = async {
+            let scope = descendant_ids(engine.pool(), parent).await?;
+            let ids: Vec<_> = family
+                .iter()
+                .map(|r| r.thread_id)
+                .filter(|id| confirmed.contains(id) && scope.contains(id))
+                .collect();
+            load(engine.pool(), TriageScope::CompletedIds(&ids)).await
+        }
+        .await;
+        let rows = match selection {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = tx.rollback().await;
+                return Err(internal_json(error));
+            }
+        };
+        let eligible = |id: &Uuid| {
+            confirmed.contains(id)
+                && rows
+                    .iter()
+                    .find(|r| r.facts.thread_id == *id)
+                    .is_some_and(|r| refuse_completed(Some(r)).is_none())
+        };
+        if !eligible(&thread_uuid) {
+            let _ = tx.rollback().await;
+            return Err((
+                StatusCode::CONFLICT,
+                axum::Json(serde_json::json!({
+                    "reason": "not_completed", "message": "The sub-thread is no longer completed and safe to archive."
+                })),
+            ));
+        }
+        plan.to_archive.retain(eligible);
+        plan.external_repo_pending.retain(eligible);
+    }
     let CascadePlan {
         to_archive,
         external_repo_pending,
@@ -523,7 +594,8 @@ pub(crate) async fn archive_family(
                     actor.clone(),
                     None,
                 )
-                .await;
+                .await
+                .map_err(internal_json)?;
             broadcast_changes = true;
         }
     }
@@ -552,7 +624,7 @@ pub(crate) async fn archive_family(
             )
             .await
             {
-                log!(
+                log_legacy!(
                     "[API] archive_thread: orphaned question on {}: {}",
                     tid,
                     msg
@@ -604,11 +676,11 @@ pub(crate) async fn archive_family(
                 // on an archived thread, so the member stays unarchived.
                 let message = e.to_string();
                 if let Some(reason) = crate::engine::claude_code::claim_refusal_reason(&message) {
-                    log!("[API] archive_thread: {} not archived: {}", tid, message);
+                    log_legacy!("[API] archive_thread: {} not archived: {}", tid, message);
                     skipped.push(skipped_member(*tid, reason, &message));
                     continue;
                 }
-                log!("[API] Failed to end Claude Code session on archive: {}", e);
+                log_legacy!("[API] Failed to end Claude Code session on archive: {}", e);
             }
         }
 
@@ -626,10 +698,25 @@ pub(crate) async fn archive_family(
                 if let Some(version) = result.and_then(|r| r.summary_version) {
                     summary_versions.insert(*tid, version);
                 }
+                // The owner's archive ends the pause. An agent's archive
+                // leaves it standing, so a revived thread still asks first.
+                if matches!(actor, Some(MessageOrigin::Device { .. })) {
+                    if let Err(e) = crate::engine::automation_pause::unpause_automation(
+                        engine.pool(),
+                        &engine.event_bus,
+                        *tid,
+                        crate::engine::thread_events::AutomationUnpauseCause::Archived,
+                        actor.clone(),
+                    )
+                    .await
+                    {
+                        log_legacy!("[API] archive_thread: pause on {} not ended: {}", tid, e);
+                    }
+                }
             }
             // The bus refused: the member parked after the lock dropped.
             Err(e) if e.downcast_ref::<LifecycleViolation>().is_some() => {
-                log!("[API] archive_thread: {} not archived: {}", tid, e);
+                log_legacy!("[API] archive_thread: {} not archived: {}", tid, e);
                 skipped.push(skipped_member(*tid, "not_archivable", LEFT_OPEN_MESSAGE));
             }
             Err(e) => return Err(internal_json(e)),
@@ -819,19 +906,21 @@ mod tests {
         }
     }
 
-    /// The target's claim is checked before the family transaction opens, so a
-    /// refused target changes nothing: no lock, no cleared change, no emit.
-    #[test]
-    fn a_claimed_target_is_refused_before_anything_is_touched() {
-        let src = crate::test_support::source_scan::read_production_source(
-            &crate::test_support::source_scan::src_root().join("api/threads/archive.rs"),
-        );
-        let body = &src[src.find("async fn archive_family(").expect("the cascade")..];
-        let check = body.find("change_claim_holder(").expect("the pre-check");
-        let begin = body.find(".begin()").expect("the family transaction");
-        assert!(
-            check < begin,
-            "the claim check must run before the transaction"
-        );
+    mod guard_tests {
+        /// The target's claim is checked before the family transaction opens, so a
+        /// refused target changes nothing: no lock, no cleared change, no emit.
+        #[test]
+        fn a_claimed_target_is_refused_before_anything_is_touched() {
+            let src = crate::test_support::source_scan::read_production_source(
+                &crate::test_support::source_scan::src_root().join("api/threads/archive.rs"),
+            );
+            let body = &src[src.find("async fn archive_family(").expect("the cascade")..];
+            let check = body.find("change_claim_holder(").expect("the pre-check");
+            let begin = body.find(".begin()").expect("the family transaction");
+            assert!(
+                check < begin,
+                "the claim check must run before the transaction"
+            );
+        }
     }
 }

@@ -180,7 +180,7 @@ async fn restore_audio(container: Container, response: Response) -> Response {
     let audio = match audio {
         Ok(audio) => audio,
         Err(e) => {
-            crate::log!("[Proxy] A speech stream did not decode: {}", e);
+            crate::log_legacy!("[Proxy] A speech stream did not decode: {}", e);
             let message = format!("the speech stream did not decode: {e}");
             return (StatusCode::BAD_GATEWAY, message).into_response();
         }

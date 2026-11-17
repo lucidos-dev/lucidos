@@ -150,6 +150,7 @@ async fn discarding_a_pinned_draft_unpins_it() {
         thread_id,
         ThreadEvent::ThreadStarted {
             recovered_compose: None,
+            agent_draft: None,
             mode: "chat".into(),
             actor: None,
         },

@@ -39,6 +39,9 @@ vi.mock('../../utils/tauri', () => ({
   takePendingNativeTaps: vi.fn(() => Promise.resolve([])),
   getNativeWindowActive: vi.fn(() => Promise.resolve(true)),
   listen: vi.fn(() => Promise.resolve(() => {})),
+  // A desktop test makes isTauri() true, so a theme repaint reaches these.
+  setTitlebarColor: vi.fn(() => Promise.resolve()),
+  windowReadyToShow: vi.fn(),
 }));
 vi.mock('../../utils/liveness', () => ({ postClientLog: vi.fn() }));
 

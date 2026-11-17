@@ -61,6 +61,19 @@ describe('answerThreadQuestion', () => {
     await expect(answerThreadQuestion('t1', 'tool-1', answer, placement)).resolves.toBe(false);
   });
 
+  it.each(['compose_snapshot_stale', 'compose_fence_required', 'overtaken'])('keeps %s refusals distinct from a duplicate answer', async (reason) => {
+    withFetch(() => Promise.resolve(new Response(JSON.stringify({ error: reason, reason }), { status: 409 })));
+    await expect(answerThreadQuestion('t1', 'tool-1', answer, placement)).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('returns the accepted compose report to the chain', async () => {
+    const compose = { compose_epoch: 13, summary_version: 20, text: '', image_hashes: [] };
+    withFetch(() => Promise.resolve(new Response(JSON.stringify({ ok: true, compose }), { status: 200 })));
+    const accepted = vi.fn();
+    await expect(answerThreadQuestion('t1', 'tool-1', answer, { ...placement, compose_epoch: 12 }, accepted)).resolves.toBe(true);
+    expect(accepted).toHaveBeenCalledWith(compose);
+  });
+
   it('raises an ApiError carrying the engine reason on a 500', async () => {
     withFetch(() => Promise.resolve(new Response('{"error":"boom"}', { status: 500 })));
 

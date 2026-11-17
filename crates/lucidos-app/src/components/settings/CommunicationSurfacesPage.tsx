@@ -84,7 +84,24 @@ export function CommunicationSurfacesPage() {
             exactly this reason, so the gallery cannot drift from what the app
             shows. */}
         <div class="surfaces-banner-preview">
-          {backupReminderBody({ layout: 'desktop', onSetUp: () => {}, onDismiss: () => {} })}
+          {backupReminderBody({
+            layout: 'desktop',
+            reminder: { state: 'setup', onSetUp: () => {} },
+            onDismiss: () => {},
+          })}
+        </div>
+        <div class="surfaces-banner-preview">
+          {backupReminderBody({
+            layout: 'desktop',
+            reminder: {
+              state: 'overdue',
+              lastBackupAt: new Date(Date.now() - 12 * 24 * 60 * 60 * 1000).toISOString(),
+              now: new Date(),
+              running: false,
+              onBackUp: () => {},
+            },
+            onDismiss: () => {},
+          })}
         </div>
         <div class="surfaces-banner-preview">
           {connectionBannerBody({ layout: 'desktop', status: 'disconnected', workspace: 'dev' })}

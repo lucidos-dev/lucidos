@@ -10,6 +10,9 @@
 // A turn naming `your reasoning effort` answers `effort: X`, X being the
 // CLAUDE_CODE_EFFORT_LEVEL it was spawned with, so a spec sees what the
 // process runs at.
+// FAKE_CLAUDE_CODE_RESTRICTED_MODELS (a comma list of model ids) plays an
+// account that may not use those models: a pick of one runs the default model,
+// and the next turn prints the CLI's warning line after its init.
 // `Take N seconds` makes that turn last N seconds. An interrupt ends the
 // turn in flight at once, with an error result and no reply.
 // A fresh session's first message carries the thread history ahead of the
@@ -80,6 +83,24 @@ export function failToStartText(prompt) {
   return /[Ff]ail to start:\s*"([^"]*)"/.exec(turnText(prompt))?.[1];
 }
 
+/** A model id without its `[1m]` context suffix or `@` pin. */
+export function modelBase(id) {
+  return id.replace(/\[1m\]$/, '').split('@')[0];
+}
+
+/** The ids FAKE_CLAUDE_CODE_RESTRICTED_MODELS names, by base. */
+export function restrictedModels(list = '') {
+  return new Set(list.split(',').map((id) => id.trim()).filter(Boolean).map(modelBase));
+}
+
+/** The warning Claude Code prints when it runs `served` in place of `requested`. */
+export function restrictionWarning(requested, served) {
+  return {
+    type: 'system', subtype: 'informational', level: 'warning',
+    content: `Model "${requested}" is restricted by your organization's settings. Using ${served} instead.`,
+  };
+}
+
 function promptText(content) {
   if (typeof content === 'string') return content;
   return (content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('\n');
@@ -91,9 +112,20 @@ function flagValue(argv, name) {
 }
 
 /** One session: turns each stdin line into the lines Claude Code would print. */
-export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_EFFORT, answer = replyTo) {
+export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_EFFORT, answer = replyTo, restricted = new Set()) {
   const sessionId = flagValue(argv, '--resume') ?? randomUUID();
-  let model = resolveModel(flagValue(argv, '--model') ?? 'default');
+  let model;
+  let warning;
+  const pick = (requested) => {
+    if (restricted.has(modelBase(requested))) {
+      model = resolveModel('default');
+      warning = restrictionWarning(requested, model);
+    } else {
+      model = resolveModel(requested);
+      warning = undefined;
+    }
+  };
+  pick(flagValue(argv, '--model') ?? 'default');
   let initSent = false;
   const usage = { input_tokens: 10, cache_creation_input_tokens: 0, cache_read_input_tokens: 0, output_tokens: 3 };
 
@@ -108,7 +140,7 @@ export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_E
       case 'initialize':
         return [controlResponse(id, { models: MODELS, commands: [] })];
       case 'set_model':
-        model = resolveModel(request.model);
+        pick(request.model);
         return [controlResponse(id)];
       case 'cancel_async_message':
         return [controlResponse(id, { cancelled: false })];
@@ -133,6 +165,10 @@ export function createSession(argv, cwd, turnMs = DEFAULT_TURN_MS, effort = NO_E
         tools: [], mcp_servers: [], permissionMode: flagValue(argv, '--permission-mode') ?? 'default',
         apiKeySource: 'none', uuid: randomUUID(),
       });
+    }
+    if (warning) {
+      out.push(warning);
+      warning = undefined;
     }
     out.push({ ...line, session_id: sessionId, timestamp: new Date().toISOString(), isReplay: true });
     const prompt = promptText(line.message?.content);
@@ -183,6 +219,15 @@ function main(argv) {
   }
   const turnMs = Number(process.env.FAKE_CLAUDE_CODE_TURN_MS ?? DEFAULT_TURN_MS);
   const answer = (prompt, effort) => {
+    const fitRenderer = turnText(prompt).match(/Probe fit renderer: (\{[^\n]*\})/);
+    if (fitRenderer) {
+      const request = JSON.parse(fitRenderer[1]);
+      const result = spawnSync(process.execPath, [fileURLToPath(new URL('./fit-renderer-probe.mjs', import.meta.url)), JSON.stringify(request.widgets), request.browser], {
+        encoding: 'utf8', timeout: 180000, maxBuffer: 131072,
+      });
+      const proof = result.status === 0 ? result.stdout.trim() : '{"verified":false,"stage":"launcher"}';
+      return '```json\n' + proof + '\n```';
+    }
     const restoreCli = turnText(prompt).match(/Probe snapshot CLI restore: (\{[^\n]*\})/);
     if (restoreCli) {
       const request = JSON.parse(restoreCli[1]);
@@ -198,12 +243,13 @@ function main(argv) {
     const selfRestore = turnText(prompt).includes('Probe snapshot self-restore refusal.');
     const gateway = turnText(prompt).match(/Probe snapshot gateway restore origin: (http:\/\/127\.0\.0\.1:[0-9]+)\./)?.[1];
     if (!gateway && !selfRestore && !turnText(prompt).includes('Probe snapshot restore origin.')) return replyTo(prompt, effort);
-    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./restore-origin-probe.mjs', import.meta.url)), ...(gateway ? ['--gateway', gateway, ...(turnText(prompt).includes('Spend snapshot approval.') ? ['--approval'] : [])] : selfRestore ? ['--self-restore'] : [])], {
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./restore-origin-probe.mjs', import.meta.url)), ...(gateway ? ['--gateway', gateway] : selfRestore ? ['--self-restore'] : [])], {
       encoding: 'utf8', timeout: 55000, maxBuffer: 8192,
     });
     return result.status === 0 ? result.stdout.trim() : '{"verified":false}';
   };
-  const session = createSession(argv, process.cwd(), turnMs, process.env.CLAUDE_CODE_EFFORT_LEVEL ?? NO_EFFORT, answer);
+  const session = createSession(argv, process.cwd(), turnMs, process.env.CLAUDE_CODE_EFFORT_LEVEL ?? NO_EFFORT, answer,
+    restrictedModels(process.env.FAKE_CLAUDE_CODE_RESTRICTED_MODELS));
   const print = (lines) => { for (const line of lines) process.stdout.write(`${JSON.stringify(line)}\n`); };
   let turns = Promise.resolve();
   let interruptTurn = () => {};

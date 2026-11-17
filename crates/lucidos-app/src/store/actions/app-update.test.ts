@@ -1355,6 +1355,19 @@ describe('followUpdateRoute', () => {
 });
 
 describe('packagedUpdateVersion', () => {
+  it.each([
+    ['9.2.0-nightly.20261116.2', '9.2.0-nightly.20261116.10', true],
+    ['9.2.0-nightly.20261116.1', '9.2.0', true],
+    ['9.2.0-nightly.20261116.1', '9.1.0', false],
+    ['9.2.0+a', '9.2.0+z', false],
+  ])('orders client release offers %s -> %s', (current, offered, upgrade) => {
+    storeSignals.releaseCheck.value = null;
+    storeSignals.clientOfferedRelease.value = offered;
+    storeSignals.latestTauriAppVersion.value = null;
+    window.__LUCIDOS_APP_RELEASE__ = current;
+    expect(packagedUpdateVersion()).toBe(upgrade ? offered : null);
+  });
+
   it('prefers the gateway answer, which covers every install shape', () => {
     storeSignals.releaseCheck.value = releaseCheckOf({
       version: '9.1.0',

@@ -1500,6 +1500,7 @@ mod tests {
             console_url: Some("https://acme.test/apps".to_string()),
             setup_hint: None,
             permissions_hint: Some("Tick the permission and press Submit.".to_string()),
+            sign_in_scopes: None,
         }
     }
 
@@ -1591,8 +1592,8 @@ mod tests {
 
     #[test]
     fn the_sign_in_scopes_are_never_reported_from_the_echo() {
-        // Every Connect asks for `openid email profile` (the frontend's
-        // SIGN_IN_SCOPES). GitHub has no such scopes and echoes neither, which
+        // A Connect without registry sign-in scopes asks for `openid email
+        // profile`. GitHub has no such scopes and echoes neither, which
         // reported every GitHub account as short of all three.
         assert_eq!(
             connect_result_message(
@@ -1699,39 +1700,43 @@ mod tests {
         assert!(message.contains("RECONNECT"));
     }
 
-    #[test]
-    fn the_result_message_names_no_provider() {
-        // CLAUDE.md bans provider-specific instructions in engine code, and the
-        // per-provider half of a shortfall message is exactly the kind of thing
-        // that invites one. It comes from the registry row instead, so a
-        // literal here would be a second copy free to drift from the JSON.
-        //
-        // Scoped to the three message builders rather than the whole file: the
-        // rest of the module legitimately quotes a provider name in comments
-        // about historical credential spellings, and the tests below name
-        // providers on purpose.
-        let source = include_str!("credentials.rs");
-        let builders = source
-            .split("fn connected_sentence")
-            .nth(1)
-            .and_then(|rest| rest.split("impl LucidosEngine").next())
-            .expect("the message builders sit between their first fn and the impl block");
-        assert!(
-            builders.contains("fn connect_result_message"),
-            "the scanned slice must cover every message builder"
-        );
-        let dir = crate::paths::repo_root()
-            .expect("repo root resolves under cargo test")
-            .join("system-knowhow");
-        let rows = oauth_registry::load_providers(Some(dir.as_path()));
-        assert!(!rows.is_empty(), "the shipped registry must list providers");
-        for row in rows {
+    mod guard_tests {
+        use super::*;
+
+        #[test]
+        fn the_result_message_names_no_provider() {
+            // CLAUDE.md bans provider-specific instructions in engine code, and the
+            // per-provider half of a shortfall message is exactly the kind of thing
+            // that invites one. It comes from the registry row instead, so a
+            // literal here would be a second copy free to drift from the JSON.
+            //
+            // Scoped to the three message builders rather than the whole file: the
+            // rest of the module legitimately quotes a provider name in comments
+            // about historical credential spellings, and the tests below name
+            // providers on purpose.
+            let source = include_str!("credentials.rs");
+            let builders = source
+                .split("fn connected_sentence")
+                .nth(1)
+                .and_then(|rest| rest.split("impl LucidosEngine").next())
+                .expect("the message builders sit between their first fn and the impl block");
             assert!(
-                !builders.to_lowercase().contains(&row.id.to_lowercase()),
-                "the connect result message names the provider '{}'. Per-provider wording \
-                 belongs in system-knowhow/oauth-providers.json.",
-                row.id
+                builders.contains("fn connect_result_message"),
+                "the scanned slice must cover every message builder"
             );
+            let dir = crate::paths::repo_root()
+                .expect("repo root resolves under cargo test")
+                .join("system-knowhow");
+            let rows = oauth_registry::load_providers(Some(dir.as_path()));
+            assert!(!rows.is_empty(), "the shipped registry must list providers");
+            for row in rows {
+                assert!(
+                    !builders.to_lowercase().contains(&row.id.to_lowercase()),
+                    "the connect result message names the provider '{}'. Per-provider wording \
+                 belongs in system-knowhow/oauth-providers.json.",
+                    row.id
+                );
+            }
         }
     }
 }

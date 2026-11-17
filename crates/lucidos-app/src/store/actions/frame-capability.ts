@@ -1,3 +1,4 @@
+import { retryTransportRead } from '../../../../../packages/lucidos-sdk/src/_transport';
 /**
  * Keeping an open frame's URL pass alive: an app frame's, and the HTML
  * artifact preview frame's.
@@ -26,7 +27,7 @@ import { deviceIdHeader } from '../../utils/deviceIdHeader';
 import { appIdForFrame, mountedAppFrames } from '../../utils/appFrame';
 import { PREVIEW_FRAME_ROLE, postToPreviewFrame } from '../../utils/previewFrameProtocol';
 import { CAPABILITY_SEGMENT } from '../../../../../packages/lucidos-sdk/src/frameCapability';
-import { postToAppFrame } from './app-bridge';
+import { postToAppFrame } from './app-frame-channel';
 
 /** Half the engine's TTL. Replaced by what the engine answers. */
 const DEFAULT_RENEW_AFTER_MS = 30 * 60 * 1000;
@@ -194,7 +195,7 @@ interface MintedCapability {
 }
 
 async function mintAt(url: string): Promise<MintedCapability> {
-  const res = await fetch(url, { headers: deviceIdHeader() });
+  const res = await retryTransportRead(() => fetch(url, { headers: deviceIdHeader() }));
   if (!res.ok) throw new Error(`the engine answered ${res.status}`);
   const body = await res.json() as { capability?: unknown; renew_after_secs?: unknown };
   const seconds = typeof body.renew_after_secs === 'number' && body.renew_after_secs > 0

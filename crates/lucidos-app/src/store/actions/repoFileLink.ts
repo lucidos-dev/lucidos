@@ -1,7 +1,7 @@
 import { repositories, showToast, encodeRepoPath, type Repository } from '../store';
 import type { RepoFileHrefTarget } from '../../utils/linkifyPaths';
 import { refreshRepositories } from './repositoriesLoader';
-import { handleNavigationRequest } from './navigation-request';
+import { handleNavigationRequest } from './navigation-dispatch';
 
 /** How the repository segment of a `repo:` link resolved against the registry. */
 export type RepositoryMatch =

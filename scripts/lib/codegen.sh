@@ -21,17 +21,21 @@ CODEGEN_INPUT_ROOTS=(
     scripts/lib/codegen.sh
     scripts/lib/codegen_blocks.py
     packages/lucidos-sdk/src/index.ts
+    crates/lucidos-agent-sandbox
     crates/lucidos-build-slot
     crates/lucidos-capabilities
     crates/lucidos-claude-code-managed
+    crates/lucidos-diagnostic-log
+    crates/lucidos-diagnostic-log-macros
     crates/lucidos-engine
     crates/lucidos-cli
     crates/lucidos-installs
-    crates/lucidos-update-address
+    crates/lucidos-update-channel
     crates/lucidos-engine-socket
     crates/lucidos-file-backup-exclusion
     crates/lucidos-frame-capability
     crates/lucidos-gateway-constants
+    crates/lucidos-gateway-stamp
     crates/lucidos-home
     crates/lucidos-local-token
     crates/lucidos-owner-lock
@@ -45,6 +49,7 @@ CODEGEN_INPUT_ROOTS=(
 # reason to render again. Keeping them out is what lets a frontend-only change
 # stay a cache hit. A path here must never feed a generated file.
 CODEGEN_COMPILE_ONLY=(
+    crates/lucidos-app/VERSION
     .gitattributes
     scripts/lib/merge_drivers.sh
     crates/lucidos-app/src/utils/dataPathPrefixes.ts
@@ -371,6 +376,7 @@ codegen_build_sdk() { # <root>
 codegen_usage() {
     cat >&2 <<'EOF'
 Usage: scripts/codegen.sh [--bin <lucidos-codegen> | --reused-bin <lucidos-codegen>] [--cached-only]
+       scripts/codegen.sh --fill-cache --bin <lucidos-codegen>
        scripts/codegen.sh --fingerprint [<rev>]
        scripts/codegen.sh --cache-dir [<rev>]
 
@@ -382,13 +388,16 @@ bundles in packages/lucidos-sdk/dist/.
                    render a miss with a lucidos-codegen the e2e engine cache
                    matched to this tree, without checking its inputs again
   --cached-only    never compile: on a miss keep the outputs already there
+  --fill-cache     render a miss into the shared cache only: write nothing
+                   into this checkout and build no SDK. The engine build uses
+                   it in its launch tree, so the live checkout syncs from it
   --fingerprint    print the codegen fingerprint of the working tree or <rev>
   --cache-dir      print the cached rendering for the working tree or <rev>
 EOF
 }
 
 codegen_main() { # <root> [args...]
-    local root=$1 bin="" reused="" cached_only="" fp dir
+    local root=$1 bin="" reused="" cached_only="" fill_cache="" fp dir
     shift
     case ${1:-} in
         --fingerprint) codegen_fingerprint "$root" "${2:-}"; return ;;
@@ -399,11 +408,22 @@ codegen_main() { # <root> [args...]
             --bin) bin=${2:?--bin needs a path}; shift 2 ;;
             --reused-bin) bin=${2:?--reused-bin needs a path}; reused=1; shift 2 ;;
             --cached-only) cached_only=1; shift ;;
+            --fill-cache) fill_cache=1; shift ;;
             -h | --help) codegen_usage; return 0 ;;
             *) codegen_usage; return 2 ;;
         esac
     done
+    if [ -n "$fill_cache" ] && { [ -z "$bin" ] || [ -n "$cached_only" ]; }; then
+        codegen_usage
+        return 2
+    fi
     fp=$(codegen_fingerprint "$root")
+    if [ -n "$fill_cache" ]; then
+        codegen_cached "$root" "$fp" >/dev/null && { codegen_log "cache hit"; return 0; }
+        codegen_log "cache miss"
+        codegen_render "$root" "$fp" "$bin" "$reused"
+        return
+    fi
     if dir=$(codegen_cached "$root" "$fp"); then
         codegen_log "cache hit"
     elif [ -n "$cached_only" ]; then

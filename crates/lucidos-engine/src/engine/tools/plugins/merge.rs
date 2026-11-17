@@ -640,7 +640,7 @@ fn classify(
         Ok(_) => (LocalChangeOutcome::Conflict, None),
         // A merge libgit2 refused to attempt is not one to guess at.
         Err(e) => {
-            log!(@Plugins, "merge {} failed, replacing instead: {}", pf.data_relative, e);
+            log_legacy!(@Plugins, "merge {} failed, replacing instead: {}", pf.data_relative, e);
             (LocalChangeOutcome::Replaced, None)
         }
     }

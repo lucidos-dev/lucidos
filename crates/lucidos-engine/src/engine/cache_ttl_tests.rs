@@ -221,6 +221,7 @@ fn capture(
         stable_prefix_fingerprint: None,
         ttft_ms: None,
         request_id: None,
+        telemetry_owned_by_cli: false,
         session: None,
     }
 }

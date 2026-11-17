@@ -198,7 +198,7 @@ impl ClaudeGatewaySignIn {
             Err(e) => Err(e.to_string()),
         };
         if let Err(error) = &outcome {
-            crate::log!("[ClaudeGateway] Sign-in to {} ended: {}", origin, error);
+            crate::log_legacy!("[ClaudeGateway] Sign-in to {} ended: {}", origin, error);
         }
         if let Some(error) = self.finish(generation, origin, outcome) {
             event_bus
@@ -360,7 +360,7 @@ pub(crate) fn spawn_url_change_sign_out(
                     _ => continue,
                 },
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[ClaudeGateway] URL watch lagged by {} events; checking the sign-in",
                         n
                     );
@@ -368,7 +368,10 @@ pub(crate) fn spawn_url_change_sign_out(
                     match prefs::CLAUDE_GATEWAY_URL.try_read(&pool).await {
                         Ok(url) => (url, None),
                         Err(e) => {
-                            crate::log!("[ClaudeGateway] URL watch could not read the URL: {}", e);
+                            crate::log_legacy!(
+                                "[ClaudeGateway] URL watch could not read the URL: {}",
+                                e
+                            );
                             continue;
                         }
                     }
@@ -390,7 +393,7 @@ async fn sign_out_unless_issued_by(
         Ok(Some(account)) => account,
         Ok(None) => return,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[ClaudeGateway] URL watch could not read the sign-in: {}",
                 e
             );
@@ -401,7 +404,7 @@ async fn sign_out_unless_issued_by(
     if configured.is_some_and(|origin| origin.as_str() == account.issuer) {
         return;
     }
-    crate::log!(
+    crate::log_legacy!(
         "[ClaudeGateway] The gateway URL no longer names {}; signing out",
         account.issuer
     );
@@ -413,7 +416,7 @@ async fn sign_out_unless_issued_by(
     )
     .await;
     if let Err(e) = signed_out {
-        crate::log!("[ClaudeGateway] Sign-out after a URL change failed: {}", e);
+        crate::log_legacy!("[ClaudeGateway] Sign-out after a URL change failed: {}", e);
     }
 }
 

@@ -190,9 +190,20 @@ An unavailable executable, HEAD or source-coverage probe reports a verification
 failure with Retry; an unknown observation never authorizes a clean build.
 
 Engine and gateway publish failures fail the build; a CLI publish failure
-remains non-fatal. The script reports persistent stale publication with exit
-75 (`head-moved`). The engine retries for an advanced HEAD, or uses the fresh
-retry budget when HEAD is unchanged. Nothing signals Cargo or deletes locks.
+remains non-fatal. A primary checkout compiles a snapshot of its working tree
+in its *launch tree* (ADR 0668). The snapshot is taken just before cargo, so
+an Apply that lands later is not in it.
+
+The script still exits 0 and prints a note naming both commits. The engine
+then reads the published binary's commit. The snapshot of the start HEAD, or
+a later one, earns one incremental follow-up build if it does not cover HEAD.
+A snapshot that covers HEAD is Ready immediately. Anything older uses the
+fresh retry budget. Nothing signals Cargo or deletes locks.
+
+The first launch-tree build is cold for workspace crates and adds a target
+dir per primary checkout. Existing `target/<profile>` outputs stay on disk
+for hand-run cargo; the launcher does not reclaim them. Linked worktrees
+keep building live in their own target dir.
 
 Build output is copied into `.lucidos/engine-build.log`. **Show build log**
 fetches its last 64 KiB through the workspace-scoped `/api/v1/engine/build-log`

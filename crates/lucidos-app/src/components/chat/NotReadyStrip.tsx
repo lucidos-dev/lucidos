@@ -22,6 +22,11 @@ export const NOT_READY_COPY: Record<StripReason, { label: string; hint: string; 
     detail:
       'Lucidos held this work back because its implementation plan is not approved yet. Approve the plan, and the agent proposes the change once it finishes.',
   },
+  plan_only_code: {
+    label: 'Not ready: approved for later',
+    hint: 'Code changes need implementation approval.',
+    detail: 'Only plan files may land. Code changes need implementation approval.',
+  },
   outside_bound: {
     label: 'Not ready: outside its fix bound',
     hint: 'The fix changes files its security marker did not name.',

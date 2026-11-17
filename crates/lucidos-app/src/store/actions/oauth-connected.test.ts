@@ -11,7 +11,7 @@
  * window of the desktop app shares it: only the page that opened the
  * authorization URL fronts itself.
  */
-import { afterEach, describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { oauthAccounts, panelOverlay, toasts } from '../store';
 
 const THIS_DEVICE = 'device-aaa';
@@ -52,10 +52,15 @@ vi.mock('./artifacts', () => ({ openUrlOutsideApp }));
 
 const {
   handleOAuthAccountConnected,
+  presentOAuthAccountConnected,
   openOAuthAuthorizationUrl,
   oauthAuthFlow,
   grantOAuthScope,
 } = await import('./oauth');
+
+// Immediate acceptance isolates the presenter/focus policy in these unit tests.
+const submitInteractiveRequest = vi.fn((request, _id?: string) => presentOAuthAccountConnected(request.payload));
+vi.mock('../interactiveDeliveryService', () => ({ submitInteractiveRequest: (...args: Parameters<typeof submitInteractiveRequest>) => submitInteractiveRequest(...args) }));
 
 const AUTH_URL = 'https://www.dropbox.com/oauth2/authorize?client_id=k8f2m9qxz1abc4d';
 
@@ -203,53 +208,16 @@ describe('handleOAuthAccountConnected', () => {
  * or the SSE never arrived. Without a fallback the button would just stop
  * spinning, which is what the first cut of this change shipped.
  */
-describe('the OAuth toast across windows', () => {
-  let other: BroadcastChannel;
-  let stop: () => void;
-
-  async function otherAuthorizes(provider: string | null): Promise<void> {
-    const { windowId } = await import('../../utils/windowStorage');
-    other.postMessage({
-      type: 'state',
-      state: {
-        id: `${windowId()}-other`, focusedThreadId: null, appId: null,
-        authorizing: { provider }, activeAt: Date.now() + 1000,
-      },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  }
-
-  beforeEach(async () => {
+describe('the OAuth delivery boundary', () => {
+  it('queues identity and keeps focus independent of toast acceptance', () => {
     oauthAuthFlow.value = null;
     toasts.value = [];
-    const { installWindowPeers } = await import('../windowPeers');
-    const { WORKSPACE_ID } = await import('../../utils/basePath');
-    other = new BroadcastChannel(`lucidos-window-peers:${WORKSPACE_ID ?? ''}`);
-    stop = installWindowPeers(() => ({
-      focusedThreadId: null,
-      appId: null,
-      authorizing: oauthAuthFlow.peek() && { provider: oauthAuthFlow.peek()!.provider },
-    }));
-  });
-  afterEach(() => {
-    stop();
-    other.close();
-  });
-
-  // Two windows waiting on the same provider: one toast, in the last-touched.
-  it('toasts once when two windows authorize the same provider', async () => {
+    submitInteractiveRequest.mockImplementationOnce(() => {});
     openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
-    await otherAuthorizes('dropbox');
-    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    handleOAuthAccountConnected(connected(THIS_DEVICE), 'connected-event');
+    expect(submitInteractiveRequest).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'oauth-connected' }), 'connected-event');
+    expect(focusCallingWindow).toHaveBeenCalled();
     expect(toasts.value).toHaveLength(0);
-  });
-
-  // The window waiting on THIS provider wins over one waiting on another.
-  it('toasts in the window authorizing this provider', async () => {
-    openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
-    await otherAuthorizes('google');
-    handleOAuthAccountConnected(connected(THIS_DEVICE));
-    expect(toasts.value).toHaveLength(1);
   });
 });
 

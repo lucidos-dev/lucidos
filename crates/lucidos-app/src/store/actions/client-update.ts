@@ -78,17 +78,17 @@ function surfaceUpdateToast(servedBuildId: string): void {
  *  from clobbering a legitimately-lit badge on noise: the dev placeholder
  *  (`__…__`) carries no signal, and an indeterminate served id (offline /
  *  transient — `getServedBuildId` returns null) leaves things as-is. */
-export async function syncClientUpdateFromBuild(): Promise<void> {
-  if (isUnstampedBuildId(CLIENT_BUILD_ID)) return; // un-stamped dev build — no signal
+export async function syncClientUpdateFromBuild(): Promise<boolean> {
+  if (isUnstampedBuildId(CLIENT_BUILD_ID)) return false; // Unstamped development build.
   // The refresh dismissal is now a GLOBAL preference (not synchronous
   // localStorage), so until preferences load we can't tell whether this build was
   // already dismissed. Skip rather than fail-open into a flash of an
   // already-dismissed toast on cold start; startClient re-runs this right after
   // loadPreferences, and resume / PreferencesChanged re-derive thereafter. A
   // 'failed' load proceeds (fail-open surfacing is the safe default).
-  if (!preferencesSettled.value) return;
+  if (!preferencesSettled.value) return false;
   const served = await getServedBuildId();
-  if (served === null) return; // couldn't determine — leave badge + toast unchanged
+  if (served === null) return false; // Leave the badge and toast unchanged.
   const stale = served !== CLIENT_BUILD_ID;
   // Badge = staleness alone: the persistent "refresh available" affordance that
   // survives a dismiss (the user can still refresh from the reload badge).
@@ -104,4 +104,5 @@ export async function syncClientUpdateFromBuild(): Promise<void> {
     // pin this build as dismissed).
     removeToast(UPDATE_TOAST_KEY);
   }
+  return stale;
 }

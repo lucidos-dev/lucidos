@@ -95,7 +95,7 @@ impl LucidosEngine {
                     )
                     .await
                 {
-                    log!("[FanOut] Child thread {} failed: {}", child_thread_id, e);
+                    log_legacy!("[FanOut] Child thread {} failed: {}", child_thread_id, e);
                 }
             },
         ));

@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use super::{LucidosEngine, ToolOutcome};
 
-use crate::gateway_operators::Reader;
+use crate::gateway_users::Reader;
 use crate::llm::tool_names as tn;
 use crate::scheduler::NotificationStore;
 

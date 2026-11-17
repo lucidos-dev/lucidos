@@ -25,6 +25,7 @@ name = "window_lifecycle_probe"
 required-features = ["window-probe"]
 
 [dependencies]
+lucidos-diagnostic-log = { path = "../lucidos-diagnostic-log" }
 # Tailnet state (CLI-free) + Tailscale CLI resolution for Mobile Access.
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 lucidos-home = { path = "../lucidos-home" }
@@ -36,7 +37,7 @@ lucidos-owner-lock = { path = "../lucidos-owner-lock" }
 # at uninstall, where it names what this uninstaller cannot remove.
 lucidos-installs = { path = "../lucidos-installs" }
 # The rule for the update address the gateway hands an update check.
-lucidos-update-address = { path = "../lucidos-update-address" }
+lucidos-update-channel = { path = "../lucidos-update-channel" }
 # image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
 # (install_tray in lib.rs). Not in tauri's default feature set.
 #
@@ -69,6 +70,8 @@ uuid = { version = "1", features = ["v4"] }
 # Asks `https://<name>` which gateway answers before the Access page calls it
 # served. The updater already compiles reqwest and rustls into the binary.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# The updater's HTTP client type, for Local's redirect policy.
+reqwest-updater = { package = "reqwest", version = "0.13", default-features = false }
 
 # Native macOS notifications via Apple's modern UserNotifications framework
 # (UNUserNotificationCenter), driven directly through objc2. Replaces the

@@ -270,6 +270,8 @@ async fn a_retracted_queued_message_stays_retracted_across_a_restart() {
         thread_id,
         ThreadEvent::QueuedMessageRemoved {
             removed_message_id: queued,
+            restore_to_compose: false,
+            compose: None,
         },
     )
     .await;
@@ -678,6 +680,8 @@ async fn a_retraction_mid_batch_still_beats_the_recovery() {
         thread_id,
         ThreadEvent::QueuedMessageRemoved {
             removed_message_id: second,
+            restore_to_compose: false,
+            compose: None,
         },
     )
     .await;

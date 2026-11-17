@@ -7,11 +7,11 @@
 //! command guard, the loop runs in-process: it blocks directly on the
 //! [`PermissionEntry`](crate::engine::cc_permission::PermissionEntry)'s broadcast
 //! channel and resumes when `POST /api/v1/mcp-permission/consent` sends the
-//! answer. The shared dedup / session-allow mechanism lives in
-//! [`crate::engine::cc_permission`] ([`PermissionState`]); the MCP-flavored
-//! allow-pattern derivation, the persisted `mcp-allowed-tools` allowlist, the
-//! reason constants, the superseded / orphan-recovery sweeps, and the
-//! in-process block orchestrator are here.
+//! answer. The shared dedup mechanism lives in [`crate::engine::cc_permission`]
+//! ([`PermissionState`]), and grants are *tool grants*
+//! ([`crate::engine::permission::tool_grants`]). The MCP-flavored allow-pattern
+//! derivation, the reason constants, the superseded / orphan-recovery sweeps,
+//! and the in-process block orchestrator are here.
 //!
 //! The card is skipped in two cases:
 //!   * the server's `auto_approve` flag (an independent, coarser server-level
@@ -25,17 +25,17 @@
 //! unresolved across a restart is cleared by
 //! [`recover_orphan_mcp_permission_requests`].
 
-use std::collections::HashSet;
 use std::sync::Mutex;
 
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::core::grants::{self, GrantFile};
+use crate::core::grants::GrantFile;
 use crate::engine::cc_permission::{DedupKey, PermissionAnswer, PermissionState};
 use crate::engine::claude_code::AllowScope;
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::permission::tool_grants::{self, AnsweredBy};
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 
@@ -57,8 +57,7 @@ pub const CANCELED_REASON: &str = "Canceled by user";
 ///
 ///   * `Narrow`  → `Mcp(<server>:<tool>)` — this specific tool on this server.
 ///   * `Broad`   → `Mcp(<server>:*)`      — any tool on this server.
-///   * `Session` → `Mcp(<server>:<tool>)` — per-tool, recorded in-memory per
-///     thread (not the file).
+///   * `Session` → `Mcp(<server>:<tool>)`, per tool, held by the thread.
 ///
 /// Always derivable for a non-empty `(server_id, tool)`; returns `None` only
 /// when either is empty (a malformed MCP tool name).
@@ -74,7 +73,7 @@ pub fn derive_mcp_allow_pattern(server_id: &str, tool: &str, scope: AllowScope) 
 
 /// Whether the granted pattern set covers `(server_id, tool)` — the auto-allow
 /// (skip the card) check. `allowed` answers "is this exact pattern granted?"
-/// over the union of the session set and the persisted allowlist.
+/// over the union of the thread's grants and the standing ones.
 ///
 /// A broad `Mcp(server:*)` grant covers every tool on that server; otherwise
 /// the exact `Mcp(server:tool)` must be granted.
@@ -86,37 +85,38 @@ pub fn mcp_is_allowed(server_id: &str, tool: &str, allowed: impl Fn(&str) -> boo
 }
 
 // ---------------------------------------------------------------------------
-// Persisted allowlist file (`mcp-allowed-tools`)
+// Tool grants (`mcp-allowed-tools`)
 // ---------------------------------------------------------------------------
 
-/// Record a granted "Always allow" by scope: `Session` into the in-memory
-/// per-thread allow set; `Narrow` / `Broad` into the persisted allowlist file
-/// ([`GrantFile::McpTools`]). No-op for scopes whose pattern doesn't derive.
-/// Mirrors `command_permission::record_command_allow_grant`.
-pub fn record_mcp_allow_grant(
+/// Record a granted "Always allow" by scope as a *tool grant*: `Session` held
+/// by the thread, `Narrow` / `Broad` standing. No-op for scopes whose pattern
+/// doesn't derive. Mirrors `command_permission::record_command_allow_grant`.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_mcp_allow_grant(
     engine: &LucidosEngine,
     thread_id: Uuid,
+    request_id: &str,
     server_id: &str,
     tool: &str,
     scope: AllowScope,
+    answered_by: AnsweredBy,
 ) {
     let Some(pattern) = derive_mcp_allow_pattern(server_id, tool, scope) else {
         return;
     };
-    match scope {
-        AllowScope::Session => {
-            let mut pending = engine.pending_mcp_permission.lock().unwrap();
-            pending.allow_session(thread_id, pattern);
-        }
-        AllowScope::Narrow | AllowScope::Broad => {
-            if let Err(e) = grants::append(&engine.grants_dir(), GrantFile::McpTools, &pattern) {
-                crate::log!(
-                    "[McpPermission] Failed to persist allow pattern {:?}: {}",
-                    pattern,
-                    e
-                );
-            }
-        }
+    if let Err(e) = tool_grants::record_card_allow(
+        &engine.event_bus,
+        &engine.grants_dir(),
+        GrantFile::McpTools,
+        thread_id,
+        request_id,
+        pattern.clone(),
+        scope,
+        answered_by,
+    )
+    .await
+    {
+        crate::log_legacy!("[McpPermission] Failed to record allow pattern {pattern:?}: {e}");
     }
 }
 
@@ -269,7 +269,7 @@ pub async fn resolve_pending_mcp_permissions_as_superseded(
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[McpPermission] unresolved-permission query failed for {}: {}",
                 thread_id,
                 e
@@ -329,7 +329,7 @@ pub async fn recover_orphan_mcp_permission_requests(pool: &sqlx::PgPool, event_b
     {
         Ok(r) => r,
         Err(e) => {
-            crate::log!("[Recovery] orphan MCP permission query failed: {}", e);
+            crate::log_legacy!("[Recovery] orphan MCP permission query failed: {}", e);
             return;
         }
     };
@@ -338,7 +338,7 @@ pub async fn recover_orphan_mcp_permission_requests(pool: &sqlx::PgPool, event_b
         return;
     }
 
-    crate::log!(
+    crate::log_legacy!(
         "[Recovery] Auto-resolving {} orphan MCP permission request(s) (chat turn gone after restart)",
         rows.len()
     );
@@ -349,7 +349,7 @@ pub async fn recover_orphan_mcp_permission_requests(pool: &sqlx::PgPool, event_b
             thread_id,
             request_id,
             false,
-            Some("Chat turn ended before answering — request expired".to_string()),
+            Some(crate::engine::cc_permission::RESTART_CLOSED_REASON.to_string()),
             None,
             EventMeta::NONE,
             "[Recovery] McpPermissionResolved (orphan)",
@@ -368,7 +368,7 @@ pub async fn resolve_mcp_permission(
     request_id: String,
     allowed: bool,
     persist_scope: Option<AllowScope>,
-    actor: Option<MessageOrigin>,
+    answered_by: AnsweredBy,
     log_context: &str,
 ) -> bool {
     let entry = {
@@ -395,7 +395,16 @@ pub async fn resolve_mcp_permission(
         if let Some((server_id, tool)) =
             crate::mcp::McpManager::parse_mcp_tool_name(&entry.tool_name)
         {
-            record_mcp_allow_grant(engine, entry.thread_id, &server_id, &tool, scope);
+            record_mcp_allow_grant(
+                engine,
+                entry.thread_id,
+                &request_id,
+                &server_id,
+                &tool,
+                scope,
+                answered_by.clone(),
+            )
+            .await;
         }
     }
     emit_mcp_permission_resolved(
@@ -405,7 +414,7 @@ pub async fn resolve_mcp_permission(
         allowed,
         reason,
         persist_scope,
-        EventMeta::with_actor(actor),
+        EventMeta::with_actor(answered_by.actor),
         log_context,
     )
     .await;
@@ -519,7 +528,7 @@ impl LucidosEngine {
         {
             Ok(row) => row.flatten(),
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[McpPermission] Failed to read the trigger of thread {}: {}",
                     thread_id,
                     e
@@ -555,7 +564,7 @@ impl LucidosEngine {
             )
             .await
         {
-            crate::log!(
+            crate::log_legacy!(
                 "[McpPermission] Failed to notify about a refused MCP call in thread {}: {}",
                 thread_id,
                 e
@@ -586,20 +595,16 @@ impl LucidosEngine {
         meta: &EventMeta,
         cancel_token: &CancellationToken,
     ) -> McpAsk {
-        // Auto-allow: prior "Allow for this thread" (session) and persisted
-        // "Always allow" (allowlist file) grants are unioned.
-        let session_patterns: HashSet<String> = {
-            let pending = self.pending_mcp_permission.lock().unwrap();
-            pending
-                .session_allows
-                .get(&thread_id)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let persisted = grants::patterns(&self.grants_dir(), GrantFile::McpTools);
-        if mcp_is_allowed(server_id, tool, |p| {
-            session_patterns.contains(p) || persisted.iter().any(|x| x == p)
-        }) {
+        // Auto-allow: the thread's own grants and the standing ones are
+        // unioned.
+        let granted = tool_grants::granted_lines(
+            &self.event_bus,
+            &self.grants_dir(),
+            GrantFile::McpTools,
+            Some(thread_id),
+        )
+        .await;
+        if mcp_is_allowed(server_id, tool, |p| granted.contains(p)) {
             return McpAsk::Proceed;
         }
 
@@ -872,21 +877,34 @@ mod tests {
         }
     }
 
-    /// The file and the gate agree: a broad grant persisted through
-    /// `core::grants` auto-allows a tool nobody has seen before. The file
-    /// mechanics themselves are covered in `core::grants`.
-    #[test]
-    fn a_persisted_broad_grant_auto_allows_a_fresh_tool_on_that_server() {
+    /// The grant and the gate agree: a broad grant a card stored auto-allows a
+    /// tool nobody has seen before. The grant mechanics themselves are covered
+    /// in `permission::tool_grants`.
+    #[tokio::test]
+    async fn a_standing_broad_grant_auto_allows_a_fresh_tool_on_that_server() {
+        use crate::test_support::{seed_coding_thread, setup_test_db, teardown_test_db};
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = seed_coding_thread(&bus, None).await;
         let tmp = tempfile::tempdir().unwrap();
-        let dir = grants::grants_dir(tmp.path());
-        grants::append(&dir, GrantFile::McpTools, "Mcp(github:*)").unwrap();
+        let dir = crate::core::grants_dir(tmp.path());
+        let pattern = derive_mcp_allow_pattern("github", "list_repos", AllowScope::Broad).unwrap();
+        tool_grants::record_card_allow(
+            &bus,
+            &dir,
+            GrantFile::McpTools,
+            thread_id,
+            "req",
+            pattern,
+            AllowScope::Broad,
+            AnsweredBy::tap(None),
+        )
+        .await
+        .unwrap();
 
-        let patterns = grants::patterns(&dir, GrantFile::McpTools);
-        assert!(mcp_is_allowed("github", "create_issue", |pat| patterns
-            .iter()
-            .any(|x| x == pat)));
-        assert!(!mcp_is_allowed("slack", "post_message", |pat| patterns
-            .iter()
-            .any(|x| x == pat)));
+        let granted = tool_grants::granted_lines(&bus, &dir, GrantFile::McpTools, None).await;
+        assert!(mcp_is_allowed("github", "create_issue", |p| granted.contains(p)));
+        assert!(!mcp_is_allowed("slack", "post_message", |p| granted.contains(p)));
+        teardown_test_db(&db).await;
     }
 }

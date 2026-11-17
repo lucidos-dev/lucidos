@@ -4,16 +4,19 @@
 //! gateway shares with us, `lucidos-frame-capability` (ADR 0238). This module
 //! is the engine's half: where the key comes from, and when a mint happens.
 //!
-//! # Only behind a gateway, and only for a frame
+//! # Only behind a gateway, for documents with opaque origins
 //!
 //! A direct-to-engine hit has no device gate to pass, so it needs no pass and
 //! gets none. Nothing is stamped into the document and the bytes are what they
 //! were. That is the ADR 0014 §4 shape every other rewrite here follows.
 //!
-//! A standalone app tab is a top-level document on a real origin, so the
+//! A local standalone app tab is a top-level document on a real origin, so the
 //! browser sends it the device cookie with every subresource. A pass there
 //! would sit in a page the user can read. It would also break the tab's links
 //! an hour later, where nothing was broken before.
+//! Remote app tabs are sandboxed by the connecting gateway (ADR 0723), so
+//! they need the same pass as a frame. The remote alias locates the workspace
+//! in the browser; the serving gateway verifies against its own workspace slug.
 
 use axum::http::HeaderMap;
 use lucidos_frame_capability as capability;
@@ -44,9 +47,15 @@ fn key() -> Option<capability::Key> {
 /// Trimming would therefore put a protocol-relative
 /// `<base href="//evil.com/…">` in the app's head, sending every relative ref
 /// to another host.
-fn slug_from_prefix(prefix: &str) -> Option<&str> {
-    let slug = prefix.strip_prefix('/')?.strip_suffix('/')?;
-    capability::is_url_safe_segment(slug).then_some(slug)
+fn scope_from_prefix(prefix: &str) -> Option<(&str, bool)> {
+    let segment = prefix.strip_prefix('/')?.strip_suffix('/')?;
+    let (slug, remote) = match segment.split_once(lucidos_gateway_constants::REMOTE_ROUTE_SEPARATOR)
+    {
+        Some((slug, gateway)) if capability::is_url_safe_segment(gateway) => (slug, true),
+        Some(_) => return None,
+        None => (segment, false),
+    };
+    capability::is_url_safe_segment(slug).then_some((slug, remote))
 }
 
 /// Mint a pass for an app frame, or `None` when this request needs none.
@@ -54,7 +63,7 @@ fn slug_from_prefix(prefix: &str) -> Option<&str> {
 /// `prefix` is [`base_path::forwarded_prefix`]'s answer, so `/` means no
 /// gateway.
 pub(super) fn mint(prefix: &str, app_id: &str) -> Option<String> {
-    let slug = slug_from_prefix(prefix)?;
+    let (slug, _) = scope_from_prefix(prefix)?;
     capability::mint(
         &key()?,
         slug,
@@ -64,17 +73,19 @@ pub(super) fn mint(prefix: &str, app_id: &str) -> Option<String> {
     )
 }
 
-/// Mint for a document the engine is about to serve, if it is a framed one.
+/// Mint for a frame or an opaque remote app tab.
 ///
 /// The framed test is `Sec-Fetch-Dest`, which a browser sets and page script
 /// cannot forge. A client sending no fetch metadata gets nothing, and loads
 /// exactly as it does today.
 pub(super) fn mint_for_document(headers: &HeaderMap, app_id: &str) -> Option<String> {
     let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
-    if !capability::is_nested_frame_dest(dest) {
+    let prefix = base_path::forwarded_prefix(headers);
+    let (_, remote) = scope_from_prefix(&prefix)?;
+    if !(capability::is_nested_frame_dest(dest) || remote && dest == Some("document")) {
         return None;
     }
-    mint(&base_path::forwarded_prefix(headers), app_id)
+    mint(&prefix, app_id)
 }
 
 #[cfg(test)]
@@ -99,6 +110,26 @@ mod tests {
             Some("site-publisher"),
             "the gateway must read back what we minted"
         );
+    }
+
+    #[test]
+    fn remote_documents_mint_for_the_workspace_at_the_verifying_gateway() {
+        let token = local_auth::publish_test_local_token();
+        let key = capability::derive_key(token);
+        for dest in ["iframe", "document"] {
+            let mut headers = framed("/dev@cloud/");
+            headers.insert("sec-fetch-dest", dest.parse().unwrap());
+            let minted = mint_for_document(&headers, "site-publisher")
+                .expect("remote documents are opaque even in a standalone tab");
+            assert_eq!(
+                capability::verify(&key, &minted, "dev", chrono::Utc::now().timestamp()).as_deref(),
+                Some("site-publisher")
+            );
+            assert!(
+                capability::verify(&key, &minted, "other", chrono::Utc::now().timestamp())
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -137,6 +168,10 @@ mod tests {
             "/deep/nested/",
             "/with space/",
             "/../",
+            "/dev@/",
+            "/@cloud/",
+            "/dev@cloud@other/",
+            "/dev@../",
         ] {
             assert_eq!(
                 mint_for_document(&framed(prefix), "site-publisher"),

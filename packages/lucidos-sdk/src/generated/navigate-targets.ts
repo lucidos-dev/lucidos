@@ -39,6 +39,7 @@ export const SETTINGS_VIEW_TARGETS = [
   'marketplaces',
   'access',
   'devices',
+  'users',
   'system',
   'system-overview',
   'appearance',

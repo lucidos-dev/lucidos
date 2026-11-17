@@ -86,7 +86,7 @@ Then set `theme` to the id.
 
 **Rules every theme must follow.** Every key is a token from § The theme token
 catalog, and nothing else: not the spacing or type scale, not `--z-*`, and not
-`--protected-*`. Every value is at most 120 characters and uses no `url(`,
+`--protected-*`. Every value is at most 256 UTF-16 units and uses no `url(`,
 `image-set(`, `expression(`, `;`, braces, `<`, `>`, `@`, backslash or `/*`.
 `var()`, `color-mix()`, `rgba()`, `calc()` and gradients are fine. A theme never
 sets `--font-ui`, `--font-family`, `--font` or the two `--font-features-*`

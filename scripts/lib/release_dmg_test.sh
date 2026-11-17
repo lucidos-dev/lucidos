@@ -5,8 +5,8 @@
 # Run: ./scripts/lib/release_dmg_test.sh
 #
 # THE BUG THIS PINS DOWN (F4 in docs/audits/2026-08-02-macos-update-path-audit.md).
-# refresh_dmg_payload writes `.rw.dmg` and `.zlib.dmg` next to the real artifact,
-# a run killed mid-refresh leaves one behind, and build-dmg.sh's main discovery
+# dmg_volume_assemble writes `.rw.dmg` and `.zlib.dmg` next to the real artifact,
+# a run killed mid-assembly leaves one behind, and build-dmg.sh's main discovery
 # was `find … -name '*.dmg' | head -1` with no exclusion and no arity check. The
 # version-stamp guard could not catch it either, because the leftovers carry the
 # same version string. The adopt path already had both checks, which is why the
@@ -37,7 +37,7 @@ new_dir() {  # <name>
 }
 
 # ── 1. The intermediate paths ────────────────────────────────────────────────
-echo "test: the intermediate paths compose the names refresh_dmg_payload writes"
+echo "test: the intermediate paths compose the names dmg_volume_assemble writes"
 D="/tmp/bundle/dmg/$REAL_NAME"
 got="$(release_dmg_rw_path "$D")"
 if [ "$got" = "/tmp/bundle/dmg/Lucidos_0.77.0_aarch64.rw.dmg" ]; then
@@ -120,7 +120,7 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "no .dmg found"; then
 else
     fail "expected a no-candidate refusal; got rc=$rc out: $out"
 fi
-if echo "$out" | grep -qi "killed mid-refresh"; then
+if echo "$out" | grep -qi "killed mid-assembly"; then
     pass "the refusal explains where the leftovers came from"
 else
     fail "the refusal does not explain the leftovers: $out"
@@ -188,14 +188,14 @@ if [ -z "$RAW_FIND" ]; then
 else
     fail "a raw '*.dmg' find bypasses the exclusion: $RAW_FIND"
 fi
-# The intermediate paths refresh_dmg_payload writes must come from the helpers,
+# The intermediate paths dmg_volume_assemble writes must come from the helpers,
 # not from a second copy of the suffix strings.
-REFRESH_FN="$(awk '/^refresh_dmg_payload\(\) \{/,/^\}/' "$BUILD_DMG")"
+REFRESH_FN="$(cat "$SCRIPT_DIR/dmg_volume.sh")"
 if printf '%s\n' "$REFRESH_FN" | grep -q 'release_dmg_rw_path' \
    && printf '%s\n' "$REFRESH_FN" | grep -q 'release_dmg_zlib_path'; then
-    pass "refresh_dmg_payload takes its intermediate paths from the shared helpers"
+    pass "dmg_volume_assemble takes its intermediate paths from the shared helpers"
 else
-    fail "refresh_dmg_payload still spells the intermediate suffixes itself"
+    fail "dmg_volume_assemble still spells the intermediate suffixes itself"
 fi
 
 echo ""

@@ -83,7 +83,7 @@ impl LimitPause {
         let Some(paused_until) = began else {
             return;
         };
-        crate::log!(
+        crate::log_legacy!(
             "[ChatGptPlan] Usage limit reached; pausing plan requests until {paused_until}"
         );
         if let Some(event_bus) = &self.event_bus {

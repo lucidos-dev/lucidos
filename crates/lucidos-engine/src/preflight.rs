@@ -134,10 +134,10 @@ async fn copy_and_boot(
     sqlx::query(&format!("CREATE DATABASE {}", quote_identifier(&copy)))
         .execute(&admin)
         .await?;
-    log!("[Preflight] Copying {source} to {copy}");
+    log_legacy!("[Preflight] Copying {source} to {copy}");
     let outcome = boot_copy(database_url, &source, &copy, scratch_dir, store).await;
     if let Err(e) = drop_database(&admin, &copy).await {
-        log!("[Preflight] Could not drop {copy}: {e}");
+        log_legacy!("[Preflight] Could not drop {copy}: {e}");
     }
     admin.close().await;
     outcome
@@ -152,7 +152,7 @@ async fn drop_leftover_copies(admin: &PgPool, source: &str) -> Result<(), BoxErr
             .fetch_all(admin)
             .await?;
     for name in leftovers {
-        log!("[Preflight] Dropping {name}, left by an earlier run");
+        log_legacy!("[Preflight] Dropping {name}, left by an earlier run");
         drop_database(admin, &name).await?;
     }
     Ok(())

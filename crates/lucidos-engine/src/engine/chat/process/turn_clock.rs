@@ -41,14 +41,14 @@ impl LucidosEngine {
         {
             Ok(Some(created)) => created,
             Ok(None) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Chat] thread {} has no events to read a clock from; using the wall clock for CURRENT TIME",
                     thread_id
                 );
                 Utc::now()
             }
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[Chat] turn clock read failed ({}); using the wall clock for CURRENT TIME",
                     e
                 );

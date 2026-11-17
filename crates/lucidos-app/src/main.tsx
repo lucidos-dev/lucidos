@@ -21,6 +21,7 @@ import { installStatusBarBlurClearance } from './utils/statusBarBlurClearance';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke, windowReadyToShow } from './utils/tauri';
+import { startPageHeartbeat } from './utils/heartbeat';
 import { handOverBootOwnership, setBootStatus } from './utils/bootSplash';
 import { startStartupStatusPolling } from './utils/startupStatus';
 import { adoptGatewayDeviceId, adoptRelayedDeviceId, reconcileDesktopDeviceId } from './store/actions/devices';
@@ -28,7 +29,6 @@ import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
 import { takePairingCodeFromUrl } from './utils/pairingCodeSeed';
 import { openAppById } from './store/actions/apps';
 import { startClient } from './store/startup';
-import { startPerfProbe } from './utils/perfProbe';
 import { installMainThreadStallProbe } from './utils/mainThreadStall';
 import './styles/global.css';
 import './styles/picker.css';
@@ -48,7 +48,6 @@ import './styles/drawer.css';
 // LAST, deliberately: it re-homes the glyph centring of badges declared across
 // the sheets above, and wins their `display` on source order. See badges.css.
 import './styles/badges.css';
-import './store/effects';
 import './store/actions/wipPreview';
 
 // What a hot update must tear down before this module runs again. Vite keeps
@@ -124,15 +123,15 @@ publishScrollbarGutter();
 
 // E2E test hook: Playwright opens an app by id from `page.evaluate`. The real
 // `openApp(app: App)` needs an `App` object the test does not hold, and
-// `openAppById` sits behind an ES import `page.evaluate` cannot reach. There is
-// no `#app=<id>` hash route either, so this window hook is the suite's only way
-// to open an app from outside the bundle.
+// `openAppById` sits behind an ES import `page.evaluate` cannot reach. The
+// `#app=<id>` hash route also fullscreens the app. So this window hook is the
+// suite's way to open one in the ordinary layout from outside the bundle.
 //
 // Installed unconditionally, and it MUST stay that way: the e2e bundle is a
 // production `vite build` (ADR 0014) over a checkout-shared `dist/`, so no
 // build-time flag scopes the hook to e2e. Shipping it everywhere is safe, since
 // `openAppById` only opens an installed app in the panel overlay.
-(window as unknown as { __openApp?: (id: string) => Promise<void> }).__openApp =
+(window as unknown as { __openApp?: (id: string) => Promise<boolean> }).__openApp =
   openAppById;
 
 // `IS_PICKER` picks the root component from the server-stamped `<base href>`
@@ -203,12 +202,10 @@ function stayOnStartingSplash(): void {
   // Painted now rather than a poll-tick from now, and matching
   // `desktop::STARTING_LABEL`, so a fast start never sees the text change.
   setBootStatus('Starting Lucidos…');
-  // As in startClient: the `catch` is a local no-op, and `invoke` reports bridge
-  // failures to the engine log itself (utils/ipcHealth). This splash runs on the
-  // bundled `tauri://localhost` origin, which the ACL treats as LOCAL. A
-  // heartbeat working here says nothing about the gateway origin (ADR 0028).
-  invoke('heartbeat').catch(() => {});
-  window.setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000);
+  // This splash runs on the bundled `tauri://localhost` origin, which the ACL
+  // treats as LOCAL. A heartbeat working here says nothing about the gateway
+  // origin (ADR 0028).
+  startPageHeartbeat();
   // Separate from the heartbeat and deliberately faster: the heartbeat's job is
   // to keep the crash watchdog quiet, and slowing this to its cadence would make
   // the elapsed counter jump in 15s steps. See utils/startupStatus.
@@ -220,6 +217,10 @@ function stayOnStartingSplash(): void {
 }
 
 async function boot() {
+  // A trusted picker must retire foreign workers/caches before any remembered
+  // remote workspace can open. A failure keeps boot closed and is reported by
+  // the boot failure handler below.
+  await (window as Window & { lucidosRemoteClientReady?: Promise<void> }).lucidosRemoteClientReady;
   // Frontend preview only (ADR 0055): adopt the `?device-id=` the preview link
   // carried, BEFORE the first API call or preference read. That resolves the
   // same device-scoped preferences instead of registering a new device, and it
@@ -253,7 +254,7 @@ async function boot() {
   // so the row this workspace keeps belongs to the device that paired. Also
   // hands the old row over, in the one window where both ids are known.
   //
-  // This is the FIRST await on the boot path, and unlike the reconcile below it
+  // This identity probe, unlike the reconcile below it,
   // is not desktop-only: browser and PWA pay it too. It is bounded for exactly
   // that reason. A gateway that accepts the connection and then stalls would
   // otherwise hold the boot splash with no ceiling. Adopting late costs only a
@@ -286,7 +287,13 @@ async function boot() {
     // longtask nor Long Animation Frames exists; it schedules nothing until perf
     // recording is switched on (utils/mainThreadStall.ts).
     if (!IS_PICKER) {
-      startPerfProbe();
+      // The probe loads as its own chunk, out of the entry chunk budget. Its
+      // observers read buffered entries, so a late start misses nothing. It is
+      // telemetry nobody asked for, so a failed load warns rather than toasts,
+      // and the next page load retries it.
+      import('./utils/perfProbe')
+        .then(({ startPerfProbe }) => startPerfProbe())
+        .catch((e: unknown) => console.warn('[perf] probe chunk failed to load', e));
       installMainThreadStallProbe();
       hmrTeardowns.push(startClient());
     }
@@ -304,7 +311,10 @@ async function boot() {
     );
   }
 }
-void boot();
+void boot().catch((error: unknown) => {
+  handOverBootOwnership();
+  setBootStatus(error instanceof Error ? error.message : 'Could not update remote workspace access. Retry from Manage workspaces.');
+});
 
 if (import.meta.hot) {
   import.meta.hot.accept();

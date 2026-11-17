@@ -28,7 +28,8 @@ worth keeping.
 ## Decision
 
 A park **hides every app window and destroys none**. `main` loses its special
-case rather than gaining company.
+case rather than gaining company. ADR 0718 extends retention to individual
+Cmd-W and red-button closes, using the same hide operation.
 
 A reopen puts back the whole arrangement. It shows every parked window, and
 builds any workspace the record names that this process no longer holds. It is

@@ -2,6 +2,7 @@ import { test, expect, Page, Locator } from './fixtures';
 import { randomUUID } from 'crypto';
 import { apiRequest, assertHealthy, navigateToApp, rightClickInsideFrame, waitForDashboardReady } from './helpers';
 import { ensureHomeThread, psql } from './db-helpers';
+import { stampPageRequests } from './harnessStamp';
 import { computeMinDashboardRailWidth } from '../src/store/paneMinimums';
 import { DASHBOARD_CELL_REM, DASHBOARD_GAP_REM } from '../src/utils/dashboardGeometry';
 
@@ -450,6 +451,7 @@ test.describe('dashboard on desktop', () => {
       expect(await order(page, ids.small)).toBe(before[1]);
 
       const other = await browser.newContext();
+      await stampPageRequests(other);
       const second = await other.newPage();
       await navigateToApp(second);
       await expect(tile(second, ids.small)).toBeVisible({ timeout: 15_000 });

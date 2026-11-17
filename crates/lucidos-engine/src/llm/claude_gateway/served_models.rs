@@ -89,7 +89,7 @@ impl ServedModels {
             ))));
         };
         if listed != base {
-            crate::log!("[ClaudeGateway] Sending {base} as the listed snapshot {listed}");
+            crate::log_legacy!("[ClaudeGateway] Sending {base} as the listed snapshot {listed}");
         }
         let wire_id = match one_million {
             true => format!("{listed}[1m]"),
@@ -196,7 +196,7 @@ async fn read_listing(origin: &GatewayOrigin, bearer: &str) -> Result<Listed, Bo
             None => return Ok(Listed::Ids(ids)),
         }
     }
-    crate::log!("[ClaudeGateway] {url} still had more models after {MAX_PAGES} pages");
+    crate::log_legacy!("[ClaudeGateway] {url} still had more models after {MAX_PAGES} pages");
     Ok(Listed::Ids(ids))
 }
 

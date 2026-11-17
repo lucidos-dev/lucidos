@@ -31,7 +31,7 @@ impl LucidosEngine {
         chat_start: std::time::Instant,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         let thread_id = claim.thread_id;
-        log!(
+        log_legacy!(
             "[Chat] [TIMING] pre-CC overhead: {:?}",
             chat_start.elapsed()
         );
@@ -93,7 +93,7 @@ impl LucidosEngine {
         let mut result = result;
         if let Err(ref e) = result {
             if e.to_string() == crate::engine::claude_code::STALE_RESUME_ERROR {
-                log!("[Chat] Stale CC resume — retrying with fresh session");
+                log_legacy!("[Chat] Stale CC resume — retrying with fresh session");
                 let retry_text = crate::engine::successor::resume_failed_input(
                     &self.pool,
                     thread_id,

@@ -18,7 +18,7 @@ use crate::engine::event_bus::{BusEvent, EmittedEvent, LagReplay, ReplayScope, S
 use crate::engine::thread_events::{ActorMode, MessageOrigin};
 use crate::engine::trigger_writes::{TriggerWrite, PREVIOUS_KEY};
 use crate::engine::LucidosEngine;
-use crate::gateway_operators::OperatorSnapshot;
+use crate::gateway_users::UserSnapshot;
 use crate::scheduler::notifications::Tap;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -111,7 +111,7 @@ impl ConfigUndo {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ConfigChange {
     pub title: &'static str,
-    /// What changed, without the person: `added the repository "x"`.
+    /// What changed, without the user: `added the repository "x"`.
     pub what: String,
     pub actor: Option<MessageOrigin>,
     pub undo: Option<ConfigUndo>,
@@ -353,9 +353,9 @@ fn trigger_change(event_type: &str, payload: &Value) -> Option<ConfigChange> {
 }
 
 /// Who made a change, as a notification names them.
-fn who(actor: &MessageOrigin, snapshot: &OperatorSnapshot) -> String {
-    match snapshot.operator_of_origin(actor) {
-        Some(person) => person.name,
+fn who(actor: &MessageOrigin, snapshot: &UserSnapshot) -> String {
+    match snapshot.user_of_origin(actor) {
+        Some(user) => user.name,
         None if actor.mode() == ActorMode::Agent => "An agent".to_string(),
         None => "Someone".to_string(),
     }
@@ -368,7 +368,7 @@ pub(crate) struct ConfigNotice {
     pub message: String,
     pub tap: Tap,
     /// Everyone's devices but the maker's. `None` is the whole team, for a
-    /// change no operator made.
+    /// change no user made.
     pub audience: Option<Vec<String>>,
 }
 
@@ -377,16 +377,16 @@ pub(crate) struct ConfigNotice {
 pub(crate) fn notice(
     change: &ConfigChange,
     event_id: Uuid,
-    snapshot: &OperatorSnapshot,
+    snapshot: &UserSnapshot,
 ) -> Option<ConfigNotice> {
-    if snapshot.person_count() < 2 {
+    if snapshot.user_count() < 2 {
         return None;
     }
     let actor = change.actor.as_ref()?;
-    let audience = match snapshot.operator_of_origin(actor) {
+    let audience = match snapshot.user_of_origin(actor) {
         Some(maker) => {
             let others: std::collections::BTreeSet<String> = snapshot
-                .person_ids()
+                .user_ids()
                 .into_iter()
                 .filter(|id| *id != maker.id)
                 .flat_map(|id| snapshot.devices_of(id))
@@ -422,14 +422,14 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
         while let Some(frames) = replay.read(rx.recv().await, engine.pool()).await {
             for frame in frames {
                 if let Err(e) = announce(&engine, &frame).await {
-                    log!(
+                    log_legacy!(
                         "[ConfigChange] Cannot post a config change notification: {}",
                         e
                     );
                 }
             }
         }
-        log!("[ConfigChange] Config change stream ended");
+        log_legacy!("[ConfigChange] Config change stream ended");
     })
 }
 
@@ -440,11 +440,7 @@ async fn announce(engine: &LucidosEngine, frame: &EmittedEvent) -> Result<(), Bo
     let Some(change) = change_of(event.event_type(), &event.to_payload()) else {
         return Ok(());
     };
-    let Some(notice) = notice(
-        &change,
-        frame.event_id,
-        &crate::gateway_operators::current(),
-    ) else {
+    let Some(notice) = notice(&change, frame.event_id, &crate::gateway_users::current()) else {
         return Ok(());
     };
     engine

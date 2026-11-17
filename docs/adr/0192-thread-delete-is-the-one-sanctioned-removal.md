@@ -2,6 +2,7 @@
 
 - **Status**: Accepted
 - **Date**: 2026-09-16
+- **Amended by**: [0647](0647-only-a-signed-claim-proves-the-owner.md): closes the typed-device-id residual
 
 ## Context
 

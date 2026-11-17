@@ -255,7 +255,7 @@ pub enum EventClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Action {
+pub enum ThreadAction {
     /// Discard the focused thread's unsent compose draft (close layer 1).
     /// Serializes as `"discard_draft"`.
     DiscardDraft,
@@ -292,15 +292,26 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "ThreadUnarchived" => EventClass::Metadata,
         // A proposal records what the agent offered; the reply moves things.
         "ThreadTriageProposed" => EventClass::Metadata,
-        // Thread people mark who steers a family, not its work (ADR 0623).
+        // Thread users mark who steers a family, not its work (ADR 0623).
         "WorkItemDriverTaken"
         | "WorkItemDriverReleased"
         | "WorkItemGateEscalated"
         | "WorkItemWatched"
         | "WorkItemUnwatched" => EventClass::Metadata,
-        // A people-only message and the agent pause start no turn and move no
+        // A user-only message and the agent pause start no turn and move no
         // status: that is the whole point of them (ADR 0649).
-        "PeopleMessagePosted" | "AgentPaused" | "AgentResumed" => EventClass::Metadata,
+        "UserOnlyMessagePosted" | "AgentPaused" | "AgentResumed" => EventClass::Metadata,
+        // The automation pause gates the engine's automatic steps. Pausing
+        // or unpausing starts no turn and moves no status.
+        "AutomationPaused" | "AutomationUnpaused" => EventClass::Metadata,
+        // A permission changing state starts no turn and moves no status.
+        // Nor does preparing a request: its card moves the thread itself.
+        "PermissionGranted"
+        | "PermissionSpent"
+        | "PermissionRestored"
+        | "PermissionRevoked"
+        | "PermissionRequestPrepared"
+        | "BatchItemRan" => EventClass::Metadata,
         // A read decision and a sighting mark the reply, not the thread's
         // work, so none bumps recency (ADR 0409).
         "ThreadReadRequested" | "ThreadReadNotRequested" | "ThreadReplySeen" => {
@@ -337,10 +348,16 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "SessionStarted"
         | "ContinuationStarted"
         | "CodingAgentSettingsChanged"
+        | "CodingAgentBillingObserved"
         | "ChatSettingsChanged"
+        | "ChatTurnSettingsResolved"
         | "CodingAgentCompacted"
+        | "CodingAgentModelSubstituted"
         | "SuccessorThreadSpawned"
         | "SessionHandedOff"
+        | "PlanProposed"
+        | "PlanApproved"
+        | "PlanStarted"
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
         | "SuccessorRequested"
@@ -387,10 +404,16 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // so they don't bump status / activity (the paired ToolCalled /
         // ToolResult already covers that for the started case, and
         // completion happens outside any LLM turn).
-        "BackgroundBashStarted" | "BackgroundBashCompleted" => EventClass::Metadata,
-        // An owner approval asked for and spent (ADR 0387). The card and the
-        // act each move the thread on their own, so both are Metadata.
-        "OwnerApprovalRequested" | "OwnerApprovalSpent" => EventClass::Metadata,
+        "BackgroundBashStarted" | "BackgroundBashCompleted" | "ConfinementRunStarted" => {
+            EventClass::Metadata
+        }
+        // The retired single-use card, asked for and spent (ADR 0387). The
+        // card and the act each moved the thread on their own.
+        "OwnerApprovalRequested" | "OwnerApprovalSpent" | "UnattestedActSpent" => {
+            EventClass::Metadata
+        }
+        // A broker act on an agent's own workspace, recorded inside its turn.
+        "MachineMadeWorkspaceChanged" => EventClass::Metadata,
         // Command-guard checkpoint lifecycle: a pure card / audit projection,
         // so neither bumps status or activity (ADR 0002, Phase 4).
         "CommandCheckpointed" | "CommandCheckpointReverted" => EventClass::Metadata,
@@ -578,9 +601,17 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "WorkItemGateEscalated",
         "WorkItemWatched",
         "WorkItemUnwatched",
-        "PeopleMessagePosted",
+        "UserOnlyMessagePosted",
         "AgentPaused",
         "AgentResumed",
+        "AutomationPaused",
+        "AutomationUnpaused",
+        "PermissionGranted",
+        "PermissionSpent",
+        "PermissionRestored",
+        "PermissionRevoked",
+        "PermissionRequestPrepared",
+        "BatchItemRan",
         "ThreadStarted",
         "ThreadDiscarded",
         "HomeThreadCreated",
@@ -613,10 +644,16 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "FormRequestResolved",
         "McpConsentRequested",
         "CodingAgentSettingsChanged",
+        "CodingAgentBillingObserved",
         "ChatSettingsChanged",
+        "ChatTurnSettingsResolved",
         "CodingAgentCompacted",
+        "CodingAgentModelSubstituted",
         "SuccessorThreadSpawned",
         "SessionHandedOff",
+        "PlanStarted",
+        "PlanProposed",
+        "PlanApproved",
         "HandoffCheckpointReached",
         "SuccessorOfferDeclined",
         "SuccessorRequested",
@@ -642,8 +679,11 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Background-bash lifecycle (run_bash_background trio).
         "BackgroundBashStarted",
         "BackgroundBashCompleted",
+        "ConfinementRunStarted",
         "OwnerApprovalRequested",
         "OwnerApprovalSpent",
+        "UnattestedActSpent",
+        "MachineMadeWorkspaceChanged",
         // Engine-internal Flash enrichment for MessageReceived images.
         "ImageDescribed",
         // The cached older-turn summary. Persisted because the event IS the
@@ -813,9 +853,14 @@ pub fn resolve_transition(
         | "ChildReportTaken"
         | "MissingHardeningDetected"
         | "CodingAgentSettingsChanged"
+        | "CodingAgentBillingObserved"
         | "CodingAgentCompacted"
+        | "CodingAgentModelSubstituted"
         | "SuccessorThreadSpawned"
         | "SessionHandedOff"
+        | "PlanProposed"
+        | "PlanApproved"
+        | "PlanStarted"
         | "HandoffCheckpointReached"
         | "SuccessorOfferDeclined"
         | "SuccessorRequested"
@@ -912,10 +957,10 @@ pub fn resolve_transition(
             ThreadType::Chat => no_change,
             ThreadType::CodingAgent => violation("McpPermissionResolved is chat-only"),
         },
-        // A rung pick between turns (ADR 0544). Only the Lucidos Agent reads it.
-        "ChatSettingsChanged" => match thread_type {
+        // Next-turn picks and applied turn settings (ADR 0544) are chat-only.
+        "ChatSettingsChanged" | "ChatTurnSettingsResolved" => match thread_type {
             ThreadType::Chat => no_change,
-            ThreadType::CodingAgent => violation("ChatSettingsChanged is chat-only"),
+            ThreadType::CodingAgent => violation("Chat settings events are chat-only"),
         },
         // Events legal for both, no section change
         "MessageReceived"
@@ -959,9 +1004,17 @@ pub fn resolve_transition(
         | "WorkItemGateEscalated"
         | "WorkItemWatched"
         | "WorkItemUnwatched"
-        | "PeopleMessagePosted"
+        | "UserOnlyMessagePosted"
         | "AgentPaused"
         | "AgentResumed"
+        | "AutomationPaused"
+        | "AutomationUnpaused"
+        | "PermissionGranted"
+        | "PermissionSpent"
+        | "PermissionRestored"
+        | "PermissionRevoked"
+        | "PermissionRequestPrepared"
+        | "BatchItemRan"
         | "TriggerStarted"
         | "TriggerCompleted"
         | "ChangeReverted"
@@ -1032,11 +1085,15 @@ pub fn resolve_transition(
         // thread for no user-visible reason.
         | "BackgroundBashStarted"
         | "BackgroundBashCompleted"
-        // An owner approval's request and spend (ADR 0387). Legal on both
-        // thread types, since the gate is shared. No section change: the
-        // card and the act each make their own.
+        | "ConfinementRunStarted"
+        // The retired single-use card's request and spend (ADR 0387). Legal
+        // on both thread types, so stored rows replay. No section change.
         | "OwnerApprovalRequested"
         | "OwnerApprovalSpent"
+        | "UnattestedActSpent"
+        // A broker act on an agent's own workspace. No section change: the
+        // agent's turn already holds the thread.
+        | "MachineMadeWorkspaceChanged"
         // Engine-internal Flash enrichment of a prior MessageReceived's
         // attached images. Emitted one or more iterations after the
         // originating MessageReceived (which already moved the section);
@@ -1353,7 +1410,7 @@ impl CodingAgentChangeState {
                 reason: reason.and_then(UnproposedReason::parse),
             },
             None => {
-                crate::log!("[ThreadLifecycle] Unknown coding_agent_change_state {kind:?}");
+                crate::log_legacy!("[ThreadLifecycle] Unknown coding_agent_change_state {kind:?}");
                 Self::Unproposed { reason: None }
             }
         }
@@ -1688,7 +1745,7 @@ pub fn available_thread_actions(
     has_live_event_waits: bool,
     has_unsent_draft: bool,
     is_saved: bool,
-) -> Vec<Action> {
+) -> Vec<ThreadAction> {
     let mut actions = Vec::new();
     // A thread holding an *event wait* is NOT live: the subscription does not
     // hold its turn, so it settles at `idle` and keeps Archive (ADR 0049).
@@ -1698,7 +1755,7 @@ pub fn available_thread_actions(
     // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be
     // discarded whether or not the thread is live.
     if has_unsent_draft {
-        actions.push(Action::DiscardDraft);
+        actions.push(ThreadAction::DiscardDraft);
     }
     // Layers 2 & 3 — change resolution then archive. Both are suppressed while
     // the thread is live (mid-turn). A pending change outranks archive: the
@@ -1722,12 +1779,12 @@ pub fn available_thread_actions(
     if !live {
         if coding_agent_pending {
             if !has_live_event_waits {
-                actions.push(Action::Discard);
-                actions.push(Action::Apply);
-                actions.push(Action::SetAside);
+                actions.push(ThreadAction::Discard);
+                actions.push(ThreadAction::Apply);
+                actions.push(ThreadAction::SetAside);
             }
         } else if stored_section == ArchiveState::Inbox && !descendants_block_archive {
-            actions.push(Action::Archive);
+            actions.push(ThreadAction::Archive);
         }
     }
     // The standing apply, offered while the thread is *settling*: running,
@@ -1742,13 +1799,13 @@ pub fn available_thread_actions(
     if thread_type == ThreadType::CodingAgent
         && (status == ThreadStatus::Running || status == ThreadStatus::Paused || watching)
     {
-        actions.push(Action::ApplyWhenSettled);
+        actions.push(ThreadAction::ApplyWhenSettled);
     }
     // Retention toggle — available in any run state, exactly one of the pair.
     if is_saved {
-        actions.push(Action::Unsave);
+        actions.push(ThreadAction::Unsave);
     } else {
-        actions.push(Action::Save);
+        actions.push(ThreadAction::Save);
     }
     actions
 }
@@ -1804,8 +1861,8 @@ pub const LAST_ACTIVITY_EVENTS: &[&str] = &[
     "VoiceSessionStarted",
     "SpokenMessageReceived",
     "SpokenReplyGenerated",
-    // People talking in a thread is activity on it, though no turn runs.
-    "PeopleMessagePosted",
+    // Users talking in a thread is activity on it, though no turn runs.
+    "UserOnlyMessagePosted",
 ];
 
 /// Event types that increment message_count in the thread_summaries projection.

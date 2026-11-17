@@ -3,28 +3,37 @@
 use std::sync::Arc;
 
 use serde_json::{json, Value};
+
+use crate::api::gateway_stamp::test_support::stamp_for;
 use uuid::Uuid;
 
 pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation: Uuid) {
     let pool = engine.pool().clone();
     let device = "recovery-test-device";
     // This device was paired after capture; never recreate it after restore.
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert("x-lucidos-device-id", device.parse().unwrap());
-    assert!(
-        crate::api::actor::require_owner_device_for(&headers, &pool, None, "owner-required")
-            .await
-            .is_ok()
-    );
+    let mut headers = crate::api::gateway_stamp::test_support::stamped_device_headers(device);
+    assert!(crate::api::actor::require_owner_device_for(
+        &headers,
+        &pool,
+        None,
+        "owner-required",
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .await
+    .is_ok());
     headers.insert(
         "x-lucidos-device-id",
         "revoked-snapshot-device".parse().unwrap(),
     );
-    assert!(
-        crate::api::actor::require_owner_device_for(&headers, &pool, None, "owner-required")
-            .await
-            .is_err()
-    );
+    assert!(crate::api::actor::require_owner_device_for(
+        &headers,
+        &pool,
+        None,
+        "owner-required",
+        crate::api::owner_door::OnUnattested::Refuse,
+    )
+    .await
+    .is_err());
     let scheduler = crate::scheduler::SchedulerManager::new(engine.clone(), pool.clone())
         .await
         .unwrap();
@@ -70,6 +79,10 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
         let response = client
             .post(format!("{base}{path}"))
             .header("x-lucidos-device-id", device)
+            .header(
+                lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+                stamp_for(device),
+            )
             .header("x-lucidos-restore-generation", generation.to_string())
             .json(&body)
             .send()
@@ -99,6 +112,10 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
         client
             .post(&url)
             .header("x-lucidos-device-id", device)
+            .header(
+                lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+                stamp_for(device),
+            )
             .header("x-lucidos-restore-generation", generation.to_string())
             .json(&body)
     };
@@ -135,6 +152,10 @@ pub(super) async fn verify(engine: Arc<crate::engine::LucidosEngine>, generation
     let edit = client
         .put(format!("{url}/{id}/compose"))
         .header("x-lucidos-device-id", device)
+        .header(
+            lucidos_gateway_stamp::HEADER_GATEWAY_STAMP,
+            stamp_for(device),
+        )
         .header("x-lucidos-restore-generation", generation.to_string())
         .json(
             &json!({"text": "Edited after recovery", "selection": edited_selection,

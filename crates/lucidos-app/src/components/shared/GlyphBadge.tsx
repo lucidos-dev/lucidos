@@ -42,8 +42,7 @@ export function GlyphBadge({ children, ...props }: JSX.HTMLAttributes<HTMLSpanEl
       restyles.disconnect();
     };
   }, []);
-  // Only text has ink to move. The brand badge's spinner and hourglass keep
-  // the flex centring badges.css gives an icon.
+  // Only text has ink to move; structured children retain their own layout.
   const text = typeof children === 'string' || typeof children === 'number';
   return (
     <span {...props} ref={ref}>

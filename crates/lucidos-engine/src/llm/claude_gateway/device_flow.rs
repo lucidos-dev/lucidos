@@ -153,7 +153,7 @@ async fn poll(
             Ok(TokenReply::Granted(tokens)) => return Ok(tokens),
             Ok(TokenReply::Refused(refusal)) => refusal,
             Err(e) => {
-                crate::log!(
+                crate::log_legacy!(
                     "[ClaudeGateway] The sign-in poll failed, trying again: {}",
                     e
                 );

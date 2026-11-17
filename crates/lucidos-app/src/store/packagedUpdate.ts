@@ -8,7 +8,7 @@
  * in. The *System attention badge* asks exactly that, from the menu-drawer button.
  */
 import { clientOfferedRelease, latestTauriAppVersion, releaseCheck } from './store';
-import { isNewerVersion } from '../utils/version';
+import { isNewerBuildId, isNewerVersion } from '../utils/version';
 
 /**
  * The newer version available to install, or `null`.
@@ -27,7 +27,9 @@ export function packagedUpdateVersion(): string | null {
   const announced = releaseCheck.value?.latest;
   if (announced) return announced.version;
   return newerThan(clientOfferedRelease.value, window.__LUCIDOS_APP_RELEASE__)
-    ?? newerThan(latestTauriAppVersion.value, window.__LUCIDOS_APP_VERSION__);
+    ?? (latestTauriAppVersion.value && window.__LUCIDOS_APP_VERSION__
+      && isNewerBuildId(latestTauriAppVersion.value, window.__LUCIDOS_APP_VERSION__)
+      ? latestTauriAppVersion.value : null);
 }
 
 function newerThan(latest: string | null, current: string | undefined): string | null {

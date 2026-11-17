@@ -27,7 +27,7 @@ impl BrowserRuntime {
                     }
                     Ok(None) => {}
                     Err(e) => {
-                        log!("[Browser] Headless blocklist lookup failed for {domain}: {e}");
+                        log_legacy!("[Browser] Headless blocklist lookup failed for {domain}: {e}");
                     }
                 }
             }
@@ -48,13 +48,13 @@ impl BrowserRuntime {
                     if let Some(ref domain) = domain {
                         if let Err(e) = HeadlessBlocklist::block(&self.pool, domain, &reason).await
                         {
-                            log!(
+                            log_legacy!(
                                 "[Browser] Failed to record headless block for {}: {}",
                                 domain,
                                 e
                             );
                         } else {
-                            log!(
+                            log_legacy!(
                                 "[Browser] Recorded headless block for {}: {}",
                                 domain,
                                 reason
@@ -112,7 +112,7 @@ impl BrowserRuntime {
         } else {
             // Wait for page to load
             if let Err(e) = page.wait_for_navigation().await {
-                log!("[Browser] Navigation timeout (continuing): {}", e);
+                log_legacy!("[Browser] Navigation timeout (continuing): {}", e);
             }
         }
 

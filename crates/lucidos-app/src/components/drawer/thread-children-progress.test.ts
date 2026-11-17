@@ -252,6 +252,7 @@ describe('family disclosure consistency across row types', () => {
       ...makeThread('search-thread').meta,
       messageCount: 5,
       activeChildrenCount: 1,
+      awaitedChildrenCount: 1,
       totalChildrenCount: 3,
     };
 

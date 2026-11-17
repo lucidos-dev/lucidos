@@ -122,6 +122,14 @@ describe('handleMarkdownLinkClick', () => {
     expect(mocks.openAppById).toHaveBeenCalledWith('pr-understanding', 'a notification', 'pr-1645');
   });
 
+  it('opens a colon-anchored Settings row without a toast', () => {
+    expect(clickFirstLink('[Agent sandbox](settings:permissions#agent-sandbox:unsandboxed)')).toBe(true);
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith({
+      target: 'settings', settings_view: 'permissions', fragment: 'agent-sandbox:unsandboxed',
+    });
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
   it('opens a panel link', () => {
     clickFirstLink('[Triggers](triggers)');
     expect(mocks.handleNavigationRequest).toHaveBeenCalledWith({ target: 'triggers' });

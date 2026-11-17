@@ -31,6 +31,9 @@ pub enum CancelCause {
     /// and resumed it at the new effort. Never emitted since the rung locks
     /// for a turn (ADR 0542). Still a redirect, so old rows render neutrally.
     EffortRestart,
+    /// The owner answered Don't allow on the card a coding-agent start waited
+    /// on, so the agent never started. Not a failure: nothing broke.
+    Refused,
     /// Pre-typed-cause legacy event, or a now-removed cause string (e.g. the
     /// retired `stale_settle` cancel cause that's now an abort cause). Catches
     /// anything unrecognized so old DB rows replay cleanly. Never emit fresh.
@@ -39,11 +42,12 @@ pub enum CancelCause {
 }
 
 impl CancelCause {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::UserStop,
         Self::UserAction,
         Self::SupersededByFollowup,
         Self::EffortRestart,
+        Self::Refused,
         Self::Unknown,
     ];
 
@@ -54,6 +58,7 @@ impl CancelCause {
             Self::UserAction => "user_action",
             Self::SupersededByFollowup => "superseded_by_followup",
             Self::EffortRestart => "effort_restart",
+            Self::Refused => "refused",
             Self::Unknown => "unknown",
         }
     }
@@ -260,7 +265,7 @@ pub enum EventWaitCancelCause {
     /// before 2026-08-07 carry it and events are append-only: dropping the arm
     /// would replay them as [`Self::Unknown`] and lose why they ended.
     ///
-    /// A Stop is turn-scoped. Cancelling unrelated subscriptions from it killed
+    /// A Stop holds engine wakes, but leaves subscriptions live. Cancelling them killed
     /// a watch armed two hours earlier with nothing anywhere saying so, and a
     /// subscription has not held a turn since ADR 0049, so it was never part of
     /// what a Stop owns. Do not re-add the emit; see `api::chat::cancel_chat`.
@@ -294,6 +299,8 @@ pub enum UnproposedReason {
     PlanMissing,
     /// A plan is recorded but the user has not approved it.
     PlanAwaitingApproval,
+    /// Approval for later does not cover the branch's code changes.
+    PlanOnlyCode,
     /// A bounded security fix reaches past the files it named.
     OutsideBound,
     /// The work never ran `/harden`, so Apply would harden it first.
@@ -312,9 +319,10 @@ pub enum UnproposedReason {
 }
 
 impl UnproposedReason {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::PlanMissing,
         Self::PlanAwaitingApproval,
+        Self::PlanOnlyCode,
         Self::OutsideBound,
         Self::HardeningMissing,
         Self::TurnIncomplete,
@@ -327,6 +335,7 @@ impl UnproposedReason {
         match self {
             Self::PlanMissing => "plan_missing",
             Self::PlanAwaitingApproval => "plan_awaiting_approval",
+            Self::PlanOnlyCode => "plan_only_code",
             Self::OutsideBound => "outside_bound",
             Self::HardeningMissing => "hardening_missing",
             Self::TurnIncomplete => "turn_incomplete",
@@ -348,6 +357,7 @@ impl From<ProposalHold> for UnproposedReason {
             ProposalHold::Plan(PlanHold::AwaitingApproval | PlanHold::PlanOnlyAwaitingApproval) => {
                 Self::PlanAwaitingApproval
             }
+            ProposalHold::Plan(PlanHold::PlanOnlyCode) => Self::PlanOnlyCode,
             ProposalHold::Plan(PlanHold::OutsideBound) => Self::OutsideBound,
             ProposalHold::HardeningMissing => Self::HardeningMissing,
             ProposalHold::IntegratedIntoParent => Self::IntegratedIntoParent,
@@ -364,6 +374,16 @@ pub enum AgentPauseCause {
     Mention,
     /// Someone tapped the pause chip above the composer.
     Chip,
+}
+
+/// Which owner act ended a thread's *automation pause*.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomationUnpauseCause {
+    /// The owner picked Unpause on a permission request.
+    Unpause,
+    /// The owner archived the thread.
+    Archived,
 }
 
 /// Why a change left the landing lane without landing.

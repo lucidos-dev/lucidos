@@ -3,6 +3,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 
 use super::*;
+use crate::core::oauth::CallbackPageState;
 use crate::core::oauth_callback::{deliver_callback, BrowserContext, CallbackDelivery};
 use crate::llm::chatgpt_plan::id_token::tests::signed_id_token;
 use crate::llm::chatgpt_plan::mock_auth::MockAuth;
@@ -177,10 +178,13 @@ async fn a_delivered_callback_completes_the_sign_in() {
     assert_eq!(f.emitted("ChatGptPlanSignInStarted").await, 1);
     f.grant_for(&started);
 
-    let delivered = deliver_callback(&callback(&started, "oaiapp_1"));
+    let delivered = deliver_callback(&callback(&started, "oaiapp_1")).await;
     assert!(matches!(
         delivered,
-        CallbackDelivery::Accepted { ok: true, .. }
+        CallbackDelivery::Accepted {
+            state: CallbackPageState::Connected,
+            ..
+        }
     ));
     assert_eq!(settled(&sign_in).await, SignInState::Idle);
     let account = ChatGptPlanAccountStore::get(&f.pool)
@@ -200,8 +204,11 @@ async fn a_refused_callback_fails_the_attempt_and_says_why() {
     let state = param(&started, "state");
     let query = format!("error=access_denied&state={}", urlencoding::encode(&state));
     assert!(matches!(
-        deliver_callback(&query),
-        CallbackDelivery::Accepted { ok: false, .. }
+        deliver_callback(&query).await,
+        CallbackDelivery::Accepted {
+            state: CallbackPageState::Refused,
+            ..
+        }
     ));
     let SignInState::Failed { error } = settled(&sign_in).await else {
         panic!("a denial fails the attempt");
@@ -226,7 +233,7 @@ async fn an_attempt_nobody_finishes_times_out() {
     assert!(error.contains("timed out"), "{error}");
     assert!(
         matches!(
-            deliver_callback(&callback(&started, "oaiapp_1")),
+            deliver_callback(&callback(&started, "oaiapp_1")).await,
             CallbackDelivery::Unclaimed { .. }
         ),
         "a timed-out attempt takes no callback"
@@ -245,7 +252,7 @@ async fn a_new_start_supersedes_the_running_attempt() {
     assert_ne!(param(&first, "state"), param(&second, "state"));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        deliver_callback(&callback(&first, "oaiapp_1")),
+        deliver_callback(&callback(&first, "oaiapp_1")).await,
         CallbackDelivery::Unclaimed { .. }
     ));
     assert!(matches!(sign_in.state(), SignInState::Pending { .. }));
@@ -266,7 +273,7 @@ async fn sign_out_cancels_the_attempt_and_closes_its_slot() {
     assert_eq!(f.emitted("ChatGptPlanSignInCanceled").await, 1);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(matches!(
-        deliver_callback(&callback(&started, "oaiapp_1")),
+        deliver_callback(&callback(&started, "oaiapp_1")).await,
         CallbackDelivery::Unclaimed { .. }
     ));
     f.done().await;

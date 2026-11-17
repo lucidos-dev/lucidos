@@ -12,7 +12,7 @@ vi.mock('../../api/client', () => ({
   API: 'http://localhost:3000/api/v1',
   isTransportError: () => false,
 }));
-vi.mock('../actions/thread-sync', () => ({
+vi.mock('../actions/thread-stream', () => ({
   connectThreadEvents: vi.fn(),
   disconnectThreadEvents: vi.fn(),
   reviveThreadEvents: vi.fn(),

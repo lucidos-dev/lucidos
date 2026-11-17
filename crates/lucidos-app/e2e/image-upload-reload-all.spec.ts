@@ -59,7 +59,7 @@ async function holdUploads(page: Page): Promise<() => void> {
   const held = new Promise<void>((resolve) => { release = resolve; });
   await page.route(BLOB_ROUTE, async (route: Route) => {
     await held;
-    await route.continue().catch(() => {});
+    await route.fallback().catch(() => {});
   });
   return release;
 }

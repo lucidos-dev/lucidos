@@ -20,9 +20,10 @@
  * a fake microphone by Playwright. The suffix is what keeps this file out of
  * the two mobile projects, one of which is WebKit.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 import { apiRequest, gotoWithRetry, hideDashboardRail, newThread, setVoiceEnabled, waitForVisibleInput } from './helpers';
 import { ensureHomeThread } from './db-helpers';
+import { stampPageWebSockets } from './harnessStamp';
 
 // A fake capture device, so `getUserMedia` resolves with no hardware and no
 // consent prompt. Both flags are needed: one supplies the device, the other
@@ -55,6 +56,7 @@ test.describe('a call the engine cannot take', () => {
   // window: no rail, no drawer, no Canvas.
   test.beforeEach(async ({ page }) => {
     await hideDashboardRail(page);
+    await stampPageWebSockets(page, /\/api\/v1\/voice\?/);
     await page.addInitScript(() => {
       localStorage.setItem('lucidos-thread-drawer-open', 'false');
       localStorage.setItem('lucidos-split-ratio', '1');

@@ -9,7 +9,8 @@ import {
 import { COPY_ICON } from './copyIcons';
 import { makeInertBody } from './escapeHtml';
 import { addMarkdownParseMs } from './renderPhaseTimers';
-import { REMOTE_GATEWAY, WORKSPACE_ID, workspaceRouteUrlSegment } from './basePath';
+import { BASE_PATH, REMOTE_GATEWAY, WORKSPACE_ID, workspaceRouteUrlSegment } from './basePath';
+import { scopeRemoteContent } from './remoteContent';
 import { THREAD_LINK_SOURCE, linkedWorkspaceRoute, resolveLinkedWorkspace } from './threadLinkWorkspace';
 import { landingHash } from './workspaceLanding';
 import { createHeadingSlugger, HEADING_ID_PREFIX } from './headingSlug';
@@ -232,6 +233,7 @@ const URL_ATTRIBUTES = [
 function stripDangerousUrlSchemes(node: Node): void {
   const el = node as Element;
   if (typeof el.getAttribute !== 'function') return;
+  if (REMOTE_GATEWAY !== null) scopeRemoteContent(el, BASE_PATH, location.origin);
   for (const name of URL_ATTRIBUTES) {
     const value = el.getAttribute(name);
     if (value === null) continue;

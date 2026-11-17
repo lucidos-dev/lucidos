@@ -17,11 +17,14 @@ use crate::engine::thread_lifecycle::ChangeStateKind;
 mod actions;
 pub(crate) mod archive;
 pub(crate) mod archive_all;
+mod automation_pause;
 mod background_tasks;
 mod cache_keep_alive;
 mod cache_warmth;
 pub(super) mod child_reports;
+mod confinement_run;
 pub(super) mod context_ceiling;
+mod create_draft;
 mod delete;
 mod detach;
 mod events_snapshot;
@@ -29,8 +32,10 @@ mod expected_wake;
 mod family;
 mod follow_up;
 mod list;
+mod liveness;
 mod read_request;
 mod search;
+mod submit_draft;
 mod successor;
 mod switch_estimate;
 mod wake_decision;
@@ -50,6 +55,8 @@ pub(super) use list::{
     get_thread_summary, list_drafts, list_held_messages, list_thread_summaries, list_threads,
 };
 pub(super) use search::search_threads;
+#[cfg(test)]
+pub(crate) use submit_draft::tests::verify_submit_draft_transports;
 
 /// Parse a `:thread_id` path segment, refusing a malformed one with a 400.
 fn parse_thread_id(raw: &str) -> Result<Uuid, (StatusCode, String)> {
@@ -90,7 +97,7 @@ struct ThreadActionFacts {
 pub(in crate::api) async fn available_thread_actions_for(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
-) -> Result<Vec<crate::engine::thread_lifecycle::Action>, sqlx::Error> {
+) -> Result<Vec<crate::engine::thread_lifecycle::ThreadAction>, sqlx::Error> {
     use crate::engine::thread_lifecycle::{
         available_thread_actions, ArchiveState, ChangeWork, ThreadStatus, ThreadType,
     };
@@ -145,7 +152,14 @@ pub(super) fn router() -> Router<super::AppState> {
         .route("/threads", post(super::threads_compose::post_thread))
         .route("/threads/list", get(list_thread_summaries))
         .route("/threads/count", get(count_thread_summaries))
-        .route("/threads/drafts", get(list_drafts))
+        .route(
+            "/threads/drafts",
+            get(list_drafts).post(create_draft::create_draft),
+        )
+        .route(
+            "/threads/:thread_id/submit-draft",
+            post(submit_draft::submit_draft),
+        )
         .route("/threads/held-messages", get(list_held_messages))
         .route("/threads/archived-count", get(get_archived_count))
         .route("/threads/search", get(search_threads))
@@ -233,6 +247,10 @@ pub(super) fn router() -> Router<super::AppState> {
             post(background_tasks::stop_background_task),
         )
         .route(
+            "/threads/:thread_id/confinement-tests",
+            post(confinement_run::run_confinement_tests),
+        )
+        .route(
             "/threads/:thread_id/child-reports/take",
             post(child_reports::take_child_reports),
         )
@@ -256,6 +274,7 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/cache-warmth",
             get(cache_warmth::get_cache_warmth),
         )
+        .route("/threads/:thread_id/liveness", get(liveness::get_liveness))
         .route(
             "/threads/:thread_id/context-ceiling",
             put(context_ceiling::set_context_ceiling),
@@ -263,6 +282,10 @@ pub(super) fn router() -> Router<super::AppState> {
         .route(
             "/threads/:thread_id/cache-keep-alive",
             post(cache_keep_alive::switch_cache_keep_alive),
+        )
+        .route(
+            "/threads/:thread_id/automation-pause",
+            post(automation_pause::pause).delete(automation_pause::unpause),
         )
         .route(
             "/threads/:thread_id/switch-estimate",

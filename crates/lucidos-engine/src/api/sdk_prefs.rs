@@ -122,7 +122,7 @@ pub(super) async fn serve_sdk_prefs_js(
     let mut prefs = match PreferenceStore::get_all_for_device(&state.pool, device).await {
         Ok(prefs) => prefs,
         Err(e) => {
-            log!("[SdkPrefs] first-paint seed unavailable, the app corrects itself: {e}");
+            log_legacy!("[SdkPrefs] first-paint seed unavailable, the app corrects itself: {e}");
             Default::default()
         }
     };
@@ -229,22 +229,6 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The boot script reads the global this route prepends. Two halves of one
-    /// contract in two languages, so a rename on either side has to be a rename
-    /// on both.
-    #[test]
-    fn the_seed_the_script_reads_is_the_one_this_route_writes() {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../packages/lucidos-sdk/src/boot/appearanceBoot.ts"),
-        )
-        .expect("the boot source exists");
-        assert!(
-            source.contains(&format!(".{SEED_GLOBAL};")),
-            "appearanceBoot.ts must read globalThis.{SEED_GLOBAL}"
-        );
-    }
 
     /// A stored preference map. The expected seed lines below spell their keys
     /// out, because that JSON is the wire format the boot script reads.
@@ -386,5 +370,25 @@ mod tests {
             seed_at < bundle_at,
             "the bundle reads the seed, so it must run after it"
         );
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// The boot script reads the global this route prepends. Two halves of one
+        /// contract in two languages, so a rename on either side has to be a rename
+        /// on both.
+        #[test]
+        fn the_seed_the_script_reads_is_the_one_this_route_writes() {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../packages/lucidos-sdk/src/boot/appearanceBoot.ts"),
+            )
+            .expect("the boot source exists");
+            assert!(
+                source.contains(&format!(".{SEED_GLOBAL};")),
+                "appearanceBoot.ts must read globalThis.{SEED_GLOBAL}"
+            );
+        }
     }
 }

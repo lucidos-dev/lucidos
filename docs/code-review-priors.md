@@ -1,5 +1,24 @@
 # Code-review priors — verified non-bugs
 
+- **Remote-client retirement fails closed when storage cannot be inspected.**
+  A rejected worker or cache enumeration does not prove legacy executable state is absent.
+  ADR 0723 requires retirement before remote navigation; the trusted entry displays the failure and keeps its completion marker unset.
+  Re-flag silent failure or remote navigation despite incomplete retirement, rather than replacing an unknown result with success.
+  (`public/remote-client-upgrade.js`, `src/main.tsx`.)
+
+- **Form synchronization uses the API client's request deadlines.**
+  Both pending and resolved form reads call `json`, which defaults to a ten-second deadline.
+  Holding the form-sync lock across those reads does not introduce an unbounded network fetch.
+  Re-flag a read that bypasses `json` or disables its deadline.
+  (`api/client/settings.ts`, `api/client/_core.ts`.)
+
+- **Uncertain interactive deliveries persist across reloads intentionally.**
+  The approved coordination plan retains uncertain requests rather than silently expiring them.
+  Dismissing a page's warning does not acknowledge a possibly unpresented request.
+  A new page can show the warning again; explicit Retry or form resolution settles it.
+  Re-flag automatic replay or silent loss, rather than retention itself.
+  (`store/interactiveDelivery.ts`, ADR 0721.)
+
 Patterns in this codebase that **look like bugs to a fresh reviewer and are
 not**. Every entry was flagged by a review agent, then dismissed by reading
 the cited source. Review agents (human or LLM) should consult this file
@@ -14,6 +33,13 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 "looks wrong, isn't" patterns that don't warrant an ADR.
 
 ## CLI
+
+- **A plan approval SHA describes the blob at approval time.** The engine
+  records that committed blob before the CLI updates its status line.
+  A later status-only commit does not retroactively change the event's fact.
+  `ChangeApplied.content` records content kind, not an approved-blob equality
+  assertion. Re-flag if approval records an uncommitted or different blob.
+  (`engine/plan_lifecycle.rs`, `crates/lucidos-cli/src/planned.rs`.)
 
 - **The connection retry window bounds when attempts may start.** A reviewer
   asks for a final attempt after the last backoff reaches the deadline.
@@ -39,17 +65,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Repository gates
 
-- **A stale published engine fails the source build, including e2e setup.**
-  A reviewer asks non-background callers to tolerate a stale artifact after
-  the bounded rebuild. That would run tests against an engine that does not
-  represent the checkout. E2e builds from its isolated worktree or pinned
-  commit; a live Apply elsewhere cannot advance its HEAD. The build-only
-  subprocess's exit 75 names HEAD movement, while e2e setup maps a failed
-  build to a failure before any tests run. Re-flag only if an unrelated live
-  checkout controls the e2e build inputs.
-
-  (`scripts/lib/workspace.sh`, `scripts/lib/e2e.sh`, ADR 0617.)
-
 - **Codegen checks coverage on the test executables that contain its writers.**
   A reviewer asks for freshness-only checks on every test-profile artifact.
   The CLI writer and clap tree share a binary test target; exempting it would
@@ -71,6 +86,71 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a marker conceals current terminology or a changed identifier.
 
 ## Rust engine
+
+- **Device-session prechecks fail closed against an older gateway.** Its strict
+  request schema refuses `check_only`; this is an explicit error before any mint.
+  Falling back would bypass the paired-device refusal that the old gateway lacks.
+  Update the gateway before using device sessions with the new engine.
+  Re-flag if an unsupported check silently mints or grants authority.
+  (`api/workspace_broker.rs`, `lucidos-gateway/src/broker.rs`.)
+
+- **Codex's bounded stop drain can reach its deadline normally.** Neither
+  Codex driver promises `OutputEnded` before process-group teardown, so the
+  usage receiver can wait its full two seconds. The deadline log describes
+  that bound, without claiming a missing flush or lost call. A zero wait
+  loses usage when the driver finishes mapping a notification after cancel.
+  Re-flag a wait beyond the bound or a capture lost within it.
+  (`engine/agent_session/run_session/run.rs`, `record_usage_flushed_at_stop`.)
+
+- **Equal billing attribution can attest fresh evidence.** A reviewer asks to
+  deduplicate `CodingAgentBillingObserved` rows when their values match.
+  Codex reads account, config and provider evidence before each turn; Claude's
+  initialize and status replies are separate observations.
+  These passive observations preserve when the CLI supplied the evidence without adding usage.
+  Re-flag a repeated row with no new observation, or one counted as usage.
+  (`runtime/codex_app_server.rs`, `runtime/claude_code_parse.rs`,
+  `engine/agent_session/run_session/run.rs`.)
+
+- **A drained ceiling re-entry does not strand its owed handoff.** A reviewer
+  flags its conversion to a generic engine re-entry because the old session's
+  ceiling-turn flags no longer apply. The drain follows that session's exit.
+  Every new run claim settles its owed ceiling handoff before resolving the
+  backend, so the replacement runs the successor rather than the old session.
+  Another live run must have passed the same claim gate already.
+
+  Re-flag if orphan replay bypasses that gate or skips its settlement.
+  (`engine/agent_session/spawn_claim.rs` `claim_thread_waiting`, pinned by
+  `the_claim_settles_the_owed_handoff_before_it_reads_the_backend`.)
+
+- **A closed lane thread's skipped handoff stays pending.** A reviewer asks
+  `successor_to_start` to end the stale engine handoff it skips. ADR 0675
+  chose to emit nothing: the only enders are a person's or a session's acts,
+  and an engine-written withdraw would be misattributed. The cost is one
+  skipped start and a log line per boot. Lane threads have no parent, so no
+  parent wake reads the handoff.
+
+  Re-flag if a closed lane thread's pending handoff starts a turn, holds a
+  parent, or blocks a user action.
+  (`engine/successor.rs` `successor_to_start`, ADR 0675.)
+
+- **The agent worktree hook installer skips the worktree config scope.** A
+  reviewer asks it to honour a user's own worktree-scoped `core.hooksPath`.
+  Lucidos creates these worktrees and owns that scope: every session start
+  rewrites it to `.lucidos/git-hooks`, so a user value there cannot persist.
+  Remembering one needs a recorded chain path, and that record pinned stale
+  targets for good (UA-2327). Re-flag only if Lucidos stops owning the
+  worktree's `config.worktree`. (`repo_hooks_path` in
+  `crates/lucidos-engine/src/engine/git_ops/worktree.rs`.)
+
+- **An agent turn sends through a spend cap hold, a trigger's turn included.**
+  A reviewer reports that scheduled trigger turns bypass the hold, since every
+  `TurnSlot` declares itself interactive. ADR 0652 gates only background work:
+  "the agent's own turns still send". A refused turn costs no tokens and
+  probes a raised cap.
+
+  The writer resolves before a file tool writes, also on purpose, so no
+  artifact lands without its writer. Re-flag if ADR 0652 changes which callers
+  a hold gates. (`crates/lucidos-engine/src/engine/model_call/mod.rs`.)
 
 - **The read-time mask leaves secret-reference credentials out on purpose.**
   A reviewer asks `stored_secret_values` to fail closed whenever a reference
@@ -120,13 +200,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   the starting run holds (ADR 0506). Re-flag only if a tombstone path bypasses
   both.
 
-- **An unmeasured context takes the plan card's small branch.** A reviewer
-  reports that `card_shape` (`crates/lucidos-cli/src/planned.rs`) offers a new
-  thread when `input_tokens` is null, and asks for the plain floor. That is the
-  design: the small card offers a new thread only for a cheaper implementer,
-  which pays off at any size (ADR 0497). A handoff needs only `can_hand_off`.
-  Only an unreadable engine reply (`ContextReading::Unknown`) keeps the floor.
-  Re-flag only if the small card offers this thread's own implementer.
+- **An unmeasured context can still offer a fresh session.** `card_shape`
+  (`crates/lucidos-cli/src/planned.rs`) needs a readable ladder and
+  `can_hand_off`, not a measured `input_tokens` value. At plan approval,
+  fresh-session choices are mandatory regardless of the estimate (ADR 0708).
+  Other checkpoints retain their intelligence-fit recommendation rules.
+  An unreadable reply or blocked handoff keeps the floor.
 
 - **A lane batch's integration branch may carry commits beyond its landing
   merges.** A reviewer reports that the landing check finds each member's
@@ -154,7 +233,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   reviewer reports that `lucidos_home::ensure()?` at the top of the gateway's
   `run()` breaks a launch with `LUCIDOS_GATEWAY_DATA` set and `HOME` unset.
   That launch never booted: `run()` also mints the local token with
-  `auth::ensure_local_token()?`, which resolves `~/.lucidos/local-token` and
+  `auth::ensure_local_token()?`, which resolves the private entry `local-token` and
   fails fatally without `HOME`. Re-flag only if the token stops living under
   `HOME`. (`lucidos-gateway/src/server.rs`, `lucidos-local-token`.)
 
@@ -190,6 +269,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   so the edit itself needs a permission card. The session's own next spawn
   re-reads the file anyway, as Claude Code does in a clone (ADR 0327). Re-flag
   only if side questions gain a tool.
+
+- **Completed sub-thread archiving preserves inherited family pins.** The scoped
+  control uses triage's existing family pin rule, as the approved plan requires.
+  Pinning the family root therefore excludes its descendants too, even when
+  individual members are unpinned. Re-flag only if the scoped action's pin
+  contract changes. (`thread_triage/facts.rs`, `archive_all.rs`.)
 
 - **The archive request resolver hears a descendant settle through its
   ancestor's own events.** A reviewer reports a request stuck on
@@ -1161,7 +1246,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `module_label(module_path!())` (`crates/lucidos-engine/src/lib.rs`), whose
   default arm is the module's own last segment. So `api::browser_origin` emits
   `[browser_origin]`, and the message's own `[API]` follows it. The full line is
-  `HH:MM:SS [pid:N] [browser_origin] [API] refused …`, and a grep for either
+  `<stamp> [pid:N] [browser_origin] [API] refused …`, and a grep for either
   prefix finds it.
 
   Re-flag only where the quoted label matches NEITHER the module segment (after
@@ -1421,6 +1506,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Desktop client (Tauri, macOS)
 
+- **Ordinary closes retain every packaged app window.** Cmd-W and red-button
+  closes hide pages; New Window can therefore grow the retained session.
+  Reopen and relaunch restore that arrangement. A retention cap or discarding
+  closed pages contradicts the approved contract (ADR 0718 and
+  `docs/plans/2026-11-16-consistent-desktop-window-close.md`).
+  Re-flag only if deliberate teardown or development stops genuinely closing.
+- **Native notification taps may reuse a retained hidden window.** Native tap
+  targeting chooses by workspace and does not prefer shown peers. Interactive
+  page requests use their own shown-peer election. Do not substitute that
+  election for native tap policy (ADR 0718 and the consistent-close plan).
+  Re-flag if a tap lands in another workspace or fails to show its target.
+
 - **`unread_targets` returning `(Option<String>, String)` is a deliberate
   asymmetry, and collapsing it to two `Option`s reintroduces a shipped bug.** A
   reviewer will read the tuple as an inconsistency (both halves are "a label or
@@ -1497,6 +1594,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   evidence the fallthrough cannot reach a browser.
 
 ## Frontend
+
+- **A compose submission ends the restoration journal even if a newer draft survives.**
+  Consumption is the approved journal boundary (ADR 0710).
+  Keeping entries whenever the stored text differs can revive content already sent from another device.
+  A newer draft may have replaced the submitted draft before acceptance obtained its row lock.
+  Re-flag only with an exact submission/restoration identity contract that distinguishes those histories.
+  (`core/store/threads/compose.rs`, `consume_compose_slot`.)
+
+- **Chat Stop restoration survives a lost response through durable compose.**
+  Removal and restoration commit together; the removal stores the exact compose report (ADR 0710).
+  Stop responses, SSE and subsequent reads reconcile compose rather than append again.
+  Transport errors still surface; repeating Stop does not replay a second restoration.
+  Re-flag if a stale compose write can erase restored text or images, or Edit appends after Stop won the removal.
+  (`api/client/chat.ts`, `engine/consumption_claim.rs`.)
+
+- **Ongoing opens judge reached positions by turn, including saved rows.**
+  A reviewer asks to compare a saved row against a failure card within its turn.
+  The approved decision in ADR 0680 treats any position inside the target turn as reached.
+  Rows resolve their owning turn just as line and turn anchors do.
+  This preserves the reader's place within that turn.
+
+  Re-flag only if the product changes its reached rule to compare individual steps.
+  (`store/thread-events/exchange-anchors.ts` `readerHasReached`.)
 
 - **A widget box's `body.scrollWidth` counts a sideways spill.** Reviewers
   read `overflow-x: clip` on `body` in `sdk_iframe.css` and expect a clipped
@@ -2839,18 +2959,17 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-app/src/utils/linkifyPaths.ts`.)
 
 - **The waiting indicator naming MORE sub-threads than the server counts is
-  the honest direction, not an off-by-one.** `unfinishedSubThreads`
+  the honest direction, not an off-by-one.** `awaitedSubThreads`
   (`components/chat/WaitingPanel.tsx`) resolves rows from `threadMap` and
   subtracts only in one direction: a shortfall becomes an "and N more" row, and
   a surplus is listed. Codex flagged the surplus as P2 on the branch that added
   the panel, asking for the rows to be capped to the server's count.
 
-  A capped list would hide a child the rest of the UI draws as running, since
-  the drawer row reads the same `effectiveThreadStatus` this does. The cut would
+  A capped list would hide a child the engine flags as awaited. The cut would
   also land on the newest child, which is the one that just started and the
   reason the count is briefly behind. Every listed row is a real sub-thread of
-  this parent, unfinished by the engine's own two counts: mid-turn
-  (`active_thread_statuses()`), or a *waiting child* (ADR 0254).
+  this parent that the engine flags `awaited_by_parent`, the same flag the
+  count counts (ADR 0672).
 
   The asymmetry with the `count <= 0` early return is deliberate and is the
   performance gate: the count decides WHETHER the thread is waiting on children,
@@ -4641,24 +4760,6 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   attributable and turn this into a real gap. Pinned by
   `an_unstamped_call_is_untouched`.
 
-- **The retraction check before a queued message is announced is a check then
-  an act, and that window is not closable here.** A reviewer sees
-  `filter_removed_queued_prompts` followed by an awaited
-  `emit_prompt_injected_event` (`chat/rerun.rs`, and the same pair in
-  `api::chat::announce_orphan_batch`) and asks for an atomic conditional write.
-
-  Three things make the residual acceptable. The check runs per message rather
-  than per batch, so the window is one statement rather than the whole announce
-  loop. The other side guards too: the removal endpoint refuses with 409 once a
-  `PromptInjected` names the message. And an atomic form would have to write
-  the event outside `EventBus`, which CLAUDE.md names as the single entry point
-  for event persistence.
-
-  The live orphan path carries the identical window, so closing it only in the
-  recovery would split one mechanism in two. Re-flag with a shape that keeps
-  every emit inside `EventBus`. Re-flag too if the consequence grows past the
-  model reading a message the user retracted a moment earlier.
-
 ## Product copy
 
 - **An event-type chip showing plain words, with the raw type only on its
@@ -4889,3 +4990,116 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
   Re-flag if an adoption commits before its hand-over resolves, or if boot
   registers anything that the hand-over does not move.
+
+- **Unread people-message delivery intentionally has no expiry.** The approved
+  delivery policy retries pending targets with stable notification identities.
+  Offline native clients may receive an unread message after reconnecting.
+  Reading it cancels recovery; receipts prevent completed targets from replaying.
+  Backoff bounds repeated attempts at an hour. Expiring pending intent would
+  restore the restart-loss gap this feature fixes.
+
+  Re-flag if a read notification retries, a completed target replays, or retries
+  lack backoff. An old unread notification reaching an offline recipient is
+  the intended durable-delivery behavior, not a stale transient frame.
+
+- **A draining engine never reads as healthy to a gateway probe.** A reviewer
+  notes that a gateway restarting during an engine's Stop drain could take the
+  engine back, since it still answers `/api/v1/health`.
+
+  The stop signal marks the engine shutting down before anything drains
+  (`begin_teardown` in `main.rs`). From then on, health answers 503
+  `shutting_down`, and the probe reads a non-success status as not healthy.
+  So `boot_all` leaves the workspace stopped.
+
+  Re-flag if health keeps answering 200 during a drain, or if the probe starts
+  reading a 503 body.
+
+- **Fit renderer expiry bounds selected requests too.** The approved renderer
+  contract gives credentials 120 seconds from registration, not an unused-only
+  TTL. Selection does not renew authority. A report after expiry must refuse,
+  even while the fit operation waits; its result remains explicitly unchecked.
+  Launchers register immediately before each check.
+
+  Re-flag if expiry produces
+  a passing fit note or selection silently extends credential lifetime.
+  (`engine/widget_fit_sessions.rs`, `docs/widget-fit-renderer.md`.)
+
+- **Push own-count fallback must wait for a known gateway reader.**
+  `scheduler/push.rs::unread_counts_by_device` uses `gateway_users::known()`.
+  Before the first directory answer, `current()` looks like an empty single-reader
+  directory even when the gateway has multiple users. Counting as Team then
+  leaks a shared total into personal badges. An omitted badge during that window
+  is intentional.
+
+  Re-flag only if the directory becomes known and a valid
+  recipient still cannot get their own count. Legacy direct-engine subscriptions
+  retain single-reader counts; unidentified gateway recipients never use them.
+
+- **Focus newest toast includes a timed toast's close X.** The shortcut
+  reaches the first control of the newest toast that offers one. Every timed
+  toast now offers its X, so a newer passive toast takes priority over an
+  older Retry action. This matches the shortcut's contract in the glossary.
+  Escape dismisses the focused toast; the shortcut can then reach the next.
+
+  Re-flag if focus skips the newest toast with controls or moves there without
+  the user invoking the shortcut.
+  (`components/shared/Toast.tsx`, `focusNewestToast`.)
+
+- **Passing retries accept standalone test edits outside the retry subset.**
+  ADR 0689 explicitly allows PASS after exclusively standalone test/spec commits
+  since the last full round started, including no commits. The retry runs only
+  what failed. Requiring every changed test to run would restore coverage that
+  this approved policy deliberately forgoes. Product edits, fixtures, imported
+  helpers and unverifiable history still require the full set.
+
+  Re-flag only if the classifier admits those excluded paths or loses the
+  original full-round baseline. Rust test modules referenced by product files
+  conservatively require RERUN; rejecting uncertain consumers is also deliberate.
+
+- **Codex config/read returns an MCP object even with no configured servers.**
+  A live app-server probe with a fresh, empty `CODEX_HOME` returned
+  `config.mcp_servers: {}`. The side-question driver requires this object
+  before disabling inherited servers and forking. A missing or non-object
+  value fails closed; accepting it as empty could leave inherited tools enabled.
+  Re-flag only with a supported CLI response that omits the object.
+
+- **Crash mount breadcrumbs count resource churn, including images and history.**
+  The counters describe mounted resources, not active decoders or unanswered
+  questions. Icons and historical question bodies intentionally contribute.
+  The twelve-event ring retains recent churn; it does not reserve slots for
+  semantic importance. Periodic resource samples remain in a separate ring.
+  Re-flag if code or documentation claims these are only live question cards
+  or videos (`utils/crashMonitor.ts`, `utils/crashBreadcrumbs.ts`).
+
+- **Video posters preserve the existing reload behaviour after intent.**
+  A player starts without a media source until play, scrub or full screen.
+  After intent, returning on screen reloads its saved position as before.
+  The approved poster scope preserves that behaviour, including paused clips.
+  Re-flag if an untouched player loads media, or release stops unloading it.
+  (`system-widgets/lucidos-video-player/index.html`, ADR 0709.)
+
+- **The external mixed-trust regression must pass `managed=false`.**
+  It proves that the admin probe rejects while another loaded rule admits an admin,
+  despite password-only disk rules. It then checks that external provenance refuses admission.
+  Passing `true` would falsely designate that external fixture as bundled provisioning.
+  The separate stale-HBA regression exercises the defense checks with managed provenance.
+
+  Re-flag if the fixture stops asserting the successful alternate connection or rejected admin probe.
+  (`runtime/agent_sandbox_native_tests.rs`, ADR 0720.)
+
+- **The older-engine authentication warning has no planned sunset.**
+  Adoption can discover an older binary after any number of gateway upgrades.
+  The conditional warning and admission refusal name the owner's Switch action without restarting that engine.
+  They implement permanent compatibility guidance, excluded from the temporary-measures registry.
+  Re-flag if a release limit or a concrete removal condition is introduced.
+  (`lucidos-gateway/src/server.rs`, `runtime/agent_sandbox.rs`, ADR 0720.)
+
+- **The ORT mirror proof deliberately rejects cache-only build output.**
+  `block-ort-upstream.sh --assert` requires a mirror fetch in every discovered output.
+  A second build-script run can reuse dfbin and emit no fetch line.
+  That output cannot certify its origin, so the CI proof fails closed.
+  The source smoke workflow wipes dfbin and build outputs before installing.
+
+  Re-flag with evidence that this workflow runs ort-sys twice after that wipe;
+  accepting any mirror line would let stale evidence mask an uncertified output.
+  (`scripts/block-ort-upstream.sh`, `scripts/lib/onnxruntime_block_test.sh`.)

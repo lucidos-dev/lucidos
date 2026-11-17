@@ -17,15 +17,17 @@ pub use messages::{
     format_child_report_filed_block, format_child_thread_completed_block, ChangeStatuses,
 };
 use sqlx::PgPool;
-pub(crate) use threads::format_display_title;
 pub use threads::{
     active_thread_statuses, attach_reader_fields, char_length, consume_compose_slot,
     fetch_thread_aggregate, has_draft, parse_status_filter_csv, parse_status_filter_values,
     status_value_list, still_working_sql, text_preview, thread_link, ComposeReport,
-    ComposeReportRow, DraftSummary, EventWaitSummary, FilterFacet, FilterFacets, LegacyInitiator,
-    MessageMatch, StatusFilter, ThreadAggregate, ThreadSearchResult, ThreadSummary,
-    ThreadSummaryFilters, COMPOSE_REPORT_COLS, HAS_DRAFT_SQL, PREVIEW_CHARS, UNTITLED_THREAD,
+    ComposeReportRow, ComposeRestoration, DraftSummary, EventWaitSummary, FilterFacet,
+    FilterFacets, LegacyInitiator, MessageMatch, StatusFilter, ThreadAggregate, ThreadSearchResult,
+    ThreadSummary, ThreadSummaryFilters, COMPOSE_REPORT_COLS, HAS_DRAFT_SQL, MAX_COMPOSE_IMAGES,
+    MAX_COMPOSE_SELECTION_BYTES, MAX_COMPOSE_TEXT_BYTES, PREVIEW_CHARS, UNTITLED_THREAD,
 };
+pub(crate) use threads::{compose_report_cols, restore_compose_slot};
+pub(crate) use threads::{format_display_title, is_thread_ancestor, pin_legacy_compose_agents};
 pub use types::*;
 use uuid::Uuid;
 

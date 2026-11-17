@@ -5,14 +5,12 @@ import { cancelThreadEventWait } from '../../api/client';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import {
-  effectiveThreadStatus,
   eventConditionDoor,
   focusedThreadId,
-  isMidTurn,
   showToast,
   threadMap,
 } from '../../store/store';
-import type { EventSubscription, EventWaitSummary, ThreadMeta, ThreadState } from '../../store/thread-events';
+import type { EventSubscription, EventWaitSummary, ThreadState } from '../../store/thread-events';
 import {
   awaitedSubject,
   formatRemaining,
@@ -70,22 +68,22 @@ function backToWaitingList(): void {
  *  visibly stutter. */
 const COUNTDOWN_TICK_MS = 1000;
 
-/** The sub-thread half of a wait: the unfinished children this client can
- *  name, and how many more the server counts. */
+/** The sub-thread half of a wait: the awaited children this client can name,
+ *  and how many more the server counts. */
 export interface SubThreadWait {
-  /** Unfinished children resolved from the loaded `threadMap`, oldest first. */
+  /** Awaited children resolved from the loaded `threadMap`, oldest first. */
   threads: ThreadState[];
-  /** Unfinished children the server counts that the loaded map cannot name,
+  /** Awaited children the server counts that the loaded map cannot name,
    *  so the panel can say so instead of showing a short list. */
   unresolved: number;
 }
 
 const NO_SUB_THREADS: SubThreadWait = { threads: [], unresolved: 0 };
 
-/** The focused thread's unfinished children, for the *waiting indicator*.
+/** The focused thread's *awaited children*, for the *waiting indicator*.
  *
  *  **The server's count decides, and the map only names.** The count is
- *  `unfinishedChildCount`, reconciled in-transaction against ground truth.
+ *  `awaitedChildrenCount`, reconciled in-transaction against ground truth.
  *  `threadMap` is a paginated cache, which may hold all of a parent's children
  *  or none.
  *
@@ -95,33 +93,26 @@ const NO_SUB_THREADS: SubThreadWait = { threads: [], unresolved: 0 };
  *  Almost no thread is waiting on children. The price is one SSE round trip of
  *  lag on a child seen starting before its parent's aggregate lands.
  *
- *  Unfinished means mid-turn (`isMidTurn`, the engine's
- *  `active_thread_statuses()`), or idle while holding its own live event wait
- *  (ADR 0254). Those are the engine's two counts. A child parked only on a
- *  proposed change has reported, so it is not listed.
+ *  A child is listed when the engine flags it `awaitedByParent` (ADR 0672):
+ *  its finish wakes this thread, and it is unfinished at any depth. A running
+ *  `no-wake` child is not listed, and neither is a child parked only on a
+ *  proposed change, which has reported.
  *
  *  The subtraction runs one way. A shortfall becomes an "and N more" row, and a
  *  surplus is listed rather than cut (`docs/code-review-priors.md`). */
-export function unfinishedSubThreads(
+export function awaitedSubThreads(
   parentId: string,
   threads: ReadonlyMap<string, ThreadState>,
-  unfinishedCount: number,
+  awaitedCount: number,
 ): SubThreadWait {
-  if (unfinishedCount <= 0) return NO_SUB_THREADS;
+  if (awaitedCount <= 0) return NO_SUB_THREADS;
   const found: ThreadState[] = [];
   for (const thread of threads.values()) {
-    if (thread.meta.parentThreadId !== parentId) continue;
-    if (!isMidTurn(effectiveThreadStatus(thread)) && thread.meta.liveEventWaitCount <= 0) continue;
+    if (thread.meta.parentThreadId !== parentId || !thread.meta.awaitedByParent) continue;
     found.push(thread);
   }
   found.sort((a, b) => a.meta.createdAt.localeCompare(b.meta.createdAt));
-  return { threads: found, unresolved: Math.max(0, unfinishedCount - found.length) };
-}
-
-/** How many children the server says have not finished: the two counts are
- *  disjoint, so they add. */
-function unfinishedChildCount(meta: ThreadMeta | undefined): number {
-  return (meta?.activeChildrenCount ?? 0) + (meta?.waitingChildrenCount ?? 0);
+  return { threads: found, unresolved: Math.max(0, awaitedCount - found.length) };
 }
 
 /** The **waiting indicator**: what this thread is waiting for, readable at any
@@ -146,7 +137,7 @@ export function waitingIndicatorAction(): HeaderActionSpec | null {
   const meta = id ? threadMap.value.get(id)?.meta : undefined;
   const waits = meta?.liveEventWaits ?? [];
   const subThreads = id
-    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
+    ? awaitedSubThreads(id, threadMap.value, meta?.awaitedChildrenCount ?? 0)
     : NO_SUB_THREADS;
   const summary = waitingIndicatorSummary(waits, subThreads);
   if (!summary) return null;
@@ -194,7 +185,7 @@ export function WaitingPanelHost() {
   // re-renders on every `threadMap` flush. The control's own spec already walks
   // once to decide whether to render, so a closed panel costs nothing.
   const subThreads = anchor && id
-    ? unfinishedSubThreads(id, threadMap.value, unfinishedChildCount(meta))
+    ? awaitedSubThreads(id, threadMap.value, meta?.awaitedChildrenCount ?? 0)
     : NO_SUB_THREADS;
   const isOpen = anchor !== null && isWaitingForAnything(waits, subThreads);
   // Clamp into the thread pane that owns the indicator. On desktop that keeps

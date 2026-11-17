@@ -54,6 +54,27 @@ An **offered** checkpoint folds a fresh-session option into the flow's own
 question. The flow names its option to stay, such as `Approve here`. It also
 says what a pick does before the handoff, such as approving the plan.
 
+## Backend policy belongs to the flow
+
+Configure backend policy in the repository's flow instructions beside each
+checkpoint. No new CLI flag or workspace setting is needed. Without a policy,
+keep the current backend. A user request or a flow policy can permit comparison
+or prefer another backend, for example Codex for straightforward implementation.
+Choose sufficient intelligence for the remaining work before applying a backend
+preference.
+
+At plan approval, always offer a fresh session when handoff is available.
+Offer each readable backend, merging an alternative into R when R names it.
+Backend policy chooses the recommendation, never which backends appear there.
+Other checkpoints offer alternatives only when the user or flow policy permits.
+Merge an alternative into the recommendation when they name the same backend.
+Preserve this policy in the
+successor narrative alongside the remaining checkpoints.
+
+Automatic checkpoints keep their own-backend verdict unless the user, approved
+plan or approval pick named another backend. An offered checkpoint's policy
+does not by itself authorize an automatic backend switch.
+
 ## What a unit is
 
 A unit is a piece of work the flow repeats, such as a plan's phase. The estimate

@@ -624,14 +624,15 @@ mod tests {
 
     #[test]
     fn a_process_born_between_the_scans_counts_all_its_time() {
+        // Half of `full` is whole seconds on any core count.
         let full = 10 * cores();
-        let (earlier, mut later) = scans(&[(600, 0, full / 4)]);
+        let (earlier, mut later) = scans(&[(600, 0, full / 2)]);
         let earlier = Scan {
             rows: Vec::new(),
             ..earlier
         };
         later.rows.retain(|r| r.pid == 600);
-        assert_eq!(busiest_apps(&earlier, &later, &[])[0].percent, 25);
+        assert_eq!(busiest_apps(&earlier, &later, &[])[0].percent, 50);
     }
 
     #[test]

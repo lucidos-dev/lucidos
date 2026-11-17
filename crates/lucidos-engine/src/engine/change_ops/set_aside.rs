@@ -104,7 +104,7 @@ impl LucidosEngine {
                 crate::engine::git_ops::branch_changed_files_checked(repo_root, &change.branch_name)
                     .await
             {
-                log!("[Changes] Bring back of {}: {}", change_id, e);
+                log_legacy!("[Changes] Bring back of {}: {}", change_id, e);
                 return Err(BRING_BACK_UNREADABLE.into());
             }
             let finished = withdraw_for_redecision(

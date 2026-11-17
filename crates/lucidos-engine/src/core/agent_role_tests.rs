@@ -36,7 +36,9 @@ async fn the_agent_role_reads_everything_but_a_secret_column() {
         "sk-the-key",
     )
     .await;
-    let url = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
 
     let name: String = sqlx::query_scalar("SELECT service_name FROM credentials")
@@ -50,6 +52,8 @@ async fn the_agent_role_reads_everything_but_a_secret_column() {
         "SELECT access_token FROM oauth_accounts",
         "SELECT private_key_pem FROM vapid_keys",
         "SELECT env FROM mcp_servers",
+        "SELECT payload FROM diagnostic_bundles",
+        "SELECT * FROM diagnostic_bundles",
     ] {
         assert!(
             denied(sqlx::query(query).fetch_all(&mut conn).await),
@@ -63,7 +67,9 @@ async fn the_agent_role_reads_everything_but_a_secret_column() {
 #[tokio::test]
 async fn the_agent_role_writes_ordinary_tables_only_inside_read_write() {
     let (pool, db_name) = setup_test_db().await;
-    let url = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
 
     let refused = sqlx::query("INSERT INTO preferences (key, value) VALUES ('probe', '1')")
@@ -98,7 +104,9 @@ async fn the_agent_role_writes_ordinary_tables_only_inside_read_write() {
 #[tokio::test]
 async fn the_agent_role_cannot_write_restore_authority_or_human_only_preferences() {
     let (pool, db_name) = setup_test_db().await;
-    let url = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
     let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
     let policy = crate::core::prefs::SNAPSHOT_RESTORE_BY_AGENTS.key();
     let other = crate::core::prefs::internal_specs()
@@ -156,10 +164,12 @@ async fn the_agent_role_cannot_write_restore_authority_or_human_only_preferences
 async fn the_agent_role_reaches_no_other_database() {
     let (pool, db_name) = setup_test_db().await;
     let (other_pool, other_db) = setup_test_db().await;
-    provision(&other_pool, &test_db_url(&other_db))
+    provision(&other_pool, &test_db_url(&other_db), None)
         .await
         .unwrap();
-    let url = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
 
     let mut elsewhere = lucidos_pg_url::PgUrl::parse(&url).unwrap();
     elsewhere.database = other_db.clone();
@@ -186,8 +196,12 @@ fn the_role_statement_carries_a_verifier_never_the_password() {
 #[tokio::test]
 async fn each_boot_mints_a_new_password() {
     let (pool, db_name) = setup_test_db().await;
-    let first = provision(&pool, &test_db_url(&db_name)).await.unwrap();
-    let second = provision(&pool, &test_db_url(&db_name)).await.unwrap();
+    let first = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
+    let second = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
     assert_ne!(first, second);
     assert!(sqlx::PgConnection::connect(&first).await.is_err());
     sqlx::PgConnection::connect(&second)
@@ -227,7 +241,7 @@ async fn a_hyphenated_database_gets_its_agent_role() {
     let url = test_db_url(&hyphenated);
     let target = sqlx::PgPool::connect(&url).await.unwrap();
 
-    let agent_url = provision(&target, &url).await.unwrap();
+    let agent_url = provision(&target, &url, None).await.unwrap();
     let mut agent = sqlx::PgConnection::connect(&agent_url).await.unwrap();
     let (database,): (String,) = sqlx::query_as("SELECT current_database()")
         .fetch_one(&mut agent)
@@ -247,5 +261,214 @@ async fn a_hyphenated_database_gets_its_agent_role() {
         sqlx::query(&cleanup).execute(&admin).await.unwrap();
     }
     admin.close().await;
+    drop_role(&pool, &db_name).await;
+}
+
+// Keep the expected policy independent of the implementation's grant list.
+const EXPECTED_WRITABLE_TABLES: &[&str] = &[
+    "preferences",
+    "memory_entries",
+    "summary_tree_nodes",
+    "summary_tree_scopes",
+    "notification_reads",
+    "pinned_apps",
+    "browser_logins",
+];
+
+#[tokio::test]
+async fn every_table_is_readable_and_only_content_tables_are_writable() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::memory::pgvector::PgVectorIndex::new(pool.clone())
+        .await
+        .unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT table_name::text FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for table in EXPECTED_WRITABLE_TABLES {
+        assert!(tables.iter().any(|name| name == table), "missing {table}");
+    }
+    let mut failures = Vec::new();
+    for table in tables {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+        )
+        .bind(&table)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let readable: Vec<String> = columns
+            .into_iter()
+            .filter(|column| {
+                let inbox_payload = table == "diagnostic_bundles" && column == "payload";
+                let secret = crate::core::secret_store::SECRET_COLUMNS
+                    .iter()
+                    .chain(crate::core::secret_store::MOVED_SECRET_COLUMNS)
+                    .any(|spec| spec.table == table && spec.column == column);
+                !(inbox_payload || secret)
+            })
+            .collect();
+        assert!(!readable.is_empty(), "no readable columns in {table}");
+        let table_ident = ident(&table).unwrap();
+        sqlx::query(&format!(
+            "SELECT {} FROM {table_ident} LIMIT 0",
+            idents(&readable).unwrap()
+        ))
+        .fetch_all(&mut conn)
+        .await
+        .unwrap_or_else(|error| panic!("cannot read {table}: {error}"));
+        let column = ident(&readable[0]).unwrap();
+        for statement in [
+            format!("EXPLAIN INSERT INTO {table_ident} DEFAULT VALUES"),
+            format!("EXPLAIN UPDATE {table_ident} SET {column} = {column} WHERE false"),
+            format!("EXPLAIN DELETE FROM {table_ident} WHERE false"),
+        ] {
+            sqlx::raw_sql("BEGIN READ WRITE")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            let result = sqlx::query(&statement).execute(&mut conn).await;
+            let expected = EXPECTED_WRITABLE_TABLES.contains(&table.as_str());
+            if expected {
+                assert!(result.is_ok(), "{statement}: {result:?}");
+            } else if !denied(result) {
+                failures.push(statement);
+            }
+            sqlx::raw_sql("ROLLBACK").execute(&mut conn).await.unwrap();
+        }
+    }
+    conn.close().await.unwrap();
+    drop_role(&pool, &db_name).await;
+    assert!(
+        failures.is_empty(),
+        "unexpected write grants: {failures:#?}"
+    );
+}
+
+#[tokio::test]
+async fn new_tables_fail_closed_and_reprovision_removes_stale_write_grants() {
+    let (pool, db_name) = setup_test_db().await;
+    sqlx::query("CREATE TABLE future_authority (value text)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
+    let role = ident(&lucidos_pg_url::agent_role(&db_name)).unwrap();
+    sqlx::query(&format!(
+        "GRANT INSERT, UPDATE, DELETE ON future_authority TO {role}"
+    ))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let url = provision(&pool, &test_db_url(&db_name), None)
+        .await
+        .unwrap();
+    let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+    let mut failures = Vec::new();
+    for statement in [
+        "INSERT INTO future_authority VALUES ('forged')",
+        "UPDATE future_authority SET value = 'forged'",
+        "DELETE FROM future_authority",
+    ] {
+        sqlx::raw_sql("BEGIN READ WRITE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        if !denied(sqlx::query(statement).execute(&mut conn).await) {
+            failures.push(statement);
+        }
+        sqlx::raw_sql("ROLLBACK").execute(&mut conn).await.unwrap();
+    }
+    conn.close().await.unwrap();
+    drop_role(&pool, &db_name).await;
+    assert!(failures.is_empty(), "unexpected write grants: {failures:?}");
+}
+
+#[test]
+fn only_known_machine_origins_widen_grants() {
+    for origin in ["agent", "demo", "eval", "e2e"] {
+        assert!(is_machine_made(Some(origin)));
+    }
+    for origin in [
+        None,
+        Some("user"),
+        Some("unknown"),
+        Some("future"),
+        Some("AGENT"),
+        Some(""),
+    ] {
+        assert!(!is_machine_made(origin));
+    }
+    assert_eq!(AGENT_WRITABLE_TABLES, EXPECTED_WRITABLE_TABLES);
+}
+
+#[tokio::test]
+async fn origin_controls_writes_and_reclassification_removes_them() {
+    let (pool, db_name) = setup_test_db().await;
+    for origin in [
+        Some("agent"),
+        Some("demo"),
+        Some("eval"),
+        Some("e2e"),
+        Some("user"),
+        Some("unknown"),
+        None,
+        Some("future"),
+    ] {
+        let url = provision(&pool, &test_db_url(&db_name), origin)
+            .await
+            .unwrap();
+        let mut conn = sqlx::PgConnection::connect(&url).await.unwrap();
+        sqlx::raw_sql("BEGIN READ WRITE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let result = sqlx::query("DELETE FROM events WHERE false")
+            .execute(&mut conn)
+            .await;
+        if is_machine_made(origin) {
+            result.unwrap();
+        } else {
+            assert!(denied(result), "events writable for {origin:?}");
+        }
+        sqlx::raw_sql("ROLLBACK").execute(&mut conn).await.unwrap();
+        assert!(
+            denied(
+                sqlx::query("SELECT payload FROM diagnostic_bundles")
+                    .fetch_all(&mut conn)
+                    .await
+            ),
+            "diagnostic payload readable for {origin:?}"
+        );
+        for table in READ_ONLY_TABLES {
+            sqlx::raw_sql("BEGIN READ WRITE")
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            assert!(
+                denied(
+                    sqlx::query(&format!(
+                        "DELETE FROM {} WHERE false",
+                        ident(table).unwrap()
+                    ))
+                    .execute(&mut conn)
+                    .await
+                ),
+                "{table} writable for {origin:?}"
+            );
+            sqlx::raw_sql("ROLLBACK").execute(&mut conn).await.unwrap();
+        }
+        conn.close().await.unwrap();
+    }
     drop_role(&pool, &db_name).await;
 }

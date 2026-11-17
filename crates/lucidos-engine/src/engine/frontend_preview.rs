@@ -76,11 +76,6 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(60);
 pub const PREVIEW_GATEWAY_ORIGIN_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_GATEWAY_ORIGIN";
 pub const PREVIEW_WORKSPACE_ID_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_WORKSPACE_ID";
 
-/// The gateway's own cert and key, handed on by `lucidos-gateway` `stack.rs`.
-/// This engine never serves with them: it reads only `LUCIDOS_TLS_*`.
-pub const GATEWAY_TLS_CERT_ENV: &str = "LUCIDOS_GATEWAY_TLS_CERT";
-pub const GATEWAY_TLS_KEY_ENV: &str = "LUCIDOS_GATEWAY_TLS_KEY";
-
 /// Override for the preview's listen port.
 pub const PREVIEW_PORT_ENV: &str = "LUCIDOS_FRONTEND_PREVIEW_PORT";
 
@@ -400,8 +395,12 @@ pub fn preview_upstream_from_env() -> Result<PreviewUpstream, PreviewRefusal> {
     resolve_preview_upstream(
         crate::api::base_path::gateway_port().as_deref(),
         crate::api::base_path::workspace_id().as_deref(),
-        std::env::var(GATEWAY_TLS_CERT_ENV).ok().as_deref(),
-        std::env::var(GATEWAY_TLS_KEY_ENV).ok().as_deref(),
+        std::env::var(crate::net_config::GATEWAY_TLS_CERT_ENV)
+            .ok()
+            .as_deref(),
+        std::env::var(crate::net_config::GATEWAY_TLS_KEY_ENV)
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -447,7 +446,7 @@ fn write_sidecar(workspace: &Path, sidecar: &PreviewSidecar) {
     let json = match serde_json::to_string(sidecar) {
         Ok(j) => j,
         Err(e) => {
-            log!("[FrontendPreview] failed to serialize sidecar: {}", e);
+            log_legacy!("[FrontendPreview] failed to serialize sidecar: {}", e);
             return;
         }
     };
@@ -455,7 +454,7 @@ fn write_sidecar(workspace: &Path, sidecar: &PreviewSidecar) {
         let _ = std::fs::create_dir_all(parent);
     }
     if let Err(e) = std::fs::write(&path, json) {
-        log!(
+        log_legacy!(
             "[FrontendPreview] failed to write {}: {}",
             path.display(),
             e
@@ -468,7 +467,7 @@ fn remove_sidecar(workspace: &Path) {
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log!(
+        Err(e) => log_legacy!(
             "[FrontendPreview] failed to remove {}: {}",
             path.display(),
             e
@@ -484,7 +483,7 @@ fn take_sidecar(workspace: &Path) -> Option<PreviewSidecar> {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            log!("[FrontendPreview] failed to read {}: {}", path.display(), e);
+            log_legacy!("[FrontendPreview] failed to read {}: {}", path.display(), e);
             return None;
         }
     };
@@ -492,7 +491,7 @@ fn take_sidecar(workspace: &Path) -> Option<PreviewSidecar> {
     match serde_json::from_slice::<PreviewSidecar>(&bytes) {
         Ok(s) => Some(s),
         Err(e) => {
-            log!("[FrontendPreview] malformed sidecar discarded: {}", e);
+            log_legacy!("[FrontendPreview] malformed sidecar discarded: {}", e);
             None
         }
     }
@@ -537,7 +536,7 @@ async fn wait_until_ready(scheme: &str, port: u16) -> bool {
     {
         Ok(c) => c,
         Err(e) => {
-            log!("[FrontendPreview] could not build probe client: {}", e);
+            log_legacy!("[FrontendPreview] could not build probe client: {}", e);
             return false;
         }
     };
@@ -624,7 +623,25 @@ impl LucidosEngine {
         })?;
 
         let scheme = upstream.scheme();
-        let mut cmd = tokio::process::Command::new(&vite_bin);
+        // Vite runs the worktree's `vite.config.ts`, which the agent may have
+        // written, so it runs in the agent sandbox (ADR 0645).
+        let sandbox = crate::runtime::agent_sandbox::Sandbox::resolve(self.pool(), &workspace)
+            .await
+            .map_err(|e| e.to_string())?;
+        if let Some(hidden) = upstream
+            .tls
+            .iter()
+            .flat_map(|(cert, key)| [cert, key])
+            .find(|file| sandbox.hides(Path::new(file.as_str())))
+        {
+            return Err(format!(
+                "The preview cannot serve HTTPS: the gateway's certificate file {hidden} \
+                 is in a folder the agent sandbox hides, so Vite cannot read it."
+            ));
+        }
+        let mut cmd = sandbox
+            .command(&vite_bin)
+            .map_err(|e| format!("Could not prepare Vite at {}: {e}", vite_bin.display()))?;
         cmd.current_dir(worktree.join("crates").join("lucidos-app"))
             // Whatever TLS this engine inherited is not the preview's: it serves
             // with the gateway's pair, or with none.
@@ -691,7 +708,7 @@ impl LucidosEngine {
         );
         *self.frontend_preview.lock().await = Some(running);
 
-        log!(
+        log_legacy!(
             "[FrontendPreview] started for thread {} on port {} ({})",
             thread_id,
             port,
@@ -742,7 +759,7 @@ impl LucidosEngine {
             let _ = running.child.wait().await;
         }
         remove_sidecar(&self.workspace_path);
-        log!(
+        log_legacy!(
             "[FrontendPreview] {} for thread {} (port {})",
             reason,
             running.thread_id,
@@ -817,12 +834,12 @@ impl LucidosEngine {
         // why the verdict has to carry whether the group may still be signalled.
         let child_exited = match running.child.try_wait() {
             Ok(Some(status)) => {
-                log!("[FrontendPreview] vite exited on its own: {}", status);
+                log_legacy!("[FrontendPreview] vite exited on its own: {}", status);
                 Some(true)
             }
             Ok(None) => Some(false),
             Err(e) => {
-                log!("[FrontendPreview] could not check on vite: {}", e);
+                log_legacy!("[FrontendPreview] could not check on vite: {}", e);
                 None
             }
         };
@@ -867,7 +884,7 @@ async fn log_stderr_lines(stderr: tokio::process::ChildStderr, thread_id: uuid::
     while let Ok(Some(line)) = lines.next_line().await {
         let line = line.trim();
         if !line.is_empty() {
-            log!("[FrontendPreview] [{}] {}", thread_id, line);
+            log_legacy!("[FrontendPreview] [{}] {}", thread_id, line);
         }
     }
 }
@@ -881,13 +898,13 @@ fn reap_orphaned_preview(workspace: &Path) {
     let self_pid = std::process::id();
     let cmd = process_command_line(sidecar.pid);
     if !sidecar_pid_is_reapable(sidecar.pid, self_pid, cmd.as_deref(), &sidecar.worktree) {
-        log!(
+        log_legacy!(
             "[FrontendPreview] not reaping pid {}, it is not the preview we recorded",
             sidecar.pid
         );
         return;
     }
-    log!(
+    log_legacy!(
         "[FrontendPreview] reaping orphaned preview pid {} (port {})",
         sidecar.pid,
         sidecar.port

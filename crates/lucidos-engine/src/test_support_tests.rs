@@ -105,3 +105,21 @@ async fn a_half_built_template_is_rebuilt_rather_than_cloned() {
     assert_eq!(clone_and_read(&template).await, expected_rows());
     drop_template(&template).await;
 }
+
+/// A sweep listed a half-built template as stale, and another run rebuilt it
+/// before the sweep took its lock. The fresh template must survive.
+#[tokio::test]
+async fn a_sweep_spares_a_template_rebuilt_since_it_listed_it() {
+    let template = private_template();
+    let mut admin = sqlx::PgConnection::connect(&admin_url())
+        .await
+        .expect("admin connect");
+    assert_eq!(clone_and_read(&template).await, expected_rows());
+    drop_if_still_stale(&mut admin, "lucidos_template_none", &template).await;
+    assert!(
+        template_is_ready(&mut admin, &template).await,
+        "the sweep dropped a template rebuilt after its list"
+    );
+    admin.close().await.ok();
+    drop_template(&template).await;
+}

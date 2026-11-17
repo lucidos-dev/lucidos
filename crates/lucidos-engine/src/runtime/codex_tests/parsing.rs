@@ -67,9 +67,71 @@ fn parses_turn_failed_message() {
     assert_eq!(
         parse_codex_line(REAL_TURN_FAILED),
         CodexLine::TurnFailed {
-            message: "The requested model 'bogus-model-name' does not exist.".into()
+            message: "The requested model 'bogus-model-name' does not exist.".into(),
+            provider_error: None,
         }
     );
+}
+
+/// The shape Codex wrote to its rollout file for the real block: snake_case
+/// `codex_error_info` on the failed turn's `error`.
+const REAL_POLICY_BLOCK: &str = r#"{"type":"turn.failed","error":{"message":"This request was blocked by our safety systems. Reason: Potentially unintended activity.","codex_error_info":"misalignment_policy_violation"}}"#;
+
+#[test]
+fn a_coded_turn_failure_carries_its_provider_error() {
+    let CodexLine::TurnFailed {
+        message,
+        provider_error: Some(provider_error),
+    } = parse_codex_line(REAL_POLICY_BLOCK)
+    else {
+        panic!("expected a coded TurnFailed");
+    };
+    assert!(message.starts_with("This request was blocked"));
+    assert!(provider_error.is_policy_block());
+}
+
+#[test]
+fn the_same_message_without_a_code_is_no_block() {
+    let uncoded = r#"{"type":"turn.failed","error":{"message":"This request was blocked by our safety systems. Reason: Potentially unintended activity."}}"#;
+    let CodexLine::TurnFailed { provider_error, .. } = parse_codex_line(uncoded) else {
+        panic!("expected TurnFailed");
+    };
+    assert_eq!(provider_error, None);
+}
+
+#[test]
+fn a_coded_turn_failure_reaches_the_failed_result() {
+    let mut tracker = TurnTracker::default();
+    let events = tracker.map_line(parse_codex_line(REAL_POLICY_BLOCK), 5);
+    let Some(AgentEvent::Result {
+        error: Some(_),
+        provider_error: Some(provider_error),
+        ..
+    }) = events.last()
+    else {
+        panic!("expected a failed Result with a provider error, got {events:?}");
+    };
+    assert!(provider_error.is_policy_block());
+}
+
+/// The code can arrive on a stream `error` before an uncoded `turn.failed`.
+#[test]
+fn an_earlier_coded_stream_error_reaches_the_failed_result() {
+    let mut tracker = TurnTracker::default();
+    let coded_error = r#"{"type":"error","message":"blocked","codex_error_info":"cyber_policy"}"#;
+    let uncoded_failure = r#"{"type":"turn.failed","error":{"message":"blocked"}}"#;
+    assert!(tracker
+        .map_line(parse_codex_line(coded_error), 1)
+        .is_empty());
+    let events = tracker.map_line(parse_codex_line(uncoded_failure), 5);
+    let Some(AgentEvent::Result {
+        provider_error: Some(provider_error),
+        ..
+    }) = events.last()
+    else {
+        panic!("expected a failed Result with a provider error, got {events:?}");
+    };
+    assert!(provider_error.is_policy_block());
 }
 
 #[test]
@@ -112,7 +174,9 @@ fn full_real_turn_maps_to_canonical_events() {
             slash_commands,
             skills,
             agent_version,
+            can_steer,
         } => {
+            assert!(!can_steer, "exec does not steer");
             assert_eq!(agent_version, &None);
             assert_eq!(session_id, "019ebbf1-e752-7fb2-ab6b-d03f5dc7686d");
             assert_eq!(*model, None, "JSONL stream doesn't echo the model");
@@ -175,6 +239,7 @@ fn full_real_turn_maps_to_canonical_events() {
             text,
             duration_ms,
             error,
+            ..
         } => {
             assert_eq!(text, "5 files", "Result.text carries the streamed answer so the engine's empty-result detection works");
             assert_eq!(*duration_ms, 1234, "driver-measured duration");

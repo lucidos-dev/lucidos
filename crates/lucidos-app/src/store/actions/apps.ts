@@ -23,7 +23,7 @@ import { isTauri } from '../../utils/platform';
 import { listen, setWindowFullscreen, WINDOW_FULLSCREEN_CHANGED_EVENT } from '../../utils/tauri';
 import { APP_FRAME_ISOLATED } from '../../components/apps/appFrameSandbox';
 import { warmAppIcons } from '../../components/shared/AppIcon';
-import { askFrame } from './app-bridge';
+import { askFrame } from './app-frame-channel';
 import { CANVAS_APP_FRAME_SELECTOR } from '../../utils/appFrame';
 import { reloadWidgetFrames } from '../widgets';
 
@@ -53,6 +53,8 @@ import { openPluginUninstallRequest } from './plugin-uninstall';
 import { isElementVisible } from '../../utils/elementVisibility';
 import { errorDetail } from '../../utils/errorDetail';
 import { openExternal } from '../../utils/tauri';
+import { BASE_PATH, REMOTE_GATEWAY } from '../../utils/basePath';
+import { appLandingHash } from './appHash';
 
 // Shared in-flight load so concurrent callers await the SAME fetch instead of
 // racing duplicate GETs: the compose destination picker's render-path kick-off
@@ -201,12 +203,14 @@ function recordAppOpened(app: App): void {
  * The retry must NOT clobber `appsList` if it fails: a transient network blip
  * on the second fetch would otherwise turn the user's loaded list into the
  * `failed` Loadable, deleting cached data for one bad click. Snapshot
- * pre-fetch and restore on transient failure. */
+ * pre-fetch and restore on transient failure.
+ *
+ * Resolves `true` once the app is open, `false` after a toast says why not. */
 export async function openAppById(
   appId: string,
   source?: string,
   fragment?: string,
-): Promise<void> {
+): Promise<boolean> {
   // `source` describes where a navigate originated (e.g. a thread label, or
   // "an app") so a miss toast says where it came from instead of swallowing it.
   const from = source ? ` (requested by ${source})` : '';
@@ -219,7 +223,7 @@ export async function openAppById(
     // loadApps stamped the failure on appsList (Loadable failed), but the user
     // who clicked the link is not on the apps tab — they'd see nothing.
     showToast(`Couldn't open app "${appId}"${from}: apps failed to load`, 'error');
-    return;
+    return false;
   }
   let app = apps.data.find((s) => s.id === appId);
   if (!app) {
@@ -236,26 +240,28 @@ export async function openAppById(
       // missing. That is no verdict: say the check failed, not that it's gone.
       const reason = refreshed.status === 'failed' ? `: ${refreshed.error}` : '';
       showToast(`Couldn't open app "${appId}"${from}: the app list failed to reload${reason}`, 'error');
-      return;
+      return false;
     }
   }
   if (app) {
     openApp(app, fragment);
-    return;
+    return true;
   }
   // The apps list never holds a widget (ADR 0402), so read the id itself
   // before calling it gone. This is how `navigate_ui` opens one in Canvas.
   try {
     openApp(await getAppApi(appId), fragment);
+    return true;
   } catch (error) {
     if (!(error instanceof ApiError && error.httpCode === 404)) {
       showToast(`Couldn't open app "${appId}"${from}: ${errorDetail(error)}`, 'error');
-      return;
+      return false;
     }
     // Disk re-scanned and the app genuinely isn't there. Name the id + source
     // so the user knows what was missing and where the navigate came from.
     console.warn(`[apps] navigate to missing app "${appId}"${from}`);
     showToast(`App "${appId}" no longer exists${from}`, 'error');
+    return false;
   }
 }
 
@@ -392,6 +398,9 @@ export async function refreshAppUI(appId?: string, options: RefreshAppUiOptions 
 
 /** Open the inline apps search bar. The bar focuses itself as it opens. */
 export function openAppSearch(): void {
+  revealContentPane();
+  // A bar that is already open will not run its opening focus effect again.
+  if (appSearchOpen.value && typeof document !== 'undefined') document.querySelector<HTMLInputElement>('.apps-search-field input')?.focus({ preventScroll: true });
   appSearchOpen.value = true;
 }
 
@@ -436,8 +445,19 @@ export function getAppFrameSrc(): string | null {
   return appUrl(app.id, tid ?? undefined, currentAppFragment.value ?? undefined, currentAppParams.value);
 }
 
-/** Open the app that's in the content pane as a top-level page of its own,
- *  outside the Lucidos shell (ADR 0044: the popout is a bare app tab).
+/** Where the popout takes the open app. Locally, the bare app URL (ADR 0044).
+ *  A remote workspace's app document is relayed under an opaque sandbox (ADR
+ *  0723), so alone it has no bridge. Its popout opens this workspace's shell
+ *  with an `#app=` landing instead, on the live app (ADR 0726). */
+export function appPopoutHref(): string | null {
+  const app = currentApp.value;
+  if (!app) return null;
+  if (REMOTE_GATEWAY === null) return getAppFrameSrc();
+  return `${BASE_PATH}/${appLandingHash({ appId: app.id, fragment: currentAppFragment.value ?? undefined })}`;
+}
+
+/** Open the app that's in the content pane as a top-level page of its own, at
+ *  {@link appPopoutHref}.
  *
  *  The packaged desktop client ONLY. Everywhere else the control stays a real
  *  `<a target="_blank">`, which keeps cmd-click, middle-click and "copy link
@@ -455,7 +475,7 @@ export function getAppFrameSrc(): string | null {
  *  replace the very app the user asked to pop out of it. The OS opener is
  *  unconditional here, the same route `openLocalFile` takes. */
 export function popOutApp(): void {
-  const src = getAppFrameSrc();
+  const src = appPopoutHref();
   if (!src) {
     showToast("Couldn't open the app in a browser: no app is open", 'error');
     return;

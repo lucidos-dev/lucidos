@@ -10,7 +10,7 @@
 //!      `CodingAgentPermissionResolved` and returns `{ allowed, reason? }`.
 
 use crate::support::{
-    base_url, db_url, register_device, seed_cc_thread_summary, user_client, workspace_path,
+    as_stamped_device, base_url, db_url, register_device, seed_cc_thread_summary, user_client,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -33,20 +33,30 @@ async fn lock_cc_allowed_tools() -> MutexGuard<'static, ()> {
 /// Restores this workspace's `cc-allowed-tools` when it goes out of scope, on
 /// the panicking path as well as the clean one.
 ///
-/// Any test that empties the file needs this. The engine's gate reads the file
-/// on every prompt (ADR 0125), so a test that leaves it emptied has taken the
-/// workspace's real grants away. Drop cannot await, so it writes the snapshot
-/// straight to disk rather than through the settings endpoint. The gate reads
-/// the file fresh, so nothing caches a stale copy.
+/// Any test that empties the list needs this, or it takes the workspace's real
+/// grants away. It restores through the settings endpoint: the file is only a
+/// mirror, and a line written there by hand grants nothing. Drop cannot await,
+/// so the PUT runs on a thread with its own runtime.
 struct CcAllowlistRestore {
     snapshot: String,
 }
 
 impl Drop for CcAllowlistRestore {
     fn drop(&mut self) {
-        let path = workspace_path().join(".lucidos").join("cc-allowed-tools");
-        if let Err(e) = std::fs::write(&path, &self.snapshot) {
-            eprintln!("failed to restore {}: {e}", path.display());
+        let snapshot = std::mem::take(&mut self.snapshot);
+        let restored = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the restore runtime")
+                .block_on(async {
+                    let client = user_client().await;
+                    restore_cc_allowed_tools(&client, &snapshot).await;
+                });
+        })
+        .join();
+        if restored.is_err() {
+            eprintln!("failed to restore the workspace's cc-allowed-tools");
         }
     }
 }
@@ -688,11 +698,13 @@ async fn agent_allowed_commands_settings_roundtrip() {
         .expect("PUT agent-allowed-commands failed");
     assert!(put.status().is_success(), "PUT must succeed");
 
+    // The file mirrors the live grants, so GET returns the PUT's grant lines
+    // under the engine's own header. A comment the PUT carried is not a grant.
     let after = read_agent_allowed_commands(&client).await;
-    assert_eq!(after, body, "GET must return exactly what was PUT");
-    assert!(
-        line_present(&after, &sentinel),
-        "round-tripped file must contain the sentinel pattern; got:\n{after}"
+    assert_eq!(
+        grant_lines(&after),
+        [sentinel.as_str(), "Python"],
+        "GET must return exactly the lines that were PUT; got:\n{after}"
     );
 
     // Restore so the e2e workspace's allowlist is left as we found it.
@@ -726,11 +738,19 @@ fn line_present(contents: &str, pattern: &str) -> bool {
 }
 
 fn count_line(contents: &str, pattern: &str) -> usize {
+    grant_lines(contents)
+        .into_iter()
+        .filter(|l| *l == pattern)
+        .count()
+}
+
+/// The grant lines of a grant file, without its comments and blank lines.
+fn grant_lines(contents: &str) -> Vec<&str> {
     contents
         .lines()
         .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && *l == pattern)
-        .count()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
 }
 
 /// End-to-end: open a permission_prompt, wait for the canonical request event,
@@ -862,13 +882,14 @@ async fn every_allowlist_put_records_the_resulting_grants() {
         let sentinel = sentinel_pattern.replace("{}", &Uuid::new_v4().simple().to_string());
         let body = format!("{header}\n{sentinel}\n");
 
-        let put = client
-            .put(format!("{}/api/v1/{route}", base_url()))
-            .header("x-lucidos-device-id", &device)
-            .json(&json!({ "contents": body }))
-            .send()
-            .await
-            .expect("PUT failed");
+        let put = as_stamped_device(
+            client.put(format!("{}/api/v1/{route}", base_url())),
+            &device,
+        )
+        .json(&json!({ "contents": body }))
+        .send()
+        .await
+        .expect("PUT failed");
         assert!(put.status().is_success(), "PUT /{route} must succeed");
 
         let row: Option<(String, serde_json::Value)> = sqlx::query_as(
@@ -915,16 +936,18 @@ async fn every_allowlist_put_records_the_resulting_grants() {
 #[tokio::test]
 async fn auto_approve_on_an_unknown_server_still_answers() {
     let client = user_client().await;
-    // The per-request header wins over the client's default. So this id needs
-    // registering in its own right, or the gate refuses before the toggle runs.
+    // The per-request header wins over the client's default, and the default's
+    // stamp names another device. So this id needs registering and stamping in
+    // its own right, or the gate refuses before the toggle runs.
     register_device("e2e-auto-approve").await;
-    let resp = client
-        .put(format!("{}/api/v1/mcp/auto-approve", base_url()))
-        .header("x-lucidos-device-id", "e2e-auto-approve")
-        .json(&json!({ "server_id": "no-such-server", "auto_approve": true }))
-        .send()
-        .await
-        .expect("PUT mcp/auto-approve failed");
+    let resp = as_stamped_device(
+        client.put(format!("{}/api/v1/mcp/auto-approve", base_url())),
+        "e2e-auto-approve",
+    )
+    .json(&json!({ "server_id": "no-such-server", "auto_approve": true }))
+    .send()
+    .await
+    .expect("PUT mcp/auto-approve failed");
     assert_eq!(resp.status().as_u16(), 200, "the toggle must answer 200");
 }
 

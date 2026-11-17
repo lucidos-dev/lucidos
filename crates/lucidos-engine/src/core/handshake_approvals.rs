@@ -274,7 +274,7 @@ pub fn entries(workspace_path: &Path) -> BTreeMap<String, Approval> {
         Ok(contents) => parse(&contents),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
         Err(e) => {
-            crate::log!(
+            crate::log_legacy!(
                 "[HandshakeApprovals] Failed to read {}: {}. Treating as no approvals.",
                 path.display(),
                 e
@@ -483,7 +483,7 @@ pub fn seed_if_absent(
     let mut seeded = BTreeMap::new();
     for entry in scripts {
         if !path_is_recordable(&entry.path) {
-            crate::log!(
+            crate::log_legacy!(
                 "[HandshakeApprovals] Not seeding {:?}: {}",
                 entry.path,
                 unrecordable_path(&entry.path)
@@ -515,7 +515,9 @@ pub fn seed_if_absent(
                     },
                 );
             }
-            Err(e) => crate::log!("[HandshakeApprovals] Not seeding {}: {}", abs.display(), e),
+            Err(e) => {
+                crate::log_legacy!("[HandshakeApprovals] Not seeding {}: {}", abs.display(), e)
+            }
         }
     }
     // Written even when nothing was found, so the marker exists and a later

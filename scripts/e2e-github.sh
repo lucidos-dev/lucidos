@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # e2e-github.sh: run e2e suites on GitHub's runners (ADR 0382).
 #
-#   ./scripts/e2e-github.sh <all|api|browser|wasm|embedder> [--commit <sha>] [the suite's own flags]
+#   ./scripts/e2e-github.sh <all|api|browser|wasm|embedder|confinement> [--commit <sha>] [the suite's own flags]
 #   ./scripts/e2e-github.sh main-check --commit <sha> [--attach <run-url> --branch <branch>]
 #
 # The e2e scripts hand over here unless the run must stay local (ADR 0386),
@@ -12,7 +12,7 @@
 #            (a *.spec.ts among the Playwright args narrows both legs to it)
 #
 # --commit tests that commit instead of HEAD. main-check is the main check's
-# selection (scripts/main-check.sh): the engine suite plus every e2e suite.
+# selection (scripts/main-check.sh): E2E_GITHUB_MAIN_CHECK_SUITES.
 # --attach picks up a main check run an earlier driver left going: it waits
 # for that run, reports it and cleans up, and pushes nothing.
 #
@@ -33,9 +33,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 suite="${1:-}"
 shift || true
 case "$suite" in
-    all | api | browser | wasm | embedder | main-check) ;;
+    all | api | browser | wasm | embedder | confinement | main-check) ;;
     *)
-        echo "usage: $0 <all|api|browser|wasm|embedder|main-check> [--commit <sha>] [flags]" >&2
+        echo "usage: $0 <all|api|browser|wasm|embedder|confinement|main-check> [--commit <sha>] [flags]" >&2
         exit 1
         ;;
 esac
@@ -95,8 +95,12 @@ fi
 
 # The main check has no local fallback and no local leg: whatever stops it
 # short of a GitHub verdict is no verdict (scripts/main-check.sh). This is the
-# exit for whatever stops a run before it reaches GitHub.
+# exit for whatever stops a run before it reaches GitHub. Confinement uses
+# 75 for this case: nothing was tested.
 pre_run_exit=1
+[ "$suite" != confinement ] || pre_run_exit=75
+local_fallback=""
+case "$suite" in confinement | main-check) local_fallback=no-local ;; esac
 if [ -n "$attach$attach_branch" ] && [ "$suite" != main-check ]; then
     echo "e2e-github.sh: --attach and --branch pick up a main check run; they need main-check" >&2
     exit 1
@@ -137,7 +141,7 @@ case "$suite" in
             shift
         done
         ;;
-    wasm | embedder)
+    wasm | embedder | confinement)
         suites=("$suite")
         [ $# -eq 0 ] || refuse "an argument to $suite"
         ;;
@@ -184,7 +188,7 @@ for arg in ${pw_args[@]+"${pw_args[@]}"}; do
     esac
 done
 
-e2e_github_preflight "$PROJECT_DIR" "$commit" || exit "$pre_run_exit"
+e2e_github_preflight "$PROJECT_DIR" "$commit" "$local_fallback" || exit "$pre_run_exit"
 # Every gh call below needs a named account, and nothing is pushed without one.
 github_auth || exit "$pre_run_exit"
 

@@ -127,6 +127,10 @@ export function mockTranscript(opts: {
   /** Step rows per turn, each `turnHeight / rowsPerTurn` tall and stamped
    *  `<turnId>-r<k>` (`ROW_ATTR`). None by default. */
   rowsPerTurn?: number;
+  /** Block children of a turn, by turn id: the heights of its paragraphs,
+   *  images and widget boxes, top to bottom. The turn is then exactly as tall
+   *  as its blocks. */
+  blocks?: Record<string, number[]>;
 }) {
   let clientHeight = opts.clientHeight ?? 800;
   const listeners: Array<() => void> = [];
@@ -137,8 +141,13 @@ export function mockTranscript(opts: {
   // Per-turn overrides on top of the shared default, keyed by id so a window
   // change cannot move one onto a different turn.
   const heights = new Map<string, number>();
-  const heightOf = (eventId: string) =>
-    heights.get(eventId) ?? turnHeight - (rowsHidden.get(eventId) ?? 0) * rowHeight();
+  const blocks = new Map(Object.entries(opts.blocks ?? {}).map(([id, list]) => [id, [...list]]));
+  const sum = (list: number[]) => list.reduce((total, px) => total + px, 0);
+  const heightOf = (eventId: string) => {
+    const own = blocks.get(eventId);
+    return heights.get(eventId) ?? (own ? sum(own)
+      : turnHeight - (rowsHidden.get(eventId) ?? 0) * rowHeight());
+  };
   // Turns drawn with their leading rows clamped off by the render window.
   const clamped = new Set<string>();
   // How many leading ROWS a clamped turn leaves out, for a turn that has rows.
@@ -166,7 +175,28 @@ export function mockTranscript(opts: {
     for (let k = rowsHidden.get(eventId) ?? 0; k < rowsPerTurn; k++) out.push(row(eventId, indexInWindow, k));
     return out;
   };
+  const blockTop = (eventId: string, indexInWindow: number, j: number) =>
+    turnTop(indexInWindow) + sum((blocks.get(eventId) ?? []).slice(0, j));
+  // Bumped when a turn's blocks are replaced, which disconnects the old ones.
+  const generations = new Map<string, number>();
+  // Each block's class, by turn: unset for a block built from `blocks`.
+  const classes = new Map<string, Array<string | null>>();
+  const block = (eventId: string, indexInWindow: number, j: number) => {
+    const generation = generations.get(eventId) ?? 0;
+    return {
+      children: [],
+      get isConnected() { return (generations.get(eventId) ?? 0) === generation; },
+      tagName: 'DIV',
+      getAttribute: (name: string) => (name === 'class' ? classes.get(eventId)?.[j] ?? null : null),
+      getBoundingClientRect: () => {
+        const height = blocks.get(eventId)?.[j] ?? 0;
+        const rectTop = blockTop(eventId, indexInWindow, j);
+        return { top: rectTop, bottom: rectTop + height, height, left: 0, right: 400, width: 400 };
+      },
+    };
+  };
   const turn = (eventId: string, indexInWindow: number) => ({
+    get children() { return (blocks.get(eventId) ?? []).map((_, j) => block(eventId, indexInWindow, j)); },
     getAttribute: (name: string) => (name === 'data-event-id' ? eventId : null),
     hasAttribute: (name: string) => name === 'data-head-clamped' && clamped.has(eventId),
     getBoundingClientRect: () => {
@@ -220,6 +250,28 @@ export function mockTranscript(opts: {
      *  anchor between two opens. The live Thinking row is derived, so the last
      *  turn loses it the moment that turn finishes (ADR 0066). */
     setTurnHeightOf: (eventId: string, px: number) => { heights.set(eventId, px); },
+    /** ONE block inside a turn changing height: an image decoding, a widget
+     *  box sizing itself. Leaves `scrollTop` alone, as the browser does. */
+    setBlockHeight: (eventId: string, j: number, px: number) => {
+      const own = blocks.get(eventId);
+      if (own) own[j] = px;
+    },
+    /** A block of class `cls` drawn into a turn at index `j`, as a keep-alive
+     *  row arrives ahead of the reply. Leaves `scrollTop` alone. */
+    insertBlock: (eventId: string, j: number, px: number, cls: string) => {
+      const own = classes.get(eventId) ?? (blocks.get(eventId) ?? []).map(() => null);
+      blocks.get(eventId)?.splice(j, 0, px);
+      own.splice(j, 0, cls);
+      classes.set(eventId, own);
+    },
+    /** A reply re-set in place: the turn's blocks are new nodes, and every
+     *  block read before this has left the DOM. */
+    replaceBlocks: (eventId: string) => { generations.set(eventId, (generations.get(eventId) ?? 0) + 1); },
+    /** Where block `j` of a turn sits, measured from the container's top. */
+    blockRelTop: (eventId: string, j: number) => {
+      const index = rendered().indexOf(eventId);
+      return blockTop(eventId, index, j) - CONTAINER_VIEWPORT_TOP;
+    },
     /** ONE turn drawn with its head clamped off, or whole again. The window
      *  edge sits mid-turn while the walk is still drawing that turn. */
     setHeadClamped: (eventId: string, on: boolean) => { if (on) clamped.add(eventId); else clamped.delete(eventId); },

@@ -60,14 +60,14 @@ impl Drop for CheckGuard {
 /// One refusal check, registered on [`WEBHOOK_REFUSAL_CRON`].
 pub(crate) async fn run_webhook_refusal_check(engine: SharedEngine, pool: PgPool) {
     let Some(_guard) = CheckGuard::try_acquire() else {
-        log!("[WebhookRefusal] Skipping run; the previous cycle is still going");
+        log_legacy!("[WebhookRefusal] Skipping run; the previous cycle is still going");
         return;
     };
     if engine.is_shutting_down() {
         return;
     }
     if let Err(e) = run_cycle(&engine, &pool).await {
-        log!("[WebhookRefusal] The cycle could not run: {e}");
+        log_legacy!("[WebhookRefusal] The cycle could not run: {e}");
     }
 }
 
@@ -83,7 +83,7 @@ async fn run_cycle(
     let hooks = WebhookStore::list(pool).await?;
     let declared = declared_refusals(pool).await?;
     for event in plan(&hooks, &declared) {
-        log!("[WebhookRefusal] {}", cycle_line(&event));
+        log_legacy!("[WebhookRefusal] {}", cycle_line(&event));
         engine
             .event_bus
             .emit_or_log(

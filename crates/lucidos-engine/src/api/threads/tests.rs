@@ -640,7 +640,7 @@ async fn seed_parked_cc_thread(
 
 #[tokio::test]
 async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
-    use crate::engine::thread_lifecycle::Action;
+    use crate::engine::thread_lifecycle::ThreadAction;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
     let (pool, db_name) = setup_test_db().await;
@@ -651,7 +651,7 @@ async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
         .await
         .expect("query the parked thread's actions");
     assert!(
-        !actions.contains(&Action::Apply) && !actions.contains(&Action::Discard),
+        !actions.contains(&ThreadAction::Apply) && !actions.contains(&ThreadAction::Discard),
         "a thread holding a live event wait must not be resolvable: {:?}",
         actions
     );
@@ -663,7 +663,7 @@ async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
         .await
         .expect("query the subscribed parent's actions");
     assert!(
-        !actions.contains(&Action::Apply) && !actions.contains(&Action::Discard),
+        !actions.contains(&ThreadAction::Apply) && !actions.contains(&ThreadAction::Discard),
         "a live event wait must gate whatever the children: {:?}",
         actions
     );
@@ -676,7 +676,7 @@ async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
         .await
         .expect("query the parent's actions");
     assert!(
-        actions.contains(&Action::Apply) && actions.contains(&Action::Discard),
+        actions.contains(&ThreadAction::Apply) && actions.contains(&ThreadAction::Discard),
         "an active sub-thread alone must not withhold Apply or Discard: {:?}",
         actions
     );
@@ -689,7 +689,7 @@ async fn only_a_live_event_wait_refuses_apply_and_discard_server_side() {
         .await
         .expect("query the settled thread's actions");
     assert!(
-        actions.contains(&Action::Apply) && actions.contains(&Action::Discard),
+        actions.contains(&ThreadAction::Apply) && actions.contains(&ThreadAction::Discard),
         "clearing the wait must restore both: {:?}",
         actions
     );
@@ -886,7 +886,10 @@ async fn a_token_for_one_thread_cannot_undo_another_thread_s_checkpoint() {
         .expect_err("a token for A must not undo B's checkpoint");
     assert_eq!(status, axum::http::StatusCode::FORBIDDEN, "{body}");
 
-    for headers in [agent_headers(Some(b)), HeaderMap::new()] {
+    for headers in [
+        agent_headers(Some(b)),
+        crate::api::gateway_stamp::test_support::stamped_device_headers("owner-phone"),
+    ] {
         let origin = authorize_checkpoint_undo(&bus, &headers, &checkpoint_id)
             .await
             .expect("B itself and the user's device keep their undo");

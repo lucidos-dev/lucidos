@@ -66,6 +66,8 @@ export interface ChatRequestBody {
    *  (`InputPosition`, ADR 0449). The engine refuses a send a later one from
    *  the same page overtook. */
   input_chain?: string;
+  /** The saved compose epoch captured when the owner pressed Send. */
+  compose_epoch?: number;
   input_seq?: number;
   /** Set on a send whose `thread_id` names a thread the server has not seen
    *  yet, because THIS request is the one creating it (a raw new send, where
@@ -75,7 +77,7 @@ export interface ChatRequestBody {
    *  Follow-ups and compose first-sends omit it: a compose thread already has
    *  its row (`sendCompose` awaits `POST /threads` before the chat POST). */
   new_thread?: boolean;
-  /** *Person mentions*, by person id (ADR 0649). A message that mentions only
+  /** *User mentions*, by person id (ADR 0649). A message that mentions only
    *  people pauses the agent and stays between people. Sent only on a team
    *  gateway: any other refuses a non-empty list. */
   mentions?: string[];
@@ -227,6 +229,8 @@ export type LadderSurface = 'chat' | CodingAgent;
 
 /** GET /api/v1/intelligence-ladder. Mirrors the engine `IntelligenceLadder`. */
 export interface IntelligenceLadder {
+  /** Other installed backends, measured against this thread’s reference. */
+  other_backend_ladders?: CodingAgentLadder[];
   surface: LadderSurface;
   /** Absent for chat. */
   coding_agent?: CodingAgent;
@@ -493,6 +497,10 @@ export interface BackfillProgress {
    *  Absent while it answers. Holds until a probe call succeeds or the user
    *  picks another model. */
   failing_model?: string | null;
+  /** Background calls wait on this provider spend-cap hold. */
+  spend_cap_held_until?: string | null;
+  /** The provider’s own reset, absent when it supplied none. */
+  spend_cap_resets_at?: string | null;
   /** The order of the frame that announced this count. A snapshot carries the
    *  last frame's order, so a frame no newer than it was already counted. */
   seq: number;

@@ -288,6 +288,7 @@ mod startup_sweep_branch_work {
                 worktree_path: Some(wt.to_string_lossy().into()),
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -504,6 +505,7 @@ mod startup_sweep_branch_work {
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::SessionStarted {
+                sandbox: None,
                 coding_agent: crate::runtime::CodingAgent::ClaudeCode,
                 session_id: "test-session".into(),
                 branch: branch.into(),
@@ -542,6 +544,7 @@ mod startup_sweep_branch_work {
                 worktree_path: Some(wt.to_string_lossy().into()),
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -692,6 +695,7 @@ mod settle_orphaned_running_sweep {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: meta(EventChannel::ClaudeCode),
         })

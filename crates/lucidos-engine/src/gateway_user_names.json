@@ -1,0 +1,48 @@
+[
+  {
+    "case": "a relayed name nobody shares stays bare",
+    "snapshot": {
+      "users": [{ "id": "op-1", "name": "Sam", "emails": [], "device_ids": ["d1"] }],
+      "relayed": [{ "device_id": "pair:d9", "user_id": "pair:op-7", "name": "Robin", "via": "A", "emails": [] }]
+    },
+    "names": { "d1": "Sam", "pair:d9": "Robin" }
+  },
+  {
+    "case": "a relayed name a local user shares gets its gateway, whatever the case or spacing",
+    "snapshot": {
+      "users": [{ "id": "op-1", "name": "Sam", "emails": [], "device_ids": ["d1"] }],
+      "relayed": [{ "device_id": "pair:d9", "user_id": "pair:op-7", "name": " sam ", "via": "A", "emails": [] }]
+    },
+    "names": { "d1": "Sam", "pair:d9": "sam (A)" }
+  },
+  {
+    "case": "two relayed users with one name each get their gateway",
+    "snapshot": {
+      "users": [{ "id": "op-1", "name": "Alex", "emails": [], "device_ids": ["d1"] }],
+      "relayed": [
+        { "device_id": "a:d1", "user_id": "a:op-1", "name": "Kim", "via": "A", "emails": [] },
+        { "device_id": "b:d1", "user_id": "b:op-1", "name": "Kim", "via": "B", "emails": [] }
+      ]
+    },
+    "names": { "a:d1": "Kim (A)", "b:d1": "Kim (B)" }
+  },
+  {
+    "case": "two devices of one relayed user never clash with each other",
+    "snapshot": {
+      "users": [{ "id": "op-1", "name": "Alex", "emails": [], "device_ids": ["d1"] }],
+      "relayed": [
+        { "device_id": "a:d1", "user_id": "a:op-1", "name": "Kim", "via": "A", "emails": [] },
+        { "device_id": "a:d2", "user_id": "a:op-1", "name": "Kim", "via": "A", "emails": [] }
+      ]
+    },
+    "names": { "a:d1": "Kim", "a:d2": "Kim" }
+  },
+  {
+    "case": "a relayed user merged by email shows the local name",
+    "snapshot": {
+      "users": [{ "id": "op-1", "name": "Sam", "emails": ["sam@example.com"], "device_ids": ["d1"] }],
+      "relayed": [{ "device_id": "pair:d9", "user_id": "pair:op-7", "name": "Laptop Sam", "via": "A", "emails": ["SAM@example.com"] }]
+    },
+    "names": { "d1": "Sam", "pair:d9": "Sam" }
+  }
+]

@@ -71,7 +71,7 @@ export function resolveVisualStatus(
 /** The meta facts `visualStatusFor` reads. */
 type VisualStatusFacts = Pick<
   ThreadMeta,
-  'id' | 'activeChildrenCount' | 'waitingChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested' | 'replySeenDevices'
+  'id' | 'awaitedChildrenCount' | 'codingAgentChangeState' | 'liveEventWaitCount' | 'readRequested' | 'replySeenDevices'
 >;
 
 /** `resolveVisualStatus` fed from a thread's meta, for a surface holding a
@@ -82,7 +82,7 @@ export function visualStatusFor(status: ThreadStatus, meta: VisualStatusFacts | 
   if (!meta) return resolveVisualStatus(status, false, false, false);
   return resolveVisualStatus(
     status,
-    meta.activeChildrenCount + (meta.waitingChildrenCount ?? 0) > 0,
+    (meta.awaitedChildrenCount ?? 0) > 0,
     changeAwaitsApply(meta),
     meta.liveEventWaitCount > 0,
     readRequestedForMe(meta),

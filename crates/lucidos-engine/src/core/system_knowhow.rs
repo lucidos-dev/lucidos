@@ -244,130 +244,132 @@ mod tests {
         assert!(pkg_warning.contains("LUCIDOS_SYSTEM_KNOWHOW_DIR"));
     }
 
-    /// A system-knowhow `description:` is a ROUTING signal, not a summary: the
-    /// engine semantically matches the user's message against it to decide
-    /// which doc to offer, and every one of them sits in the prompt of every
-    /// turn whether or not it is ever loaded. So it carries two things and
-    /// nothing else: what the doc covers, and the phrases a user might say that
-    /// should reach it. The doc body one `load_knowhow` away carries the
-    /// conclusions, the worked examples and the caveats.
-    ///
-    /// The ceiling is per-file rather than a total, because a total lets one
-    /// runaway description hide behind twenty short ones. Same reasoning as
-    /// `PER_TOOL_SCHEMA_CEILING_CHARS`.
-    ///
-    /// A RATCHET, set just above where the 2026-08-07 trim landed: 24 files,
-    /// 6,584 characters of description, mean 274, largest 362
-    /// (`thread-events`). It was 700 before that trim, which let a description
-    /// carry a summary of the doc rather than a route to it (`oauth-providers`
-    /// was 692). Raising it means a description has earned the room, in a
-    /// change that says why.
-    #[test]
-    fn system_knowhow_descriptions_stay_routing_sized() {
-        const MAX_DESCRIPTION_CHARS: usize = 400;
+    mod guard_tests {
+        use super::*;
 
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let summaries = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"));
-        assert!(
-            !summaries.is_empty(),
-            "no system-knowhow files loaded, the scan is broken rather than the \
-             descriptions being clean"
-        );
+        /// A system-knowhow `description:` is a ROUTING signal, not a summary. The
+        /// engine matches the user's message against it to decide which doc to
+        /// offer. Every one sits in the prompt of every turn, loaded or not.
+        ///
+        /// So it carries what the doc covers and the phrases a user might say that
+        /// should reach it, and nothing else. The doc body, one `load_knowhow`
+        /// away, carries the conclusions, the worked examples and the caveats.
+        ///
+        /// The ceiling is per-file rather than a total, because a total lets one
+        /// runaway description hide behind twenty short ones. Same reasoning as
+        /// `PER_TOOL_SCHEMA_CEILING_CHARS`.
+        ///
+        /// A RATCHET, set just above where the last trim landed: 24 files, 6,584
+        /// characters of description, mean 274, largest 362 (`thread-events`). At
+        /// 700 a description could carry a summary rather than a route. Raising it
+        /// means a description has earned the room, in a change that says why.
+        #[test]
+        fn system_knowhow_descriptions_stay_routing_sized() {
+            const MAX_DESCRIPTION_CHARS: usize = 400;
 
-        let mut oversized = Vec::new();
-        for kh in &summaries {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let summaries = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"));
             assert!(
-                !kh.description.trim().is_empty(),
-                "system-knowhow/{} has an empty description, so nothing can route to it",
-                kh.id
+                !summaries.is_empty(),
+                "no system-knowhow files loaded, the scan is broken rather than the \
+             descriptions being clean"
             );
-            if kh.description.chars().count() > MAX_DESCRIPTION_CHARS {
-                oversized.push(format!(
-                    "  {:>5} chars  system-knowhow/{}",
-                    kh.description.chars().count(),
+
+            let mut oversized = Vec::new();
+            for kh in &summaries {
+                assert!(
+                    !kh.description.trim().is_empty(),
+                    "system-knowhow/{} has an empty description, so nothing can route to it",
                     kh.id
-                ));
+                );
+                if kh.description.chars().count() > MAX_DESCRIPTION_CHARS {
+                    oversized.push(format!(
+                        "  {:>5} chars  system-knowhow/{}",
+                        kh.description.chars().count(),
+                        kh.id
+                    ));
+                }
             }
-        }
-        assert!(
-            oversized.is_empty(),
-            "system-knowhow description(s) over {MAX_DESCRIPTION_CHARS} chars. A \
+            assert!(
+                oversized.is_empty(),
+                "system-knowhow description(s) over {MAX_DESCRIPTION_CHARS} chars. A \
              description carries coverage plus the phrases that should route to \
              the doc; the doc itself carries the detail:\n{}",
-            oversized.join("\n")
-        );
-    }
-
-    /// Files without `---\nname: ...\n---` are silently dropped at load time,
-    /// so `load_knowhow("system-knowhow/<id>")` returns missing and the LLM
-    /// concludes the file doesn't exist.
-    #[test]
-    fn shipped_system_knowhow_files_all_parse() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let dir = repo.join("system-knowhow");
-        let missing: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
-            .into_iter()
-            .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
-            .filter(|id| SystemKnowhowStore::load(&dir, id).is_none())
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "system-knowhow files missing valid `---\\nname: ...\\n---` frontmatter \
-             (load_knowhow returns missing for these): {:?}",
-            missing
-        );
-    }
-
-    /// The Workspace Prompt Footprint page's Run audit button sends a sentence
-    /// as an ordinary message. The audit root must route on its words, or the
-    /// button starts a general chat instead of the audit.
-    #[test]
-    fn the_footprint_page_prompt_routes_to_the_audit_root() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let page = std::fs::read_to_string(
-            repo.join("crates/lucidos-app/src/components/settings/promptFootprint.ts"),
-        )
-        .expect("the page helpers exist");
-        let prompt = page
-            .lines()
-            .find_map(|l| l.strip_prefix("export const PROMPT_FOOTPRINT_AUDIT_PROMPT = "))
-            .expect("the page names its audit prompt")
-            .to_lowercase();
-        let root = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"))
-            .into_iter()
-            .find(|s| s.id == "workspace-audit")
-            .expect("the audit root is listed");
-        let description = root.description.to_lowercase();
-        for word in ["audit", "workspace", "prompt footprint"] {
-            assert!(prompt.contains(word), "the button's prompt drops {word:?}");
-            assert!(
-                description.contains(word),
-                "the audit root's description drops {word:?}, so the button may not reach it"
+                oversized.join("\n")
             );
         }
-    }
 
-    /// A shipped file in a folder is in no routing list, so only its owning
-    /// doc can tell the agent the id exists. One named by no top-level doc is
-    /// unreachable: it ships and nothing ever loads it.
-    #[test]
-    fn every_nested_shipped_file_is_named_by_a_top_level_doc() {
-        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
-        let dir = repo.join("system-knowhow");
-        let top_level: String = SystemKnowhowStore::load_summaries(&dir)
-            .iter()
-            .filter_map(|s| std::fs::read_to_string(dir.join(format!("{}.md", s.id))).ok())
-            .collect();
-        let unnamed: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
-            .into_iter()
-            .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
-            .filter(|id| id.contains('/'))
-            .filter(|id| !top_level.contains(&format!("system-knowhow/{id}")))
-            .collect();
-        assert!(
-            unnamed.is_empty(),
-            "nested system-knowhow files no top-level doc names by \
+        /// Files without `---\nname: ...\n---` are silently dropped at load time,
+        /// so `load_knowhow("system-knowhow/<id>")` returns missing and the LLM
+        /// concludes the file doesn't exist.
+        #[test]
+        fn shipped_system_knowhow_files_all_parse() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let dir = repo.join("system-knowhow");
+            let missing: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
+                .into_iter()
+                .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
+                .filter(|id| SystemKnowhowStore::load(&dir, id).is_none())
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "system-knowhow files missing valid `---\\nname: ...\\n---` frontmatter \
+             (load_knowhow returns missing for these): {:?}",
+                missing
+            );
+        }
+
+        /// The Workspace Prompt Footprint page's Run audit button sends a sentence
+        /// as an ordinary message. The audit root must route on its words, or the
+        /// button starts a general chat instead of the audit.
+        #[test]
+        fn the_footprint_page_prompt_routes_to_the_audit_root() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let page = std::fs::read_to_string(
+                repo.join("crates/lucidos-app/src/components/settings/promptFootprint.ts"),
+            )
+            .expect("the page helpers exist");
+            let prompt = page
+                .lines()
+                .find_map(|l| l.strip_prefix("export const PROMPT_FOOTPRINT_AUDIT_PROMPT = "))
+                .expect("the page names its audit prompt")
+                .to_lowercase();
+            let root = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"))
+                .into_iter()
+                .find(|s| s.id == "workspace-audit")
+                .expect("the audit root is listed");
+            let description = root.description.to_lowercase();
+            for word in ["audit", "workspace", "prompt footprint"] {
+                assert!(prompt.contains(word), "the button's prompt drops {word:?}");
+                assert!(
+                    description.contains(word),
+                    "the audit root's description drops {word:?}, so the button may not reach it"
+                );
+            }
+        }
+
+        /// A shipped file in a folder is in no routing list, so only its owning
+        /// doc can tell the agent the id exists. One named by no top-level doc is
+        /// unreachable: it ships and nothing ever loads it.
+        #[test]
+        fn every_nested_shipped_file_is_named_by_a_top_level_doc() {
+            let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+            let dir = repo.join("system-knowhow");
+            let top_level: String = SystemKnowhowStore::load_summaries(&dir)
+                .iter()
+                .filter_map(|s| std::fs::read_to_string(dir.join(format!("{}.md", s.id))).ok())
+                .collect();
+            let unnamed: Vec<String> = crate::core::knowhow::collect_md_files(&dir)
+                .into_iter()
+                .filter_map(|path| crate::core::knowhow::id_from_path(&dir, &path))
+                .filter(|id| id.contains('/'))
+                .filter(|id| !top_level.contains(&format!("system-knowhow/{id}")))
+                .collect();
+            assert!(
+                unnamed.is_empty(),
+                "nested system-knowhow files no top-level doc names by \
              `system-knowhow/<id>`, so nothing can reach them: {unnamed:?}"
-        );
+            );
+        }
     }
 }

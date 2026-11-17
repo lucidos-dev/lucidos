@@ -92,6 +92,16 @@ vi.mock('./entityReferences', () => ({
   PROVIDER_PREFERENCE_KEYS: new Set(['opencode_free_enabled', 'provider_enabled_openai']),
 }));
 
+// Caller/presenter tests accept claims immediately. Real claims are covered in
+// the independent-page browser test, rather than a simulated peer map here.
+const submitted = vi.hoisted(() => vi.fn());
+vi.mock('../interactiveDeliveryService', () => ({
+  submitInteractiveRequest: (request: import('../interactiveDeliveryRecords').InteractiveRequest, id?: string) => {
+    submitted(request, id);
+    return presentInteractiveRequest(request);
+  },
+}));
+const { presentInteractiveRequest } = await import('./interactive-delivery');
 const { handleNavigationRequest, handleThreadEvent } = await import('./thread-sync');
 
 describe('handleNavigationRequest', () => {
@@ -520,29 +530,10 @@ describe('with a second window on this device', () => {
     other.close();
   });
 
-  it('leaves a navigate to the window touched last when both show the thread', async () => {
+  it('queues navigation even when cached peers nominate another window', async () => {
     await otherShows({ focusedThreadId: 'thread-A' });
-    handleThreadEvent(navEvent('thread-A'));
-    expect(openAppById).not.toHaveBeenCalled();
-    expect(toasts.value).toHaveLength(0);
-  });
-
-  it('acts here when only this window shows the thread', async () => {
-    await otherShows({ focusedThreadId: 'thread-C' });
     handleThreadEvent(navEvent('thread-A'));
     expect(openAppById).toHaveBeenCalledTimes(1);
-  });
-
-  it('offers the jump only in the window touched last', async () => {
-    await otherShows({ focusedThreadId: 'thread-C' });
-    handleThreadEvent(navEvent('thread-B'));
-    expect(toasts.value).toHaveLength(0);
-  });
-
-  it('asks to enable push only in the window showing the thread', async () => {
-    await otherShows({ focusedThreadId: 'thread-A' });
-    handleThreadEvent({ thread_id: 'thread-A', event: { type: 'PushNotificationRequested' } });
-    expect(confirmState.value.visible).toBe(false);
   });
 
   it('leaves a fit check to the window showing its thread', async () => {
@@ -569,4 +560,18 @@ describe('with a second window on this device', () => {
     });
     expect(captureAppUI).not.toHaveBeenCalled();
   });
+});
+
+it('threads envelope identity through automatic navigation without changing its payload', () => {
+  focusedThreadId.value = 'thread-A';
+  handleThreadEvent({ ...navEvent('thread-A'), event_id: 'legacy-identity' }, 'envelope-identity');
+  expect(submitted).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'navigation' }), 'envelope-identity');
+});
+
+it('accepts the push prompt synchronously without waiting for an answer', () => {
+  settleConfirm(false);
+  const accepted = presentInteractiveRequest({ id: 'push-event', kind: 'push-enable', payload: {}, preference: { threadId: 'thread-A' } });
+  expect(accepted).toBe(true);
+  expect(confirmState.value.visible).toBe(true);
+  settleConfirm(false);
 });

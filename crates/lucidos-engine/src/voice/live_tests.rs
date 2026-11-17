@@ -99,6 +99,73 @@ fn a_tool_less_talker_is_told_when_to_ask_for_help() {
     }
 }
 
+/// A `[WORKING]` note rides the quiet channel, and the Live model still spoke
+/// after one. "Not spoken on arrival" is the channel's promise, not the
+/// model's, so the instructions say it too.
+#[test]
+fn a_tool_less_talker_is_told_a_working_note_is_no_cue_to_speak() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    assert!(
+        instructions.contains(&format!("A note that starts with {}", WORKING_NOTE_TAG)),
+        "the note is never named: {}",
+        instructions
+    );
+    assert!(
+        instructions.contains("never a cue to speak"),
+        "nothing keeps the talker quiet on a note: {}",
+        instructions
+    );
+}
+
+/// A call opens listening (ADR 0666). The Live talker opened two calls with a
+/// recap nobody asked for, so the opening says the caller has not spoken yet.
+/// It also names the `[EARLIER]` note as the talker's alone.
+#[test]
+fn a_tool_less_talker_is_told_the_call_opens_listening() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    let earlier_note = format!("A note that starts with {} is for you alone", EARLIER_TAG);
+    for fact in [
+        "the caller has not spoken yet",
+        "Say nothing until they do",
+        "recap of earlier talk only when they ask",
+        earlier_note.as_str(),
+    ] {
+        assert!(
+            instructions.contains(fact),
+            "{} is missing: {}",
+            fact,
+            instructions
+        );
+    }
+}
+
+/// The Live model said "Good, I'm" and "Yeah!" into the caller's pauses. A
+/// session takes no turn-taking settings, so the provider's own label is the
+/// only lever.
+#[test]
+fn a_tool_less_talker_leaves_an_unfinished_sentence_in_silence() {
+    let start = session_start("gpt-live-1", &opening());
+    let instructions = start["session"]["instructions"]
+        .as_str()
+        .expect("instructions are a string");
+    assert!(
+        instructions.contains("Backchannel policy: None."),
+        "the provider's label is missing: {}",
+        instructions
+    );
+    assert!(
+        instructions.contains("An unfinished sentence gets silence, never a filler"),
+        "nothing keeps the talker out of a pause: {}",
+        instructions
+    );
+}
+
 /// The load-bearing half: a promise and the handover are one turn.
 ///
 /// Its absence is what a caller actually meets. They hear "on it", nothing is
@@ -954,12 +1021,12 @@ fn an_untyped_frame_produces_nothing() {
 async fn a_real_session_accepts_the_opening_payload() {
     crate::net_config::install_crypto_provider();
     let Ok(api_key) = std::env::var("OPENAI_API_KEY") else {
-        println!("skipped: OPENAI_API_KEY is not set");
+        crate::log_legacy!("skipped: OPENAI_API_KEY is not set");
         return;
     };
     let model =
         std::env::var("LUCIDOS_VOICE_TALKER_MODEL").unwrap_or_else(|_| "gpt-live-1".to_string());
-    println!("opening a session on {}", model);
+    crate::log_legacy!("opening a session on {}", model);
 
     let provider = LiveProvider::new(api_key, model);
     let mut session = provider.open(opening()).await.expect("connect");
@@ -971,7 +1038,7 @@ async fn a_real_session_accepts_the_opening_payload() {
             Ok(Some(VoiceEvent::Failed { message })) => {
                 panic!("the opening payload was refused: {}", message)
             }
-            Ok(Some(other)) => println!("received {:?}", other),
+            Ok(Some(other)) => crate::log_legacy!("received {:?}", other),
             Ok(None) => panic!("the provider closed the socket"),
             Err(_) => break,
         }
@@ -1123,6 +1190,139 @@ fn an_ask_cuts_the_caller_off_where_the_frame_says_it_landed() {
     );
 }
 
+/// The rest of what an ask was made on, out of what a frame produced.
+fn continuations(events: &[VoiceEvent]) -> Vec<String> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            VoiceEvent::UserTurnContinued { transcript } => Some(transcript.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// **The ask goes out on its own frame, and the tail follows it** (F1).
+///
+/// The Home call's shape: the talker asked during the caller's pause, and
+/// "finished" began after the ask but before the talker's first word. It is
+/// the rest of the asked sentence, never a turn of its own.
+///
+/// Nothing waits for it. The ask is in the delegation frame's own batch.
+#[test]
+fn the_rest_of_an_asked_sentence_continues_the_ask() {
+    let mut turn = TurnState::default();
+    frame(
+        caller_said_at("when do you estimate that it's", 500),
+        &mut turn,
+    );
+
+    let asked = frame(a_delegation_at(2_000), &mut turn);
+    assert!(matches!(
+        asked.last(),
+        Some(VoiceEvent::DelegationRequested { .. })
+    ));
+    assert_eq!(
+        utterances(&asked),
+        vec!["when do you estimate that it's".to_string()]
+    );
+
+    frame(caller_said_at(" finished", 2_100), &mut turn);
+    let reply = frame(talker_said_at("Hmm.", 2_300), &mut turn);
+    assert_eq!(
+        reply,
+        vec![
+            VoiceEvent::UserTurnContinued {
+                transcript: "finished".to_string()
+            },
+            VoiceEvent::TalkerTranscript {
+                text: "Hmm.".to_string()
+            },
+        ]
+    );
+}
+
+/// **A tail transcribed late still continues the ask.** Input transcription
+/// runs behind the audio, so the piece can land after the reply began.
+///
+/// It began before the reply, so the clock still places it in the sentence.
+#[test]
+fn a_tail_transcribed_after_the_reply_began_still_continues_the_ask() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("is this in the latest", 500), &mut turn);
+    frame(a_delegation_at(2_000), &mut turn);
+    frame(talker_said_at("Good", 2_300), &mut turn);
+
+    frame(caller_said_at(" release", 1_900), &mut turn);
+    let next = frame(talker_said_at(" question.", 2_600), &mut turn);
+    assert_eq!(continuations(&next), vec!["release".to_string()]);
+    assert!(utterances(&next).is_empty(), "{:?}", next);
+}
+
+/// **Words said over the reply are a turn of their own**, ask or no ask.
+///
+/// The reply began at 2.3 s, so "never mind" at 2.5 s answers it. Folded into
+/// the asked sentence, it would reach the doer as part of the question.
+#[test]
+fn words_said_over_the_reply_to_an_ask_do_not_continue_it() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("move my three o'clock", 500), &mut turn);
+    frame(a_delegation_at(2_000), &mut turn);
+    frame(talker_said_at("Sure", 2_300), &mut turn);
+
+    frame(caller_said_at(" never mind", 2_500), &mut turn);
+    let next = frame(talker_said_at(" thing.", 2_900), &mut turn);
+    assert!(continuations(&next).is_empty(), "{:?}", next);
+    assert_eq!(utterances(&next), vec!["never mind".to_string()]);
+}
+
+/// **With no ask, a late piece continues nothing.** The talker answered on
+/// its own, so no turn exists that the piece could belong to.
+#[test]
+fn a_late_piece_after_a_reply_with_no_ask_continues_nothing() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("is this in the latest", 500), &mut turn);
+    frame(talker_said_at("Yes", 2_000), &mut turn);
+
+    frame(caller_said_at(" release", 1_800), &mut turn);
+    let next = frame(talker_said_at(" it is.", 2_400), &mut turn);
+    assert!(continuations(&next).is_empty(), "{:?}", next);
+    assert_eq!(utterances(&next), vec!["release".to_string()]);
+}
+
+/// **An ask made mid-reply ends its sentence where the reply began.** The
+/// talker's first word was already its judgment that the caller finished.
+///
+/// A late piece from before that word continues the ask. A piece said over
+/// the reply does not, even though the ask came after it.
+#[test]
+fn an_ask_made_mid_reply_ends_its_sentence_where_the_reply_began() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("when is it done", 500), &mut turn);
+    frame(talker_said_at("Let", 2_000), &mut turn);
+    frame(a_delegation_at(2_400), &mut turn);
+
+    frame(caller_said_at(" today", 1_900), &mut turn);
+    frame(caller_said_at(" thanks", 2_600), &mut turn);
+    let next = frame(talker_said_at(" me check.", 2_800), &mut turn);
+    assert_eq!(continuations(&next), vec!["today".to_string()]);
+    assert_eq!(utterances(&next), vec!["thanks".to_string()]);
+}
+
+/// **The closing socket still marks the rest of an asked sentence.** A turn
+/// running when the line drops keeps going, and its sentence is owed whole.
+#[test]
+fn the_closing_socket_still_hands_over_the_rest_of_an_asked_sentence() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("cancel the", 500), &mut turn);
+    frame(a_delegation_at(1_500), &mut turn);
+    frame(caller_said_at(" other one", 1_600), &mut turn);
+
+    assert_eq!(
+        continuations(&closing_events(&mut turn)),
+        vec!["other one".to_string()]
+    );
+}
+
 /// The socket going takes everything, boundary or not. A piece held back for a
 /// turn that will never come is a piece lost for good.
 #[test]
@@ -1161,4 +1361,56 @@ fn the_callers_words_reach_the_seam_ahead_of_the_reply_they_triggered() {
             },
         ]
     );
+}
+
+#[test]
+fn a_silent_talker_does_not_keep_an_asked_sentence_open_forever() {
+    for start in [3_999, 4_000, 20_000] {
+        let mut turn = TurnState::default();
+        frame(caller_said_at("check the build", 500), &mut turn);
+        frame(a_delegation_at(2_000), &mut turn);
+        frame(caller_said_at("and the tests", start), &mut turn);
+        let events = frame(talker_said_at("Checking.", 21_000), &mut turn);
+        if start < 4_000 {
+            assert_eq!(continuations(&events), ["and the tests"]);
+            assert!(utterances(&events).is_empty());
+        } else {
+            assert!(continuations(&events).is_empty());
+            assert_eq!(utterances(&events), ["and the tests"]);
+        }
+    }
+}
+
+#[test]
+fn a_late_transcript_cannot_extend_the_bound_after_the_talker_replies() {
+    let mut turn = TurnState::default();
+    frame(caller_said_at("check the build", 500), &mut turn);
+    frame(a_delegation_at(2_000), &mut turn);
+    frame(talker_said_at("Checking.", 20_000), &mut turn);
+    frame(caller_said_at("another request", 10_000), &mut turn);
+    let events = closing_events(&mut turn);
+    assert!(continuations(&events).is_empty());
+    assert_eq!(utterances(&events), ["another request"]);
+}
+
+#[test]
+fn unplaced_asks_and_untimed_pieces_continue_nothing() {
+    for timed_ask in [false, true] {
+        let mut turn = TurnState::default();
+        frame(caller_said_at("check the build", 500), &mut turn);
+        let mut ask = a_delegation_at(2_000);
+        if !timed_ask {
+            ask.as_object_mut().unwrap().remove("offset_ms");
+        }
+        frame(ask, &mut turn);
+        let piece = if timed_ask {
+            caller_said("another request")
+        } else {
+            caller_said_at("another request", 2_100)
+        };
+        frame(piece, &mut turn);
+        let events = closing_events(&mut turn);
+        assert!(continuations(&events).is_empty());
+        assert_eq!(utterances(&events), ["another request"]);
+    }
 }

@@ -278,6 +278,11 @@ pub(crate) fn model_source(purpose: ContextPurpose) -> AuxModelSource {
             reasoning: Some(&prefs::REASONING_EXPECTED_WAKE_DECISION),
             needs_vision: false,
         },
+        ContextPurpose::PermissionAnswer => AuxModelPrefs {
+            model: &prefs::MODEL_PERMISSION_ANSWER,
+            reasoning: Some(&prefs::REASONING_PERMISSION_ANSWER),
+            needs_vision: false,
+        },
         ContextPurpose::QueryClassification => AuxModelPrefs {
             model: &prefs::MODEL_QUERY_CLASSIFICATION,
             reasoning: Some(&prefs::REASONING_QUERY_CLASSIFICATION),
@@ -438,6 +443,7 @@ pub(crate) const BACKGROUND_ROWS: &[ContextPurpose] = &[
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
     ContextPurpose::ExpectedWakeDecision,
+    ContextPurpose::PermissionAnswer,
 ];
 
 /// The model preference key `purpose` reads, which names its Settings row.
@@ -547,7 +553,8 @@ pub(crate) fn budget_for(purpose: ContextPurpose) -> AuxBudget {
         | ContextPurpose::CommandJudge
         | ContextPurpose::ReadDecision
         | ContextPurpose::WakeDecision
-        | ContextPurpose::ExpectedWakeDecision => SHORT_CALL_BUDGET,
+        | ContextPurpose::ExpectedWakeDecision
+        | ContextPurpose::PermissionAnswer => SHORT_CALL_BUDGET,
         // Nine that never ask. None is an auxiliary HTTP call this module
         // times: a turn and the five `AgentModel` purposes run on the agent's
         // own provider and its timeout, and the talker holds a socket. Web
@@ -713,6 +720,7 @@ pub(crate) const ALL_PURPOSES: &[ContextPurpose] = &[
     ContextPurpose::ReadDecision,
     ContextPurpose::WakeDecision,
     ContextPurpose::ExpectedWakeDecision,
+    ContextPurpose::PermissionAnswer,
     ContextPurpose::CacheKeepAlive,
     ContextPurpose::PrefillProbe,
 ];
@@ -754,11 +762,12 @@ mod tests {
                 | ContextPurpose::ReadDecision
                 | ContextPurpose::WakeDecision
                 | ContextPurpose::ExpectedWakeDecision
+                | ContextPurpose::PermissionAnswer
                 | ContextPurpose::CacheKeepAlive
                 | ContextPurpose::PrefillProbe => {}
             }
         }
-        assert_eq!(ALL_PURPOSES.len(), 24);
+        assert_eq!(ALL_PURPOSES.len(), 25);
     }
 
     /// The key an unset handle inherits, if any.

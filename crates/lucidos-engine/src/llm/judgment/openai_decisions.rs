@@ -170,14 +170,14 @@ pub(crate) fn parse_response(
             .and_then(Value::as_str)
             .unwrap_or_default();
         if !questions.iter().any(|(id, _)| id == name) {
-            log!("[Judgment] Dropping a decision for unasked {:?}", name);
+            log_legacy!("[Judgment] Dropping a decision for unasked {:?}", name);
             continue;
         }
         match read_answer(answer) {
             Some(parsed) => {
                 answers.insert(name.to_string(), parsed);
             }
-            None => log!(
+            None => log_legacy!(
                 "[Judgment] Dropping unreadable decision {}: {}",
                 name,
                 answer
@@ -226,12 +226,9 @@ impl JudgmentProvider for OpenAiDecisionsProvider {
         if !status.is_success() {
             // The body names the offending parameter and never the key, which
             // rides in the header.
-            return Err(format!(
-                "OpenAI Decisions returned {}: {}",
-                status.as_u16(),
-                text.trim()
-            )
-            .into());
+            return Err(
+                crate::llm::ProviderError::from_http("OpenAI", status.as_u16(), &text).into(),
+            );
         }
         let mut judgment = parse_response(&text, &questions)?;
         judgment.request_chars = request_chars;

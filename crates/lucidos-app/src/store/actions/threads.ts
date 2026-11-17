@@ -11,13 +11,13 @@ import { threadQueueHolds } from './threadQueue';
 import { abandonRowIntent, acknowledgeRowIntent, archiveRequestInFlight, holdRowIntent, rowRequestInFlight, type RowFields, type RowIntent } from '../rowIntents';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, threadEventsStillArriving } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
-import { acknowledgeComposeEdits, knownComposeEpoch, noteLocalComposeEdit, type ComposeReport } from '../composeSync';
+import { acknowledgeComposeEdits, knownComposeEpoch, noteLocalComposeEdit, type ParsedComposeReport } from '../composeSync';
 import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollStateHandle';
 import { pushThreadNavState } from './thread-navigation';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { errorDetail } from '../../utils/errorDetail';
-import { pruneRecents } from './entityReferences';
+import { pruneRecents } from './searchRecents';
 import { BLOCKER_REASON, blockedRefusal, type BlockedRefusal } from './blockerCopy';
 import { collectThreadFamily } from './threadFamily';
 import { openListedThread } from './event-navigation';
@@ -646,7 +646,7 @@ function discardThreadDraft(threadId: string): void {
     .then((result) => {
       // A stale write still answers with the engine's draft, which a
       // submission has just consumed.
-      const fallback: ComposeReport = { revision: null, epoch: null, text: '', imageHashes: [], mode: null, selection: null };
+      const fallback: ParsedComposeReport = { revision: null, epoch: null, text: '', imageHashes: [], mode: null, selection: null };
       acknowledgeComposeEdits(threadId, seq, result.report ?? fallback);
     })
     .catch((e) => {

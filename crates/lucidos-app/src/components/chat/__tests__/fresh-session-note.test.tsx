@@ -33,6 +33,13 @@ describe('a fresh session is noted in the thread', () => {
     expect(at).toBeLessThan(events.findIndex(e => e.type === 'text'));
   });
 
+  it('draws the note for a session started because the provider blocked the last one', () => {
+    const events = exchangeResponseEvents(turnStartingWith({ kind: 'fresh', reason: 'provider-blocked' }));
+    expect(events.find(e => e.type === 'fresh_session')).toMatchObject({ reason: 'provider-blocked' });
+    const s = JSON.stringify(FreshSessionRow({ event: { type: 'fresh_session', reason: 'provider-blocked' } }));
+    expect(s).toContain('The provider blocked the previous session');
+  });
+
   it.each([
     ['a first session', { kind: 'first' } as const],
     ['a resumed session', { kind: 'resumed' } as const],

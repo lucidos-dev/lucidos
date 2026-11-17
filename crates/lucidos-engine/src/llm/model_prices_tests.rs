@@ -283,63 +283,6 @@ fn the_table_serializes_with_provenance() {
     );
 }
 
-/// Every price is defined once, here. A second copy shows as a rate literal
-/// divided by a million, a `ModelPrice` literal, or a JSON price key.
-/// `lucidos-eval` pins its own run prices on purpose (its `prices.toml`).
-#[test]
-fn no_rate_literal_lives_outside_the_price_table() {
-    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let per_million =
-        regex::Regex::new(r"\d+\.\d+\s*/\s*(1e6|1_000_000(\.0)?)\b").expect("a regex");
-    let price_key = |key: &str| {
-        key.to_ascii_lowercase().contains("price")
-            || ["uncached_in", "cache_read", "cache_write", "cache_write_1h"].contains(&key)
-    };
-    let mut hits = Vec::new();
-    let mut stack = vec![crates.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("a readable dir").flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if path.is_dir() {
-                let skipped = ["target", "node_modules", "dist", "lucidos-eval"];
-                if !skipped.contains(&name.as_str()) && !name.starts_with('.') {
-                    stack.push(path);
-                }
-                continue;
-            }
-            let rel = path
-                .strip_prefix(&crates)
-                .unwrap_or(&path)
-                .display()
-                .to_string();
-            if rel.ends_with("llm/model_prices.json") || rel.ends_with("llm/model_prices.rs") {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if name.ends_with(".json") {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                    collect_price_keys(&value, &price_key, &rel, &mut hits);
-                }
-            } else if [".rs", ".ts", ".tsx"].iter().any(|ext| name.ends_with(ext)) {
-                for (n, line) in text.lines().enumerate() {
-                    let price_literal = line.contains("ModelPrice {") && !line.contains("->");
-                    if per_million.is_match(line) || price_literal {
-                        hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
-                    }
-                }
-            }
-        }
-    }
-    assert!(
-        hits.is_empty(),
-        "rates outside the price table:\n{}",
-        hits.join("\n")
-    );
-}
-
 fn collect_price_keys(
     value: &serde_json::Value,
     price_key: &dyn Fn(&str) -> bool,
@@ -391,4 +334,65 @@ fn november_models_use_standard_prices_and_december_boundary() {
     assert_eq!(card.rates.cache_read, 0.2);
     assert_eq!(card.rates.cache_write, 10.0);
     assert_eq!(card.rates.cache_write_1h, Some(16.0));
+}
+
+mod guard_tests {
+    use super::*;
+
+    /// Every price is defined once, here. A second copy shows as a rate literal
+    /// divided by a million, a `ModelPrice` literal, or a JSON price key.
+    /// `lucidos-eval` pins its own run prices on purpose (its `prices.toml`).
+    #[test]
+    fn no_rate_literal_lives_outside_the_price_table() {
+        let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let per_million =
+            regex::Regex::new(r"\d+\.\d+\s*/\s*(1e6|1_000_000(\.0)?)\b").expect("a regex");
+        let price_key = |key: &str| {
+            key.to_ascii_lowercase().contains("price")
+                || ["uncached_in", "cache_read", "cache_write", "cache_write_1h"].contains(&key)
+        };
+        let mut hits = Vec::new();
+        let mut stack = vec![crates.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("a readable dir").flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    let skipped = ["target", "node_modules", "dist", "lucidos-eval"];
+                    if !skipped.contains(&name.as_str()) && !name.starts_with('.') {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&crates)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                if rel.ends_with("llm/model_prices.json") || rel.ends_with("llm/model_prices.rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                if name.ends_with(".json") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        collect_price_keys(&value, &price_key, &rel, &mut hits);
+                    }
+                } else if [".rs", ".ts", ".tsx"].iter().any(|ext| name.ends_with(ext)) {
+                    for (n, line) in text.lines().enumerate() {
+                        let price_literal = line.contains("ModelPrice {") && !line.contains("->");
+                        if per_million.is_match(line) || price_literal {
+                            hits.push(format!("{rel}:{}: {}", n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "rates outside the price table:\n{}",
+            hits.join("\n")
+        );
+    }
 }

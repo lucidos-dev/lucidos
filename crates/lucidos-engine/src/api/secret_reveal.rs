@@ -161,6 +161,9 @@ pub(crate) enum RefererRule {
 /// and the API e2e suite. A browser-shaped one whose `Referer` names an app
 /// document is refused under either.
 pub(crate) fn reveal_request_allowed(headers: &HeaderMap, rule: RefererRule) -> bool {
+    if headers.contains_key(lucidos_gateway_stamp::HEADER_DEVICE_SESSION) {
+        return false;
+    }
     let header = |name: &str| {
         headers
             .get(name)

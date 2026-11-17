@@ -11,6 +11,8 @@ pub struct Listing {
     pub name: String,
     pub status: String,
     pub restore_available: bool,
+    /// The journaled workspace is machine-made, so an agent may restore it.
+    pub machine_made: bool,
     pub bytes: Option<u64>,
     pub warning: Option<String>,
 }
@@ -42,6 +44,7 @@ pub fn list(app_data: &Path) -> Result<Vec<Listing>, BoxError> {
                 name,
                 status: "legacy".into(),
                 restore_available: false,
+                machine_made: false,
                 bytes: None,
                 warning: None,
             };
@@ -116,6 +119,10 @@ pub fn list(app_data: &Path) -> Result<Vec<Listing>, BoxError> {
                                 }
                                 warning.push_str("Linked worktrees restore with detached HEADs at saved commits; reattach branches explicitly. Archives without saved commits require manual recovery.");
                             }
+                            row.machine_made = entry
+                                .workspace
+                                .as_ref()
+                                .is_some_and(|ws| ws.cleanup.origin.is_machine_made());
                             row.name = entry
                                 .workspace
                                 .as_ref()

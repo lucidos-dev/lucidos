@@ -254,13 +254,13 @@ impl LucidosEngine {
             if crate::engine::agent_recovery::thread_has_unanswered_question(&self.pool, thread_id)
                 .await
             {
-                log!(
+                log_legacy!(
                     "[Shutdown] Preserving thread {} — parked on an unanswered question",
                     thread_id
                 );
                 continue;
             }
-            log!(
+            log_legacy!(
                 "[Shutdown] Emitting ResponseAborted for active thread {}",
                 thread_id
             );
@@ -291,7 +291,7 @@ impl LucidosEngine {
                 })
                 .await
             {
-                log!(
+                log_legacy!(
                     "[Shutdown] Failed to emit ResponseAborted for thread {}: {}",
                     thread_id,
                     e
@@ -303,7 +303,7 @@ impl LucidosEngine {
 
     pub async fn shutdown_browser(&self) {
         if let Err(e) = self.browser_runtime.close_all().await {
-            log!("[Engine] Error closing browsers on shutdown: {}", e);
+            log_legacy!("[Engine] Error closing browsers on shutdown: {}", e);
         }
     }
 
@@ -351,7 +351,7 @@ impl LucidosEngine {
             return;
         }
 
-        log!(
+        log_legacy!(
             "[Shutdown] Gracefully stopping {} Claude Code session(s)...",
             sessions.len()
         );
@@ -397,7 +397,7 @@ impl LucidosEngine {
                 stop.notify_one();
                 continue;
             }
-            log!("[Shutdown] Interrupting Claude Code session {}", tid);
+            log_legacy!("[Shutdown] Interrupting Claude Code session {}", tid);
             match startup_cancel {
                 Some(startup_cancel) => startup_cancel.cancel(),
                 None => interrupt.notify_one(),
@@ -412,7 +412,7 @@ impl LucidosEngine {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                log!(
+                log_legacy!(
                     "[Shutdown] {} session(s) still active after timeout — force-stopping",
                     remaining
                 );
@@ -431,7 +431,7 @@ impl LucidosEngine {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
 
-        log!("[Shutdown] Coding-agent sessions stopped.");
+        log_legacy!("[Shutdown] Coding-agent sessions stopped.");
     }
 }
 
@@ -475,7 +475,7 @@ pub(crate) async fn emit_teardown_abort_unless_question_parked(
     use crate::engine::thread_events::{self, EventMeta};
 
     if crate::engine::agent_recovery::thread_has_unanswered_question(pool, thread_id).await {
-        log!(
+        log_legacy!(
             "[Restart] Preserving thread {} — parked on an unanswered question, no boundary abort",
             thread_id
         );

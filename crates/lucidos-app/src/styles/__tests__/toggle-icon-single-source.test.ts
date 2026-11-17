@@ -100,7 +100,8 @@ describe('an icon toggle has one definition', () => {
       .filter(file => relativeToSrc(file) !== TONE_COMPONENT)
       .flatMap(file => handPressedIconButtons(readFileSync(file, 'utf8'), relativeToSrc(file)));
     expect(offenders, 'render the toggle through ToggleIconButton').toEqual([]);
-  });
+    // It parses every client source file, which outlasts 5 s on a loaded host.
+  }, 30_000);
 
   it('flags a hand-pressed icon button (fixture)', () => {
     const source = `const a = <button class={\`icon-btn header-icon\`} aria-pressed={on} />;

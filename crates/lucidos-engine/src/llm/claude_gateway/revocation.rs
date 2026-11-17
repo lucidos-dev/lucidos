@@ -35,7 +35,7 @@ pub(crate) async fn revoke(ended: EndedSignIn) {
     let endpoint = match discover(&origin).await {
         Ok(endpoints) => endpoints.revocation,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Could not revoke the sign-in at {origin}: {e}");
+            crate::log_legacy!("[ClaudeGateway] Could not revoke the sign-in at {origin}: {e}");
             return;
         }
     };
@@ -61,12 +61,12 @@ async fn post(endpoint: &str, form: &[(&str, &str)]) {
         Ok(resp) => {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            crate::log!(
+            crate::log_legacy!(
                 "[ClaudeGateway] {endpoint} answered {status} to a revocation: {}",
                 excerpt(&body)
             );
         }
-        Err(e) => crate::log!("[ClaudeGateway] Could not reach {endpoint} to revoke: {e}"),
+        Err(e) => crate::log_legacy!("[ClaudeGateway] Could not reach {endpoint} to revoke: {e}"),
     }
 }
 

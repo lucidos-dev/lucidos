@@ -1,5 +1,5 @@
 import { APP_FRAME_ISOLATED } from './appFrameSandbox';
-import { tellFrame } from '../../store/actions/app-bridge';
+import { tellFrame } from '../../store/actions/app-frame-channel';
 
 /** Deliver an app fragment to a MOUNTED app, and re-scope the frame's own URL.
  *

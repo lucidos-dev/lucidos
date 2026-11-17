@@ -730,6 +730,38 @@ pub const REASONING_EXPECTED_WAKE_DECISION: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const MODEL_PERMISSION_ANSWER: Pref<Text> = Pref::text(PrefSpec {
+    key: "model_permission_answer",
+    label: "Permission-answer model",
+    access: PrefAccess::Human {
+        hint: "this model decides whether the owner's words grant a permission, so it is managed in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Value(BACKGROUND_MODEL),
+    description: concat!(
+        "Background model that reads the owner's typed or spoken words against an open permission request and says which option they choose, if any. Only a clear pick counts. An unsure answer or a failed call grants nothing, and a tap still works. Settings offers the System One models in the same control, which write judgment_permission_answer instead. It follows no other key.",
+        aux_fallback_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
+pub const REASONING_PERMISSION_ANSWER: Pref<Text> = Pref::text(PrefSpec {
+    key: "reasoning_permission_answer",
+    label: "Permission-answer reasoning",
+    access: PrefAccess::Human {
+        hint: "the permission-answer thinking budget is part of who may grant a permission, so it is managed in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(REASONING_EFFORTS),
+    default: PrefDefault::Value("none"),
+    description: concat!(
+        "Thinking budget for the permission answer, one pick among a request's options. A forced call on Claude runs without thinking whatever this says.",
+        task_tier_note!()
+    ),
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MODEL_MEMORY: Pref<Text> = Pref::text(PrefSpec {
     key: "model_memory",
     label: "Memory model",
@@ -914,7 +946,18 @@ pub const FOLLOW_MAIN_INTERVAL_MINUTES: Pref<Number> = Pref::number(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Number { min: 1.0, max: 60.0 },
     default: PrefDefault::Value("3"),
-    description: "How often a source checkout asks its origin remote for a newer main, in minutes. A newer main fast-forwards local main and builds in the background, and 'Switch to new version' still waits for a tap. Only a checkout with an origin remote follows. Lower it to pick up another gateway's landings sooner. Applies from the next round.",
+    description: "How often a paired source checkout asks its origin remote for a newer main, in minutes. A newer main fast-forwards local main. The follow_main_build preference controls whether it builds automatically. Switching still waits for a tap. Lower it to pick up another gateway's landings sooner. Applies from the next round.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const FOLLOW_MAIN_BUILD: Pref<Text> = Pref::text(PrefSpec {
+    key: "follow_main_build",
+    label: "Build followed main",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(&["auto", "on-switch"]),
+    default: PrefDefault::Value("auto"),
+    description: "When to build newer source in this workspace. 'auto' builds after following origin and allows automatic repair builds. 'on-switch' waits for Build new version, then offers Switch when ready. Following origin still runs promptly. Local Apply and explicit rebuilds still build. Other workspaces sharing the checkout can still build its shared binary. Applies from the next automatic build check.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1240,6 +1283,21 @@ pub const CODING_AGENT_CONTEXT_CEILING: Pref<Text> = Pref::text(PrefSpec {
     side_effect: PrefSideEffect::None,
 });
 
+pub const MAIN_CHECK: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "main_check_setting",
+    label: "Main check",
+    access: PrefAccess::Human {
+        hint: "the main-check setting decides which suites /harden leaves to the main check, so only a person sets it, in Settings → Coding Agents",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Enum(&crate::engine::MAIN_CHECK_SETTING_VALUES),
+    default: PrefDefault::Unset(
+        "'here' where this checkout can run the main check, else 'off'",
+    ),
+    description: "Which workspace runs the main check after main moves (ADR 0694). 'here' checks every new main, from a landing or a followed origin, and repairs a red one. 'another-host' starts nothing here, because another workspace checks main. 'off' means no main check covers this workspace. Under 'here' and 'another-host', /harden leaves the slow suites to the main check. Under 'off' it runs them all. Two workspaces set to 'here' both check and both repair.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const MODEL_CLAUDE_CODE: Pref<Text> = Pref::text(PrefSpec {
     key: "model_claude_code",
     label: "Claude Code default model",
@@ -1345,6 +1403,17 @@ pub const LONG_PROMPT_SHARE: Pref<Optional> = Pref::optional(PrefSpec {
 });
 
 // ---- Appearance (device-scoped) ----
+pub const AGENT_BRAND_COLOURS: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "agent-brand-colours",
+    label: "Agent brand colours",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Device,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("true"),
+    description: "Show agent brand colours in the thread drawer on THIS device. Off preserves the existing appearance, including the flat Lucidos mark. Other surfaces and status indicators are unchanged.",
+    side_effect: PrefSideEffect::None,
+});
+
 pub const THEME_MODE: Pref<Text> = Pref::text(PrefSpec {
     key: "theme-mode",
     label: "Theme mode",
@@ -1483,7 +1552,7 @@ pub const SNAPSHOT_RESTORE_BY_AGENTS: Pref<Text> = Pref::text(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Enum(&["ask", "allow"]),
     default: PrefDefault::Value("ask"),
-    description: "Whether agents restoring this workspace need a single-use owner approval. 'ask' requires approval; 'allow' permits verified agents from other workspaces. An agent can never restore its own workspace.",
+    description: "Whether agents restoring this workspace need the owner's permission, once. 'ask' requires it; 'allow' permits verified agents from other workspaces. An agent can never restore its own workspace, nor a user's or unknown one. A machine-made workspace is the agent's, so under 'ask' an agent still restores it with no card.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1516,7 +1585,18 @@ pub const BACKUP_REMINDER_DISMISSED: Pref<Optional> = Pref::optional(PrefSpec {
     scope: PrefScope::Global,
     value: PrefValue::Text,
     default: PrefDefault::Unset("the reminder shows"),
-    description: "Dismissal state of the app-shell banner shown while backup is off (no active backup_schedule with a backup_provider). Three values: unset or empty means never dismissed, so the banner shows; an RFC 3339 instant means dismissed then, hidden for 30 days from that instant; 'forever' means dismissed a second time, hidden permanently. Set it to empty to bring the reminder back. The banner is only ever shown while backup is off, so enabling a schedule hides it whatever this says.",
+    description: "Dismissal state of the app-shell banner shown while no backup_provider is set. Three values: unset or empty means never dismissed, so the banner shows; an RFC 3339 instant means dismissed then, hidden for 30 days from that instant; 'forever' means dismissed a second time, hidden permanently. Set it to empty to bring the reminder back. Choosing a backup_provider hides the banner whatever this says, even with a manual-only ('off') schedule.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const BACKUP_OVERDUE_REMINDER_DISMISSED: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "backup_overdue_reminder_dismissed",
+    label: "Backup overdue reminder dismissed",
+    access: PrefAccess::Agent,
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("the reminder shows"),
+    description: "Dismissal state of the app-shell banner shown when a backup_provider is set but the last successful backup is more than 7 days old, or none has run. Unset or empty means never dismissed, so the banner shows. An RFC 3339 instant means dismissed then, hidden for 7 days from that instant. A successful backup clears the banner whatever this says. Set it to empty to bring the reminder back.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1558,6 +1638,19 @@ pub const CODING_AGENT_AUTO_ANSWER: Pref<Flag> = Pref::flag(PrefSpec {
     value: PrefValue::Bool,
     default: PrefDefault::Value("false"),
     description: "Whether Lucidos answers the permission cards of coding-agent commands (Codex command_execution, Claude Code Bash) with the command guard's classifier and judge. On, a command placed as safe or reversible runs without a card. There is no undo for a wrong reversible verdict. Off, no Claude Code command runs unasked. Independent of command_guard. A catastrophic command the guard recognises is refused whatever this says, and a Codex sandbox escape placed as safe runs whatever this says.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const AGENTS_UNSANDBOXED: Pref<Flag> = Pref::flag(PrefSpec {
+    key: "agents_unsandboxed",
+    label: "Sandbox agents",
+    access: PrefAccess::Human {
+        hint: "the sandbox keeps agents away from Lucidos's own secrets, so only the owner lifts it, in Settings → Permissions",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Bool,
+    default: PrefDefault::Value("false"),
+    description: "Stored value defaults to false. The Sandbox agents control shows the inverse: on means agents_unsandboxed=false. Every agent-steered process then runs in an OS sandbox. This covers chat commands, scripts, coding agents, background tasks and MCP servers. The sandbox hides Lucidos's private files and protects each workspace's grant files. Where this machine cannot apply the sandbox, such a process does not start. Turning Sandbox agents off sets agents_unsandboxed=true. Agents in this workspace then run unsandboxed, and the app shows a standing warning. Other workspaces keep their own setting (ADR 0645).",
     side_effect: PrefSideEffect::None,
 });
 
@@ -1671,6 +1764,19 @@ pub const JUDGMENT_EXPECTED_WAKE_DECISION: Pref<Optional> = Pref::optional(PrefS
     value: PrefValue::Text,
     default: PrefDefault::Unset("the expected wake decision runs on its chat model"),
     description: "The System One model that estimates when a waiting thread wakes next, by id, or chat for model_expected_wake_decision. A System One model answers with a probability per time bucket, the chat model with one bucket. Unset runs on model_expected_wake_decision.",
+    side_effect: PrefSideEffect::None,
+});
+
+pub const JUDGMENT_PERMISSION_ANSWER: Pref<Optional> = Pref::optional(PrefSpec {
+    key: "judgment_permission_answer",
+    label: "Permission-answer backend",
+    access: PrefAccess::Human {
+        hint: "which backend reads the owner's words against a permission request (chat, or a System One model such as jev or openai): it decides who may grant a permission, so only the user decides, in Settings → Models (Background tasks), never via set_preference",
+    },
+    scope: PrefScope::Global,
+    value: PrefValue::Text,
+    default: PrefDefault::Unset("the permission answer runs on its chat model"),
+    description: "The System One model that reads the owner's words against an open permission request, by id, or chat for model_permission_answer. A System One model answers with a probability per option, the chat model with one option. Unset runs on model_permission_answer.",
     side_effect: PrefSideEffect::None,
 });
 
@@ -2112,6 +2218,8 @@ pub const CATALOG: &[&PrefSpec] = &[
     &REASONING_WAKE_DECISION.spec,
     &MODEL_EXPECTED_WAKE_DECISION.spec,
     &REASONING_EXPECTED_WAKE_DECISION.spec,
+    &MODEL_PERMISSION_ANSWER.spec,
+    &REASONING_PERMISSION_ANSWER.spec,
     &MODEL_MEMORY.spec,
     &REASONING_MEMORY.spec,
     &MODEL_QUERY_CLASSIFICATION.spec,
@@ -2127,6 +2235,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &OPENCODE_FREE_ENABLED.spec,
     &PROXY_TIMEOUT_SECS.spec,
     &FOLLOW_MAIN_INTERVAL_MINUTES.spec,
+    &FOLLOW_MAIN_BUILD.spec,
     &DRIVER_TIMEOUT_HOURS.spec,
     &NOTIFICATIONS_FILTER.spec,
     &NOTIFICATION_TOASTS.spec,
@@ -2155,6 +2264,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &CODING_AGENT_AUTO_COMPACT_TRIAL.spec,
     &CACHE_KEEP_ALIVE_MODE.spec,
     &CODING_AGENT_CONTEXT_CEILING.spec,
+    &MAIN_CHECK.spec,
     &MODEL_CLAUDE_CODE.spec,
     &REASONING_CLAUDE_CODE.spec,
     &MODEL_CODEX.spec,
@@ -2163,6 +2273,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &INTELLIGENCE_LADDER_CLAUDE_CODE.spec,
     &INTELLIGENCE_LADDER_CODEX.spec,
     &LONG_PROMPT_SHARE.spec,
+    &AGENT_BRAND_COLOURS.spec,
     &THEME_MODE.spec,
     &FONT_FAMILY.spec,
     &UI_SCALE.spec,
@@ -2178,9 +2289,11 @@ pub const CATALOG: &[&PrefSpec] = &[
     &SNAPSHOT_RETENTION.spec,
     &SNAPSHOT_RECOVERY_RETENTION.spec,
     &BACKUP_REMINDER_DISMISSED.spec,
+    &BACKUP_OVERDUE_REMINDER_DISMISSED.spec,
     &COMMAND_GUARD.spec,
     &COMMAND_GUARD_JUDGE.spec,
     &CODING_AGENT_AUTO_ANSWER.spec,
+    &AGENTS_UNSANDBOXED.spec,
     &MODEL_COMMAND_JUDGE.spec,
     &REASONING_COMMAND_JUDGE.spec,
     &JUDGMENT_COMMAND_GUARD.spec,
@@ -2189,6 +2302,7 @@ pub const CATALOG: &[&PrefSpec] = &[
     &JUDGMENT_READ_DECISION.spec,
     &JUDGMENT_WAKE_DECISION.spec,
     &JUDGMENT_EXPECTED_WAKE_DECISION.spec,
+    &JUDGMENT_PERMISSION_ANSWER.spec,
     &MAX_TOOL_CALLS.spec,
     &CAPTURE_CONTEXT.spec,
     &CACHE_CARDS.spec,
@@ -2966,6 +3080,13 @@ mod tests {
     }
 
     #[test]
+    fn agent_brand_colours_are_device_scoped_and_on_by_default() {
+        assert_eq!(AGENT_BRAND_COLOURS.spec.scope, PrefScope::Device);
+        assert!(AGENT_BRAND_COLOURS.default_flag());
+        assert!(validate(&AGENT_BRAND_COLOURS.spec, "false").is_ok());
+    }
+
+    #[test]
     fn theme_mode_is_device_scoped_and_language_is_global() {
         assert_eq!(THEME_MODE.spec.scope, PrefScope::Device);
         assert_eq!(LANGUAGE.spec.scope, PrefScope::Global);
@@ -3020,126 +3141,6 @@ mod tests {
         assert!(validate(spec, "shift-enter").is_err());
     }
 
-    /// Drift guard (`.claude/rules/system-knowhow.md`): every catalogued key is
-    /// documented in `system-knowhow/preferences.md`, and every default the doc
-    /// states is the catalog's. The doc is prose the agent reads raw, so it
-    /// keeps its own copy, pinned here (ADR 0368).
-    ///
-    /// - A table row's Default column holds the value in backticks, the key it
-    ///   inherits in backticks, or a parenthesised note for an unset default.
-    /// - A number row's Allowed column states the catalog's bounds.
-    /// - A bullet that says "Default `X`" names the catalog's value.
-    #[test]
-    fn doc_lists_every_key_with_its_catalog_default() {
-        let doc = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../system-knowhow/preferences.md"
-        ))
-        .expect("system-knowhow/preferences.md must exist");
-        let stated_default = regex::Regex::new(r"Default `([^`]+)`").unwrap();
-        for spec in CATALOG {
-            let name = format!("`{}`", spec.key);
-            assert!(
-                doc.contains(&name),
-                "preference '{}' is not documented in system-knowhow/preferences.md",
-                spec.key
-            );
-            let row_start = format!("| {name} |");
-            if let Some(row) = doc.lines().find(|line| line.starts_with(&row_start)) {
-                if let PrefValue::Number { min, max } = spec.value {
-                    let allowed = row.split(" | ").nth(2).unwrap_or_default();
-                    assert!(
-                        allowed.contains(&format!("{min}–{max}")),
-                        "preferences.md states '{allowed}' for {}, but the catalog bounds are {min}–{max}",
-                        spec.key
-                    );
-                }
-                let column = row.split(" | ").nth(3).unwrap_or_default();
-                let holds = match spec.default {
-                    PrefDefault::Value(value) => column.contains(&format!("`{value}`")),
-                    PrefDefault::Inherits(other) => column.contains(&format!("`{}`", other.key)),
-                    PrefDefault::Unset(_) => column.starts_with('('),
-                };
-                assert!(
-                    holds,
-                    "preferences.md states '{}' for {}, but the catalog default is {}",
-                    column,
-                    spec.key,
-                    spec.default_label()
-                );
-            }
-            let bullet_start = format!("- {name}");
-            if let Some(at) = doc.find(&bullet_start) {
-                let bullet = &doc[at..];
-                let bullet = &bullet[..bullet[2..].find("\n- ").map_or(bullet.len(), |n| n + 2)];
-                if let Some(stated) = stated_default.captures(bullet) {
-                    assert_eq!(
-                        Some(&stated[1]),
-                        spec.default_value(),
-                        "preferences.md states another default for {}",
-                        spec.key
-                    );
-                }
-            }
-        }
-    }
-
-    /// The one-definition guard (ADR 0368): no Rust source outside this
-    /// file spells a preference key. A reader names a key only through its
-    /// handle, so its default can only come from here.
-    ///
-    /// A key with a `_` or `-` is flagged anywhere it appears as a whole string
-    /// literal. A plain-word key such as `language` is also an ordinary word
-    /// and a wire field. It is flagged only on a line that names
-    /// `PreferenceStore` or a `key`. No allowlist: a hit is fixed at its
-    /// source.
-    #[test]
-    fn no_preference_key_is_spelled_outside_the_catalog() {
-        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let catalog = std::path::Path::new(file!()).file_name().unwrap();
-        let literal = regex::Regex::new(r#""([a-z][a-z0-9_\-]*)""#).unwrap();
-        let context = regex::Regex::new(r"PreferenceStore|\bkey\b").unwrap();
-        let mut scanned = 0;
-        let mut offenders = Vec::new();
-        let mut stack = vec![crates];
-        while let Some(dir) = stack.pop() {
-            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-                let path = entry.path();
-                let name = entry.file_name();
-                if path.is_dir() {
-                    if !matches!(name.to_str(), Some("target" | "node_modules" | "dist")) {
-                        stack.push(path);
-                    }
-                    continue;
-                }
-                let is_catalog =
-                    name == catalog && path.parent().is_some_and(|p| p.ends_with("src/core"));
-                if path.extension().is_none_or(|ext| ext != "rs") || is_catalog {
-                    continue;
-                }
-                scanned += 1;
-                let source = std::fs::read_to_string(&path).unwrap();
-                for (n, line) in source.lines().enumerate() {
-                    for capture in literal.captures_iter(line) {
-                        let word = &capture[1];
-                        let Some(spec) = spec(word) else { continue };
-                        let distinctive = spec.key.contains(['_', '-']);
-                        if distinctive || context.is_match(line) {
-                            offenders.push(format!("{}:{}: {word}", path.display(), n + 1));
-                        }
-                    }
-                }
-            }
-        }
-        assert!(scanned > 500, "the walk found only {scanned} Rust files");
-        assert!(
-            offenders.is_empty(),
-            "a preference key is spelled outside the catalog; read it through its \
-             `prefs::` handle instead:\n{}",
-            offenders.join("\n")
-        );
-    }
-
     /// The catalog's bounds are the proxy's own.
     #[test]
     fn the_proxy_timeout_entry_takes_the_proxy_bounds() {
@@ -3155,6 +3156,133 @@ mod tests {
         );
         assert!(validate(spec, &(MIN_SECS - 1).to_string()).is_err());
         assert!(validate(spec, "soon").is_err());
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// Drift guard (`.claude/rules/system-knowhow.md`): every catalogued key is
+        /// documented in `system-knowhow/preferences.md`, and every default the doc
+        /// states is the catalog's. The doc is prose the agent reads raw, so it
+        /// keeps its own copy, pinned here (ADR 0368).
+        ///
+        /// - A table row's Default column holds the value in backticks, the key it
+        ///   inherits in backticks, or a parenthesised note for an unset default.
+        /// - A number row's Allowed column states the catalog's bounds.
+        /// - A bullet that says "Default `X`" names the catalog's value.
+        #[test]
+        fn doc_lists_every_key_with_its_catalog_default() {
+            let doc = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../system-knowhow/preferences.md"
+            ))
+            .expect("system-knowhow/preferences.md must exist");
+            let stated_default = regex::Regex::new(r"Default `([^`]+)`").unwrap();
+            for spec in CATALOG {
+                let name = format!("`{}`", spec.key);
+                assert!(
+                    doc.contains(&name),
+                    "preference '{}' is not documented in system-knowhow/preferences.md",
+                    spec.key
+                );
+                let row_start = format!("| {name} |");
+                if let Some(row) = doc.lines().find(|line| line.starts_with(&row_start)) {
+                    if let PrefValue::Number { min, max } = spec.value {
+                        let allowed = row.split(" | ").nth(2).unwrap_or_default();
+                        assert!(
+                            allowed.contains(&format!("{min}–{max}")),
+                            "preferences.md states '{allowed}' for {}, but the catalog bounds are {min}–{max}",
+                            spec.key
+                        );
+                    }
+                    let column = row.split(" | ").nth(3).unwrap_or_default();
+                    let holds = match spec.default {
+                        PrefDefault::Value(value) => column.contains(&format!("`{value}`")),
+                        PrefDefault::Inherits(other) => {
+                            column.contains(&format!("`{}`", other.key))
+                        }
+                        PrefDefault::Unset(_) => column.starts_with('('),
+                    };
+                    assert!(
+                        holds,
+                        "preferences.md states '{}' for {}, but the catalog default is {}",
+                        column,
+                        spec.key,
+                        spec.default_label()
+                    );
+                }
+                let bullet_start = format!("- {name}");
+                if let Some(at) = doc.find(&bullet_start) {
+                    let bullet = &doc[at..];
+                    let bullet =
+                        &bullet[..bullet[2..].find("\n- ").map_or(bullet.len(), |n| n + 2)];
+                    if let Some(stated) = stated_default.captures(bullet) {
+                        assert_eq!(
+                            Some(&stated[1]),
+                            spec.default_value(),
+                            "preferences.md states another default for {}",
+                            spec.key
+                        );
+                    }
+                }
+            }
+        }
+
+        /// The one-definition guard (ADR 0368): no Rust source outside this
+        /// file spells a preference key. A reader names a key only through its
+        /// handle, so its default can only come from here.
+        ///
+        /// A key with a `_` or `-` is flagged anywhere it appears as a whole string
+        /// literal. A plain-word key such as `language` is also an ordinary word
+        /// and a wire field. It is flagged only on a line that names
+        /// `PreferenceStore` or a `key`. No allowlist: a hit is fixed at its
+        /// source.
+        #[test]
+        fn no_preference_key_is_spelled_outside_the_catalog() {
+            let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+            let catalog = std::path::Path::new(file!()).file_name().unwrap();
+            let literal = regex::Regex::new(r#""([a-z][a-z0-9_\-]*)""#).unwrap();
+            let context = regex::Regex::new(r"PreferenceStore|\bkey\b").unwrap();
+            let mut scanned = 0;
+            let mut offenders = Vec::new();
+            let mut stack = vec![crates];
+            while let Some(dir) = stack.pop() {
+                for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                    let path = entry.path();
+                    let name = entry.file_name();
+                    if path.is_dir() {
+                        if !matches!(name.to_str(), Some("target" | "node_modules" | "dist")) {
+                            stack.push(path);
+                        }
+                        continue;
+                    }
+                    let is_catalog =
+                        name == catalog && path.parent().is_some_and(|p| p.ends_with("src/core"));
+                    if path.extension().is_none_or(|ext| ext != "rs") || is_catalog {
+                        continue;
+                    }
+                    scanned += 1;
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in source.lines().enumerate() {
+                        for capture in literal.captures_iter(line) {
+                            let word = &capture[1];
+                            let Some(spec) = spec(word) else { continue };
+                            let distinctive = spec.key.contains(['_', '-']);
+                            if distinctive || context.is_match(line) {
+                                offenders.push(format!("{}:{}: {word}", path.display(), n + 1));
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(scanned > 500, "the walk found only {scanned} Rust files");
+            assert!(
+                offenders.is_empty(),
+                "a preference key is spelled outside the catalog; read it through its \
+             `prefs::` handle instead:\n{}",
+                offenders.join("\n")
+            );
+        }
     }
 }
 

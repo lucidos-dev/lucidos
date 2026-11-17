@@ -3,6 +3,7 @@
 - **Status**: Accepted
 - **Date**: 2026-10-27
 - **Extends**: [0132](0132-gateway-auth-state-is-per-gateway.md)
+- **Amended by**: [0647](0647-only-a-signed-claim-proves-the-owner.md): loopback pairs over `http`, and a local process's pairing waits for the owner
 
 ## Context
 

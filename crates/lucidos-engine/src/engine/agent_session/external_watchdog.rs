@@ -206,7 +206,7 @@ impl ExternalWatchdog {
             // lands at `EXTERNAL_WATCHDOG_TICK_SECS` instead of racing
             // engine startup.
             interval.tick().await;
-            log!(
+            log_legacy!(
                 "[ExternalWatchdog] starting (limit={}min, tick={}s)",
                 self.limit_ms / 60_000,
                 EXTERNAL_WATCHDOG_TICK_SECS,
@@ -287,7 +287,7 @@ impl ExternalWatchdog {
                         crate::engine::claude_code::thread_is_running(&self.pool, c.thread_id)
                             .await
                             .unwrap_or_else(|e| {
-                                log!(
+                                log_legacy!(
                                     "[ExternalWatchdog] thread={} running-state probe failed: {}; not recovering this tick",
                                     c.thread_id,
                                     e
@@ -295,7 +295,7 @@ impl ExternalWatchdog {
                                 false
                             });
                     if !still_running {
-                        log!(
+                        log_legacy!(
                             "[ExternalWatchdog] thread={} past ceiling / exited-stale but no longer `running` (awaiting user answer / already settled) — not recovering",
                             c.thread_id,
                         );
@@ -364,7 +364,7 @@ impl ExternalWatchdog {
         {
             Ok(rows) => rows,
             Err(e) => {
-                log!("[ExternalWatchdog] orphan settle query failed: {}", e);
+                log_legacy!("[ExternalWatchdog] orphan settle query failed: {}", e);
                 return;
             }
         };
@@ -389,7 +389,7 @@ impl ExternalWatchdog {
             )
             .await
             {
-                Ok(true) => log!(
+                Ok(true) => log_legacy!(
                     "[ExternalWatchdog] thread={} was `running` with no live session and \
                      nothing for {}min, settled",
                     thread_id,
@@ -398,7 +398,7 @@ impl ExternalWatchdog {
                 // Something settled it between the query and now. The helper
                 // re-checks `running` itself, so this is the expected race.
                 Ok(false) => {}
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[ExternalWatchdog] settling orphaned thread={} failed: {}",
                     thread_id,
                     e
@@ -444,7 +444,7 @@ impl ExternalWatchdog {
                 // cancel/kill a live, progressing session — skip it.
                 let current_last_ms = c.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
                 if current_last_ms > c.snapshot_last_ms {
-                    log!(
+                    log_legacy!(
                         "[ExternalWatchdog] thread={} produced a fresh event since the snapshot (recovered) — leaving it alone",
                         c.thread_id,
                     );
@@ -489,7 +489,7 @@ impl ExternalWatchdog {
                     // A recovery-mode spawn took this thread over since the
                     // snapshot. Its entry and its turn are not ours to end, and
                     // the wedged subprocess above is now cancelled either way.
-                    log!(
+                    log_legacy!(
                         "[ExternalWatchdog] thread={} was taken over by a replacement session \
                          since the snapshot: cancelled the wedged subprocess, left the \
                          replacement's entry and its turn alone",
@@ -503,7 +503,7 @@ impl ExternalWatchdog {
         }
 
         for s in to_emit {
-            log!(
+            log_legacy!(
                 "[ExternalWatchdog] thread={} stuck for {}s (limit={}min) — \
                  in-loop watchdog never fired (likely wedged event handler); \
                  cancelling the coding-agent subprocess + dropping session entry \

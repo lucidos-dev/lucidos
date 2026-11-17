@@ -16,6 +16,12 @@ pub(crate) enum Actor {
     Owner {
         workspace_id: String,
     },
+    /// An agent thread through the workspace broker, after its engine spent
+    /// the owner's Allow once.
+    Agent {
+        workspace_id: String,
+        thread_id: String,
+    },
 }
 
 #[derive(Serialize)]

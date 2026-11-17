@@ -277,10 +277,8 @@ pub fn build_wasmtime_engine() -> Result<Engine, String> {
     config.epoch_interruption(true);
     let engine = Engine::new(&config).map_err(|e| format!("wasmtime engine init: {e}"))?;
 
-    // Detached epoch ticker. Holds an `Engine` clone (cheap Arc-backed handle);
-    // since the engine lives for the process there is one such thread per
-    // process. (In the test binaries each `build_wasmtime_engine()` spawns its
-    // own short-lived ticker — harmless for a test process.)
+    // Each call starts a detached ticker that retains its Engine clone until
+    // the process exits, including calls made by tests.
     let ticker = engine.clone();
     std::thread::Builder::new()
         .name("wasm-epoch-ticker".to_string())
@@ -457,7 +455,7 @@ fn signer_fault(
     redactions: &[String],
 ) -> (StatusCode, String) {
     let detail = crate::core::redact_secret_values(detail, redactions);
-    crate::log!("[wasm-signer:{signer}] {what}: {detail}");
+    crate::log_legacy!("[wasm-signer:{signer}] {what}: {detail}");
     (status, format!("signer {signer} {what}"))
 }
 

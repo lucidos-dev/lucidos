@@ -6,12 +6,14 @@ import type { AffectedTrigger, App, PinnedAppEntry } from '../../store/types';
 import type { ApiResult, ArtifactsResponse, UploadResponse } from '../types';
 
 // --- Workspaces ---
+/** One row of `GET /api/v1/workspaces`, the engine's projection of its
+ *  gateway's listing (`api/workspace_list.rs`). */
 export interface WorkspaceInfo {
+  id: string;
   name: string;
   path: string;
-  port: number | null;
-  engine_running: boolean;
-  engine_version: string;
+  port: number;
+  health: 'restoring' | 'booting' | 'healthy' | 'unhealthy';
 }
 
 export async function fetchWorkspaces(): Promise<{ workspaces: WorkspaceInfo[] }> {

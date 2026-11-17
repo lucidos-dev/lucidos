@@ -19,7 +19,6 @@ vi.mock('./store', async (importOriginal) => {
 import { ApiError } from '../api/client';
 import {
   QUICK_FAILURE_MS,
-  SIDE_QUESTION_CODEX,
   SIDE_QUESTION_EMPTY,
   SIDE_QUESTION_NOT_STARTED,
   askSideQuestion,
@@ -40,7 +39,7 @@ import { SEND_RETRY_BACKOFF_MS } from './actions/sendRetry';
 import type { StoredEvent } from './thread-events/thread-event-types';
 import type { ThreadState } from './thread-events/thread-meta';
 
-const STARTED = { started: true, codex: false };
+const STARTED = { started: true };
 
 describe('sideQuestionModeOn', () => {
   afterEach(() => { composeSelections.value = new Map(); });
@@ -70,12 +69,10 @@ describe('routeSideQuestion', () => {
   });
 
   it('refuses, keeping the draft, where it cannot be asked', () => {
-    expect(routeSideQuestion('q', { started: false, codex: false }, true))
+    expect(routeSideQuestion('q', { started: false }, true))
       .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_NOT_STARTED });
     expect(routeSideQuestion('   ', STARTED, true)).toEqual({ kind: 'refuse', toast: SIDE_QUESTION_EMPTY });
-    // A Codex thread takes none, and refusing here keeps the draft's images.
-    expect(routeSideQuestion('q', { started: true, codex: true }, true))
-      .toEqual({ kind: 'refuse', toast: SIDE_QUESTION_CODEX });
+
   });
 });
 
@@ -133,10 +130,10 @@ describe('askSideQuestion', () => {
   });
 
   it("puts the engine's refusal on the card, for a Codex thread", async () => {
-    post.mockRejectedValue(new ApiError(400, 'Side questions are not available in Codex threads.'));
+    post.mockRejectedValue(new ApiError(400, 'Update Codex to use ephemeral side-question forks.'));
     await askSideQuestion('codex-thread', 'q');
     expect(sideQuestionsFor('codex-thread')).toMatchObject([
-      { status: 'failed', error: 'Side questions are not available in Codex threads.' },
+      { status: 'failed', error: 'Update Codex to use ephemeral side-question forks.' },
     ]);
   });
 
@@ -417,7 +414,7 @@ describe('dismissSideQuestion', () => {
   });
 
   it('drops a card the engine never recorded', async () => {
-    post.mockRejectedValue(new ApiError(400, 'Side questions are not available in Codex threads.'));
+    post.mockRejectedValue(new ApiError(400, 'Update Codex to use ephemeral side-question forks.'));
     postDismissal.mockRejectedValue(new ApiError(404, 'No side question with this id was asked on this thread.'));
     await askSideQuestion('t1', 'q');
     await dismissSideQuestion(sideQuestionsFor('t1')[0]);

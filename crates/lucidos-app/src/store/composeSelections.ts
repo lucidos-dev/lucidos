@@ -1,49 +1,24 @@
-/** Per-thread compose dropdown selections — target scope, coding-agent backend,
- *  Lucidos Agent model + reasoning, and coding-agent model + reasoning — kept OUT
- *  of the global picker signals so a change while editing one draft never leaks
- *  to another.
+/** Per-draft compose selections, synced beside text/images/mode through the
+ *  debounced compose PUT and `ThreadComposeChanged` (ADR 0437).
  *
- *  SERVER-SYNCED (DB-backed). Unlike its first iteration (client-only, wiped on
- *  reload), a draft's selection is persisted alongside the draft's text/images/
- *  mode in `thread_summaries.compose_selection` and rehydrated on reload and via
- *  the `ThreadComposeChanged` SSE (`setComposeSelectionFromServer`), so a stored
- *  draft keeps its picks across a refresh and across devices. The write path
- *  piggybacks on the debounced compose PUT (`compose.ts` includes the selection
- *  in the body). See docs/plans/2026-07-01-compose-selection-db-persistence.md.
+ *  Each field overrides its account default. Scope and coding agent are copied
+ *  from their last-used seeds when a draft is created, so later picks cannot
+ *  move it. Explicit coding-agent chip picks also remember the workspace
+ *  preference; the server preserves inherited legacy selections atomically (ADR 0006).
+ *  Model and reasoning picks only change the draft.
  *
- *  The map stores only OVERRIDES. A field the user hasn't touched for a draft
- *  falls back to the account default at read time — the same
- *  "per-draft value ?? account default" shape as `effectiveSendMode`. Editing a
- *  draft writes ONLY the override (and, for scope, the localStorage last-used
- *  seed below); it never writes the account-wide preference (`chat_model` /
- *  `chat_reasoning_efforts` / `coding_agent_default`). `sendCompose` consumes the
- *  resolved values at send and then `clearComposeSelection`s the entry.
- *
- *  SCOPE'S LAST-USED SEED (localStorage). Scope has no account preference — its
- *  default IS the last-used value, `selectedScope` (localStorage). A compose
- *  scope pick updates `selectedScope` so the NEXT new draft seeds from it, and a
- *  new draft eager-copies `selectedScope` into its OWN stored scope at creation
- *  (`ensureFocusedComposeThread`). Crucially, `resolveScope` reads `selectedScope`
- *  ONLY for the no-draft compose view — an EXISTING draft resolves scope from its
- *  own stored value (never the shared `selectedScope`). That is what keeps a scope
- *  pick on draft A from leaking into draft B (the original per-draft bug): no
- *  existing draft reads the shared seed. Model/agent/reasoning have real account
- *  defaults, so reading those as the fallback for an unset field never leaks.
- *
- *  THE PENDING SLOT. A compose draft is created lazily (on the first keystroke),
- *  so the fresh compose view can have NO focused draft yet while the user picks a
- *  destination/agent/model. Those picks (threadId `null`) go to
- *  `pendingComposeSelection`, a single unkeyed override transferred onto the
- *  draft's own entry when it is created (`ensureFocusedComposeThread` →
- *  `seedComposeSelection` + `takePendingComposeSelection`), then cleared. A
- *  `null`/`undefined` threadId routes reads AND writes through the pending slot; a
- *  real id routes through the keyed map. */
+ *  Before the first keystroke creates a draft, picks use the pending slot
+ *  (`threadId` null). `ensureFocusedComposeThread` transfers those picks onto
+ *  the new draft. `sendCompose` binds resolved values at promotion, then clears
+ *  the selection. */
 
 import { signal } from '@preact/signals';
 import {
   type Scope,
   selectedScope,
   selectedCodingAgent,
+  threadMap,
+  preferences,
   currentModel,
 } from './store';
 import { accountChatEffort } from './actions/preferences';
@@ -69,9 +44,9 @@ export interface ComposeSelectionOverride {
   /** The composer is in side-question mode. Turned off as an explicit `false`,
    *  since the compose PUT omits an empty selection and the engine keeps it. */
   sideQuestionMode?: boolean;
-  /** A teammate the new thread is for, by person id (ADR 0649). `null` clears
+  /** A teammate the new thread is for, by user id (ADR 0649). `null` clears
    *  it, since the compose PUT omits an absent field and the engine keeps it. */
-  person?: string | null;
+  user?: string | null;
 }
 
 export const composeSelections = signal<Map<string, ComposeSelectionOverride>>(new Map());
@@ -185,8 +160,20 @@ export function resolveScope(threadId: string | null | undefined): Scope {
 }
 
 /** The teammate this draft is addressed to, or `null` for an agent. */
-export function resolvePerson(threadId: string | null | undefined): string | null {
-  return getComposeSelectionOverride(threadId).person ?? null;
+export function resolveUser(threadId: string | null | undefined): string | null {
+  return getComposeSelectionOverride(threadId).user ?? null;
+}
+
+/** Keep legacy drafts stable locally while the server atomically pins them.
+ *  This changes no draft content and schedules no compose writes. */
+export function applyCodingAgentDefault(agent: CodingAgent): void {
+  if (agent === selectedCodingAgent.value) return;
+  for (const [id, thread] of threadMap.value) {
+    if (preferences.value.status === 'loaded' && thread.meta.state === 'composing' && !getComposeSelectionOverride(id).codingAgent) {
+      patchComposeSelection(id, { codingAgent: selectedCodingAgent.value });
+    }
+  }
+  selectedCodingAgent.value = agent;
 }
 
 export function resolveCodingAgent(threadId: string | null | undefined): CodingAgent {

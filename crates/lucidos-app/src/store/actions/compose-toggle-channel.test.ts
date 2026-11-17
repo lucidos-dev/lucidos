@@ -49,7 +49,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../api/client')>()),
   API_BASE: '',
   submitChat: vi.fn().mockResolvedValue({ event_id: 'srv-evt' }),
-  cancelChat: vi.fn().mockResolvedValue(undefined),
+  cancelChat: vi.fn().mockResolvedValue({ canceled: true, taken_back_messages: [], failed_take_back_ids: [] }),
   stopClaudeCode: vi.fn().mockResolvedValue(undefined),
   putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),

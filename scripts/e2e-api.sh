@@ -74,7 +74,8 @@ CMD=(cargo test --locked -p lucidos-e2e --test api)
 # The bin-only gateway chain fixture is also selectable for focused iteration.
 # Do not send its name to the API binary, where it would silently run zero tests.
 if [ "$FILTER" = "chain_tests::an_app_frames_own_files_load_through_a_gateway" ] || \
-   [ "$FILTER" = "server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip" ]; then
+   [ "$FILTER" = "server::snapshot_roundtrip_tests::isolated_snapshot_cli_roundtrip" ] || \
+   [ "$FILTER" = "relay::tests::isolation::remote_production_client_continuity" ]; then
     CMD=(cargo test --locked -p lucidos-gateway "$FILTER")
     CARGO_ARGS=(--ignored --exact "${CARGO_ARGS[@]}")
 else
@@ -110,6 +111,8 @@ if [ -z "$FILTER" ]; then
     # focused chain run, rather than inheriting the preceding suite's state.
     reset_e2e_database
     echo "Running the gateway chain test (an app's own files behind a gateway)"
+    [ "${LUCIDOS_E2E_GATEWAY:-none}" = own ] \
+        || echo "  It skips the restore-origin proof: the engine has no gateway identity here."
     cargo test --locked -p lucidos-gateway -- --ignored --exact \
         chain_tests::an_app_frames_own_files_load_through_a_gateway
     echo "Running isolated snapshot CLI restore and Undo (private workspaces and database)"

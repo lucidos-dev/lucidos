@@ -1,3 +1,4 @@
+import { ProviderSpendCapAction, ProviderSpendCapStatus } from './ProviderSpendCap';
 import { useEffect, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { configuredProviders, preferences } from '../../store/store';
@@ -102,7 +103,8 @@ export function ProviderBlock(props: {
       anchor={props.anchor}
       explainer={props.explainer}
       detail={props.detail}
-      actions={props.actions}
+      actions={<>{props.actions}<ProviderSpendCapAction provider={props.id} /></>}
+      status={<ProviderSpendCapStatus provider={props.id} />}
       switchedOff={state === 'switched-off'}
       hasStoredConfig={props.hasStoredConfig}
       loaded={loaded}

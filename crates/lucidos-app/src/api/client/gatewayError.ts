@@ -10,11 +10,18 @@
  * in the store to get it: the picker runs them before any workspace exists.
  */
 export async function gatewayErrorReason(res: Response): Promise<string> {
+  return (await gatewayErrorBody(res)).reason;
+}
+
+/** The sentence, plus the `reason_kind` a typed refusal carries for the UI. */
+export async function gatewayErrorBody(res: Response): Promise<{ reason: string; reasonKind: string | null }> {
   try {
     const body = await res.json();
-    if (body?.error) return String(body.error);
+    if (body?.error) {
+      return { reason: String(body.error), reasonKind: body.reason_kind ? String(body.reason_kind) : null };
+    }
   } catch {
     /* non-JSON body */
   }
-  return res.statusText || `HTTP ${res.status}`;
+  return { reason: res.statusText || `HTTP ${res.status}`, reasonKind: null };
 }

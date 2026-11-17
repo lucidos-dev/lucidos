@@ -60,7 +60,7 @@ pub(crate) async fn summarize_on<P: LlmProvider + ?Sized>(
     {
         Ok(response) => response.content,
         Err(e) => {
-            log!("[Memory] Failed to generate summary for {}: {}", path, e);
+            log_legacy!("[Memory] Failed to generate summary for {}: {}", path, e);
             None
         }
     }
@@ -107,13 +107,13 @@ impl LucidosEngine {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            log!(@Memory, "Rebuild already in progress, skipping");
+            log_legacy!(@Memory, "Rebuild already in progress, skipping");
             return;
         }
         self.cancel_rebuild.store(false, Ordering::SeqCst);
 
         let Some(ref index) = self.memory_index else {
-            log!(@Memory, "No memory index, skipping rebuild");
+            log_legacy!(@Memory, "No memory index, skipping rebuild");
             self.rebuilding_memory.store(false, Ordering::SeqCst);
             return;
         };
@@ -127,7 +127,7 @@ impl LucidosEngine {
         // this too; this is the fail-fast floor for every caller). The background
         // loader runs the reembed sweep itself once the model installs.
         if !self.embedder.is_ready() {
-            log!(
+            log_legacy!(
                 @Memory,
                 "Embedding model not ready yet — refusing memory rebuild (would clear entries it can't re-index); retry once memory is active"
             );
@@ -158,27 +158,27 @@ impl LucidosEngine {
         };
 
         if force {
-            log!(@Memory, "Starting FULL memory rebuild (force=true)...");
+            log_legacy!(@Memory, "Starting FULL memory rebuild (force=true)...");
             match index.clear().await {
                 Ok(deleted) => {
                     if deleted > 0 {
-                        log!(@Memory, "Cleared {} existing memory entries", deleted);
+                        log_legacy!(@Memory, "Cleared {} existing memory entries", deleted);
                     }
                 }
                 Err(e) => {
-                    log!(@Memory, "Failed to clear memory entries: {}", e);
+                    log_legacy!(@Memory, "Failed to clear memory entries: {}", e);
                     self.rebuilding_memory.store(false, Ordering::SeqCst);
                     return;
                 }
             }
         } else if re_extract_stale {
-            log!(@Memory, "Starting INCREMENTAL memory rebuild (re_extract_stale=true)...");
+            log_legacy!(@Memory, "Starting INCREMENTAL memory rebuild (re_extract_stale=true)...");
             match index
                 .delete_below_extractor_version(crate::memory::EXTRACTOR_VERSION)
                 .await
             {
                 Ok(deleted) if deleted > 0 => {
-                    log!(
+                    log_legacy!(
                         @Memory,
                         "Deleted {} stale entries (extractor_version < {}) — they will be re-extracted",
                         deleted,
@@ -186,16 +186,16 @@ impl LucidosEngine {
                     );
                 }
                 Ok(_) => {
-                    log!(@Memory, "No stale entries to re-extract");
+                    log_legacy!(@Memory, "No stale entries to re-extract");
                 }
                 Err(e) => {
-                    log!(@Memory, "Failed to delete stale entries: {}", e);
+                    log_legacy!(@Memory, "Failed to delete stale entries: {}", e);
                     self.rebuilding_memory.store(false, Ordering::SeqCst);
                     return;
                 }
             }
         } else {
-            log!(@Memory, "Starting INCREMENTAL memory rebuild (resume mode)...");
+            log_legacy!(@Memory, "Starting INCREMENTAL memory rebuild (resume mode)...");
         }
 
         // SQL narrows to the indexable types; memory_content_for_event decides.
@@ -211,7 +211,7 @@ impl LucidosEngine {
                 .filter(|e| Self::memory_content_for_event(e).is_some())
                 .collect(),
             Err(e) => {
-                log!(@Memory, "Failed to load events: {}", e);
+                log_legacy!(@Memory, "Failed to load events: {}", e);
                 self.rebuilding_memory.store(false, Ordering::SeqCst);
                 return;
             }
@@ -221,7 +221,7 @@ impl LucidosEngine {
         let artifact_changes = match self.artifact_manager.walk_artifact_history() {
             Ok(changes) => changes,
             Err(e) => {
-                log!(@Memory, "Failed to walk artifact history: {}, continuing without artifacts", e);
+                log_legacy!(@Memory, "Failed to walk artifact history: {}, continuing without artifacts", e);
                 Vec::new()
             }
         };
@@ -246,11 +246,11 @@ impl LucidosEngine {
             }
             match index.sources_indexed(&all_sources).await {
                 Ok(set) => {
-                    log!(@Memory, "Found {} already-indexed sources, will skip them", set.len());
+                    log_legacy!(@Memory, "Found {} already-indexed sources, will skip them", set.len());
                     set
                 }
                 Err(e) => {
-                    log!(@Memory, "Failed to load indexed sources: {}, processing all", e);
+                    log_legacy!(@Memory, "Failed to load indexed sources: {}, processing all", e);
                     std::collections::HashSet::new()
                 }
             }
@@ -258,7 +258,7 @@ impl LucidosEngine {
             std::collections::HashSet::new()
         };
 
-        log!(@Memory, "Rebuilding: {} events + {} artifact versions ({} total, {} already indexed)",
+        log_legacy!(@Memory, "Rebuilding: {} events + {} artifact versions ({} total, {} already indexed)",
             events.len(), artifact_changes.len(), combined_total, already_indexed.len());
 
         // Build base extraction context (system + user, no conversation since this is a rebuild)
@@ -292,7 +292,7 @@ impl LucidosEngine {
         progress += events_skipped;
         if events_skipped > 0 {
             send_progress(progress, combined_total);
-            log!(@Memory, "Skipped {} already-indexed events", events_skipped);
+            log_legacy!(@Memory, "Skipped {} already-indexed events", events_skipped);
         }
 
         let mut last_log = 0usize;
@@ -336,7 +336,7 @@ impl LucidosEngine {
                 progress += 1;
                 send_progress(progress, combined_total);
                 if progress - last_log >= 50 {
-                    log!(@Memory, "Rebuild progress: {}/{} ({} indexed, {} skipped, {} fallbacks)",
+                    log_legacy!(@Memory, "Rebuild progress: {}/{} ({} indexed, {} skipped, {} fallbacks)",
                         progress, combined_total, indexed, skipped, fallbacks);
                     last_log = progress;
                 }
@@ -347,9 +347,9 @@ impl LucidosEngine {
         {
             let ids = std::mem::take(&mut *deferred_deletes.lock().unwrap());
             if !ids.is_empty() {
-                log!(@Memory, "Flushing {} deferred deletes from event phase", ids.len());
+                log_legacy!(@Memory, "Flushing {} deferred deletes from event phase", ids.len());
                 if let Err(e) = index.delete_many(&ids).await {
-                    log!(@Memory, "Failed to flush deferred deletes: {}", e);
+                    log_legacy!(@Memory, "Failed to flush deferred deletes: {}", e);
                 }
             }
         }
@@ -378,7 +378,7 @@ impl LucidosEngine {
         progress += artifacts_skipped;
         if artifacts_skipped > 0 {
             send_progress(progress, combined_total);
-            log!(@Memory, "Skipped {} already-indexed artifacts", artifacts_skipped);
+            log_legacy!(@Memory, "Skipped {} already-indexed artifacts", artifacts_skipped);
         }
 
         last_log = progress;
@@ -396,7 +396,7 @@ impl LucidosEngine {
                 .collect();
             let ext_skipped = artifacts_to_process.len() - artifacts_after_ext_filter.len();
             if ext_skipped > 0 {
-                log!(@Memory, "Skipped {} binary/image/archive artifacts", ext_skipped);
+                log_legacy!(@Memory, "Skipped {} binary/image/archive artifacts", ext_skipped);
             }
             skipped += ext_skipped;
             progress += ext_skipped;
@@ -452,7 +452,7 @@ impl LucidosEngine {
                 progress += 1;
                 send_progress(progress, combined_total);
                 if progress - last_log >= 50 {
-                    log!(@Memory, "Rebuild progress: {}/{} (artifact phase, {} indexed, {} skipped)",
+                    log_legacy!(@Memory, "Rebuild progress: {}/{} (artifact phase, {} indexed, {} skipped)",
                         progress, combined_total, indexed, skipped);
                     last_log = progress;
                 }
@@ -463,9 +463,9 @@ impl LucidosEngine {
         {
             let ids = std::mem::take(&mut *deferred_deletes.lock().unwrap());
             if !ids.is_empty() {
-                log!(@Memory, "Flushing {} deferred deletes from artifact phase", ids.len());
+                log_legacy!(@Memory, "Flushing {} deferred deletes from artifact phase", ids.len());
                 if let Err(e) = index.delete_many(&ids).await {
-                    log!(@Memory, "Failed to flush deferred deletes: {}", e);
+                    log_legacy!(@Memory, "Failed to flush deferred deletes: {}", e);
                 }
             }
         }
@@ -485,17 +485,17 @@ impl LucidosEngine {
                     )
                     .await
                 }
-                Err(e) => log!(@Memory, "Failed to load correction events: {}", e),
+                Err(e) => log_legacy!(@Memory, "Failed to load correction events: {}", e),
             }
         }
 
         let count = index.len().await.unwrap_or(0);
         if canceled {
-            log!(@Memory, "Rebuild CANCELED at {}/{}. {} memory entries ({} indexed, {} skipped, {} fallbacks). Resume with force=false.",
+            log_legacy!(@Memory, "Rebuild CANCELED at {}/{}. {} memory entries ({} indexed, {} skipped, {} fallbacks). Resume with force=false.",
                 progress, combined_total, count, indexed, skipped, fallbacks);
         } else {
             send_progress(combined_total, combined_total);
-            log!(@Memory, "Rebuild complete. {} memory entries from {} events + {} artifact versions ({} indexed, {} skipped, {} fallbacks).",
+            log_legacy!(@Memory, "Rebuild complete. {} memory entries from {} events + {} artifact versions ({} indexed, {} skipped, {} fallbacks).",
                 count, events.len(), artifact_changes.len(), indexed, skipped, fallbacks);
         }
         self.rebuilding_memory.store(false, Ordering::SeqCst);
@@ -508,7 +508,7 @@ impl LucidosEngine {
         // there. We previously used this hook to OCR / pdf-extract PDFs into
         // a `.txt` sidecar and index that out-of-band; that capability has
         // been removed, leaving nothing extra to do at upload time.
-        log!(@import_bg, "Background processing complete for {}", dest_relative);
+        log_legacy!(@import_bg, "Background processing complete for {}", dest_relative);
     }
 }
 

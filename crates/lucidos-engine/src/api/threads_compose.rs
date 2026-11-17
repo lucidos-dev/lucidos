@@ -12,37 +12,27 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::api::actor::user_actor;
-use crate::api::thread_reach::{refuse_without_authority, ThreadReachVerb};
+use crate::api::thread_reach::refuse_without_authority;
 use crate::api::{ApiError, AppState};
 use crate::core::blobs::write_blob_from_base64;
-use crate::core::store::{ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS};
+use crate::core::store::{
+    ComposeReport, ComposeReportRow, COMPOSE_REPORT_COLS, MAX_COMPOSE_IMAGES,
+    MAX_COMPOSE_SELECTION_BYTES, MAX_COMPOSE_TEXT_BYTES,
+};
 use crate::engine::event_bus::BusEvent;
+use crate::engine::permission::Action;
 use crate::engine::thread_events::{EventMeta, RecoveredCompose, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
-
-/// Cap on `compose_text` size. Compose updates fan out to every connected
-/// SSE subscriber on every keystroke; without a cap a pathological paste
-/// (or runaway client) multiplies the bandwidth cost by N devices.
-const MAX_COMPOSE_TEXT_BYTES: usize = 64 * 1024;
-/// How many images one compose draft may carry. A COUNT, not a byte budget:
-/// each entry is a blob hash of fixed length, checked by `is_blob_hash`, so
-/// the two caps together bound the array at 32 x 64 bytes.
-const MAX_COMPOSE_IMAGES: usize = 32;
-/// Cap on the JSON-encoded `compose_selection` object. A partial
-/// `ComposeSelectionOverride` is a handful of short fields (~a few hundred
-/// bytes); 8 KiB is generous headroom while still fencing off a runaway client,
-/// since this fans out over SSE like the other compose fields.
-const MAX_COMPOSE_SELECTION_BYTES: usize = 8 * 1024;
 
 /// The clause-4 verb `PUT /api/v1/threads/:id/compose` and
 /// `POST /api/v1/threads/:id/blobs` ask (ADR 0168). The draft holds the next
 /// message and its model picks, so writing it drives the thread's session, as
 /// changing its model does.
-pub(in crate::api) const COMPOSE_VERB: ThreadReachVerb = ThreadReachVerb::Control;
+pub(in crate::api) const COMPOSE_VERB: Action = Action::Control;
 /// The clause-4 verb `DELETE /api/v1/threads/:id` asks. Discarding a draft
 /// thread takes it off the thread list, which is what Archive does to an
 /// active one.
-pub(in crate::api) const DISCARD_DRAFT_VERB: ThreadReachVerb = ThreadReachVerb::Archive;
+pub(in crate::api) const DISCARD_DRAFT_VERB: Action = Action::Archive;
 
 #[derive(Debug, Deserialize)]
 pub(super) struct PostThreadBody {
@@ -135,8 +125,8 @@ pub(super) struct PutComposeBody {
     /// Per-draft dropdown selections (target/scope, coding agent, Lucidos
     /// model + reasoning, coding-agent model + reasoning) as a partial
     /// `ComposeSelectionOverride`-shaped object. `None` (absent) preserves the
-    /// existing stored selection via SQL COALESCE — a text-only keystroke PUT
-    /// must not wipe the draft's picks; a dropdown change sends the full object.
+    /// stored selection. A present object replaces other picks; omitting
+    /// `codingAgent` preserves its stored pin for legacy clients.
     #[serde(default)]
     pub selection: Option<JsonValue>,
     /// The *compose epoch* (`docs/glossary.md`) this write was composed
@@ -151,36 +141,6 @@ pub(super) struct PutComposeBody {
     /// cannot know to send one.
     #[serde(default)]
     pub compose_epoch: Option<i64>,
-}
-
-/// A composer submission was accepted: consume the thread's compose slot and
-/// tell every device what that left (ADR 0450). `device_id` names the
-/// submitting device. Shared by `chat_submit` and the answer-question endpoint.
-pub(crate) async fn consume_and_announce_compose_slot(
-    state: &AppState,
-    thread_id: Uuid,
-    submitted_text: &str,
-    submitted_image_hashes: &[String],
-    device_id: Option<String>,
-) -> Result<Option<ComposeReport>, sqlx::Error> {
-    let report = crate::core::store::consume_compose_slot(
-        state.engine.pool(),
-        thread_id,
-        submitted_text,
-        submitted_image_hashes,
-    )
-    .await?;
-    if let Some(report) = &report {
-        state
-            .engine
-            .event_bus
-            .emit_or_log(
-                report.clone().broadcast(thread_id, device_id),
-                "[Compose] ThreadComposeChanged",
-            )
-            .await;
-    }
-    Ok(report)
 }
 
 /// Accept a compose mode in either spelling, and answer with the STORED one.
@@ -329,9 +289,18 @@ pub(super) async fn post_thread(
         images,
         stored_mode,
         selection,
+        restorations,
     )) = row
     {
-        let existing = ComposeReport::from((version, epoch, text, images, stored_mode, selection));
+        let existing = ComposeReport::from((
+            version,
+            epoch,
+            text,
+            images,
+            stored_mode,
+            selection,
+            restorations,
+        ));
         // A recovery retry observes the destination without restoring its old
         // payload over subsequent user edits, sends, mode changes or discards.
         if recovering {
@@ -396,6 +365,7 @@ pub(super) async fn post_thread(
         thread_id: body.id,
         event: ThreadEvent::ThreadStarted {
             recovered_compose: body.recovered_compose,
+            agent_draft: None,
             mode: mode.to_string(),
             actor: actor.clone(),
         },
@@ -456,6 +426,7 @@ type PostThreadRow = (
     JsonValue,
     Option<String>,
     Option<JsonValue>,
+    JsonValue,
 );
 
 /// Upload a legacy inline-base64 compose batch and return its blob hashes.
@@ -474,7 +445,7 @@ fn upload_legacy_compose_images(
     if images.is_empty() {
         return Ok(Vec::new());
     }
-    crate::log!(
+    crate::log_legacy!(
         "[Compat] legacy image upload via PUT compose ({} images)",
         images.len()
     );
@@ -523,11 +494,10 @@ fn stale_compose_epoch_response(current: ComposeReport) -> Response {
 
 /// PUT /api/v1/threads/:id/compose — update compose fields.
 ///
-/// One round-trip: `UPDATE ... RETURNING` folds the state-machine guard, the
-/// mutation, and the *compose report* read-back into a single query. The
-/// report is both the `200` body and the SSE payload. Hot-path keystroke cost
-/// is one DB query plus one SSE broadcast. No event row written (per design —
-/// keystroke history isn't audit-worthy).
+/// A shared transaction lock excludes coding-agent seed changes while the
+/// UPDATE applies the state-machine guard and returns the compose report.
+/// The report is both the `200` body and the SSE payload. Keystrokes write
+/// no event row.
 ///
 /// `mode` is COALESCE'd so text-only PUTs preserve the user's existing mode
 /// preference; explicit mode-change PUTs are rejected once the thread leaves
@@ -592,24 +562,34 @@ pub(super) async fn put_compose(
     // WHERE clause already gates mode-carrying writes to `state='composing'`.
     //
     // `compose_images` uses COALESCE($3, compose_images): NULL bind preserves
-    // the existing array, `[]` clears it. `compose_selection` uses
-    // COALESCE($5, compose_selection) the same way: a text-only/keystroke PUT
-    // (NULL bind) must preserve the draft's stored dropdown picks, while a
-    // dropdown change sends the full object.
+    // the existing array, `[]` clears it. A missing selection preserves all
+    // stored picks. A present selection replaces them, except that omitting
+    // codingAgent preserves its pin for clients editing a legacy draft.
     //
     // `compose_updated_at` dates the draft for the `threads` tool's `drafts`
     // action. Recovered drafts also initialize these fields in their creation event.
     //
     // `compose_epoch = $6` is the write fence. It costs nothing on the
-    // keystroke path because the epoch counts SUBMISSIONS, not writes: every
-    // PUT between two submissions carries the same value, so only a write that
-    // straddles a submission can fail it.
+    // keystroke path because only submissions and Stop restorations advance it.
+    // A PUT straddling either change fails the fence.
+    let mut tx = state
+        .engine
+        .pool()
+        .begin()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    crate::core::preferences::lock_compose_agent_seed(&mut tx, false)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
     let row: Option<ComposeReportRow> = sqlx::query_as(&format!(
         "UPDATE thread_summaries
             SET compose_text = $2,
                 compose_images = COALESCE($3, compose_images),
                 compose_mode = COALESCE($4, compose_mode),
-                compose_selection = COALESCE($5, compose_selection),
+                compose_selection = CASE WHEN $5::jsonb IS NULL THEN compose_selection
+                    ELSE (CASE WHEN compose_selection->>'codingAgent' IS NOT NULL
+                        THEN jsonb_build_object('codingAgent', compose_selection->'codingAgent')
+                        ELSE '{{}}'::jsonb END) || $5::jsonb END,
                 compose_updated_at = now(),
                 source = CASE $4::text
                     WHEN 'claude_code' THEN 'claude_code'
@@ -628,9 +608,13 @@ pub(super) async fn put_compose(
     .bind(mode)
     .bind(body.selection.as_ref())
     .bind(body.compose_epoch)
-    .fetch_optional(state.engine.pool())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
+
+    tx.commit()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let Some(row) = row else {
         return refuse_unapplied_compose(&state, id, body.compose_epoch, mode).await;
@@ -668,7 +652,7 @@ async fn refuse_unapplied_compose(
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let (st, current) = match lookup {
-        Some((st, version, epoch, text, images, stored_mode, selection)) => (
+        Some((st, version, epoch, text, images, stored_mode, selection, restorations)) => (
             Some(ThreadState::from_db_str(&st).map_err(|e| ApiError::internal(e.to_string()))?),
             Some(ComposeReport::from((
                 version,
@@ -677,6 +661,7 @@ async fn refuse_unapplied_compose(
                 images,
                 stored_mode,
                 selection,
+                restorations,
             ))),
         ),
         None => (None, None),
@@ -726,6 +711,7 @@ type StateAndReportRow = (
     JsonValue,
     Option<String>,
     Option<JsonValue>,
+    JsonValue,
 );
 
 /// DELETE /api/v1/threads/:id — discard a composing thread.

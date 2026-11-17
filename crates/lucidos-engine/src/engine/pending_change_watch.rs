@@ -166,7 +166,7 @@ where
             // cache is stale too, and a thread back in its cached state would
             // read as unchanged.
             Err(BroadcastStreamRecvError::Lagged(n)) => {
-                log!(
+                log_legacy!(
                     "[PendingChangeWatch] Broadcast lagged by {} events, rebuilding the changes frame",
                     n
                 );
@@ -262,6 +262,7 @@ mod tests {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         }
     }
 

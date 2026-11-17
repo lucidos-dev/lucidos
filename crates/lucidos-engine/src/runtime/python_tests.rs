@@ -23,7 +23,10 @@ async fn ensure_packages_refuses_flags_urls_and_paths() {
         "",
     ] {
         let err = runtime
-            .ensure_packages(&["pandas", spec])
+            .ensure_packages(
+                &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+                &["pandas", spec],
+            )
             .await
             .expect_err(spec);
         assert!(err.contains("is not a package name"), "{spec}: {err}");
@@ -44,7 +47,12 @@ async fn test_execute_simple_python() {
     let dir = tempdir().unwrap();
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
-    let result = runtime.execute("print('hello')").await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('hello')",
+        )
+        .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "hello");
 }
@@ -54,7 +62,12 @@ async fn test_execute_python_error() {
     let dir = tempdir().unwrap();
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
-    let result = runtime.execute("raise ValueError('test error')").await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "raise ValueError('test error')",
+        )
+        .await;
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("ValueError"));
 }
@@ -65,7 +78,10 @@ async fn test_execute_writes_to_workspace_cwd() {
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
     let result = runtime
-        .execute("open('test_file.txt', 'w').write('ok'); print('done')")
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "open('test_file.txt', 'w').write('ok'); print('done')",
+        )
         .await;
     assert!(result.is_ok());
     assert_eq!(result.unwrap().trim(), "done");
@@ -78,7 +94,10 @@ async fn test_execute_reads_anywhere() {
     let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
 
     let result = runtime
-        .execute("import os; print(os.path.exists('/etc'))")
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "import os; print(os.path.exists('/etc'))",
+        )
         .await;
     assert!(result.is_ok());
 }
@@ -99,7 +118,12 @@ async fn test_execute_writes_outside_workspace_succeed() {
     let target_str = target.to_string_lossy().replace('\\', "\\\\");
     let code = format!("open('{}', 'w').write('hello'); print('done')", target_str);
 
-    let result = runtime.execute(&code).await;
+    let result = runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+        )
+        .await;
     assert!(
         result.is_ok(),
         "outside-workspace write failed: {:?}",
@@ -120,6 +144,7 @@ async fn test_staging_redirects_data_writes() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n1,2'); print('done')",
             vec![],
             &staging,
@@ -146,6 +171,7 @@ async fn test_staging_reads_fall_through_to_workspace() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "content = open('data/artifacts/existing.txt').read(); print(content)",
             vec![],
             &staging,
@@ -166,6 +192,7 @@ async fn test_staging_reads_own_writes() {
     let staging = ws.join(".lucidos/staging/test-run-3");
 
     let result = runtime.execute_staged(
+        &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
         "open('data/output.txt', 'w').write('hello')\ncontent = open('data/output.txt').read()\nprint(content)",
         vec![],
         &staging,
@@ -185,6 +212,7 @@ async fn test_staging_non_data_writes_go_to_workspace() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('scratch.txt', 'w').write('temp'); print('ok')",
             vec![],
             &staging,
@@ -217,6 +245,7 @@ async fn test_staging_data_prefixed_siblings_are_not_diverted() {
 
     let result = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('database.json', 'w').write('{}')\n\
              open('datasets/rows.csv', 'w').write('a,b')\n\
              open('data_backup/old.txt', 'w').write('x')\n\
@@ -266,6 +295,7 @@ async fn a_symlinked_data_root_still_stages_its_writes() {
     let staging = ws.join(".lucidos/staging/relocated-data-run");
     let out = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n')\n\
              print(open('data/artifacts/report.csv').read().strip())",
             vec![],
@@ -326,7 +356,11 @@ async fn execute_file_runs_the_real_path_not_a_copy() {
     );
 
     let out = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
     let reported = out.trim();
@@ -377,7 +411,11 @@ print(data["approved_version"])
     );
 
     let out = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
 
@@ -407,7 +445,11 @@ async fn execute_file_writes_audit_logs_without_copying_the_script() {
     );
 
     runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect("execute_file_with_env");
 
@@ -450,7 +492,11 @@ async fn execute_file_shapes_errors_like_run_script() {
     let script = write_trigger_script(&ws, "boom", "raise ValueError('kaboom')\n");
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script raises");
     assert!(err.starts_with("Python error:"), "got: {err}");
@@ -472,7 +518,11 @@ async fn a_failure_with_empty_stderr_reports_the_end_of_stdout() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script exits 1");
     assert!(err.contains("end of stdout"), "got: {err}");
@@ -498,7 +548,11 @@ async fn a_long_stdout_log_reports_its_end_under_the_label() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("script exits 1");
     assert!(err.contains("this is the end of stdout"), "got: {err}");
@@ -550,6 +604,7 @@ async fn execute_file_applies_env_vars() {
 
     let out = runtime
         .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &script,
             vec![(
                 "TRIGGER_EVENT_TYPE".to_string(),
@@ -571,7 +626,11 @@ async fn execute_with_env_still_runs_from_the_exhaust_copy() {
     let runtime = PythonRuntime::new(ws.clone()).unwrap();
 
     let out = runtime
-        .execute_with_env("import os\nprint(os.path.abspath(__file__))\n", vec![])
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "import os\nprint(os.path.abspath(__file__))\n",
+            vec![],
+        )
         .await
         .expect("execute_with_env");
     let reported = out.trim();
@@ -675,7 +734,13 @@ async fn execute_kills_subprocess_when_future_dropped() {
 
     // Pre-warm the venv so the cancel below races the actual subprocess, not
     // the one-time venv creation, which takes seconds on a fresh tempdir.
-    runtime.execute("print('warmup')").await.expect("warmup");
+    runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('warmup')",
+        )
+        .await
+        .expect("warmup");
 
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
@@ -695,9 +760,10 @@ async fn execute_kills_subprocess_when_future_dropped() {
     // execute future is dropped — taking the inner Command future and
     // its Child handle with it. kill_on_drop(true) on the Command
     // makes the OS send SIGKILL to the python process.
+    let sandbox = crate::runtime::agent_sandbox::Sandbox::unsandboxed();
     tokio::select! {
         _ = token.cancelled() => {}
-        r = runtime.execute(&code) => {
+        r = runtime.execute(&sandbox, &code) => {
             panic!("execute completed before cancel: {:?}", r);
         }
     };
@@ -736,7 +802,13 @@ const RUNAWAY_SLEEP_SECS: u64 = 60;
 /// that instead.
 async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> PythonRuntime {
     let runtime = PythonRuntime::new(workspace.to_path_buf()).unwrap();
-    runtime.execute("print('warmup')").await.expect("warmup");
+    runtime
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            "print('warmup')",
+        )
+        .await
+        .expect("warmup");
     runtime.with_execution_timeout(ceiling)
 }
 
@@ -779,9 +851,10 @@ async fn sync_execution_is_bounded_by_the_hard_ceiling() {
 
     let started = std::time::Instant::now();
     let err = runtime
-        .execute(&format!(
-            "import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\nprint('ran to completion')"
-        ))
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\nprint('ran to completion')"),
+        )
         .await
         .expect_err("a script that outruns the ceiling must fail");
     let elapsed = started.elapsed();
@@ -838,7 +911,10 @@ async fn the_execution_timeout_kills_the_python_child() {
     );
 
     let err = runtime
-        .execute(&code)
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+        )
         .await
         .expect_err("the script sleeps past the ceiling");
     assert!(err.contains("timed out"), "got: {err}");
@@ -874,6 +950,7 @@ async fn a_timed_out_staged_run_leaves_data_untouched() {
     let staging = ws.join(".lucidos/staging/timed-out-run");
     let err = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             &format!(
                 "open('data/artifacts/report.csv', 'w').write('half written')\n\
                  import time\n\
@@ -909,7 +986,11 @@ async fn an_in_place_script_gets_the_ceiling_too() {
     );
 
     let err = runtime
-        .execute_file_with_env(&script, vec![])
+        .execute_file_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &script,
+            vec![],
+        )
         .await
         .expect_err("an in-place script must be bounded too");
     assert!(err.contains("timed out after 1s"), "got: {err}");
@@ -928,6 +1009,7 @@ async fn a_fast_script_still_succeeds_and_still_stages() {
     let staging = ws.join(".lucidos/staging/fast-run");
     let out = runtime
         .execute_staged(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
             "open('data/artifacts/report.csv', 'w').write('a,b\\n1,2'); print('done')",
             vec![],
             &staging,
@@ -953,7 +1035,10 @@ async fn a_timeout_leaves_a_note_in_the_exhaust_dir() {
     let runtime = warmed_runtime(&ws, Duration::from_secs(1)).await;
 
     runtime
-        .execute(&format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})"))
+        .execute(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})"),
+        )
         .await
         .expect_err("the script sleeps past the ceiling");
 
@@ -1418,7 +1503,14 @@ print('done')
         port = port,
     );
 
-    let out = runtime.execute_with_env(&code, env).await.expect("execute");
+    let out = runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
     assert!(out.contains("done"), "python output was: {out}");
 
     let headers = capture.await.expect("capture task");
@@ -1476,7 +1568,14 @@ print('done')
         port = port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     let headers = capture.await.expect("capture task");
     assert!(
@@ -1525,7 +1624,14 @@ print('done')
         port = real_port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     let headers = capture.await.expect("capture task");
     assert!(
@@ -1596,7 +1702,14 @@ print('done')
         port = port,
     );
 
-    runtime.execute_with_env(&code, env).await.expect("execute");
+    runtime
+        .execute_with_env(
+            &crate::runtime::agent_sandbox::Sandbox::unsandboxed(),
+            &code,
+            env,
+        )
+        .await
+        .expect("execute");
 
     assert!(
         marker.exists(),

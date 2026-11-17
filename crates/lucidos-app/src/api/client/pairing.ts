@@ -11,6 +11,7 @@
  * Settings -> Access can add a phone with nobody walking back to a terminal.
  */
 
+import { AWAITING_OWNER, isAwaitingOwner, untilOwnerAllows, type AwaitingOwner } from './awaitingOwner';
 import { gatewayErrorReason } from './gatewayError';
 import { isTauri } from '../../utils/platform';
 import { invoke } from '../../utils/tauri';
@@ -41,16 +42,20 @@ export interface PairingCode {
  * `origin` is the address the NEW device should open, never this page's own.
  * The caller resolves it, because only the client knows which of this
  * machine's addresses another device can reach. Pass `null` to mint a bare
- * code. `operatorId` names the person the new device joins; without it the
+ * code. `userId` names the user the new device joins; without it the
  * device joins the gateway's first person.
  */
 export async function mintPairingCode(
   origin: string | null,
-  operatorId: string | null = null,
+  userId: string | null = null,
 ): Promise<PairingCode> {
   const params = new URLSearchParams();
   if (origin) params.set('origin', origin);
-  if (operatorId) params.set('operator', operatorId);
+  if (userId) {
+    params.set('user', userId);
+    // See "User rename wire aliases" in docs/temporary-measures.md.
+    params.set('operator', userId);
+  }
   const query = params.size > 0 ? `?${params}` : '';
   const res = await fetch(`${AUTH}/pairing-code${query}`, {
     method: 'POST',
@@ -80,19 +85,38 @@ export async function pairingSession(): Promise<PairingSession> {
 }
 
 /**
- * Spend a code, so this browser becomes a paired device.
+ * Spend a code once, so this browser becomes a paired device.
  *
- * The credential arrives as an `HttpOnly` cookie, so there is nothing to store
- * and nothing returned. The browser sends it from here on.
+ * The credential arrives as an `HttpOnly` cookie, so there is nothing to store.
+ * The browser sends it from here on. [`AWAITING_OWNER`] means the code waits
+ * for a paired device's Allow, and the caller presents it again.
  */
-export async function redeemPairingCode(code: string, label?: string): Promise<void> {
+async function redeemOnce(code: string, label?: string): Promise<'paired' | AwaitingOwner> {
   const res = await fetch(`${AUTH}/pair`, {
     method: 'POST',
     credentials: 'same-origin',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ code, label }),
   });
+  if (isAwaitingOwner(res)) return AWAITING_OWNER;
   if (!res.ok) throw new Error(await gatewayErrorReason(res));
+  return 'paired';
+}
+
+/**
+ * Spend a code, waiting for a paired device's Allow when the code needs one.
+ *
+ * `onWaiting` runs each time the gateway says it waits, so the screen can say
+ * so. Resolves once paired, and rejects on a refusal: a wrong or expired code,
+ * or Don't allow.
+ */
+export async function redeemPairingCode(
+  code: string,
+  label?: string,
+  onWaiting: () => void = () => {},
+  signal?: AbortSignal,
+): Promise<void> {
+  await untilOwnerAllows(() => redeemOnce(code, label), onWaiting, signal);
 }
 
 /**
@@ -105,11 +129,14 @@ export async function redeemPairingCode(code: string, label?: string): Promise<v
  *
  * Rejects off Tauri, and whenever the mint or the redemption failed. The caller
  * falls back to the typed form rather than treating it as a dead end.
+ *
+ * The mint goes through the local token, so once another device is paired the
+ * window waits for that device's Allow. `onWaiting` lets the screen say so.
  */
-export async function pairDesktopWindow(): Promise<void> {
+export async function pairDesktopWindow(onWaiting: () => void = () => {}): Promise<void> {
   if (!isTauri()) throw new Error('not running in the Lucidos desktop app');
   const minted = await invoke<{ code: string }>('mint_pairing_code');
   const code = minted?.code?.trim();
   if (!code) throw new Error('the desktop app minted no pairing code');
-  await redeemPairingCode(code, DESKTOP_DEVICE_LABEL);
+  await redeemPairingCode(code, DESKTOP_DEVICE_LABEL, onWaiting);
 }

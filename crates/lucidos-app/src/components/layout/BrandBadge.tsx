@@ -5,7 +5,7 @@ import {
   mobileView,
   type ApplyPhase,
 } from '../../store/store';
-import { crossWorkspaceUnreadTotal } from '../../store/actions/app-badge';
+import { notificationsMenuUnreadTotal } from '../../store/actions/app-badge';
 import { liveActivityRows, type ActivityRow } from '../../store/actions/activityRows';
 // One cap for both header counts, so the mark and the menu rows cannot start
 // eliding at different numbers. Each site's own box is its own business; the
@@ -117,9 +117,7 @@ export function unreadBadgeLabel(count: number): string | null {
   return count === 1 ? '1 unread notification' : `${count} unread notifications`;
 }
 
-/** The unread count on the mark, and the ONLY in-app mirror of the app-icon
- *  badge. Both read `crossWorkspaceUnreadTotal`, so they cannot show different
- *  numbers.
+/** The unread count on the mark, totaling the notification menu's rows.
  *
  *  It rides the mark rather than the bell because the bell is not on every
  *  pane: `ContentHeaderActions` owns it, so the thread pane and the threads
@@ -137,7 +135,7 @@ export function unreadBadgeLabel(count: number): string | null {
  *  is never that element. The mark speaks the count instead, through
  *  {@link unreadBadgeLabel} in its label and an Unread row in its tooltip. */
 export function UnreadBrandBadge() {
-  const count = crossWorkspaceUnreadTotal.value;
+  const count = notificationsMenuUnreadTotal.value;
   if (count <= 0) return null;
   return (
     <GlyphBadge class="badge brand-unread-badge" aria-hidden="true">
@@ -157,24 +155,21 @@ export function BrandBadge() {
   if (state === 'ready') {
     return <GlyphBadge class="badge brand-badge" aria-hidden="true">!</GlyphBadge>;
   }
-  const pending = state === 'pending';
+  if (state === 'pending') {
+    return <span class="badge brand-badge brand-badge-dot" aria-hidden="true" />;
+  }
   const waiting = rows.every((r) => r.queued);
   return (
-    <GlyphBadge
-      class={`badge brand-badge${pending ? ' brand-badge-dot' : ''}`}
+    <span
+      class="badge brand-badge badge-icon"
       aria-hidden="true"
     >
-      {/* Pending draws no glyph at all: the badge box IS the dot. The `!` is
-          spoken for by `ready`, and a second attention mark beside it would say
-          "act on this" about the one state where there is nothing to act on
-          yet.
-
-          Keyed on the mobile pane: each mobile header has its own badge, and
+      {/* Keyed on the mobile pane: each mobile header has its own badge, and
           the hidden headers are `display: none`. iOS WebKit can leave a spin
           frozen on an element that comes back from that, so each swap draws
           a fresh element whose animation starts anew. */}
-      {!pending && !waiting && <span key={mobileView.value} class="brand-badge-spinner"><ReloadIcon /></span>}
-      {!pending && waiting && <span class="brand-badge-queued"><HourglassIcon /></span>}
-    </GlyphBadge>
+      {!waiting && <span key={mobileView.value} class="brand-badge-spinner"><ReloadIcon /></span>}
+      {waiting && <span class="brand-badge-queued"><HourglassIcon /></span>}
+    </span>
   );
 }

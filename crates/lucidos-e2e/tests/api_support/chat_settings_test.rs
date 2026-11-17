@@ -1,6 +1,5 @@
 //! `POST /api/v1/chat/settings` records a rung pick on a Lucidos Agent thread.
-//! While a turn runs, the rung is locked: the pick is refused with 409 and
-//! `reason: "turn-running"`, and nothing is recorded.
+//! A pick during a turn is saved for its next turn.
 
 use crate::support::{base_url, db_url, seed_chat_thread_summary, user_client};
 use serde_json::{json, Value};
@@ -36,7 +35,7 @@ async fn recorded_picks(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
 }
 
 #[tokio::test]
-async fn a_pick_while_a_turn_runs_is_refused_as_turn_running() {
+async fn a_pick_while_a_turn_runs_is_saved_for_the_next_turn() {
     let pool = pool().await;
     for status in ["running", "waiting_for_user_answer", "paused"] {
         let thread_id = Uuid::new_v4();
@@ -47,9 +46,8 @@ async fn a_pick_while_a_turn_runs_is_refused_as_turn_running() {
             "reasoning_effort": "high",
         }))
         .await;
-        assert_eq!(code, 409, "{status}: {body}");
-        assert_eq!(body["reason"], "turn-running", "{status}: {body}");
-        assert_eq!(recorded_picks(&pool, thread_id).await, 0, "{status}");
+        assert_eq!(code, 200, "{status}: {body}");
+        assert_eq!(recorded_picks(&pool, thread_id).await, 1, "{status}");
     }
 }
 

@@ -1,5 +1,5 @@
 import { signal } from '@preact/signals';
-import { isChosenByPreference, type PeerState } from '../windowPeers';
+import { submitInteractiveRequest } from '../interactiveDeliveryService';
 import {
   knownOAuthProviders,
   oauthAccounts,
@@ -90,7 +90,7 @@ export function handleOAuthAccountConnected(payload: {
   provider?: string;
   email?: string | null;
   actor?: { kind?: string; device_id?: string } | null;
-}): void {
+}, eventId?: string): void {
   if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();
 
   const actor = payload.actor;
@@ -99,21 +99,19 @@ export function handleOAuthAccountConnected(payload: {
   const flow = oauthAuthFlow.value;
   const startedHere =
     flow !== null && (flow.provider === null || flow.provider === payload.provider);
-  const authorizingThis = (window: PeerState) => window.authorizing !== null
-    && (window.authorizing.provider === null || window.authorizing.provider === payload.provider);
-  // Elected before the flow clears, so this window still counts as authorizing.
-  const toastHere = isChosenByPreference(
-    authorizingThis, (window) => window.authorizing !== null, () => true,
-  );
+  submitInteractiveRequest({
+    kind: 'oauth-connected', payload: { provider: payload.provider ?? null, email: payload.email ?? null },
+    preference: { provider: payload.provider ?? null },
+  }, eventId);
   oauthAuthFlow.value = null;
 
-  const provider = payload.provider || 'Account';
-  const email = payload.email;
-  if (toastHere) {
-    showToast(email ? `${provider} connected (${email})` : `${provider} connected`, 'success');
-  }
-
   if (startedHere && isTauri()) focusCallingWindow();
+}
+
+/** Delivery acceptance is the toast opening, independent of focus authorization. */
+export function presentOAuthAccountConnected(payload: { provider?: string | null; email?: string | null }): void {
+  const provider = payload.provider || 'Account';
+  showToast(payload.email ? `${provider} connected (${payload.email})` : `${provider} connected`, 'success');
 }
 
 /** The authorization a credential save should continue into, or null.
@@ -131,7 +129,7 @@ export function handleOAuthAccountConnected(payload: {
  *
  *  Cleared before the resume runs, so a failed continuation cannot re-fire on
  *  the next unrelated credential save. */
-let pendingConnect: { provider: string; scopes: string } | null = null;
+let pendingConnect: { provider: string; scopes: string; signIn: boolean } | null = null;
 
 /** Abandon any queued continuation. Called when the registration form is
  *  dismissed: a cancelled form must not open a browser. */
@@ -159,7 +157,7 @@ export async function resumeOAuthConnectAfterCredentialSaved(service: string): P
   if (!pending) return false;
   if (pending.provider.toLowerCase() !== service.trim().toLowerCase()) return false;
   pendingConnect = null;
-  await grantOAuthScope(pending.provider, pending.scopes);
+  await grantOAuthScope(pending.provider, pending.scopes, pending.signIn);
   return true;
 }
 
@@ -182,20 +180,29 @@ export async function loadOAuthAccounts(): Promise<void> {
   }
 }
 
-export async function grantOAuthScope(provider: string, scopes: string): Promise<boolean> {
+/** Open the provider's consent page for `scopes`.
+ *
+ *  `signIn` adds the provider's sign-in scopes, which the engine resolves: only
+ *  the Settings Connect press sets it. Everything else asks for exactly the
+ *  scopes it names. */
+export async function grantOAuthScope(
+  provider: string,
+  scopes: string,
+  signIn = false,
+): Promise<boolean> {
   if (isIOSPwa()) {
     showToast('OAuth connection is not available in the iOS app. Use the desktop browser instead.', 'error');
     return false;
   }
   try {
     // Phase 1: Get the authorization URL from the backend
-    const startResult = await reauthorizeOAuth(provider, scopes);
+    const startResult = await reauthorizeOAuth(provider, scopes, signIn);
     if (startResult.credential_request) {
       // The registration is missing or incomplete, so the form opens. Remember
       // what this press was FOR, so saving it continues straight into the
       // browser rather than ending here with the user on the Accounts page
       // wondering what to do next.
-      pendingConnect = { provider, scopes };
+      pendingConnect = { provider, scopes, signIn };
       openCredentialRequest(startResult.credential_request);
       return false;
     }

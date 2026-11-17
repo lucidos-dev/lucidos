@@ -1,8 +1,10 @@
 import { signal, type ReadonlySignal } from '@preact/signals';
-import { useDelayedFlag } from '../hooks/useDelayedLoading';
 import { effectiveThreadStatus } from './store';
 import { awaitedQuestionCard, computeExchanges, type AnswerKind, type ThreadState } from './thread-events';
 import type { SendFailure } from './actions/sendRetry';
+import type { AnswerPlacement } from '../api/client/chat';
+import { forgetUnsentMessageRecord } from './unsentMessageRecords';
+import type { UnsentMessage } from './unsentMessages';
 
 /** The optimistic picks of one kind of card, keyed by the card's own id.
  *
@@ -35,18 +37,6 @@ export function pendingDecisions<T>(): PendingDecisions<T> {
   };
 }
 
-/** What the picked choice draws in its mark slot: its radio dot or check. */
-export type PickMark = 'none' | 'spinner' | 'mark';
-
-/** The picked choice's mark only moves forward: nothing while the pick is
- *  unconfirmed, a spinner once that wait passes the delay gate, then the mark.
- *  Never pass back over a mark the reader has seen, or a confirm landing just
- *  past the gate reads as a blink. */
-export function usePickMark(confirmed: boolean, pending: boolean): PickMark {
-  const sending = useDelayedFlag(!confirmed && pending);
-  return confirmed ? 'mark' : sending ? 'spinner' : 'none';
-}
-
 /** The question cards' optimistic picks, keyed by tool-use id. In the store
  *  because a send reads it too: a typed message is no answer to a card whose
  *  pick is already on its way (`questionTheSendAnswers`). */
@@ -70,9 +60,20 @@ export function questionTheSendAnswers(thread: ThreadState): string | undefined 
 export interface UnsentPick {
   threadId: string;
   answer: AnswerKind;
-  failure: SendFailure;
+  failure?: SendFailure;
+  /** Unknown retries keep the original wire identity and compose fence. */
+  placement?: AnswerPlacement;
+  refusal?: UnsentMessage['refusal'];
 }
 
-/** Unsent picks, keyed by tool-use id. In memory only, so a reload leaves the
- *  card live with nothing marked. */
-export const unsentPicks = pendingDecisions<UnsentPick>();
+/** Unsent picks, keyed by tool-use id. Composer-bearing answers also live in
+ *  the device pending-send journal. Clearing the card retires that record. */
+const picks = pendingDecisions<UnsentPick>();
+export const unsentPicks: PendingDecisions<UnsentPick> = {
+  ...picks,
+  clear(id) {
+    const eventId = picks.map.peek().get(id)?.placement?.event_id;
+    if (eventId) forgetUnsentMessageRecord(eventId);
+    picks.clear(id);
+  },
+};

@@ -5,6 +5,10 @@
 //! `.launch/`, and names the page to show in [`URL_ENV`]. The build that Apply
 //! starts may publish a newer one at the same path. The window moves to it only
 //! once the engine it shows has moved too, so it is never newer than the stack.
+//!
+//! Every start restores the windows the last one left, from the records the
+//! launcher keeps in the checkout (`window_persist::WindowRecords`). So a switch
+//! brings back every window, each at its frame and on its workspace.
 
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -39,6 +43,10 @@ struct Published {
 /// follow a switch. The launcher then starts the binary published at its path.
 pub const RELAUNCH_FILE_ENV: &str = "LUCIDOS_DEV_WINDOW_RELAUNCH_FILE";
 
+/// The checkout's own dir for the window records, so a dev window never
+/// shares the packaged client's. See `window_persist::WindowRecords`.
+pub const RECORDS_DIR_ENV: &str = "LUCIDOS_DEV_WINDOW_RECORDS_DIR";
+
 /// A window the launcher started: the binary it runs, the origin of the page it
 /// was pointed at, and where to hand the launcher a relaunch.
 struct LaunchedWindow {
@@ -51,7 +59,8 @@ struct LaunchedWindow {
 /// Set once, by [`launch`], and only for a window the launcher started.
 static LAUNCHED: OnceLock<LaunchedWindow> = OnceLock::new();
 
-/// Point the window at the page the launcher named, once its server answers.
+/// Point the window at the page the launcher named, once its server answers,
+/// and reopen the other windows the last start left.
 ///
 /// Without [`URL_ENV`] the window keeps `build.devUrl` and never follows a
 /// switch, which is what a bare `cargo run` gets. The page's origin gets the
@@ -90,7 +99,23 @@ pub fn launch(app: &AppHandle) {
         if !wait_until_listening(&parsed, SERVER_WAIT) {
             eprintln!("[dev-window] nothing answers at {url} yet; showing it anyway");
         }
-        crate::desktop::navigate_main_window(&handle, &url);
+        // The launcher's page is a packaged launch's notification tap. It wins
+        // `main`, and a switch names `main`'s own page, so `main` keeps its frame.
+        // A no-gateway launch has a records dir of its own, which holds no
+        // workspace windows (`dev_window_records_dir` in `workspace.sh`).
+        let restore = crate::window_persist::resolve_window_session_plan();
+        let plan = crate::desktop::launch_plan(Some(url), restore, &origin);
+        crate::desktop::navigate_main_window(&handle, &plan.main);
+        if plan.extra.is_empty() {
+            return;
+        }
+        // Building a window is a main-thread call.
+        let windows = handle.clone();
+        if let Err(e) = handle.run_on_main_thread(move || {
+            crate::app_window::restore_extra_windows(&windows, &plan.extra);
+        }) {
+            eprintln!("[dev-window] could not restore the other windows: {e}");
+        }
     });
 }
 
@@ -101,7 +126,7 @@ pub fn launch(app: &AppHandle) {
 /// The page calls this with its engine's `started_at` on its first health
 /// answer and on every restart, so a switch from any device reaches it. Only a
 /// page on the launcher's origin counts. The launcher starts the new binary on
-/// the page the window showed, so the user stays where they were.
+/// `main`'s page, and that start restores the other windows from the records.
 ///
 /// It never execs in place. macOS registers a self-exec'd app again with pid
 /// -1, and window managers such as Rectangle then cannot find the window.
@@ -123,6 +148,11 @@ pub fn follow_engine_switch(
     if !should_follow(window.id, read_published(&window.path), engine_started_at) {
         return Ok(false);
     }
+    let app = webview.app_handle();
+    let main_page = app
+        .get_webview(crate::app_window::MAIN_WINDOW_LABEL)
+        .and_then(|main| main.url().ok());
+    let page = relaunch_page(main_page, page, &window.origin);
     eprintln!(
         "[dev-window] the engine moved to a new version; relaunching {} on {page}",
         window.path.display()
@@ -133,8 +163,7 @@ pub fn follow_engine_switch(
             window.relaunch_file.display()
         )
     })?;
-    // The same exit as restart_app, so the new window keeps this one's frame.
-    let app = webview.app_handle();
+    // The same exit as restart_app, so the new start finds every window recorded.
     crate::window_persist::persist_windows(app);
     crate::window_persist::begin_teardown();
     app.cleanup_before_exit();
@@ -155,6 +184,15 @@ fn should_follow(
         Some(published) => published.id != running && engine_started_at > published.at,
         None => false,
     }
+}
+
+/// The page the relaunched window opens on: `main`'s, whichever window's page
+/// noticed the switch. Every window asks, and an extra one may answer first.
+///
+/// `main` on another origin (still on `devUrl`) leaves the caller's page.
+fn relaunch_page(main: Option<tauri::Url>, caller: tauri::Url, origin: &str) -> tauri::Url {
+    main.filter(|main| is_on_origin(main, origin))
+        .unwrap_or(caller)
 }
 
 /// Whether `page` is on the launcher's origin. The window opens on `devUrl`
@@ -257,6 +295,119 @@ mod tests {
         assert!(!is_on_origin(&dev_url, origin));
     }
 
+    const ORIGIN: &str = "https://localhost:5251";
+
+    const WINDOW_A: &str = "window-0123456789abcdef0123456789abcdef";
+
+    fn rect(x: i64, y: i64, width: i64, height: i64) -> crate::window_restore::Rect {
+        crate::window_restore::Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    fn snapshot(
+        label: &str,
+        url: &str,
+        frame: crate::window_restore::Rect,
+    ) -> crate::window_session::WindowSnapshot {
+        crate::window_session::WindowSnapshot {
+            label: label.to_string(),
+            url: url.to_string(),
+            frame,
+            whereabouts: crate::window_restore::Whereabouts::OnScreen(None),
+            rescued: false,
+        }
+    }
+
+    // The reported defect: after a switch the dev window lost its size, and a
+    // second window on a remote workspace never came back. This is the record's
+    // whole trip through a switch, in a records dir of the dev window's own.
+    #[test]
+    fn a_switch_brings_back_every_window_at_its_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_page = format!("{ORIGIN}/dev/threads/1");
+        let main_frame = rect(40, 60, 1500, 900);
+        let remote_frame = rect(900, 100, 800, 700);
+        let live = [
+            snapshot(crate::app_window::MAIN_WINDOW_LABEL, &main_page, main_frame),
+            snapshot(WINDOW_A, &format!("{ORIGIN}/team@studio/"), remote_frame),
+        ];
+        let captured = crate::window_session::capture(&Default::default(), &live);
+        crate::window_session::write(dir.path(), &captured);
+        let restore =
+            crate::window_session::restore_plan(&crate::window_session::read(dir.path()), true);
+
+        let plan = crate::desktop::launch_plan(Some(main_page.clone()), &restore, ORIGIN);
+
+        assert_eq!(plan.main, main_page);
+        // The startup geometry step sizes `main` from the first restored window.
+        assert!(restore[0].main_may_take());
+        assert_eq!(
+            restore[0].frame,
+            Some(crate::window_restore::RememberedFrame::new(
+                main_frame, None
+            ))
+        );
+        assert_eq!(
+            plan.extra,
+            vec![crate::desktop::PlannedWindow {
+                url: format!("{ORIGIN}/team@studio/"),
+                label: Some(WINDOW_A.to_string()),
+                frame: Some(crate::window_restore::RememberedFrame::new(
+                    remote_frame,
+                    None
+                )),
+            }]
+        );
+    }
+
+    // The picker is on no workspace route, and once read as a bare engine
+    // origin. A switch from it then dropped every other window for good.
+    #[test]
+    fn a_switch_from_the_picker_still_brings_back_every_window() {
+        let picker = format!("{ORIGIN}/~/");
+        let remote_frame =
+            crate::window_restore::RememberedFrame::new(rect(900, 100, 800, 700), None);
+        let restore = [crate::window_session::RestoredWindow {
+            label: Some(WINDOW_A.to_string()),
+            workspace: "team@studio".to_string(),
+            frame: Some(remote_frame.clone()),
+        }];
+        let plan = crate::desktop::launch_plan(Some(picker.clone()), &restore, ORIGIN);
+        assert_eq!(plan.main, picker);
+        assert_eq!(
+            plan.extra,
+            vec![crate::desktop::PlannedWindow {
+                url: format!("{ORIGIN}/team@studio/"),
+                label: Some(WINDOW_A.to_string()),
+                frame: Some(remote_frame),
+            }]
+        );
+    }
+
+    // Every window asks on its engine's health answer. An extra window that
+    // answered first used to put `main` on its own page after the switch.
+    #[test]
+    fn the_relaunch_page_is_mains_whichever_window_asked() {
+        let main: tauri::Url = format!("{ORIGIN}/dev/").parse().unwrap();
+        let extra: tauri::Url = format!("{ORIGIN}/team@studio/").parse().unwrap();
+        assert_eq!(
+            relaunch_page(Some(main.clone()), extra.clone(), ORIGIN),
+            main
+        );
+        assert_eq!(
+            relaunch_page(Some(main.clone()), main.clone(), ORIGIN),
+            main
+        );
+        // `main` still on `devUrl`, or gone, leaves the caller's page.
+        let dev_url: tauri::Url = "http://localhost:5173/".parse().unwrap();
+        assert_eq!(relaunch_page(Some(dev_url), extra.clone(), ORIGIN), extra);
+        assert_eq!(relaunch_page(None, extra.clone(), ORIGIN), extra);
+    }
+
     /// The launcher sets the variables this module reads. Shell cannot import
     /// the names, so the scripts are pinned to them here.
     #[test]
@@ -265,6 +416,7 @@ mod tests {
         for (script, source, name) in [
             ("workspace.sh", launcher, URL_ENV),
             ("workspace.sh", launcher, RELAUNCH_FILE_ENV),
+            ("workspace.sh", launcher, RECORDS_DIR_ENV),
             (
                 "status.sh",
                 include_str!("../../../scripts/status.sh"),

@@ -1,12 +1,11 @@
 /** WHERE THE READER IS, said as content rather than as pixels: which turn sits
  *  at the top of the viewport, and the exact offset its own top sat at.
  *
- *  It is the durable twin of `recordAnchor` and `restoreAfterReflow` in
- *  `scrollState.ts`. Those take the same two measurements to hold a reader still
- *  across a pane resize. Two differences here, both forced by the position
- *  outliving the DOM it was measured in. The anchor must name a child that can
- *  be found again, so an unidentified one is skipped. And the restore resolves
- *  its target by that name, where the correction still holds the element itself.
+ *  The pane-resize correction in `scrollState.ts` (`recordAnchor`) and the hold
+ *  after a restore both measure the line block from here, holding the element
+ *  itself. A stored position must outlive the DOM it was measured in. So it
+ *  names a child that can be found again, skipping an unidentified one, and the
+ *  restore resolves its target by that name.
  *
  *  A LEAF: this module reaches for no store, no signal and no storage. The
  *  measurement is here and the codec is in `hooks/useScrollMemory.ts`, so
@@ -118,6 +117,153 @@ export function readRowAnchor(el: HTMLElement): RowAnchor | null {
   return found;
 }
 
+/** The finest block on the reader's line: the turn at the line, then down
+ *  through block children while one straddles the container's top. `path`
+ *  holds each step's child index. `relTop` is the block's own top and
+ *  `turnRelTop` the turn's, both unrounded. */
+export interface LineBlock {
+  turn: HTMLElement;
+  block: HTMLElement;
+  path: number[];
+  relTop: number;
+  turnRelTop: number;
+}
+
+/** The block the reader's line runs through, or null when no turn is at or
+ *  above the line. A line in a gap between children stops the descent there,
+ *  so the answer is never finer than the content makes it. */
+export function readLineBlock(el: HTMLElement): LineBlock | null {
+  const line = childAtLine(el);
+  if (!line || line.last < 0 || line.lastRel === null) return null;
+  const turn = line.kids[line.last] as HTMLElement;
+  let block = turn;
+  let relTop = line.lastRel;
+  const path: number[] = [];
+  for (let next = straddlerOf(block, line.top); next; next = straddlerOf(block, line.top)) {
+    path.push(next.index);
+    block = next.block;
+    relTop = next.relTop;
+  }
+  return { turn, block, path, relTop, turnRelTop: line.lastRel };
+}
+
+/** A reading position expressed against the LINE block inside a named turn:
+ *  the turn's id, the child-index path down to the block, and both tops.
+ *  `turnRelTop` is the fallback for a path that never resolves. `kinds`
+ *  fingerprints the elements along the path (`kindsAlong`). */
+export interface LineAnchor {
+  eventId: string;
+  path: number[];
+  kinds: string;
+  relTop: number;
+  turnRelTop: number;
+}
+
+/** The line block as a recordable anchor, or null where only a coarser form
+ *  is honest. Three cases answer null:
+ *  - the turn at the line has no id, as a *continuation fragment* has none;
+ *  - the line runs through no block of it, so the path would be empty;
+ *  - the turn is drawn head-clamped, whose missing rows shift every index. */
+export function readLineAnchor(el: HTMLElement): LineAnchor | null {
+  const line = readLineBlock(el);
+  if (!line || line.path.length === 0) return null;
+  const eventId = line.turn.getAttribute?.(ANCHOR_ATTR);
+  if (!eventId || line.turn.hasAttribute?.(HEAD_CLAMPED_ATTR)) return null;
+  const walked = walkPath(line.turn, line.path);
+  if (!walked) return null;
+  return {
+    eventId,
+    path: line.path,
+    kinds: walked.kinds,
+    relTop: Math.round(line.relTop),
+    turnRelTop: Math.round(line.turnRelTop),
+  };
+}
+
+/** The block `anchor` names, or null until it can be measured. That covers a
+ *  turn absent or clamped, a missing step of the path, and a block with no box
+ *  yet. A path that now runs through other kinds of element is null too. */
+export function lineBlockOf(el: HTMLElement, anchor: LineAnchor): HTMLElement | null {
+  const turn = anchorTurn(el, anchor);
+  if (!turn || turn.hasAttribute?.(HEAD_CLAMPED_ATTR)) return null;
+  const walked = walkPath(turn, anchor.path);
+  if (!walked || walked.kinds !== anchor.kinds) return null;
+  const { block } = walked;
+  if (typeof block.getBoundingClientRect !== 'function') return null;
+  return block.getBoundingClientRect().height > 0 ? block : null;
+}
+
+/** The element `path` leads to from `turn`, and the fingerprint of every
+ *  element on the way, or null at a missing step.
+ *
+ *  An index alone resolves to whatever sits there now. A row inserted ahead
+ *  of the reply, as a keep-alive row is, shifts it onto a different element.
+ *  Each step's kind is its tag and first class, which a state class leaves
+ *  alone, hashed with 32-bit FNV-1a into eight hex digits. */
+function walkPath(turn: HTMLElement, path: number[]): { block: HTMLElement; kinds: string } | null {
+  let block = turn;
+  let hash = 0x811c9dc5;
+  for (const index of path) {
+    const next = block.children?.[index] as HTMLElement | undefined;
+    if (!next) return null;
+    block = next;
+    const kind = `${block.tagName ?? ''}.${(block.getAttribute?.('class') ?? '').split(' ')[0]}/`;
+    for (let i = 0; i < kind.length; i++) hash = Math.imul(hash ^ kind.charCodeAt(i), 0x01000193);
+  }
+  return { block, kinds: (hash >>> 0).toString(16).padStart(8, '0') };
+}
+
+/** The `scrollTop` that puts `anchor`'s block back where it sat, or null while
+ *  `lineBlockOf` cannot find it. Same contract as `anchorTargetTop`: null is
+ *  the WAIT signal, and both terms are measured now. */
+export function lineTargetTop(el: HTMLElement, anchor: LineAnchor): number | null {
+  if (typeof el.getBoundingClientRect !== 'function') return null;
+  const block = lineBlockOf(el, anchor);
+  const rel = block ? blockRelTop(el, block) : null;
+  if (rel === null) return null;
+  return Math.max(0, Math.round(el.scrollTop + rel - anchor.relTop));
+}
+
+/** Where `block` sits now, measured from `el`'s top, or null once it has left
+ *  the DOM or lost its box. */
+export function blockRelTop(el: HTMLElement, block: HTMLElement): number | null {
+  if (block.isConnected === false || typeof block.getBoundingClientRect !== 'function') return null;
+  const rect = block.getBoundingClientRect();
+  if (rect.height <= 0) return null;
+  return rect.top - el.getBoundingClientRect().top;
+}
+
+/** The child of `parent` that straddles the viewport line `top`, or null.
+ *
+ *  The same boundary search as `childAtLine`, since block children are laid
+ *  out in document order too. A boxless child (hidden, or `display: contents`)
+ *  defers to its nearest boxed sibling before it, so it cannot split the
+ *  search. */
+function straddlerOf(parent: HTMLElement, top: number): { block: HTMLElement; index: number; relTop: number } | null {
+  const kids = parent.children;
+  if (!kids || kids.length === 0) return null;
+  const rectOf = (i: number) => {
+    const kid = kids[i] as HTMLElement;
+    if (typeof kid.getBoundingClientRect !== 'function') return null;
+    const rect = kid.getBoundingClientRect();
+    return rect.height > 0 ? rect : null;
+  };
+  let lo = 0;
+  let hi = kids.length - 1;
+  let last = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    let boxed = mid;
+    while (boxed >= lo && !rectOf(boxed)) boxed--;
+    if (boxed < lo) { lo = mid + 1; continue; }
+    if (rectOf(boxed)!.top - top <= 0) { last = boxed; lo = mid + 1; } else { hi = boxed - 1; }
+  }
+  if (last < 0) return null;
+  const rect = rectOf(last)!;
+  if (rect.top + rect.height <= top) return null;
+  return { block: kids[last] as HTMLElement, index: last, relTop: rect.top - top };
+}
+
 /** The feed's children, and the boundary: the last child at or above the
  *  container's top, or -1 when the reader is above them all.
  *
@@ -198,7 +344,7 @@ export function anchorTurnIsClamped(el: HTMLElement, anchor: ScrollAnchor): bool
 }
 
 /** The turn `anchor` names, or null while it is not rendered. */
-export function anchorTurn(el: HTMLElement, anchor: ScrollAnchor): HTMLElement | null {
+export function anchorTurn(el: HTMLElement, anchor: Pick<ScrollAnchor, 'eventId'>): HTMLElement | null {
   if (typeof el.querySelector !== 'function') return null;
   return el.querySelector<HTMLElement>(`[${ANCHOR_ATTR}="${CSS.escape(anchor.eventId)}"]`);
 }

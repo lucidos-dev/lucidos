@@ -39,17 +39,45 @@ ort_cache_dir() {
     fi
 }
 
+# Only known build roots, not arbitrary nested caches. Cargo can place profiles
+# directly under the target root or under a cross-compilation triple.
+ort_build_dirs() {
+    local roots=("$ROOT/target" "$ROOT/target/launch-tree/target")
+    local root dir
+    if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
+        roots+=("$CARGO_TARGET_DIR")
+    fi
+    for root in "${roots[@]}"; do
+        for dir in "$root"/*/build "$root"/*/*/build; do
+            [[ -d "$dir" ]] && printf '%s\n' "$dir"
+        done
+    done
+    return 0
+}
+
 wipe_ort_state() {
+    local dir
     rm -rf "$(ort_cache_dir)/dfbin"
-    rm -rf "$ROOT"/target/*/build/ort-sys-* "$ROOT"/target/*/.fingerprint/ort-sys-*
+    while IFS= read -r dir; do
+        rm -rf "$dir"/ort-sys-* "${dir%/build}"/.fingerprint/ort-sys-*
+    done < <(ort_build_dirs)
     echo "wiped the ort cache and ort-sys build artifacts"
 }
 
 assert_fetched_from_mirror() {
-    local outputs=("$ROOT"/target/*/build/ort-sys-*/output)
-    [[ -e "${outputs[0]}" ]] || { echo "ERROR: no ort-sys build output under $ROOT/target: it was not built." >&2; return 1; }
-    grep -q "fetched ONNX Runtime from the Lucidos mirror" "${outputs[@]}" \
-        || { echo "ERROR: ort-sys did not fetch from the Lucidos mirror. Output files: ${outputs[*]}" >&2; return 1; }
+    local dir output count=0
+    while IFS= read -r dir; do
+        for output in "$dir"/ort-sys-*/output; do
+            [[ -f "$output" ]] || continue
+            count=$((count + 1))
+            if ! grep -qF "fetched ONNX Runtime from the Lucidos mirror:" "$output" \
+                || grep -qF "fetched ONNX Runtime from upstream:" "$output"; then
+                echo "ERROR: ort-sys lacks exclusive mirror-fetch evidence: $output" >&2
+                return 1
+            fi
+        done
+    done < <(ort_build_dirs)
+    [[ "$count" -gt 0 ]] || { echo "ERROR: no ort-sys build output in known target roots: it was not built." >&2; return 1; }
     echo "ort-sys fetched ONNX Runtime from the Lucidos mirror"
 }
 

@@ -24,7 +24,7 @@ import { paneOfFocus, paneUnder, usePaneCentre } from '../../hooks/usePaneCentre
 import { toFailed, type Loadable } from '../../store/types';
 import { LoadingFade } from '../shared/LoadingFade';
 import { ListSkeletonOf, SkBlock, SkText } from '../shared/Skeleton';
-import { RECENTS_KEY } from '../../store/actions/entityReferences';
+import { RECENTS_KEY } from '../../store/actions/searchRecents';
 import { CloseIcon, ClearIcon } from '../shared/icons';
 import { SearchField } from '../shared/SearchField';
 import { CategoryIcon } from '../shared/CategoryIcon';

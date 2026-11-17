@@ -45,7 +45,7 @@ pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
         .filter(|l| !l.is_empty())
         .collect();
     if roots.len() > 1 {
-        log!(
+        log_legacy!(
             "[GitOps] {} root commits at {} — using lexically-smallest for stable repo id",
             roots.len(),
             repo_root.display()
@@ -77,7 +77,7 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
     let output = match git_cmd(&["status", "--porcelain"], repo_root).await {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[GitOps] auto_commit_safe_files_if_dirty: git status exited non-zero at {}: {}. Reporting dirty, never clean",
                 repo_root.display(),
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -85,7 +85,7 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
             return true;
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[GitOps] auto_commit_safe_files_if_dirty: git status failed at {}: {}. Reporting dirty, never clean",
                 repo_root.display(),
                 e
@@ -137,13 +137,13 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
         for args in [add_args.as_slice(), commit_args.as_slice()] {
             match git_cmd(args, repo_root).await {
                 Ok(o) if o.status.success() => {}
-                Ok(o) => log!(
+                Ok(o) => log_legacy!(
                     "[Git] auto-commit of {:?}: `git {}` exited non-zero: {}",
                     dirty_files,
                     args.join(" "),
                     String::from_utf8_lossy(&o.stderr).trim()
                 ),
-                Err(e) => log!(
+                Err(e) => log_legacy!(
                     "[Git] auto-commit of {:?}: could not run `git {}`: {}",
                     dirty_files,
                     args.join(" "),
@@ -157,24 +157,24 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
                     .lines()
                     .any(porcelain_line_blocks_merge);
                 if still_dirty {
-                    log!(
+                    log_legacy!(
                         "[Git] auto-commit of {:?} did not land. Reporting dirty, never clean",
                         dirty_files
                     );
                 } else {
-                    log!("[Git] Auto-committed dirty files: {:?}", dirty_files);
+                    log_legacy!("[Git] Auto-committed dirty files: {:?}", dirty_files);
                 }
                 still_dirty
             }
             Ok(o) => {
-                log!(
+                log_legacy!(
                     "[Git] auto-commit re-check: git status exited non-zero: {}. Reporting dirty, never clean",
                     String::from_utf8_lossy(&o.stderr).trim()
                 );
                 true
             }
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[Git] auto-commit re-check: git status failed: {e}. Reporting dirty, never clean"
                 );
                 true
@@ -334,7 +334,7 @@ pub(crate) async fn sole_branch_containing(
     .await
     .ok()?;
     if !out.status.success() {
-        log!(
+        log_legacy!(
             "[Git] for-each-ref --contains {} failed: {}",
             sha,
             String::from_utf8_lossy(&out.stderr).trim()
@@ -351,7 +351,7 @@ pub(crate) async fn sole_branch_containing(
         [only] => Some((*only).to_string()),
         [] => None,
         [first, second, ..] => {
-            log!(
+            log_legacy!(
                 "[Git] {} is contained by more than one branch ({}, {}, ...), refusing to guess",
                 sha,
                 first,
@@ -374,7 +374,7 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
     match git_cmd(&["log", "--oneline", &range], repo_root).await {
         Ok(o) if o.status.success() => !o.stdout.is_empty(),
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[Git] git log failed for branch {}: {}",
                 branch_name,
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -382,7 +382,7 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
             true
         }
         Err(e) => {
-            log!("[Git] git log failed for branch {}: {}", branch_name, e);
+            log_legacy!("[Git] git log failed for branch {}: {}", branch_name, e);
             true
         }
     }
@@ -426,7 +426,15 @@ pub(crate) async fn branch_changed_files_checked(
 ) -> Result<Vec<String>, String> {
     let base = default_diff_base(repo_root).await;
     let range = format!("{}...{}", base, branch_name);
-    let out = git_cmd(&["diff", "--name-only", &range], repo_root).await?;
+    changed_files_in_range(repo_root, &range).await
+}
+
+/// Read the files changed between the actual pre- and post-landing trees.
+pub(crate) async fn changed_files_in_range(
+    repo_root: &Path,
+    range: &str,
+) -> Result<Vec<String>, String> {
+    let out = git_cmd(&["diff", "--name-only", range], repo_root).await?;
     if !out.status.success() {
         return Err(format!(
             "git diff --name-only {} failed: {}",
@@ -473,7 +481,7 @@ pub(crate) async fn has_unmerged_authored_commits(repo_root: &Path, branch_name:
             .map(|n| n > 0)
             .unwrap_or(true),
         Ok(o) => {
-            log!(
+            log_legacy!(
                 "[Git] git rev-list --no-merges failed for branch {}: {}",
                 branch_name,
                 String::from_utf8_lossy(&o.stderr).trim()
@@ -481,7 +489,7 @@ pub(crate) async fn has_unmerged_authored_commits(repo_root: &Path, branch_name:
             true
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Git] git rev-list --no-merges failed for branch {}: {}",
                 branch_name,
                 e
@@ -556,7 +564,7 @@ pub(crate) async fn git_failure_reason_env(
 async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
     if let Ok(conflicted) = conflicted_paths(worktree_path).await {
         if !conflicted.is_empty() {
-            log!(
+            log_legacy!(
                 "[Git] Auto-commit skipped in {}: {} path(s) still hold merge conflict markers ({})",
                 worktree_path.display(),
                 conflicted.len(),
@@ -566,7 +574,7 @@ async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
         }
     }
     if let Some(reason) = git_failure_reason(&["add", "-A"], worktree_path).await {
-        log!(
+        log_legacy!(
             "[Git] git add -A reported a failure in {}: {}. Committing whatever staged",
             worktree_path.display(),
             reason
@@ -574,7 +582,7 @@ async fn stage_and_commit_logged(worktree_path: &Path, message: &str) {
     }
     if let Some(reason) = git_failure_reason(&["commit", "-m", message], worktree_path).await {
         if !reason.contains("nothing to commit") {
-            log!(
+            log_legacy!(
                 "[Git] Auto-commit failed at git commit in {}: {}",
                 worktree_path.display(),
                 reason
@@ -837,13 +845,13 @@ pub(crate) async fn auto_commit_preserving_marker(
     if let Some(tier) = fresh_tier {
         if let Some(sha) = current_head_sha(worktree_path).await {
             if let Err(e) = record_hardened(pool, repo_root, branch_name, &sha, tier).await {
-                log!(
+                log_legacy!(
                     "[Git] Failed to re-stamp hardened_branches for {}: {}",
                     branch_name,
                     e
                 );
             } else {
-                log!("[Git] Re-stamped harden marker after auto-commit");
+                log_legacy!("[Git] Re-stamped harden marker after auto-commit");
             }
         }
     }

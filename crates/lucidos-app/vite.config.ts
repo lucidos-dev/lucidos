@@ -11,6 +11,7 @@ import { shellChunkPreload } from './vite/shellChunkPreload';
 import { inlineBootScript } from './vite/inlineBootScript';
 import { layoutMediaPlugin } from './vite/layoutMediaPlugin';
 import { readHeadCommit, sourceCommitStamp } from './vite/sourceCommitStamp';
+import { installedClientInventory } from './vite/installedClientInventory';
 import { ensureGenerated } from './vite/ensureGenerated';
 
 // First, before any plugin or module reads a generated file.
@@ -303,6 +304,13 @@ export default defineConfig({
     stampServiceWorker(), preact(), chunkBudget(underDevBuildWatch(process.env, process.ppid)),
     shellChunkPreload(),
     sourceCommitStamp(!!process.env.LUCIDOS_ATOMIC_DIST, () => readHeadCommit(__dirname), resolve(__dirname, 'dist')),
+    installedClientInventory(resolve(__dirname, 'dist'), resolve(__dirname, 'public'), () => {
+      // Read after ensureGenerated: config imports are bundled before it runs.
+      const constants = fs.readFileSync(resolve(__dirname, '../../packages/lucidos-sdk/src/generated/engine-constants.ts'), 'utf8');
+      const match = /^export const WORKSPACE_CLIENT_VERSION = (\d+);$/m.exec(constants);
+      if (!match) throw new Error('Missing generated workspace-client version');
+      return Number(match[1]);
+    }),
     atomicDistPublish(),
   ],
   css: { postcss: { plugins: [layoutMediaPlugin()] } },

@@ -86,7 +86,7 @@ impl std::fmt::Display for MarketplaceWriteError {
 /// guarantee is reachability, not atomicity.
 async fn announce(bus: &dyn EventBusEmitter, event: BusEvent, ctx: &str) {
     if let Err(e) = bus.emit(event).await {
-        log!("[EventBus] {} emit failed: {}", ctx, e);
+        log_legacy!("[EventBus] {} emit failed: {}", ctx, e);
     }
 }
 
@@ -166,7 +166,7 @@ pub(crate) async fn unregister_with_bus(
     // Its catalog media goes with it. A failure leaves a cache the next scan
     // prunes, so it is logged rather than failing the removal.
     if let Err(e) = crate::core::plugin_media::remove_marketplace_cache(workspace_path, id) {
-        log!("[Plugins] could not delete the media cache of marketplace '{id}': {e}");
+        log_legacy!("[Plugins] could not delete the media cache of marketplace '{id}': {e}");
     }
 
     let commit = artifact_manager

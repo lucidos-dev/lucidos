@@ -803,9 +803,14 @@ async fn artifact_writes(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
         .copied()
         .filter(|t| !TURN_END_EVENT_TYPES.contains(t))
         .collect();
-    let writes: Vec<(Option<String>, bool)> = sqlx::query_as(&format!(
+    let writes: Vec<(
+        Option<String>,
+        bool,
+        Option<sqlx::types::Json<crate::engine::event_bus::ArtifactWriter>>,
+    )> = sqlx::query_as(&format!(
         "SELECT COALESCE(payload->'data', payload)->>'artifact_path', \
-           created > now() - make_interval(days => $1) \
+           created > now() - make_interval(days => $1), \
+           NULLIF(COALESCE(payload->'data', payload)->'writer', 'null'::jsonb) \
          FROM events WHERE event_type IN ({})",
         sql_list(&artifact_types)
     ))
@@ -813,7 +818,10 @@ async fn artifact_writes(pool: &PgPool) -> Result<(u64, u64), sqlx::Error> {
     .fetch_all(pool)
     .await?;
     let (mut artifacts, mut recent_artifacts) = (0, 0);
-    for (path, recent) in writes {
+    for (path, recent, writer) in writes {
+        if writer.as_ref().is_some_and(|w| !w.0.is_workspace_leaf()) {
+            continue;
+        }
         let Some(path) = path else { continue };
         let path = LucidosEngine::canonicalize_artifact_path(&path);
         if LucidosEngine::should_skip_artifact_for_memory(path) {
@@ -845,6 +853,86 @@ fn artifact_leaves(n: u64) -> Leaves {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn artifact_estimate_and_log_agree_for_all_writers_and_legacy_events() {
+        use crate::engine::event_bus::{ArtifactWriter, BusEvent, EventBus, SystemEvent};
+        use crate::engine::summary_tree::workspace_log::WorkspaceLog;
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let writer_thread = uuid::Uuid::new_v4();
+        super::super::tests::seed(&bus, writer_thread, crate::engine::thread_events::EventChannel::Chat,
+            vec![serde_json::json!({"type": "MessageReceived", "text": "save notes", "mode": "human"})]).await;
+        let writers = [
+            None, // Forward only: old events keep their positions.
+            Some(ArtifactWriter::Person),
+            Some(ArtifactWriter::Thread),
+            Some(ArtifactWriter::App {
+                app_id: "notes".into(),
+            }),
+            Some(ArtifactWriter::Engine),
+            Some(ArtifactWriter::Trigger {
+                trigger_id: "report".into(),
+            }),
+        ];
+        let mut expected = Vec::new();
+        for (i, writer) in writers.into_iter().enumerate() {
+            for kind in ["ArtifactCreated", "ArtifactUpdated", "ArtifactImported"] {
+                let event: SystemEvent = serde_json::from_value(serde_json::json!({
+                    "type": kind, "data": {
+                        "artifact_path": format!("notes/{i}-{kind}.md"),
+                        "commit": "c1", "commit_hash": "c1", "source": null,
+                        "source_type": "fixture", "source_detail": "fixture", "summary": null,
+                        "writer_thread_id": writer_thread, "writer": writer,
+                    }
+                }))
+                .unwrap();
+                let id = bus
+                    .emit(BusEvent::System(event))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .event_id;
+                if i != 5 {
+                    expected.push(id);
+                }
+            }
+        }
+        super::super::tests::age_events(&pool).await;
+        let mut log = WorkspaceLog::default();
+        assert!(!log.extend(&pool).await.unwrap());
+        assert_eq!(
+            log.leaves.iter().map(|l| l.event_id()).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(artifact_writes(&pool).await.unwrap(), (15, 15));
+        let through = log.through;
+        assert!(!log.extend(&pool).await.unwrap());
+        assert_eq!(
+            log.through, through,
+            "excluded events still advance the cursor"
+        );
+        assert_eq!(log.leaves.len(), 15);
+        sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+            .bind(writer_thread)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut reread = WorkspaceLog::default();
+        reread.extend(&pool).await.unwrap();
+        assert_eq!(
+            reread
+                .leaves
+                .iter()
+                .map(|l| l.event_id())
+                .collect::<Vec<_>>(),
+            expected,
+            "writer deletion cannot change leafhood or positions"
+        );
+        assert_eq!(artifact_writes(&pool).await.unwrap(), (15, 15));
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
 
     #[test]
     fn merge_count_matches_the_tree_shape() {

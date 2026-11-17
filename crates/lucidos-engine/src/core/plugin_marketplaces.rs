@@ -444,7 +444,7 @@ fn scan_one_marketplace(
         let (manifest, planned) = match validate_tree(&plugin_root) {
             Ok(ok) => ok,
             Err(e) => {
-                log!(
+                log_legacy!(
                     "[PluginMarketplaces] Skipping invalid plugin in {} at {}: {}",
                     marketplace.source,
                     rel,
@@ -465,7 +465,7 @@ fn scan_one_marketplace(
         };
 
         if !seen.insert(manifest.id.clone()) {
-            log!(
+            log_legacy!(
                 "[PluginMarketplaces] Skipping duplicate plugin id '{}' in {}",
                 manifest.id,
                 marketplace.source
@@ -591,7 +591,7 @@ fn cache_media(
         }
         .media(&resolved.index),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[PluginMarketplaces] could not cache media for '{}': {}",
                 plugin.id,
                 e

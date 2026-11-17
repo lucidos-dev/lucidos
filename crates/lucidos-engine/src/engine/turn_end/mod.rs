@@ -9,11 +9,14 @@
 //! thread that reports to a parent, the wake decision. Beside them, a turn that
 //! leaves its thread waiting with the keep-alive on gets an expected wake.
 //!
-//! Two re-entries exist. The *ceiling re-entry* asks a session past its
-//! *context ceiling* to hand off (ADR 0629). The *proposal hold*'s owns when
-//! Lucidos-source work lacks a plan marker or a harden, and what the agent is
-//! told. This module owns only that each sends the agent back, and how often.
+//! Three re-entries exist. The *ceiling re-entry* asks a session past its
+//! *context ceiling* to hand off (ADR 0629). The *approved-plan re-entry* tells
+//! a session to build the plan the user approved this turn, when the turn
+//! changed no source file. The *proposal hold*'s owns when Lucidos-source work
+//! lacks a plan marker or a harden, and what the agent is told. This module
+//! owns only that each sends the agent back, and how often.
 
+pub(crate) mod approved_plan;
 mod expected_wake_decision;
 mod read_decision;
 pub(crate) mod wake_decision;
@@ -28,15 +31,14 @@ pub use wake_decision::{
 };
 
 use crate::engine::change_ops::{PlanHold, ProposalHold};
-use crate::engine::context_ceiling::{CeilingCrossing, ContextCeiling};
-use crate::engine::successor::SessionReading;
+use crate::engine::context_ceiling::CeilingCrossing;
 use crate::llm::judgment::{system_one_or_default_for, JudgmentProvider, JudgmentSite};
 
 impl crate::engine::LucidosEngine {
-    /// The System One row a turn-end decision runs on, or `None` for its chat
-    /// model. Only the wake decision has a default row, and both share one
-    /// fallback (ADRs 0435, 0472).
-    async fn turn_end_system_one(
+    /// The System One row a judgment site runs on, or `None` for its chat
+    /// model. Only the wake decision has a default row, and every site shares
+    /// one fallback (ADRs 0435, 0472).
+    pub(crate) async fn judgment_system_one(
         &self,
         site: JudgmentSite,
         timeout: std::time::Duration,
@@ -58,6 +60,9 @@ pub(crate) enum TurnEndRequirement {
     /// only the agent can write the handoff narrative. It outranks the hold,
     /// whose work the successor session then owes.
     CeilingHandoff(CeilingCrossing),
+    /// The user approved building the plan this turn, and the turn ended with
+    /// no source change: a session re-entry, since only the agent can build.
+    StartApprovedPlan,
     /// The proposal hold kept the turn's work: a session re-entry, since only
     /// the agent can set a plan marker or run `/harden`.
     Reentry(ProposalHold),
@@ -66,24 +71,14 @@ pub(crate) enum TurnEndRequirement {
 /// What an ordinary clean turn end knows about its session's context ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CeilingFacts {
-    pub(crate) reading: SessionReading,
-    pub(crate) ceiling: ContextCeiling,
-    /// The session already recorded a `ContextCeilingReached`.
-    pub(crate) reached: bool,
-    /// The turn that just ended is the session's first.
-    pub(crate) first_turn: bool,
-    /// Something keeps the session from handing off now: an input the agent
-    /// has not read, an open card, or a handoff already pending.
+    pub(crate) owed: Option<CeilingCrossing>,
+    /// Unread input, an open card, or a handoff block defers delivery.
     pub(crate) busy: bool,
 }
 
 impl CeilingFacts {
-    /// The crossing these facts make due.
     pub(crate) fn crossing(&self) -> Option<CeilingCrossing> {
-        if self.reached || self.first_turn || self.busy {
-            return None;
-        }
-        self.ceiling.crossed_by(self.reading)
+        self.owed.filter(|_| !self.busy)
     }
 }
 
@@ -96,6 +91,8 @@ pub(crate) struct SessionFacts {
     /// Why the proposal hold kept this idle's work, if it did. Never set
     /// while a handoff is pending: the successor session owes it then.
     pub(crate) held: Option<ProposalHold>,
+    /// The turn approved the plan's full scope and changed no source file.
+    pub(crate) approved_plan_unstarted: bool,
 }
 
 /// The state one turn ends in.
@@ -136,6 +133,13 @@ impl TurnEndState {
         if let Some(crossing) = self.ceiling {
             unmet.push(TurnEndRequirement::CeilingHandoff(crossing));
         }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|s| s.approved_plan_unstarted)
+        {
+            unmet.push(TurnEndRequirement::StartApprovedPlan);
+        }
         if let Some(hold) = self.session.as_ref().and_then(|s| s.held) {
             unmet.push(TurnEndRequirement::Reentry(hold));
         }
@@ -147,12 +151,28 @@ impl TurnEndState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DueReentry {
     Ceiling(CeilingCrossing),
+    ApprovedPlan,
     Hold(ProposalHold),
+}
+
+impl DueReentry {
+    /// The automatic step this re-entry takes, which an automation pause asks
+    /// the owner for first.
+    pub(crate) fn step(self) -> crate::engine::permission::Action {
+        use crate::engine::permission::Action;
+        match self {
+            Self::Ceiling(_) => Action::HandOff,
+            Self::ApprovedPlan => Action::BuildApprovedPlan,
+            Self::Hold(ProposalHold::HardeningMissing) => Action::Harden,
+            Self::Hold(_) => Action::SetPlanMarker,
+        }
+    }
 }
 
 /// What each re-entry last sent the agent back for.
 ///
-/// Held for the session's life. The ceiling sends once. Each kind of hold
+/// Held for the session's life. The ceiling and the approved plan each send
+/// once. Each kind of hold
 /// sends at most once per branch HEAD: an agent that ignores one ends its turn
 /// rather than looping, and new commits earn a new one. The plan and the
 /// harden keep separate keys, so settling the plan still lets the harden ask
@@ -160,6 +180,7 @@ pub(crate) enum DueReentry {
 #[derive(Debug, Default)]
 pub(crate) struct ReentryLedger {
     ceiling_sent: bool,
+    approved_plan_sent: bool,
     plan: Option<String>,
     hardening: Option<String>,
 }
@@ -194,6 +215,10 @@ impl ReentryLedger {
                     self.ceiling_sent = true;
                     DueReentry::Ceiling(crossing)
                 }),
+                TurnEndRequirement::StartApprovedPlan => (!self.approved_plan_sent).then(|| {
+                    self.approved_plan_sent = true;
+                    DueReentry::ApprovedPlan
+                }),
                 TurnEndRequirement::Reentry(hold) => {
                     let slot = self.slot(hold)?;
                     (slot.as_deref() != Some(head.as_str())).then(|| {
@@ -202,6 +227,20 @@ impl ReentryLedger {
                     })
                 }
             })
+    }
+
+    /// Un-record `due`, which an automation pause asked the owner about
+    /// instead of sending. The next idle asks again while it is still due.
+    pub(crate) fn forget(&mut self, due: DueReentry) {
+        match due {
+            DueReentry::Ceiling(_) => self.ceiling_sent = false,
+            DueReentry::ApprovedPlan => self.approved_plan_sent = false,
+            DueReentry::Hold(hold) => {
+                if let Some(slot) = self.slot(hold) {
+                    *slot = None;
+                }
+            }
+        }
     }
 }
 

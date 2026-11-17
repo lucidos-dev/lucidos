@@ -68,7 +68,7 @@ pub(super) async fn resolve_idle_change_state(input: IdleChangeStateInput<'_>) -
     let changed_files = match branch_changed_files_checked(input.repo_root, &branch_name).await {
         Ok(files) => Some(files),
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Diff probe FAILED at idle for thread {} on branch {}: {}. \
                  Treating the change state as unknown and preserving what the thread already \
                  had (a failed probe is never reported as 'no changes').",
@@ -113,7 +113,7 @@ async fn resolve_idle_branch(input: &IdleChangeStateInput<'_>) -> String {
         // nobody to tell. The next spawn re-derives the mismatch from
         // `SessionStarted.branch` and injects its own adoption note.
         Some((adopted, _note)) => {
-            log!(
+            log_legacy!(
                 "[AgentSession] Adopting renegade branch '{}' at idle (was tracking '{}') for thread {}",
                 adopted,
                 tracked,

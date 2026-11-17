@@ -10,6 +10,32 @@ use uuid::Uuid;
 
 use super::super::{EventBus, SystemEvent};
 
+struct QueuedProjection<'a> {
+    entry_id: Uuid,
+    kind: crate::engine::thread_queue::ThreadQueueKind,
+    trigger_id: Option<&'a str>,
+    trigger_name: Option<&'a str>,
+    thread_id: Option<Uuid>,
+    summary: &'a str,
+    request: &'a serde_json::Value,
+}
+
+async fn project_queued(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    queued: QueuedProjection<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Upsert also serves boot requeue: the original immutable request stays,
+    // while admission time resets for the new queue wait.
+    sqlx::query(
+        "INSERT INTO thread_queue (id, kind, trigger_id, trigger_name, thread_id, summary, request, status, queued_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'queued',NOW()) \
+         ON CONFLICT (id) DO UPDATE SET status='queued', queued_at=NOW(), admitted_at=NULL",
+    ).bind(queued.entry_id).bind(queued.kind.as_str()).bind(queued.trigger_id)
+        .bind(queued.trigger_name).bind(queued.thread_id).bind(queued.summary).bind(queued.request)
+        .execute(&mut **tx).await?;
+    Ok(())
+}
+
 impl EventBus {
     /// Fill in the audience of a `NotificationCreated` that names none, from
     /// the root thread of the thread it opens (ADR 0623). The event then carries
@@ -33,19 +59,19 @@ impl EventBus {
             return event;
         };
         let link_event = event_id.as_deref().and_then(|e| Uuid::parse_str(e).ok());
-        let audience = crate::engine::thread_people::audience_of_notification(
+        let audience = crate::engine::thread_users::audience_of_notification(
             self.pool(),
             &tap,
             link_event,
-            &crate::gateway_operators::current(),
+            &crate::gateway_users::current(),
         )
         .await
         .unwrap_or_else(|e| {
-            log!(
+            log_legacy!(
                 "[EventBus] Cannot read a notification's audience (team): {}",
                 e
             );
-            crate::engine::thread_people::Audience::Team
+            crate::engine::thread_users::Audience::Team
         })
         .device_ids();
         SystemEvent::NotificationCreated {
@@ -107,6 +133,93 @@ impl EventBus {
                 .await?;
                 Ok(())
             }
+            SystemEvent::OrdinarySubmissionAccepted {
+                thread_id,
+                entry_id,
+                request,
+                compose,
+                ..
+            } => {
+                // A projection rebuild applies the accepted report once, never
+                // over a newer compose epoch. Live acceptance consumed this
+                // slot already on the same transaction.
+                if let Some(report) = compose {
+                    sqlx::query("UPDATE thread_summaries SET compose_text=$2, compose_images=$3, compose_mode=$4, compose_selection=$5, compose_epoch=$6, compose_restorations=$7 WHERE thread_id=$1 AND compose_epoch < $6")
+                        .bind(thread_id).bind(&report.text)
+                        .bind(serde_json::json!(report.image_hashes))
+                        .bind(&report.mode).bind(&report.selection).bind(report.compose_epoch).bind(serde_json::json!(report.restorations))
+                        .execute(&mut **tx).await?;
+                }
+                let request_json = serde_json::to_value(request)?;
+                project_queued(
+                    tx,
+                    QueuedProjection {
+                        entry_id: *entry_id,
+                        kind: request.kind(),
+                        trigger_id: None,
+                        trigger_name: None,
+                        thread_id: Some(*thread_id),
+                        summary: &request.summary(None),
+                        request: &request_json,
+                    },
+                )
+                .await
+            }
+            SystemEvent::DraftSubmissionAccepted {
+                receipt, request, ..
+            } => {
+                let inserted = sqlx::query(
+                    "INSERT INTO draft_submissions (retry_key, thread_id, revision, epoch, event_id, queue_entry_id) \
+                     VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (retry_key) DO NOTHING",
+                )
+                .bind(receipt.retry_key).bind(receipt.thread_id)
+                .bind(receipt.revision).bind(receipt.epoch)
+                .bind(event_id).bind(receipt.queue_entry_id)
+                .execute(&mut **tx).await?.rows_affected();
+                if inserted == 0 {
+                    let existing: (Uuid, i64, i64, Uuid, Uuid) = sqlx::query_as(
+                        "SELECT thread_id, revision, epoch, event_id, queue_entry_id FROM draft_submissions WHERE retry_key=$1",
+                    ).bind(receipt.retry_key).fetch_one(&mut **tx).await?;
+                    if existing
+                        != (
+                            receipt.thread_id,
+                            receipt.revision,
+                            receipt.epoch,
+                            event_id,
+                            receipt.queue_entry_id,
+                        )
+                    {
+                        return Err("draft_retry_key_conflict".into());
+                    }
+                    // Replaying this acceptance must not resurrect completed
+                    // work or consume a draft written after it.
+                    return Ok(());
+                }
+                sqlx::query(
+                    "UPDATE thread_summaries SET compose_text='', compose_images='[]'::jsonb, \
+                     compose_mode=NULL, compose_selection=NULL, compose_restorations='[]'::jsonb, compose_epoch=compose_epoch+1 \
+                     WHERE thread_id=$1 AND draft_revision=$2 AND compose_epoch=$3",
+                )
+                .bind(receipt.thread_id)
+                .bind(receipt.revision)
+                .bind(receipt.epoch)
+                .execute(&mut **tx)
+                .await?;
+                let request_json = serde_json::to_value(request)?;
+                project_queued(
+                    tx,
+                    QueuedProjection {
+                        entry_id: receipt.queue_entry_id,
+                        kind: request.kind(),
+                        trigger_id: None,
+                        trigger_name: None,
+                        thread_id: Some(receipt.thread_id),
+                        summary: &request.summary(None),
+                        request: &request_json,
+                    },
+                )
+                .await
+            }
             SystemEvent::ThreadQueued {
                 entry_id,
                 kind,
@@ -118,26 +231,19 @@ impl EventBus {
                 requeued: _,
                 actor: _,
             } => {
-                // Upsert: the boot sweep re-queues an 'admitted' entry whose
-                // work died with the previous engine process by re-emitting
-                // ThreadQueued for the same entry_id. queued_at resets so the
-                // backlog-age notification doesn't fire spuriously right
-                // after a restart.
-                sqlx::query(
-                    "INSERT INTO thread_queue (id, kind, trigger_id, trigger_name, thread_id, summary, request, status, queued_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', NOW()) \
-                     ON CONFLICT (id) DO UPDATE SET status = 'queued', queued_at = NOW(), admitted_at = NULL",
+                project_queued(
+                    tx,
+                    QueuedProjection {
+                        entry_id: *entry_id,
+                        kind: *kind,
+                        trigger_id: trigger_id.as_deref(),
+                        trigger_name: trigger_name.as_deref(),
+                        thread_id: *thread_id,
+                        summary,
+                        request,
+                    },
                 )
-                .bind(entry_id)
-                .bind(kind.as_str())
-                .bind(trigger_id.as_deref())
-                .bind(trigger_name.as_deref())
-                .bind(thread_id)
-                .bind(summary)
-                .bind(request)
-                .execute(&mut **tx)
-                .await?;
-                Ok(())
+                .await
             }
             SystemEvent::ThreadQueueAdmitted {
                 entry_id,
@@ -216,6 +322,22 @@ impl EventBus {
                 .execute(&mut **tx)
                 .await?;
                 Ok(())
+            }
+            SystemEvent::PermissionGrantsChanged {
+                grant_file,
+                patterns,
+                source,
+                granted_in_thread_id,
+                ..
+            } => {
+                crate::engine::permission::projection::write_standing_set(
+                    tx,
+                    *grant_file,
+                    patterns,
+                    *source,
+                    *granted_in_thread_id,
+                )
+                .await
             }
             _ => Ok(()),
         }

@@ -1,7 +1,7 @@
 /** Device-local upload storage. No application state or browser startup effects. */
 import { uploadSourceVersion } from './pendingUploadSource';
 import { queuedRestoreSourceId } from '../utils/restoreAdmission';
-import { openDeviceDatabase } from './deviceDatabase';
+import { BOUNDED, openDeviceDatabase } from './deviceDatabase';
 import type { PendingUploadBackend, PendingUploadRecord, QueuedUploadSendRecord } from './pendingUploadRecords';
 
 const UPLOADS = 'uploads';
@@ -101,8 +101,8 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
         dropHistory<PendingUploadRecord>(s.transaction.objectStore(UPLOAD_HISTORY), null, (r) => r.localId === localId);
       });
     },
-    listUploadHistory: async () => (await transact<PendingUploadRecord[]>(UPLOAD_HISTORY, 'readonly', (s) => s.getAll())) ?? [],
-    listUploads: async () => (await transact<PendingUploadRecord[]>(UPLOADS, 'readonly', (s) => s.getAll())) ?? [],
+    listUploadHistory: async () => (await transact<PendingUploadRecord[]>(UPLOAD_HISTORY, 'readonly', (s) => s.getAll(), BOUNDED)) ?? [],
+    listUploads: async () => (await transact<PendingUploadRecord[]>(UPLOADS, 'readonly', (s) => s.getAll(), BOUNDED)) ?? [],
     putQueuedUploadSend: async (record) => {
       await transact(QUEUED_HISTORY, 'readwrite', (s) => {
         const active = s.get(`active:${queuedSlot(record)}`);
@@ -126,9 +126,9 @@ export function createIndexedDbBackend(name: string): PendingUploadBackend {
       });
     },
     listQueuedUploadSends: async () => (await transact<QueuedUploadSendRecord[]>(QUEUED_HISTORY, 'readonly',
-      (s) => s.getAll(IDBKeyRange.bound('active:', 'active;')))) ?? [],
+      (s) => s.getAll(IDBKeyRange.bound('active:', 'active;')), BOUNDED)) ?? [],
     listQueuedUploadHistory: async () => (await transact<QueuedUploadSendRecord[]>(QUEUED_HISTORY, 'readonly',
-      (s) => s.getAll(sourceRange()))) ?? [],
+      (s) => s.getAll(sourceRange()), BOUNDED)) ?? [],
   };
 }
 

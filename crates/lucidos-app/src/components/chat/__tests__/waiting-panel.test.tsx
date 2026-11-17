@@ -1,7 +1,7 @@
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import type { ComponentChildren, VNode } from 'preact';
 import {
-  unfinishedSubThreads,
+  awaitedSubThreads,
   SubThreadRow,
   subscriptionLine,
   waitingIndicatorBody,
@@ -97,42 +97,49 @@ function map(...threads: ThreadState[]): Map<string, ThreadState> {
 // Which children count, and who decides how many there are.
 // ──────────────────────────────────────────────────────────────────────────
 
-describe('unfinishedSubThreads', () => {
-  it('names nothing while the server counts no unfinished child', () => {
-    const children = map(thread('c', { parentThreadId: 'p', status: 'running' }));
-    expect(unfinishedSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
+describe('awaitedSubThreads', () => {
+  it('names nothing while the server counts no awaited child', () => {
+    const children = map(
+      thread('c', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      // A running `no-wake` child is loaded, and still not listed.
+      thread('no-wake', { parentThreadId: 'p', status: 'running' }),
+    );
+    expect(awaitedSubThreads('p', children, 0)).toEqual({ threads: [], unresolved: 0 });
   });
 
-  it('takes the running, question and waiting children, and no others', () => {
+  it('takes the children the engine flags as awaited, and no others', () => {
     const children = map(
-      thread('running', { parentThreadId: 'p', status: 'running' }),
-      thread('asking', { parentThreadId: 'p', status: 'waiting_for_user_answer' }),
-      // Idle while holding its own subscription: it has not finished
-      // (ADR 0254), and the engine counts it in `waiting_children_count`.
-      thread('subscribed', { parentThreadId: 'p', status: 'idle', liveEventWaitCount: 1 }),
-      // Idle with a proposed change: it reported, and waits only for the user.
-      thread('proposed', { parentThreadId: 'p', status: 'waiting', codingAgentChangeState: { kind: 'proposed', requires_restart: false }}),
+      thread('running', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      // Idle, but awaiting a grandchild whose finish wakes `p` (ADR 0672).
+      thread('awaiting', { parentThreadId: 'p', status: 'idle', awaitedByParent: true }),
+      // Running under `no-wake`: its finish wakes nobody.
+      thread('no-wake', { parentThreadId: 'p', status: 'running' }),
       thread('finished', { parentThreadId: 'p', status: 'idle' }),
-      thread('elsewhere', { parentThreadId: 'other', status: 'running' }),
+      thread('elsewhere', { parentThreadId: 'other', status: 'running', awaitedByParent: true }),
     );
-    const found = unfinishedSubThreads('p', children, 3);
-    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['asking', 'running', 'subscribed']);
+    const found = awaitedSubThreads('p', children, 2);
+    expect(found.threads.map((t) => t.meta.id).sort()).toEqual(['awaiting', 'running']);
     expect(found.unresolved).toBe(0);
   });
 
+  it('lists an awaited idle child when the count is 1', () => {
+    const children = map(thread('c1', { parentThreadId: 'p', status: 'idle', awaitedByParent: true }));
+    expect(awaitedSubThreads('p', children, 1)).toEqual({ threads: [children.get('c1')], unresolved: 0 });
+  });
+
   it('reports the children the server counts and the map cannot name', () => {
-    const children = map(thread('c1', { parentThreadId: 'p', status: 'running' }));
-    const found = unfinishedSubThreads('p', children, 3);
+    const children = map(thread('c1', { parentThreadId: 'p', status: 'running', awaitedByParent: true }));
+    const found = awaitedSubThreads('p', children, 3);
     expect(found.threads.map((t) => t.meta.id)).toEqual(['c1']);
     expect(found.unresolved).toBe(2);
   });
 
   it('never reports a negative shortfall when the map is ahead of the count', () => {
     const children = map(
-      thread('c1', { parentThreadId: 'p', status: 'running' }),
-      thread('c2', { parentThreadId: 'p', status: 'running' }),
+      thread('c1', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
+      thread('c2', { parentThreadId: 'p', status: 'running', awaitedByParent: true }),
     );
-    expect(unfinishedSubThreads('p', children, 1).unresolved).toBe(0);
+    expect(awaitedSubThreads('p', children, 1).unresolved).toBe(0);
   });
 });
 

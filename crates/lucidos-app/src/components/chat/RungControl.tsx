@@ -190,17 +190,23 @@ function ChatRungControl({ folded, rowAttrs, threadId, composeContext, disabledR
       }}
     >
       {({ close, keyboardHolder: holder }) => (
-        <RungPicker
-          label={LUCIDOS_AGENT_LABEL}
-          rows={chat.rungList.rows}
-          current={chat.rungList.current}
-          keyboardHolder={holder}
-          providerStep={chat.providerStep}
-          onPick={(value, provider) => {
-            close();
-            chat.pickRung(value, provider);
-          }}
-        />
+        <>
+          {chat.shown?.nextTurn && <div class="rung-turn-summary" role="status">
+            <div>Running: {chat.shown.name}{chat.shown.effort ? ` · ${chat.shown.effort}` : ''}</div>
+            <div>* Next turn: {chat.shown.nextTurn}</div>
+          </div>}
+          <RungPicker
+            label={LUCIDOS_AGENT_LABEL}
+            rows={chat.rungList.rows}
+            current={chat.rungList.current}
+            keyboardHolder={holder}
+            providerStep={chat.providerStep}
+            onPick={(value, provider) => {
+              close();
+              chat.pickRung(value, provider);
+            }}
+          />
+        </>
       )}
     </RungShell>
   );

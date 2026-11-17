@@ -448,7 +448,7 @@ describe('ActivityMenuGroup', () => {
     const pendingRow = [...el.querySelectorAll('button')].find((b) => b.textContent?.includes('New code pending'));
     pendingRow?.click();
     expect(onClose).toHaveBeenCalledOnce();
-    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Rebuild');
+    expect(toasts.value.find((t) => t.key === 'engine-new-version')?.action?.label).toBe('Build new version');
   });
 
   it('opens a fix thread the page never loaded, such as an archived one', async () => {

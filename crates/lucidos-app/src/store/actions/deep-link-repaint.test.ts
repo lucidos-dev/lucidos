@@ -36,9 +36,9 @@ vi.mock('./notifications', async () => {
     viewNotification: (id: string, generation?: string) => viewNotification(id, generation),
   };
 });
-vi.mock('./navigation-request', async () => {
-  const actual = await vi.importActual<typeof import('./navigation-request')>(
-    './navigation-request',
+vi.mock('./navigation-dispatch', async () => {
+  const actual = await vi.importActual<typeof import('./navigation-dispatch')>(
+    './navigation-dispatch',
   );
   return {
     ...actual,

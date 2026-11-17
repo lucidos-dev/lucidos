@@ -1,6 +1,7 @@
-//! The `threads` tool's read actions for what a thread holds unsent: its
-//! *draft* (`drafts`) and its *held messages* (`held_messages`). Both are
-//! read-only, and neither has a write counterpart on any agent surface.
+//! The `threads` tool's actions for what a thread holds unsent: its *draft*
+//! (`drafts`, `submit_draft`) and its *held messages* (`held_messages`). An
+//! agent reads both. It sends a saved draft exactly as saved, and only with
+//! the owner's authority (ADR 0651). Held messages stay read-only.
 
 use super::ToolOutcome;
 use crate::engine::LucidosEngine;
@@ -69,6 +70,59 @@ impl LucidosEngine {
                  Call 'drafts' with no thread_id to see which threads do."
             )),
             Err(e) => Err(format!("Error: failed to read the draft: {e}")),
+        }
+    }
+
+    /// `threads` action `submit_draft`: send a saved draft by revision and
+    /// epoch. Mirrors `POST /api/v1/threads/:thread_id/submit-draft` and
+    /// `lucidos threads submit-draft`.
+    pub(super) async fn execute_submit_draft(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::draft_submission::{refusal_report, RefusalAudience};
+        let raw = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .ok_or("Error: submit_draft needs the draft's thread_id.")?;
+        let thread_id = crate::api::resolve_thread_id_arg(raw, Some(caller_thread_id))
+            .map_err(|e| format!("Error: {e}"))?;
+        let token = |field: &str| {
+            args.get(field).and_then(|v| v.as_i64()).ok_or_else(|| {
+                format!(
+                    "Error: submit_draft needs {field}. Read it from the draft's snapshot \
+                     with the 'drafts' action."
+                )
+            })
+        };
+        let retry_key = match args.get("retry_key").and_then(|v| v.as_str()) {
+            None => uuid::Uuid::new_v4(),
+            Some(raw) => uuid::Uuid::parse_str(raw.trim())
+                .map_err(|_| format!("Error: retry_key takes a uuid, and '{raw}' is not one."))?,
+        };
+        let request = crate::core::draft_submission::SubmitDraftRequest {
+            thread_id,
+            expected_revision: token("expected_revision")?,
+            expected_epoch: token("expected_epoch")?,
+            retry_key,
+        };
+        match self
+            .submit_saved_draft_as_agent(caller_thread_id, request)
+            .await
+        {
+            Ok(receipt) => {
+                let json = serde_json::to_string(&receipt)
+                    .map_err(|e| format!("Error: failed to serialise the receipt: {e}"))?;
+                Ok(format!(
+                    "Accepted the saved draft on thread {thread_id}. It runs next. \
+                     Retry with the same retry_key to read this receipt again.\n{json}"
+                ))
+            }
+            Err(error) => {
+                let report = refusal_report(&*error, thread_id, RefusalAudience::ChatAgent);
+                Err(format!("Error: {}", report.message))
+            }
         }
     }
 

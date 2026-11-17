@@ -24,14 +24,14 @@ fn suggested_url_in(path: &Path) -> Option<String> {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Could not read {}: {}", path.display(), e);
+            crate::log_legacy!("[ClaudeGateway] Could not read {}: {}", path.display(), e);
             return None;
         }
     };
     let settings: serde_json::Value = match serde_json::from_str(&text) {
         Ok(settings) => settings,
         Err(e) => {
-            crate::log!("[ClaudeGateway] Could not parse {}: {}", path.display(), e);
+            crate::log_legacy!("[ClaudeGateway] Could not parse {}: {}", path.display(), e);
             return None;
         }
     };

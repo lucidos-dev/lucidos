@@ -66,6 +66,11 @@ fn parse_minted_code(body: &str) -> Option<MintedCode> {
     if code.is_empty() {
         return None;
     }
+    for key in ["secret", "code"] {
+        if let Some(value) = json.get(key).and_then(serde_json::Value::as_str) {
+            crate::client_log::secret(value.trim().to_string());
+        }
+    }
     Some(MintedCode {
         code,
         // The gateway has always sent this. A default keeps an older one
@@ -80,6 +85,19 @@ fn parse_minted_code(body: &str) -> Option<MintedCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn both_normalized_pairing_credentials_are_registered_before_return() {
+        let minted =
+            parse_minted_code(r#"{"code":" 31415926 ","secret":" opaque-shell-pairing-fixture "}"#)
+                .unwrap();
+        assert_eq!(minted.code, "opaque-shell-pairing-fixture");
+        let text = lucidos_diagnostic_log::sanitize::sanitize(
+            "pairing 31415926 opaque-shell-pairing-fixture",
+        );
+        assert!(!text.contains("31415926"));
+        assert!(!text.contains("opaque-shell-pairing-fixture"));
+    }
 
     #[test]
     fn a_minted_code_is_read_with_its_expiry() {

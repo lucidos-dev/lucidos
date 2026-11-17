@@ -630,7 +630,7 @@ impl LucidosEngine {
             })
             .collect();
         let files = self.artifact_manager.list_artifacts().unwrap_or_else(|e| {
-            crate::log!(
+            crate::log_legacy!(
                 "[Footprint] Cannot list artifacts: {}. Reporting no files",
                 e
             );

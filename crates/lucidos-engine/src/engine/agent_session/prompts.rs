@@ -142,8 +142,7 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     whether this is complex work — ADR- or design-thread-backed, cross-layer, any routing / \
     topology / storage / security / migration / process change, or anything beyond a local bug \
     fix. If it is, produce an implementation plan FIRST: run the `implementation-plan` skill \
-    (`.claude/skills/implementation-plan/SKILL.md`) — it turns the prompt, any grill/design \
-    thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records a \
+    (`.claude/skills/implementation-plan/SKILL.md`). It writes `docs/plans/<date>-<slug>.md` and records a \
     PROPOSED plan marker via `lucidos planned mark --plan <path>`. A proposed plan does NOT \
     unblock editing: ASK FOR APPROVAL WITH THE QUESTION TOOL named in the ASKING USERS section, \
     offering `Approve` and `Request changes` in the shape that section gives. A message that also \
@@ -151,7 +150,7 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     of the plan, ask last. Offer the options the skill's approval checkpoint prints, which may \
     swap this pair for `Implement in a fresh session`. \
     Once the user approves, run `lucidos planned approve` to flip the marker to gate-satisfying, which unblocks \
-    edits and Apply. Lucidos refuses it unless the user tapped an approving \
+    edits and Apply. Then build in the same turn, unless the user picked a fresh session. Lucidos refuses it unless the user tapped an approving \
     option, or typed a plain approval such as `approve`, after you proposed the plan. A tapped \
     fork is an approval too: revise the plan file to that variant, re-commit, then run \
     `lucidos planned approve`. A typed reply that asks, suggests or questions is a request for \
@@ -458,10 +457,10 @@ const RAISE_USER_REACHING_FINDINGS_RULE: &str = "RAISE A USER-REACHING FINDING Y
     silent failure, a security hole, data exposure, or data loss. A finding you DO fix in this \
     change needs no question; one that is out of scope but loud and harmless can stay a note.";
 
-/// Permission allowlist rule — Claude Code ONLY. Lucidos passes
+/// Permission allowlist rule, Claude Code ONLY. Lucidos passes
 /// `--allowedTools` when spawning CC, which overrides settings.json permission
-/// rules, so tool allowlist edits MUST go in the workspace's
-/// `.lucidos/cc-allowed-tools` (ADR 0095).
+/// rules. The flag is built from the workspace's tool grants, which the
+/// `.lucidos/cc-allowed-tools` file only mirrors (ADRs 0095, 0677).
 /// None of this applies to Codex (it uses its own sandbox + approval-policy
 /// model — approval cards raised by the app-server's `requestApproval`, not
 /// `--allowedTools`), so [`append_backend_rules`] appends this only in the
@@ -470,15 +469,15 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     PERMISSION CONFIG: Lucidos passes `--allowedTools` to your Claude Code subprocess. This flag \
     OVERRIDES `~/.claude/settings.json` permission rules, so a tool added to `permissions.allow` \
     there has NO effect and the user keeps seeing the prompt. The prompt card remembers a grant \
-    three ways: (1) `Always allow Tool(scope)` (narrow) and (2) `Always allow` (broad) append to \
-    `<workspace>/.lucidos/cc-allowed-tools` (one entry per line, `#` comments ignored). It is PER \
-    WORKSPACE: a grant binds here and is asked again in another workspace (ADR 0095). The next \
-    Claude Code session reads the file at spawn, and the running subprocess keeps its frozen \
-    flag. Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted through the broad button: CC \
-    settles them itself, so a bare `Edit` line does nothing, and the UI hides that button. \
-    (3) `Allow <scope> for this thread` records the pattern in the engine's in-memory per-thread \
-    allow set, which works for every tool and path, including CC-protected ones. Lost on engine \
-    restart.";
+    three ways: (1) `Always allow Tool(scope)` (narrow) and (2) `Always allow` (broad) record a \
+    standing grant. It is PER WORKSPACE: a grant binds here and is asked again in another \
+    workspace (ADR 0095). `<workspace>/.lucidos/cc-allowed-tools` only mirrors these grants: a \
+    line added by hand grants nothing until the owner approves it (ADR 0677). A session gets them \
+    at spawn and keeps that frozen flag. Bare \
+    `Edit`/`Write`/`NotebookEdit` cannot be persisted through the broad button: CC settles them \
+    itself, so a bare `Edit` line does nothing, and the UI hides that button. (3) `Allow <scope> \
+    for this thread` records a grant this thread holds, for every tool and path, including \
+    CC-protected ones. It survives a restart.";
 
 /// App-building knowhow pointer shared by the two app worktree prompts
 /// (`app_worktree_system_prompt`, `app_worktree_recovery_system_prompt`).
@@ -872,6 +871,13 @@ const READ_NARROWLY_RULE: &str = "\n\n\
     Read a whole file only when you need all of it. Do not re-read lines \
     already in your context unless the file changed or you are about to edit them.";
 
+/// Backend-independent, riding [`append_backend_rules`]. A thread verdict
+/// made from history called a working thread stalled (ADR 0679).
+const THREAD_VERDICT_RULE: &str = "\n\n\
+    THREAD VERDICTS: Call another thread stalled, stuck, failed or done only from its \
+    liveness, read in THIS turn: the `# thread:` line `lucidos events query --thread-id` \
+    prints on stderr. Say the state it reports. Your own earlier message is history.";
+
 /// How a session continues in a *successor session*. The procedure lives in
 /// `lucidos successor --help`. Advice from any other source to `/clear` or to
 /// write a handoff file is read the same way, without naming that source.
@@ -882,8 +888,15 @@ const SUCCESSOR_SESSION_RULE: &str = "\n\n\
     CHECKPOINT is a `lucidos successor offer --at <name>` step in a repo flow: run it and follow \
     it. Setup: `lucidos knowhow read system-knowhow/coding-agent-flows`.";
 
+/// How a session obeys "checkpoint and pause": as an *automation pause*, which
+/// the engine sees, not as chat text it cannot (ADR 0664).
+const CHECKPOINT_AND_PAUSE_RULE: &str = "\n\n\
+    CHECKPOINT AND PAUSE: When told to checkpoint and pause, commit, run `lucidos threads \
+    pause-automation --reason \"<why>\"`, then end your turn. Lucidos then asks the owner \
+    before any automatic step.";
+
 /// The *ceiling re-entry*: what a session past its *context ceiling* is told
-/// at the turn end that crossed it (ADR 0629). The turn is the handoff alone.
+/// at its next safe boundary (ADR 0629).
 pub(crate) fn ceiling_reentry_prompt(
     crossing: crate::engine::context_ceiling::CeilingCrossing,
 ) -> String {
@@ -892,6 +905,8 @@ pub(crate) fn ceiling_reentry_prompt(
     format!(
         "CONTEXT CEILING: This session's context holds {}k tokens, past this thread's context \
          ceiling of {}k. Hand off to a fresh session now, and do no more work on the task.\n\n\
+         Stop the step you are on at a safe point. Leave running background tasks alone; \
+         the successor inherits them.\n\n\
          1. Commit any finished work.\n\
          2. Write a handoff narrative to a file. Give it these markdown headings: {sections}.\n\
          3. Run `lucidos successor start --narrative <file>`, then end your turn.\n\n\
@@ -946,7 +961,7 @@ pub(super) async fn integrated_section(pool: &sqlx::PgPool, thread_id: uuid::Uui
     .fetch_optional(pool)
     .await
     .unwrap_or_else(|e| {
-        log!("[AgentSession] parent title for {}: {}", thread_id, e);
+        log_legacy!("[AgentSession] parent title for {}: {}", thread_id, e);
         None
     })
     .flatten();
@@ -978,12 +993,12 @@ const NO_STANDING_INSTRUCTION_NOTE: &str = "\n\n\
     403, an act on a thread outside your own subtree, such as an Apply, archive or cancel. \
     Spawning a thread, top-level or child, needs no authority. An ordinary question card cannot \
     authorize such an act, even when the owner picks the option naming it. When the decision \
-    you would ask about is one, ask for an owner approval INSTEAD of an ordinary card. Run \
-    `lucidos ask-owner-approval <verb> --thread <uuid> --reason \"<why>\"` \
-    (`lucidos ask-owner-approval --help` lists the verbs). Then ask your question tool with the \
-    id it prints as the only question. Lucidos shows its own owner approval card, with Allow \
-    once, in its place. A 409 from it means you hold the authority after all, for example \
-    because the owner has written to you since. Then go ahead as usual.";
+    you would ask about is one, ask for a permission INSTEAD of an ordinary card. Run \
+    `lucidos ask-permission <action> --thread <uuid> --reason \"<why>\"` \
+    (`lucidos ask-permission --help` lists the actions). Then ask your question tool with the \
+    id it prints as the only question. Lucidos shows its own permission card in its place. A \
+    409 from it means you hold the authority after all, for example because the owner has \
+    written to you since or already allowed it. Then go ahead as usual.";
 
 /// The [`NO_STANDING_INSTRUCTION_NOTE`] section for a session on `thread_id`,
 /// or empty when its current turn carries the owner's standing instruction.
@@ -1146,7 +1161,8 @@ pub(super) fn append_backend_rules(
     let prompt = format!(
         "{prompt}{REASONING_NOT_VISIBLE_RULE}{SHOWING_AN_IMAGE_RULE}\
          {HTML_ARTIFACT_TYPE_SCALE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}\
-         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}{READ_NARROWLY_RULE}{SUCCESSOR_SESSION_RULE}"
+         {PERMISSION_ASK_RULE}{READ_DECISION_RULE}{READ_NARROWLY_RULE}{THREAD_VERDICT_RULE}\
+         {SUCCESSOR_SESSION_RULE}{CHECKPOINT_AND_PAUSE_RULE}"
     );
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
@@ -2619,31 +2635,39 @@ mod tests {
         // EVERY Codex row rose by 240 to 243 bytes for `codex_exec_question_rule`.
         // A question asked from a code-mode `exec` cell otherwise yields after
         // 30 s, and the model re-bills its whole context on each `wait` poll.
-        ("worktree", "claude-code", 25674),
-        ("worktree", "codex", 25842),
+        //
+        // EVERY row rose by 249 bytes for `THREAD_VERDICT_RULE` (ADR 0679). A
+        // thread verdict made from history once called a working thread
+        // stalled, in every repo a session can read another thread from.
+        //
+        // EVERY row rose by 193 to 196 bytes for `CHECKPOINT_AND_PAUSE_RULE`
+        // (ADR 0664). A pause the agent only promises in chat is one the
+        // engine cannot see, so its own nudge restarts the work.
+        ("worktree", "claude-code", 26116),
+        ("worktree", "codex", 26284),
         // The four external-repo rows are 569 bytes higher than they were, for
         // `BUILD_SLOT_RULE` (ADR 0070). Only these flavors carry it. A
         // Lucidos-source session is already covered, because `make lint` and
         // `make test` take a slot themselves. Carrying it there would pay for
         // an instruction the session cannot use.
-        ("external_repo", "claude-code", 18487),
-        ("external_repo", "codex", 18655),
-        ("recovery", "claude-code", 24391),
-        ("recovery", "codex", 24559),
-        ("external_repo_recovery", "claude-code", 18389),
-        ("external_repo_recovery", "codex", 18557),
-        ("app_worktree", "claude-code", 20979),
-        ("app_worktree", "codex", 21147),
-        ("app_worktree_recovery", "claude-code", 19539),
-        ("app_worktree_recovery", "codex", 19707),
+        ("external_repo", "claude-code", 18929),
+        ("external_repo", "codex", 19097),
+        ("recovery", "claude-code", 24833),
+        ("recovery", "codex", 25001),
+        ("external_repo_recovery", "claude-code", 18831),
+        ("external_repo_recovery", "codex", 18999),
+        ("app_worktree", "claude-code", 21421),
+        ("app_worktree", "codex", 21589),
+        ("app_worktree_recovery", "claude-code", 19981),
+        ("app_worktree_recovery", "codex", 20149),
         // Both conflict_resolution rows rose by about 115 bytes when
         // `SHOWING_AN_IMAGE_RULE` learned that saving a picture shows nothing
         // either. The other rows had the slack to absorb it. Both rose again,
         // by 384, for its visual-choice clause: a real picture per option.
         // The external-repo, app-worktree and conflict-resolution rows rose by
         // 22 bytes when `READ_DECISION_RULE` excused a turn that asks a question.
-        ("conflict_resolution", "claude-code", 7178),
-        ("conflict_resolution", "codex", 9485),
+        ("conflict_resolution", "claude-code", 7620),
+        ("conflict_resolution", "codex", 9930),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
@@ -2756,6 +2780,24 @@ mod tests {
         }
         assert!(READ_NARROWLY_RULE.contains("rg -n"));
         assert!(READ_NARROWLY_RULE.contains("100 lines"));
+    }
+
+    /// Every session, on both backends, needs a same-turn liveness read before
+    /// a thread verdict, and the rule names where the CLI prints it.
+    #[test]
+    fn every_session_reads_liveness_before_a_thread_verdict() {
+        for (flavor, prompt) in all_prompt_flavors() {
+            for (agent, label) in all_backends() {
+                let prompt = append_backend_rules(prompt.clone(), agent);
+                assert!(
+                    prompt.contains(THREAD_VERDICT_RULE),
+                    "{flavor}/{label} lacks the thread verdict rule"
+                );
+            }
+        }
+        assert!(THREAD_VERDICT_RULE.contains("read in THIS turn"));
+        assert!(THREAD_VERDICT_RULE.contains("earlier message is history"));
+        assert!(THREAD_VERDICT_RULE.contains("# thread:"));
     }
 
     /// Every session, on both backends, learns the one handoff path, and the

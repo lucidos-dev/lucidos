@@ -245,7 +245,7 @@ impl AppKind {
             None | Some("app") => Self::App,
             Some("widget") => Self::Widget,
             Some(other) => {
-                log!(
+                log_legacy!(
                     "[Apps] {}: unrecognised manifest kind {:?}, listing it as an app",
                     app_id,
                     other
@@ -302,7 +302,7 @@ impl WidgetOrigin {
                     origin_thread_id: id,
                 }),
                 Err(_) => {
-                    log!(
+                    log_legacy!(
                         "[Apps] {}: origin_thread_id {:?} is not a uuid",
                         app_id,
                         raw
@@ -347,7 +347,7 @@ impl AppReveal {
             None | Some("on-load") => Self::OnLoad,
             Some("on-ready") => Self::OnReady,
             Some(other) => {
-                log!(
+                log_legacy!(
                     "[Apps] {}: unrecognised manifest reveal {:?}, using on-load",
                     app_id,
                     other
@@ -511,7 +511,7 @@ impl AppManager {
     pub fn new(workspace_path: &Path) -> Result<Self, git2::Error> {
         let apps_path = workspace_path.join("data/apps");
         if let Err(e) = std::fs::create_dir_all(&apps_path) {
-            log!(
+            log_legacy!(
                 "[Apps] Failed to create apps directory {}: {}",
                 apps_path.display(),
                 e
@@ -687,7 +687,7 @@ impl AppManager {
         let kind = AppKind::from_manifest(&id, manifest.kind.as_deref());
         // A bad value must not drop the widget off its board; the audit reports it.
         let tile = check_widget_manifest(kind, &manifest).unwrap_or_else(|e| {
-            log!("[Apps] {}: {}, using the default tile", id, e);
+            log_legacy!("[Apps] {}: {}, using the default tile", id, e);
             WidgetTile {
                 sizes: match kind {
                     AppKind::Widget => WidgetSize::UNDECLARED.to_vec(),
@@ -780,7 +780,7 @@ impl AppManager {
             if path.is_dir() {
                 match self.load_app(&path, built_in) {
                     Ok(app) => apps.push(app),
-                    Err(e) => log!("[Apps] Skipping {}: {}", path.display(), e),
+                    Err(e) => log_legacy!("[Apps] Skipping {}: {}", path.display(), e),
                 }
             }
         }
@@ -1210,7 +1210,7 @@ impl AppManager {
             let dirs: Vec<String> = removed.iter().map(|id| format!("data/apps/{id}")).collect();
             let message = format!("Delete widgets with their thread: {}", removed.join(", "));
             let commit = self.commit_removals(held, &dirs, &message)?;
-            log!("[Apps] Removed widgets {:?} in {}", removed, commit);
+            log_legacy!("[Apps] Removed widgets {:?} in {}", removed, commit);
         }
         Ok((removed, failure))
     }
@@ -1877,25 +1877,6 @@ pub(crate) mod tests {
         let manager = AppManager::new(tmp.path()).unwrap();
 
         assert_eq!(manager.contained_app_dir("todo"), None);
-    }
-
-    /// A pin, because the doc cannot import the constants it states.
-    #[test]
-    fn the_app_icon_doc_states_the_real_rules() {
-        // Read at run time: an `include_str!` would make the doc an engine
-        // embed, and every edit to it an Apply that needs a restart.
-        let path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../system-knowhow/building-an-app.md");
-        let doc = std::fs::read_to_string(path).unwrap();
-        let section = doc.split("## App icon").nth(1).expect("§ App icon exists");
-        assert!(section.contains(&format!("{} KiB", APP_ICON_MAX_BYTES / 1024)));
-        assert!(section.contains(APP_ICON_DEFAULT_PATH));
-        for ext in APP_ICON_EXTENSIONS {
-            assert!(
-                section.to_lowercase().contains(ext),
-                "§ App icon names {ext}"
-            );
-        }
     }
 
     #[tokio::test]
@@ -2667,5 +2648,28 @@ pub(crate) mod tests {
         .await
         .unwrap();
         assert!(on_main(ws, "data/apps/habit-tracker/manifest.json").is_none());
+    }
+
+    mod guard_tests {
+        use super::*;
+
+        /// A pin, because the doc cannot import the constants it states.
+        #[test]
+        fn the_app_icon_doc_states_the_real_rules() {
+            // Read at run time: an `include_str!` would make the doc an engine
+            // embed, and every edit to it an Apply that needs a restart.
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../system-knowhow/building-an-app.md");
+            let doc = std::fs::read_to_string(path).unwrap();
+            let section = doc.split("## App icon").nth(1).expect("§ App icon exists");
+            assert!(section.contains(&format!("{} KiB", APP_ICON_MAX_BYTES / 1024)));
+            assert!(section.contains(APP_ICON_DEFAULT_PATH));
+            for ext in APP_ICON_EXTENSIONS {
+                assert!(
+                    section.to_lowercase().contains(ext),
+                    "§ App icon names {ext}"
+                );
+            }
+        }
     }
 }

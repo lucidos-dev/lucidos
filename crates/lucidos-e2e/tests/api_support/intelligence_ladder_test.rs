@@ -260,3 +260,27 @@ async fn sorting_a_climbing_ladder_restates_it_and_stores_nothing() {
     assert_eq!(after["customised"], false, "{after}");
     assert_eq!(after["climbs"], true, "{after}");
 }
+
+/// A thread's alternative ladders use its reference and never repeat its backend.
+#[tokio::test]
+async fn thread_ladder_serves_other_installed_backends_on_a_common_reference() {
+    let pool = sqlx::PgPool::connect(&crate::support::db_url())
+        .await
+        .unwrap();
+    let thread = uuid::Uuid::new_v4();
+    crate::support::seed_cc_thread_summary(&pool, thread, "idle").await;
+    let ladder = get_ladder(&format!("?thread_id={thread}")).await;
+    let other = ladder["other_backend_ladders"]
+        .as_array()
+        .expect("alternative ladders");
+    let installed = lucidos_engine::runtime::installed_coding_agents(&pool).await;
+    let expected = installed
+        .iter()
+        .filter(|a| serde_json::to_value(a).unwrap() != ladder["coding_agent"])
+        .count();
+    assert_eq!(other.len(), expected, "{ladder}");
+    for alternative in other {
+        assert_ne!(alternative["coding_agent"], ladder["coding_agent"]);
+        assert_eq!(alternative["reference"], ladder["reference"]);
+    }
+}

@@ -123,7 +123,7 @@ fn installed_media(workspace_path: &Path, plugin_id: &str) -> PluginMedia {
         Ok(Some(index)) => MediaSource::Installed { plugin_id }.media(&index),
         Ok(None) => PluginMedia::default(),
         Err(e) => {
-            log!("[Plugins] could not read the media of '{plugin_id}': {e}");
+            log_legacy!("[Plugins] could not read the media of '{plugin_id}': {e}");
             PluginMedia {
                 problems: vec![plugin_media::MediaProblem {
                     path: plugin_media::MEDIA_DIR.to_string(),

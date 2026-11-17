@@ -16,10 +16,10 @@
 //! - The script is self-contained: stdlib and installed packages only, never a
 //!   module beside it. See [`RUN_CHECKED_SOURCE`].
 
+use crate::runtime::agent_sandbox::{Sandbox, SandboxedCommand};
 use axum::http::{HeaderName, HeaderValue};
 use std::path::Path as FsPath;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -217,7 +217,10 @@ fn is_handshake_secret_name(name: &str) -> bool {
 ///
 /// Split out so the timeout above wraps the whole exchange. The child is
 /// `kill_on_drop`, so a timeout that drops this future also kills the process.
-async fn run_with_source(mut cmd: Command, source: &[u8]) -> std::io::Result<std::process::Output> {
+async fn run_with_source(
+    mut cmd: SandboxedCommand,
+    source: &[u8],
+) -> std::io::Result<std::process::Output> {
     use tokio::io::AsyncWriteExt;
 
     let mut child = cmd.spawn()?;
@@ -232,6 +235,7 @@ async fn run_with_source(mut cmd: Command, source: &[u8]) -> std::io::Result<std
 }
 
 pub async fn run_handshake_script(
+    sandbox: &Sandbox,
     workspace_path: &FsPath,
     script_rel_path: &str,
     env_vars: Vec<(String, String)>,
@@ -278,7 +282,7 @@ pub async fn run_handshake_script(
     let rel_key = crate::core::handshake_approvals::workspace_relative(workspace_path, &script_abs)
         .unwrap_or_else(|| script_abs.display().to_string());
     if !crate::core::handshake_approvals::is_approved(workspace_path, &rel_key, &source) {
-        crate::log!(
+        crate::log_legacy!(
             "[Proxy] refused an unapproved handshake script: {} (see ADR 0144)",
             rel_key
         );
@@ -289,7 +293,7 @@ pub async fn run_handshake_script(
         .into_iter()
         .partition(|(name, _)| is_handshake_secret_name(name));
     for (name, _) in &dropped {
-        crate::log!(
+        crate::log_legacy!(
             "[Proxy] dropped env var {} from handshake {}: a handshake script gets only CRED_* and OAUTH_* names",
             name,
             rel_key
@@ -300,7 +304,9 @@ pub async fn run_handshake_script(
     // scrubbed out first.
     let secret_values: Vec<String> = secrets.iter().map(|(_, v)| v.clone()).collect();
 
-    let mut cmd = Command::new("python3");
+    let mut cmd = sandbox
+        .command("python3")
+        .map_err(|e| RunError::Spawn(e.to_string()))?;
     cmd.arg("-c").arg(RUN_CHECKED_SOURCE).arg(&script_abs);
     // Least privilege: the script is untrusted code. It starts from an EMPTY
     // environment and gets back only the runtime names below, plus the
@@ -411,7 +417,7 @@ import json
 print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz"}, "expires_in": 3600}))
 "#,
         );
-        let out = run_handshake_script(tmp.path(), &rel, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .unwrap();
         assert_eq!(out.expires_in, 3600);
@@ -431,7 +437,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             "data-loc.py",
             r#"import json; print(json.dumps({"headers": {"X-Where": "data"}, "expires_in": 60}))"#,
         );
-        let out = run_handshake_script(tmp.path(), &rel, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .unwrap();
         let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
@@ -454,7 +460,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             r#"import json; print(json.dumps({"headers": {"X-Where": "data"}, "expires_in": 60}))"#,
         );
         let prefixed = format!("data/{rel}");
-        let out = run_handshake_script(tmp.path(), &prefixed, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &prefixed, vec![])
             .await
             .unwrap_or_else(|e| panic!("'{prefixed}' must resolve to the same file: {e}"));
         let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
@@ -503,7 +509,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
         )
         .unwrap();
 
-        let err = run_handshake_script(tmp.path(), rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), rel, vec![])
             .await
             .expect_err("a workspace-root script must not run");
         match err {
@@ -531,7 +537,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
                 marker.display().to_string()
             ),
         );
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("an unapproved script must not run");
         match err {
@@ -551,7 +557,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             "swap.py",
             r#"print('{"headers": {"X-A": "1"}, "expires_in": 60}')"#,
         );
-        run_handshake_script(tmp.path(), &rel, vec![])
+        run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect("the approved content runs");
 
@@ -560,7 +566,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             r#"print('{"headers": {"X-B": "2"}, "expires_in": 60}')"#,
         )
         .unwrap();
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("swapped content must be refused");
         assert!(matches!(err, RunError::NotApproved(_)), "got {err:?}");
@@ -572,7 +578,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
     async fn the_refusal_names_the_script_and_the_fix() {
         let tmp = tempfile::tempdir().unwrap();
         let rel = write_unapproved_script(tmp.path(), "hand-edited.py", "print(1)");
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("unapproved");
         let msg = err.to_string();
@@ -596,7 +602,7 @@ leftover = sys.stdin.read()
 print(json.dumps({"headers": {"X-Leftover": str(len(leftover))}, "expires_in": 60}))
 "#,
         );
-        let out = run_handshake_script(tmp.path(), &rel, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .unwrap();
         let leftover = out
@@ -627,7 +633,7 @@ print(json.dumps({
 }))
 "#,
         );
-        let out = run_handshake_script(tmp.path(), &rel, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .unwrap();
         let map: std::collections::HashMap<&str, &str> = out
@@ -660,7 +666,7 @@ import sibling
 print(json.dumps({"headers": {"X-Ran": "yes"}, "expires_in": 60}))
 "#,
         );
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("a sibling import must not resolve");
         match err {
@@ -692,7 +698,7 @@ import json
 print(json.dumps({"headers": {"X-Ran": "real"}, "expires_in": 60}))
 "#,
         );
-        let out = run_handshake_script(tmp.path(), &rel, vec![])
+        let out = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect("the real stdlib json must still import");
         let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
@@ -724,6 +730,7 @@ print(json.dumps({"headers": {"X-Ran": "real"}, "expires_in": 60}))
 "#,
         );
         let out = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![(
@@ -759,6 +766,7 @@ print(json.dumps({
         );
         let granted = |name: &str| (name.to_string(), "granted-value".to_string());
         let out = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![
@@ -838,9 +846,14 @@ print(json.dumps({
     #[tokio::test]
     async fn missing_script_returns_not_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = run_handshake_script(tmp.path(), "scripts/auth/nope.py", vec![])
-            .await
-            .expect_err("expected NotFound");
+        let err = run_handshake_script(
+            &Sandbox::unsandboxed(),
+            tmp.path(),
+            "scripts/auth/nope.py",
+            vec![],
+        )
+        .await
+        .expect_err("expected NotFound");
         match err {
             RunError::NotFound(_) => {}
             other => panic!("expected NotFound, got {:?}", other),
@@ -854,9 +867,14 @@ print(json.dumps({
         // workspace and spawn python3. `PathRejected` rather than `NotFound`
         // is what proves the guard fired, rather than the file being absent.
         let tmp = tempfile::tempdir().unwrap();
-        let err = run_handshake_script(tmp.path(), "../../etc/evil.py", vec![])
-            .await
-            .expect_err("traversal path must be rejected");
+        let err = run_handshake_script(
+            &Sandbox::unsandboxed(),
+            tmp.path(),
+            "../../etc/evil.py",
+            vec![],
+        )
+        .await
+        .expect_err("traversal path must be rejected");
         match err {
             RunError::PathRejected(reason) => {
                 assert!(reason.contains("../../etc/evil.py"), "got: {reason}");
@@ -871,9 +889,14 @@ print(json.dumps({
     #[tokio::test]
     async fn a_dot_dot_substring_is_rejected_too() {
         let tmp = tempfile::tempdir().unwrap();
-        let err = run_handshake_script(tmp.path(), "scripts/auth/a..b.py", vec![])
-            .await
-            .expect_err("a '..' substring must be rejected");
+        let err = run_handshake_script(
+            &Sandbox::unsandboxed(),
+            tmp.path(),
+            "scripts/auth/a..b.py",
+            vec![],
+        )
+        .await
+        .expect_err("a '..' substring must be rejected");
         assert!(
             matches!(err, RunError::PathRejected(_)),
             "expected PathRejected, got {err:?}"
@@ -892,7 +915,7 @@ print("login failed: bad creds", file=sys.stderr)
 sys.exit(2)
 "#,
         );
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("expected non-zero exit");
         match err {
@@ -926,6 +949,7 @@ sys.exit(3)
 "#,
         );
         let err = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![
@@ -967,7 +991,7 @@ sys.exit(3)
     async fn invalid_json_output_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
         let rel = write_script(tmp.path(), "badjson.py", r#"print("not json")"#);
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("expected invalid output");
         match err {
@@ -984,7 +1008,7 @@ sys.exit(3)
             "noheaders.py",
             r#"import json; print(json.dumps({"expires_in": 60}))"#,
         );
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("expected missing headers");
         match err {
@@ -1001,7 +1025,7 @@ sys.exit(3)
             "noexpiry.py",
             r#"import json; print(json.dumps({"headers": {"X": "y"}}))"#,
         );
-        let err = run_handshake_script(tmp.path(), &rel, vec![])
+        let err = run_handshake_script(&Sandbox::unsandboxed(), tmp.path(), &rel, vec![])
             .await
             .expect_err("expected missing expires_in");
         match err {
@@ -1028,6 +1052,7 @@ print(json.dumps({"headers": {"X-Token": tok, "X-Email": email}, "expires_in": 6
 "#,
         );
         let out = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![
@@ -1066,6 +1091,7 @@ print(json.dumps({"headers": {"X-User": u, "X-Pass": p}, "expires_in": 60}))
 "#,
         );
         let out = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![
@@ -1108,6 +1134,7 @@ print(json.dumps({
 "#,
         );
         let out = run_handshake_script(
+            &Sandbox::unsandboxed(),
             tmp.path(),
             &rel,
             vec![("CRED_SVC".to_string(), "injected-value".to_string())],

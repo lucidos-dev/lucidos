@@ -200,21 +200,23 @@ impl ChatGptPlanSignIn {
         let outcome = match tokio::time::timeout(self.timeout, callback.received()).await {
             Err(_) => Err("The sign-in timed out before ChatGPT sent the browser back.".into()),
             Ok(Err(refused)) => Err(refused.to_string()),
-            Ok(Ok(grant)) => {
+            Ok(Ok(received)) => {
                 let _store = self.store.lock().await;
-                if self.lock().generation == generation {
+                let completed = if self.lock().generation == generation {
                     pending
-                        .complete(pool, event_bus, grant, actor.clone())
+                        .complete(pool, event_bus, received.grant, actor.clone())
                         .await
                         .map(|_| ())
                         .map_err(|e| e.to_string())
                 } else {
                     Err("A sign-out or a newer sign-in replaced this one.".to_string())
-                }
+                };
+                received.reply.settle(completed.is_ok());
+                completed
             }
         };
         if let Err(error) = &outcome {
-            crate::log!("[ChatGptPlan] Sign-in ended: {}", error);
+            crate::log_legacy!("[ChatGptPlan] Sign-in ended: {}", error);
         }
         if let Some(error) = self.finish(generation, outcome) {
             event_bus

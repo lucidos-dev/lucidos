@@ -54,6 +54,7 @@ async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) {
 
 fn session_started(continuity: SessionContinuity) -> ThreadEvent {
     ThreadEvent::SessionStarted {
+        sandbox: None,
         coding_agent: CodingAgent::ClaudeCode,
         session_id: "test-session".into(),
         branch: "claude-code/scope".into(),

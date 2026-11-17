@@ -185,7 +185,7 @@ pub fn register_as_build_watch_consumer(source: &Path) {
         Ok(lock) => {
             let _ = BUILD_WATCH_CONSUMER.set(lock);
         }
-        Err(e) => crate::log!(
+        Err(e) => crate::log_legacy!(
             "[Frontend] could not register with the build-watch at {}: {e}",
             path.display()
         ),
@@ -485,7 +485,7 @@ impl LucidosEngine {
         // client. Skip; the Switch advances client + engine together. (Re-checked
         // before the swap, since a mixed Apply can land during the poll window.)
         if !self.applying_advance_is_safe().await {
-            crate::log!(
+            crate::log_legacy!(
                 "[Frontend] frontend-only Apply: an engine version change is pending — not advancing the served client (the Switch will)"
             );
             // Tell the page the change is queued for the Switch (not ignored).
@@ -528,7 +528,7 @@ impl LucidosEngine {
                 // so a build queued behind it has had time to move the id.
                 if !in_worktree && !watch_stopped && read_build_succeeded_since(&source, applied_at)
                 {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Frontend] frontend-only Apply: {} rebuilt with the same BUILD_ID, so \
                          the served client is already current",
                         source.display()
@@ -536,7 +536,7 @@ impl LucidosEngine {
                     return;
                 }
                 if let Some(reason) = build_error.as_deref() {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Frontend] the build-watch reports a FAILING build, which is why \
                          nothing republished: {reason}"
                     );
@@ -545,14 +545,14 @@ impl LucidosEngine {
                 // status file: a stopped watch is retrying nothing, so the
                 // reason it last recorded describes a build nobody will repeat.
                 if watch_stopped {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Frontend] the build-watch is NOT RUNNING, so nothing will republish \
                          {} until the stack is relaunched",
                         source.display()
                     );
                 }
                 if in_worktree {
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Frontend] frontend-only Apply STRANDED: {} is inside a coding-agent \
                          worktree, so the build-watch republishes a different directory and the \
                          served client can NEVER advance — relaunch the stack from the real \
@@ -563,7 +563,7 @@ impl LucidosEngine {
                     // Only recoverable while something is still watching. With
                     // the watch stopped the periodic sync has nothing to pick
                     // up, and the line above already said so.
-                    crate::log!(
+                    crate::log_legacy!(
                         "[Frontend] frontend-only Apply: {} did not republish within {}s — not \
                          advancing the served client yet. Recoverable: the periodic sync picks \
                          it up if the rebuild lands.",
@@ -591,7 +591,7 @@ impl LucidosEngine {
         // engine source past HEAD). If so, the dist we're about to snapshot is for
         // the new engine — don't serve it on the running old engine.
         if !self.applying_advance_is_safe().await {
-            crate::log!(
+            crate::log_legacy!(
                 "[Frontend] frontend-only Apply: an engine version change landed during the rebuild wait — not advancing the served client (the Switch will)"
             );
             // Tell the page the change is queued for the Switch (not ignored).
@@ -634,7 +634,7 @@ impl LucidosEngine {
                     let mut guard = handle.write().unwrap();
                     std::mem::replace(&mut *guard, new_dir.clone())
                 };
-                crate::log!(
+                crate::log_legacy!(
                     "[Frontend] serving re-snapshotted dist at {}",
                     new_dir.display()
                 );
@@ -652,7 +652,9 @@ impl LucidosEngine {
             }
             Err(e) => {
                 // Fail-safe: leave the current served dir in place (never a 404).
-                crate::log!("[Frontend] re-snapshot failed ({e}); served snapshot unchanged");
+                crate::log_legacy!(
+                    "[Frontend] re-snapshot failed ({e}); served snapshot unchanged"
+                );
             }
         }
     }
@@ -707,7 +709,7 @@ impl LucidosEngine {
         {
             return;
         }
-        crate::log!(
+        crate::log_legacy!(
             "[Frontend] WARNING: serving dist/ from a coding-agent worktree ({}). \
              A worktree is a throwaway checkout pinned to one commit, and the build-watch \
              republishes the real checkout's dist/, so frontend changes will NOT appear here. \
@@ -775,7 +777,8 @@ impl LucidosEngine {
     /// 2. **Engine-version self-heal** (`self_heal_engine_version_if_needed`) — if
     ///    the engine source is behind HEAD with a stale on-disk binary (a mixed
     ///    Apply's rebuild failed / never ran), (re)trigger a coordinated background
-    ///    rebuild so the Switch surfaces without a manual `-b`. See
+    ///    rebuild so the Switch surfaces without a manual `-b`, unless the workspace
+    ///    chose manual source builds. See
     ///    `docs/plans/2026-07-03-engine-version-switch-selfheal.md`.
     ///
     /// Packaged returns immediately (no source rebuild); a headless engine (no
@@ -796,7 +799,7 @@ impl LucidosEngine {
                 // engine SOURCE is behind HEAD with a stale on-disk binary
                 // (a mixed Apply's rebuild failed / never ran), (re)trigger a
                 // coordinated background rebuild so the Switch can surface without
-                // a manual `-b`. No-op packaged / when not behind.
+                // a manual `-b`. No-op packaged, in manual mode, or when not behind.
                 engine.self_heal_engine_version_if_needed().await;
             }
         })

@@ -24,12 +24,13 @@ _shared_pg_port() {
 _iter_workspace_dirs() {
     local reg
     reg="$(gateway_data_dir)/config/workspaces.json"
-    if [ -f "$reg" ]; then
-        python3 - "$reg" "$(gateway_data_dir)" <<'PY'
+    if [ -f "$reg" ] && python3 - "$reg" "$(gateway_data_dir)" <<'PY'; then
 import json, os, sys
 reg, base = sys.argv[1:3]
 try:
     data = json.load(open(reg))
+except PermissionError:
+    sys.exit(1)
 except Exception:
     data = {}
 for w in data.get("workspaces", []):
@@ -41,6 +42,9 @@ for w in data.get("workspaces", []):
     print(d)
 PY
         return
+    fi
+    if [ -n "${LUCIDOS_AGENT_SANDBOXED:-}" ]; then
+        echo "note: the agent sandbox hides the gateway registry (ADR 0645), so this lists ~/workspaces only." >&2
     fi
     for d in "$HOME"/workspaces/*; do
         [ -d "$d/.lucidos" ] && echo "$d"

@@ -976,3 +976,23 @@ Implementation: `engine/command_guard.rs` (`lucidos_call_is_workspace_local`,
 `rebinds_lucidos_cli`, `python_program_proof`, `inline_python_is_proven`,
 `blank_proven_inline_python`). Plan:
 `docs/plans/2026-11-01-command-guard-proves-workspace-local-lucidos-calls.md`.
+
+## Addendum: workspace operation refusals distinguish execution from data
+
+The workspace destruction floor inspects the operation and target within an
+executable command. A mention of `pg_ctl`, `dropdb`, or a control URL in a
+document does not establish such an operation.
+
+The operation scan preserves shell quoting and places heredoc bodies with their
+consumers. A shell or SQL interpreter can execute its input; a literal file
+write cannot. Python literal subprocess calls reuse the existing lexer.
+Known data calls may carry ordinary string contents without making them code.
+Unknown execution, dynamic arguments and recursion limits retain conservative
+refusals. Read-only database probes and control requests receive their own
+classification rather than borrowing keywords from other commands.
+
+This changes only the workspace operation floor. Filesystem destruction checks,
+secret protection, normal classification and consent remain in force. Real
+workspace destruction still precedes grants, for chat and both coding agents.
+Regression pairs cover inert data and executed operations at the shared guard
+and coding-agent gate.

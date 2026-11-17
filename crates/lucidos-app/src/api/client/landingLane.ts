@@ -28,3 +28,8 @@ export async function cancelLaneBatch(batchId: string): Promise<{ canceled: stri
 export async function closeMainCheckRed(): Promise<{ message: string }> {
   return json(`${API}/main-check/close`, { method: 'POST' });
 }
+
+/** Start the current main repair as owner work. */
+export async function fixMainNow(): Promise<{ message: string }> {
+  return json(`${API}/main-check/fix-now`, { method: 'POST' });
+}

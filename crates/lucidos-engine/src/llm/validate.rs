@@ -80,7 +80,7 @@ pub fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
                 .collect();
 
             if !missing.is_empty() {
-                crate::log!(
+                crate::log_legacy!(
                     "[LlmValidate] WARNING: {} tool_use IDs missing tool_result in messages[{}]: {:?}",
                     missing.len(),
                     i + 1,
@@ -119,7 +119,7 @@ pub fn validate_tool_use_pairing(messages: &mut Vec<Message>) -> usize {
         } else {
             // No following user message at all — the assistant message with tool_use
             // is the last message. This shouldn't happen but inject a user message.
-            crate::log!(
+            crate::log_legacy!(
                 "[LlmValidate] WARNING: assistant message at index {} has tool_use blocks but no following user message",
                 i
             );

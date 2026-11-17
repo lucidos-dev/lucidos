@@ -60,6 +60,7 @@ impl LucidosEngine {
                             .map(|p| p.to_string_lossy().into_owned()),
                         worktree_head_sha,
                         bg_bash_pending: snapshot.bg_bash_pending,
+                        turn_end: snapshot.turn_end,
                     },
                     meta: meta.clone(),
                 },
@@ -78,6 +79,8 @@ pub(super) struct CodingAgentIdleSnapshot<'a> {
     pub(super) bg_bash_pending: bool,
     pub(super) worktree_path: Option<&'a std::path::Path>,
     pub(super) turn: IdleTurn,
+    /// How the agent ended the turn, when an agent turn closed here.
+    pub(super) turn_end: Option<crate::engine::thread_events::TurnEndFacts>,
 }
 
 /// Whose turn an idle ends. An engine turn's idle carries a `reason`, so no

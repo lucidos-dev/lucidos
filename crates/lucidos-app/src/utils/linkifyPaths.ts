@@ -225,7 +225,7 @@ export interface SettingsHrefTarget {
   /** A `navigate_ui` `settings_view` id. */
   view: string;
   /** The row's name without its `#`, or null when the link names the page only.
-   *  The row's anchor is `<view>:<fragment>`. */
+   *  Accepts a full indexed anchor or a row's short name. */
   fragment: string | null;
 }
 
@@ -238,7 +238,7 @@ export interface SettingsHrefTarget {
  *  find, so a stale name is reported, never swallowed.
  *  Bare `settings` (the Settings home) stays with `extractNavTargetFromHref`. */
 export function extractSettingsTargetFromHref(href: string): SettingsHrefTarget | null {
-  const m = /^settings:([a-z0-9-]+)\/?(?:#([a-z0-9-]+))?$/i.exec(href);
+  const m = /^settings:([a-z0-9-]+)\/?(?:#([a-z0-9:-]+))?$/i.exec(href);
   return m ? { view: m[1], fragment: m[2] ?? null } : null;
 }
 

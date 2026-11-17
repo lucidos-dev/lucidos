@@ -101,7 +101,7 @@ async fn voice(
             let provider = match provider {
                 Ok(provider) => provider,
                 Err(message) => {
-                    log!("[Voice] No talker to call: {}", message);
+                    log_legacy!("[Voice] No talker to call: {}", message);
                     let _ = transport
                         .send_frame(ServerFrame::Error {
                             message: "No voice model is configured. Set one in Settings."
@@ -171,7 +171,9 @@ async fn admit(
         .get(super::actor::HEADER_DEVICE_ID)
         .and_then(|v| v.to_str().ok());
     if header_device.is_some_and(|header| header != device_id) {
-        crate::log!("[Voice] Refusing a call: the ticket names another device than the header");
+        crate::log_legacy!(
+            "[Voice] Refusing a call: the ticket names another device than the header"
+        );
         return Err(ApiError::new(StatusCode::FORBIDDEN, NO_LIVE_TICKET));
     }
 
@@ -182,6 +184,7 @@ async fn admit(
         pool,
         Some(&device_id),
         NOT_A_PERSONS_DEVICE,
+        crate::api::owner_door::OnUnattested::Refuse,
     )
     .await?;
     refuse_call_on(pool, sessions, thread_id).await?;
@@ -261,7 +264,7 @@ pub(super) async fn refuse_call_on(
             ));
         }
         Err(e) => {
-            log!(
+            log_legacy!(
                 "[Voice] Could not read whether {} is home: {}",
                 thread_id,
                 e
@@ -298,7 +301,7 @@ impl CallTransport for SocketTransport {
                 Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
                 Some(Ok(Message::Close(_))) | None => CallerFrame::Closed,
                 Some(Err(e)) => {
-                    log!("[Voice] The caller's socket failed: {}", e);
+                    log_legacy!("[Voice] The caller's socket failed: {}", e);
                     CallerFrame::Closed
                 }
             };

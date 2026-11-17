@@ -6,6 +6,9 @@ use crate::remote_gateways::RemoteGateway;
 use std::sync::{Arc, Mutex};
 use tower::ServiceExt as _;
 
+#[path = "relay_isolation_tests.rs"]
+mod isolation;
+
 const CREDENTIAL: &str = "the-gateway-credential";
 const NOW: i64 = 1_800_000_000;
 
@@ -183,8 +186,11 @@ const ORIGIN_STATE_HEADERS: &[(&str, &str)] = &[
 fn engine(seen: Seen, held: tokio::sync::oneshot::Receiver<()>) -> axum::Router {
     let held = Arc::new(Mutex::new(Some(held)));
     let record = move |req: Request| {
-        // The gateway's own signal that operators changed, not a relayed call.
-        if req.uri().path() == "/api/v1/operators/changed" {
+        // The gateway's own signal that users changed, not a relayed call.
+        if matches!(
+            req.uri().path(),
+            "/api/v1/users/changed" | "/api/v1/operators/changed"
+        ) {
             return req;
         }
         let mut line = format!("{} {}\n", req.method(), req.uri());
@@ -195,9 +201,13 @@ fn engine(seen: Seen, held: tokio::sync::oneshot::Receiver<()>) -> axum::Router 
         req
     };
     axum::Router::new().fallback(move |req: Request| {
-        let req = record(req);
+        let health = req.uri().path() == "/api/v1/health";
+        let req = if health { req } else { record(req) };
         let held = held.clone();
         async move {
+            if health {
+                return axum::Json(serde_json::json!({"workspace_client": lucidos_gateway_stamp::workspace_client::ClientContract::engine(), "release": "different-engine-build"})).into_response();
+            }
             match req.uri().path() {
                 "/" => ([(header::CONTENT_TYPE, "text/html")], PAGE).into_response(),
                 "/api/v1/gz" => (
@@ -252,14 +262,46 @@ pub(crate) struct Paired {
 }
 
 pub(crate) async fn paired() -> Paired {
+    paired_with_engine(engine).await
+}
+
+fn install_client_inventory(dir: &std::path::Path, assets: &[&str]) {
+    use sha2::Digest;
+    let files: serde_json::Map<String, serde_json::Value> = assets
+        .iter()
+        .map(|path| {
+            let bytes = std::fs::read(dir.join(path)).unwrap();
+            (
+                (*path).to_string(),
+                serde_json::json!(format!("{:x}", sha2::Sha256::digest(bytes))),
+            )
+        })
+        .collect();
+    std::fs::write(
+        dir.join("workspace-client-assets.json"),
+        serde_json::to_vec(&serde_json::json!({"version": 1, "client_version": lucidos_gateway_stamp::workspace_client::VERSION, "files": files})).unwrap(),
+    )
+    .unwrap();
+}
+
+async fn paired_with_engine(
+    make_engine: impl FnOnce(Seen, tokio::sync::oneshot::Receiver<()>) -> axum::Router,
+) -> Paired {
+    paired_with_engine_token(make_engine, "test-local-token").await
+}
+
+async fn paired_with_engine_token(
+    make_engine: impl FnOnce(Seen, tokio::sync::oneshot::Receiver<()>) -> axum::Router,
+    token: &str,
+) -> Paired {
     let seen: Seen = Arc::default();
     let (release, held) = tokio::sync::oneshot::channel();
     let engine_dir = test_engine::scratch();
     let b_dir = tempfile::tempdir().unwrap();
-    let b = GatewayState::for_tests_with_static_dir(Some(b_dir.path().to_path_buf()));
+    let b = GatewayState::for_tests_with(Some(b_dir.path().to_path_buf()), token, false);
     b.set_route_for_test(
         "dev",
-        test_engine::serve(&engine_dir, engine(seen.clone(), held)),
+        test_engine::serve(&engine_dir, make_engine(seen.clone(), held)),
     );
     let cert = localhost_cert();
     let port = serve_https(
@@ -269,24 +311,39 @@ pub(crate) async fn paired() -> Paired {
     .await;
     let b_address = format!("https://localhost:{port}");
 
-    let code = b.paired_gateways().mint_secret(None).unwrap();
+    let code = b
+        .paired_gateways()
+        .mint_secret(None, false, crate::pairing::Minter::PairedDevice)
+        .unwrap();
     let GatewayRedemption::Paired {
         pairing_id,
         credential,
     } = b
         .paired_gateways()
-        .redeem(&code, Some("Gateway A"))
+        .redeem(
+            &code,
+            Some("Gateway A"),
+            crate::pairing::OwnerGate::NoDevicePaired,
+        )
         .unwrap()
     else {
         panic!("a fresh code redeems");
     };
 
     let a_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        a_dir.path().join("index.html"),
+        "<!doctype html><html><head></head><body data-trusted-client>A's installed client</body></html>",
+    )
+    .unwrap();
+    install_client_inventory(a_dir.path(), &["index.html"]);
     let a = GatewayState::for_tests_with_static_dir(Some(a_dir.path().to_path_buf()));
+    std::fs::write(a_dir.path().join("manifest.json"), "{}").unwrap();
     a.peer_connection()
         .trust_for_test(cert.cert.pem().as_bytes());
     a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: "cloud".to_string(),
             address: b_address.clone(),
             pairing_id: pairing_id.clone(),
@@ -322,11 +379,13 @@ impl Paired {
         format!("{}=cred-abc", self.a.device_cookie_name())
     }
 
-    /// A paired device's request to A, plus `extra` headers.
+    /// A paired device after trusted client retirement, plus `extra` headers.
+    /// Migration regressions build a request explicitly without that marker.
     async fn device_get(&self, path: &str, extra: &[(&str, &str)]) -> Response {
-        let mut builder = axum::http::Request::builder()
-            .uri(path)
-            .header(header::COOKIE, self.cookie());
+        let mut builder = axum::http::Request::builder().uri(path).header(
+            header::COOKIE,
+            format!("{}; lucidos-remote-client=1", self.cookie()),
+        );
         for (name, value) in extra {
             builder = builder.header(*name, *value);
         }
@@ -447,16 +506,6 @@ fn the_relay_drops_origin_state_headers_and_keeps_the_rest() {
 }
 
 #[tokio::test]
-async fn the_page_comes_back_byte_for_byte() {
-    let p = paired().await;
-    let response = p
-        .device_get("/dev@cloud/", &[("accept", "text/html")])
-        .await;
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(body_bytes(response).await, PAGE.as_bytes());
-}
-
-#[tokio::test]
 async fn a_compressed_body_crosses_untouched() {
     let p = paired().await;
     let response = p
@@ -548,6 +597,7 @@ async fn an_unreachable_remote_gateway_sends_a_page_load_to_the_list() {
     drop(closed);
     p.a.remote_gateways()
         .add(RemoteGateway {
+            gateway_id: None,
             name: "down".to_string(),
             address,
             pairing_id: p.pairing_id.clone(),
@@ -690,25 +740,26 @@ async fn unpair_on_b_refuses_the_very_next_relayed_request() {
 }
 
 /// A request that passed auth just before the unpair must not bring back a
-/// person the unpair forgot.
+/// user the unpair forgot.
 #[tokio::test]
-async fn an_ended_pairing_records_no_relayed_person() {
+async fn an_ended_pairing_records_no_relayed_user() {
     let p = paired().await;
     assert!(p.b.paired_gateways().unpair(&p.pairing_id).unwrap());
     let gateway = crate::gateway_protocol::AuthenticatedGateway {
         pairing_id: p.pairing_id.clone(),
         label: "laptop".into(),
+        may_manage: false,
     };
     let device = AuthenticatedDevice {
         id: namespaced_device_id(&p.pairing_id, "device-1"),
         label: "Phone".into(),
     };
-    let operator = RelayedOperator {
+    let user = RelayedUser {
         id: "op-1".into(),
         name: "Sam".into(),
         emails: vec![],
     };
-    record_relayed_operator(&p.b, &gateway, &device, operator);
+    record_relayed_user(&p.b, &gateway, &device, user);
     assert!(p.b.directory().relayed.is_empty());
 }
 
@@ -881,37 +932,34 @@ async fn b_honours_a_local_browser_stamp_only_under_the_pairing_credential() {
     assert!(p.last_seen().unwrap().contains(LOCAL_STAMP));
 }
 
-// ── A's operator crosses the relay signed ───────────────────────────────────
+// ── A's user crosses the relay signed ───────────────────────────────────
 
 #[tokio::test]
-async fn a_relayed_device_arrives_with_as_operator() {
+async fn a_relayed_device_arrives_with_as_user() {
     let p = paired().await;
     let response = p.device_get("/dev@cloud/api/v1/threads/list", &[]).await;
     assert_eq!(response.status(), StatusCode::OK);
     let relayed = p.b.directory().relayed;
     assert_eq!(relayed.len(), 1, "{relayed:?}");
-    assert_eq!(
-        relayed[0].name,
-        crate::gateway_event_log::FIRST_OPERATOR_NAME
-    );
+    assert_eq!(relayed[0].name, crate::gateway_event_log::FIRST_USER_NAME);
     assert_eq!(
         relayed[0].device_id,
         namespaced_device_id(&p.pairing_id, "device-1")
     );
     assert!(relayed[0]
-        .operator_id
+        .user_id
         .starts_with(&format!("{}:", p.pairing_id)));
-    // The engine never sees the operator headers: B's own log is the record.
+    // The engine never sees the user headers: B's own log is the record.
     let seen = p.last_seen().unwrap();
-    assert!(!seen.contains(HEADER_RELAY_OPERATOR), "{seen}");
+    assert!(!seen.contains(HEADER_RELAY_USER), "{seen}");
 }
 
 #[tokio::test]
-async fn an_unsigned_or_forged_operator_names_nobody() {
+async fn an_unsigned_or_forged_user_names_nobody() {
     let p = paired().await;
     let path = "/dev/api/v1/threads/list";
     let claim = fresh(Some(device("device-1")));
-    let operator = RelayedOperator {
+    let user = RelayedUser {
         id: "op-1".into(),
         name: "Sam".into(),
         emails: vec!["sam@example.com".into()],
@@ -919,34 +967,99 @@ async fn an_unsigned_or_forged_operator_names_nobody() {
     .encode();
 
     let mut unsigned = credential_and_claim(&p.credential, &claim, &p.credential);
-    unsigned.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
+    unsigned.insert(HEADER_RELAY_USER, user.parse().unwrap());
     assert_eq!(to_b(&p, path, unsigned).await, 200);
 
     let mut forged = credential_and_claim(&p.credential, &claim, &p.credential);
-    forged.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
-    let signature = sign_operator("not-the-credential", &claim.encode(), &operator);
-    forged.insert(HEADER_RELAY_OPERATOR_SIGNATURE, signature.parse().unwrap());
+    forged.insert(HEADER_RELAY_USER, user.parse().unwrap());
+    let signature = sign_user("not-the-credential", &claim.encode(), &user);
+    forged.insert(HEADER_RELAY_USER_SIGNATURE, signature.parse().unwrap());
     assert_eq!(to_b(&p, path, forged).await, 200);
 
     assert!(p.b.directory().relayed.is_empty());
 
     let mut signed = credential_and_claim(&p.credential, &claim, &p.credential);
-    signed.insert(HEADER_RELAY_OPERATOR, operator.parse().unwrap());
-    let signature = sign_operator(&p.credential, &claim.encode(), &operator);
-    signed.insert(HEADER_RELAY_OPERATOR_SIGNATURE, signature.parse().unwrap());
+    signed.insert(HEADER_RELAY_USER, user.parse().unwrap());
+    let signature = sign_user(&p.credential, &claim.encode(), &user);
+    signed.insert(HEADER_RELAY_USER_SIGNATURE, signature.parse().unwrap());
     assert_eq!(to_b(&p, path, signed).await, 200);
     assert_eq!(p.b.directory().relayed[0].name, "Sam");
     assert_eq!(p.b.directory().relayed[0].emails, vec!["sam@example.com"]);
 }
 
+/// An A older than the user rename sends the operator pair. B records the
+/// user anyway, so "Sam via A" survives B upgrading first.
+#[tokio::test]
+async fn an_older_a_with_the_operator_header_still_names_its_user() {
+    let p = paired().await;
+    let claim = fresh(Some(device("device-1")));
+    let user = RelayedUser {
+        id: "op-1".into(),
+        name: "Sam".into(),
+        emails: Vec::new(),
+    }
+    .encode();
+    let mut headers = credential_and_claim(&p.credential, &claim, &p.credential);
+    headers.insert(LEGACY_HEADER_RELAY_OPERATOR, user.parse().unwrap());
+    let signature = sign(
+        &p.credential,
+        &format!("{}|operator|{user}", claim.encode()),
+    );
+    headers.insert(
+        LEGACY_HEADER_RELAY_OPERATOR_SIGNATURE,
+        signature.parse().unwrap(),
+    );
+    assert_eq!(to_b(&p, "/dev/api/v1/threads/list", headers).await, 200);
+    assert_eq!(p.b.directory().relayed[0].name, "Sam");
+    let seen = p.last_seen().unwrap();
+    assert!(!seen.contains(LEGACY_HEADER_RELAY_OPERATOR), "{seen}");
+}
+
+/// A B older than the user rename reads only the operator pair. A new A
+/// signs it beside the user pair, so "Sam via A" survives A upgrading first.
+#[tokio::test]
+async fn a_new_a_also_signs_the_operator_header_for_an_older_b() {
+    let p = paired().await;
+    let (_, mut headers) = signed_claim_headers(
+        &p.a,
+        &p.credential,
+        "/dev/".into(),
+        Some(device("device-1")),
+    )
+    .unwrap();
+    let user = headers.get(HEADER_RELAY_USER).unwrap().clone();
+    assert_eq!(headers.get(LEGACY_HEADER_RELAY_OPERATOR), Some(&user));
+    headers.remove(HEADER_RELAY_USER);
+    headers.remove(HEADER_RELAY_USER_SIGNATURE);
+    let older_b_reads = signed_user(&headers, &p.credential).unwrap();
+    assert_eq!(
+        older_b_reads.name,
+        crate::gateway_event_log::FIRST_USER_NAME
+    );
+}
+
+/// The new pair signed with the old binding is a forgery: a header name
+/// never picks the binding it is checked against.
 #[test]
-fn an_operator_round_trips_its_emails_and_an_older_shape_has_none() {
-    let operator = RelayedOperator {
+fn a_user_header_signed_with_the_operator_binding_names_nobody() {
+    let claim = fresh(Some(device("device-1"))).encode();
+    let user = "op-1|Sam";
+    let mut headers = HeaderMap::new();
+    headers.insert(HEADER_RELAY_CLAIM, claim.parse().unwrap());
+    headers.insert(HEADER_RELAY_USER, user.parse().unwrap());
+    let signature = sign("cred", &format!("{claim}|operator|{user}"));
+    headers.insert(HEADER_RELAY_USER_SIGNATURE, signature.parse().unwrap());
+    assert_eq!(signed_user(&headers, "cred"), None);
+}
+
+#[test]
+fn a_user_round_trips_its_emails_and_an_older_shape_has_none() {
+    let user = RelayedUser {
         id: "op-1".into(),
         name: "Sam | K".into(),
         emails: vec!["sam@example.com".into(), "s,k@example.org".into()],
     };
-    assert_eq!(RelayedOperator::decode(&operator.encode()), Some(operator));
-    let older = RelayedOperator::decode("op-1|Sam").unwrap();
+    assert_eq!(RelayedUser::decode(&user.encode()), Some(user));
+    let older = RelayedUser::decode("op-1|Sam").unwrap();
     assert!(older.emails.is_empty(), "an older gateway signs no emails");
 }

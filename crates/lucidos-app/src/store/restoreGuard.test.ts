@@ -16,6 +16,7 @@ import {
 import {
   _resetWindowStorageForTests, readWindowItem, windowId, writeWindowItem,
 } from '../utils/windowStorage';
+import { TAB_WINDOW_ID_KEY } from '../utils/windowIdKey';
 
 const FOCUS_KEY = 'test-focused-thread';
 
@@ -156,6 +157,33 @@ describe('installRestoreGuard', () => {
     focus = 't2';
     setVisibility('visible');
     expect(markerThread()).toBe('t2');
+  });
+
+  it('keeps background focus changes disarmed until the page returns', () => {
+    setVisibility('hidden');
+    focus = 't2';
+    writeWindowItem(FOCUS_KEY, focus);
+    armRestoreGuard(focus);
+    expect(markerThread()).toBeNull();
+    expect(readGuardedFocus(FOCUS_KEY)).toBe('t2');
+    expect(takeWithheldThread()).toBeNull();
+
+    setVisibility('visible');
+    expect(markerThread()).toBe('t2');
+    vi.advanceTimersByTime(RESTORE_GUARD_SURVIVAL_MS);
+    expect(markerThread()).toBeNull();
+  });
+
+  it('does not clear a live peer marker on a hidden focus change', () => {
+    const ownWindow = windowId();
+    becomeAnotherWindow();
+    armRestoreGuard('peer-thread');
+    const peerMarker = localStorage.getItem(RESTORE_GUARD_KEY);
+    sessionStorage.setItem(TAB_WINDOW_ID_KEY, ownWindow);
+    _resetWindowStorageForTests();
+    setVisibility('hidden');
+    armRestoreGuard('background-thread');
+    expect(localStorage.getItem(RESTORE_GUARD_KEY)).toBe(peerMarker);
   });
 
   it('stops listening after teardown', () => {

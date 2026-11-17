@@ -35,7 +35,7 @@ function waitingThread(): ThreadState {
       liveEventWaitCount: 1,
       liveEventWaits: [WAIT],
       activeChildrenCount: 0,
-      waitingChildrenCount: 0,
+      awaitedChildrenCount: 0,
     } as unknown as ThreadMeta,
     events: new Map(),
   } as unknown as ThreadState;

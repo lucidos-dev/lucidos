@@ -409,9 +409,12 @@ fn the_themes_knowhow_lists_every_catalog_token() {
 #[test]
 fn value_length_counts_what_javascript_counts() {
     // An astral character is one char but two UTF-16 units.
-    let value = "\u{1F600}".repeat(61);
-    assert_eq!(value.chars().count(), 61);
-    assert!(!is_valid_token_value(&value));
+    let value = "\u{1F600}".repeat(MAX_VALUE_LENGTH / 2);
+    assert_eq!(value.encode_utf16().count(), MAX_VALUE_LENGTH);
+    assert!(is_valid_token_value(&value));
+    assert!(!is_valid_token_value(&format!("{value}a")));
+    assert!(is_valid_token_value(&"a".repeat(MAX_VALUE_LENGTH)));
+    assert!(!is_valid_token_value(&"a".repeat(MAX_VALUE_LENGTH + 1)));
 }
 
 // --- Fonts a theme suggests ---

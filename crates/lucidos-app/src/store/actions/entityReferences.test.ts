@@ -754,8 +754,8 @@ describe('processSSEForReferences', () => {
         provider: 'google',
         actor: { kind: 'device', device_id: 'device-aaa' },
       };
-      processSSEForReferences('OAuthAccountConnected', payload);
-      expect(handleOAuthAccountConnected).toHaveBeenCalledWith(payload);
+      processSSEForReferences('OAuthAccountConnected', payload, 'oauth-envelope');
+      expect(handleOAuthAccountConnected).toHaveBeenCalledWith(payload, 'oauth-envelope');
       // And NOT a second, unscoped reload from this arm.
       expect(loadOAuthAccounts).not.toHaveBeenCalled();
     });

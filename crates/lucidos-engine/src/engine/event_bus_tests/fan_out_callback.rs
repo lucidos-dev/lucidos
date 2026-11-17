@@ -115,6 +115,7 @@ async fn test_fan_out_parent_callback() {
                 worktree_path: None,
                 worktree_head_sha: None,
                 bg_bash_pending: false,
+                turn_end: None,
             },
             meta: EventMeta::NONE,
         })
@@ -571,6 +572,7 @@ async fn test_cc_child_session_ended_without_idle_sends_callback() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "cc-session-1".into(),
             branch: String::new(),
@@ -703,6 +705,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
         event: ThreadEvent::SessionStarted {
+            sandbox: None,
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,
             session_id: "cc-session-2".into(),
             branch: String::new(),
@@ -738,6 +741,7 @@ async fn test_cc_child_no_duplicate_callback_after_idle_then_session_ended() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -854,6 +858,7 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -958,6 +963,7 @@ async fn refire_skips_parent_that_already_resumed() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -979,6 +985,7 @@ async fn refire_skips_parent_that_already_resumed() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1152,6 +1159,7 @@ async fn a_childs_cache_keep_alive_turn_reports_nothing_to_the_parent() {
             worktree_path: None,
             worktree_head_sha: None,
             bg_bash_pending: false,
+            turn_end: None,
         },
     ] {
         bus.emit(BusEvent::Thread {
@@ -1262,6 +1270,8 @@ async fn a_wake_never_overwrites_a_parent_parked_on_a_question() {
             worktree_path: None,
             multi_select: false,
             owner_approval: None,
+            unattested_act: None,
+            permission_request: None,
         },
         meta: EventMeta::NONE,
     })
@@ -1870,7 +1880,9 @@ async fn emit_response_failed(bus: &EventBus, thread_id: Uuid, error: &str) {
         thread_id,
         event: ThreadEvent::ResponseFailed {
             error: error.into(),
+            spend_cap: None,
             agent_exit: None,
+            provider_error: None,
         },
         meta: EventMeta::NONE,
     })
@@ -2157,6 +2169,7 @@ async fn emit_pending_change(bus: &EventBus, thread_id: Uuid, change_id: Uuid) {
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ChangeProposed {
+            content: Default::default(),
             change_id: change_id.to_string(),
             description: Some("milestone work".into()),
             files: vec!["a.rs".into()],

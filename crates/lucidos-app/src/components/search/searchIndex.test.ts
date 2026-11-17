@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { enginePackaged, preferences } from '../../store/store';
-import { getSettingsSearchResults, findSettingsEntry, settingsLinkAnchor } from './searchIndex';
+import { getSettingsSearchResults, findSettingsEntry, settingsLinkAnchor, settingsSearchEntryIds } from './searchIndex';
 
 // Only `isIOS` is steered. Everything else stays real, so jsdom answers as the
 // desktop browser it is.
@@ -334,12 +334,33 @@ describe('settings search: ranked before the cut', () => {
 });
 
 describe('settingsLinkAnchor', () => {
+  it('lands every full indexed anchor without adding a view prefix', () => {
+    for (const id of settingsSearchEntryIds()) {
+      const entry = findSettingsEntry(id)!;
+      if (!entry.anchor) continue;
+      expect(settingsLinkAnchor(entry.subview, entry.anchor), id).toBe(entry.anchor);
+    }
+  });
+
+  it('resolves a full row id inside a fold to its ancestor', () => {
+    expect(settingsLinkAnchor('providers', 'providers:vertex-region')).toBe('providers:vertex');
+  });
+
   it('resolves a fragment on a page whose anchors carry another prefix', () => {
     expect(settingsLinkAnchor('permissions', 'guard')).toBe('command-safety:guard');
   });
 
   it('lands a row inside a fold on the ancestor its entry names', () => {
     expect(settingsLinkAnchor('providers', 'vertex-region')).toBe('providers:vertex');
+  });
+
+  it('resolves retired full anchors before finding their landing row', () => {
+    expect(settingsLinkAnchor('providers', 'models:vertex-ai')).toBe('providers:vertex');
+    expect(settingsLinkAnchor('providers', 'models:region')).toBe('providers:vertex');
+  });
+
+  it('preserves unknown full anchors without adding a prefix', () => {
+    expect(settingsLinkAnchor('providers', 'old:no-such-row')).toBe('old:no-such-row');
   });
 
   it('keeps <view>:<fragment> for a fragment the index lacks', () => {

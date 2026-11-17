@@ -235,7 +235,10 @@ describe('restorePendingUploads', () => {
     const prefix = PAGE_OWNER_LOCK_PREFIX;
     Object.defineProperty(globalThis.navigator, 'locks', {
       configurable: true,
-      value: { query: async () => ({ held: [{ name: prefix + 'other-tab' }] }), request: async () => {} },
+      value: {
+        query: async () => ({ held: [{ name: prefix + 'other-tab' }] }),
+        request: (...args: [string, () => Promise<never>]) => args[1](),
+      },
     });
     // Their draft would read as gone here, so a wrong adopt would drop it.
     await seed(record('theirs', { ownerId: 'other-tab', threadId: 't-gone' }), record('orphan'));

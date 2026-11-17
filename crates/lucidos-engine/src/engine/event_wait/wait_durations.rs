@@ -496,7 +496,7 @@ impl LucidosEngine {
         tokio::spawn(async move {
             match read_wait_durations(&pool, zone).await {
                 Ok(durations) => cache.store(durations),
-                Err(e) => crate::log!("[KeepAlive] Could not read the wait durations: {e}"),
+                Err(e) => crate::log_legacy!("[KeepAlive] Could not read the wait durations: {e}"),
             }
         });
     }

@@ -37,7 +37,7 @@ What you expected to happen instead.
 ## Environment
 
 - **Lucidos release / commit:** <!-- the `release` field of
-  `curl -H "x-lucidos-local-token: $(cat ~/.lucidos/local-token)" http://localhost:5252/~/api/v1/health`,
+  `curl -H "x-lucidos-local-token: $(cat ~/.lucidos/local-token 2>/dev/null || cat ~/.lucidos/private/local-token)" http://localhost:5252/~/api/v1/health`,
   the repo's `RELEASE` file, or the commit -->
 - **OS:** <!-- e.g. macOS 15.5, Ubuntu 24.04 -->
 - **Install:** <!-- one-liner (curl … | sh) / macOS .dmg / dev setup via

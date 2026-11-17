@@ -224,7 +224,7 @@ impl LucidosEngine {
             .expect("check_off_schedule_run rejects a missing config")
             .name;
 
-        log!(
+        log_legacy!(
             "[Triggers] Off-schedule run requested for '{}' ({})",
             name,
             trigger_id
