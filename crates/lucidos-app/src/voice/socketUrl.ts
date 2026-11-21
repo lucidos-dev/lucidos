@@ -1,0 +1,75 @@
+/**
+ * The address of a call.
+ *
+ * A `WebSocket` will not take a relative URL, so this is the one place in the
+ * voice client that builds an absolute one. It is still base-path aware (ADR
+ * 0014). `API` already carries the `/<slug>` prefix the gateway routes on. So a
+ * call reaches the right engine from a workspace, the picker, or a legacy
+ * direct engine alike.
+ *
+ * No credential is appended. The gateway authenticates a same-origin handshake
+ * by cookie, exactly as it does an ordinary request (ADR 0151).
+ *
+ * The call ticket rides the query, because a `WebSocket` cannot set a header.
+ * It names the device and the thread the shell minted it for, and opens one
+ * socket once.
+ */
+import { QUERY_CALL_TICKET } from '@lucidos/engine-constants';
+import { API, REMOTE_GATEWAY } from '../utils/basePath';
+
+/** Whether this page can open a call at all. A workspace opened through
+ *  another gateway cannot: the relay carries no socket (ADR 0591). */
+export function voiceReachable(): boolean {
+  return REMOTE_GATEWAY === null;
+}
+
+/** The socket scheme matching a page scheme. */
+export function socketScheme(pageProtocol: string): 'ws:' | 'wss:' {
+  return pageProtocol === 'https:' ? 'wss:' : 'ws:';
+}
+
+/** Where a socket on this origin starts, base path and all. */
+export interface SocketOrigin {
+  api: string;
+  protocol: string;
+  host: string;
+}
+
+function socketBase(opts: SocketOrigin): string {
+  return `${socketScheme(opts.protocol)}//${opts.host}${opts.api}`;
+}
+
+/** Pure: the call URL for a thread and its ticket, given where the page is
+ *  served from. */
+export function computeVoiceSocketUrl(
+  opts: SocketOrigin & { threadId: string; ticket: string },
+): string {
+  const thread = encodeURIComponent(opts.threadId);
+  const ticket = encodeURIComponent(opts.ticket);
+  return `${socketBase(opts)}/voice?thread_id=${thread}&${QUERY_CALL_TICKET}=${ticket}`;
+}
+
+/**
+ * Pure: the echo URL, which answers whether an upgrade survives the hops.
+ *
+ * The engine's `/api/v1/ws-echo` reaches nothing and holds no session. So a
+ * `101` from it means every hop carried the upgrade. That is the one question
+ * a refused call cannot answer for itself.
+ */
+export function computeWsEchoUrl(opts: SocketOrigin): string {
+  return `${socketBase(opts)}/ws-echo`;
+}
+
+function servedOrigin(): SocketOrigin {
+  return { api: API, protocol: location.protocol, host: location.host };
+}
+
+/** Live-wired {@link computeVoiceSocketUrl} for the served context. */
+export function voiceSocketUrl(threadId: string, ticket: string): string {
+  return computeVoiceSocketUrl({ ...servedOrigin(), threadId, ticket });
+}
+
+/** Live-wired {@link computeWsEchoUrl} for the served context. */
+export function wsEchoUrl(): string {
+  return computeWsEchoUrl(servedOrigin());
+}

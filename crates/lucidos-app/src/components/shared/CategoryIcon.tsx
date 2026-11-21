@@ -1,0 +1,48 @@
+import { AppsIcon } from './icons';
+
+/**
+ * Content-pane category icon — the small glyph that labels a destination by
+ * what KIND of content it is (a thread, file, app, trigger, settings page,
+ * change, …). Single source of truth shared by Search Everywhere's result rows
+ * and the content-pane back/forward history menu (ContentNav), so the same
+ * category is marked the same way wherever it appears.
+ *
+ * Rendered as inline SVG (rather than pulled from icons.tsx) so the set stays
+ * small and self-contained; every glyph strokes/fills with `currentColor` so a
+ * caller tints the whole set via CSS.
+ *
+ * ONE exception to that inlining, and it is deliberate: `apps` delegates to
+ * `AppsIcon` in icons.tsx. Apps are the only category ALSO marked outside this
+ * set (the message route panel's fallback for an app whose manifest declares no
+ * icon), and a concept with two glyphs diverges on the next tweak. So the apps
+ * mark has one definition and this file reads it, rather than the two agreeing
+ * by hand. `AppsIcon` is authored in the same 16-unit stroke-1.5 box the spread
+ * below applies, so it sits at the family's weight. A future category that
+ * escapes this file the same way takes the same route.
+ */
+export function CategoryIcon({ category }: { category: string }) {
+  const props = { width: '1rem', height: '1rem', viewBox: '0 0 16 16', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round' as const, 'stroke-linejoin': 'round' as const };
+  switch (category) {
+    case 'threads':
+      return <svg {...props}><path d="M13 10a1.5 1.5 0 0 1-1.5 1.5H5.5L3 14V4.5A1.5 1.5 0 0 1 4.5 3h7A1.5 1.5 0 0 1 13 4.5z" /></svg>;
+    case 'files':
+      return <svg {...props}><path d="M9 2H5a1.5 1.5 0 0 0-1.5 1.5v9A1.5 1.5 0 0 0 5 14h6a1.5 1.5 0 0 0 1.5-1.5V6z" /><polyline points="9 2 9 6 12.5 6" /></svg>;
+    case 'apps':
+      return <AppsIcon />;
+    case 'plugins':
+      // A plug: two prongs, a body and a cord.
+      return <svg {...props}><path d="M6 2v3M10 2v3M4 5h8v3a4 4 0 0 1-8 0zM8 12v2" /></svg>;
+    case 'triggers':
+      return <svg {...props}><circle cx="8" cy="8" r="5.5" /><path d="M8 4.5V8l2.5 1.5" /></svg>;
+    case 'settings':
+      return <svg {...props}><circle cx="8" cy="8" r="2" /><path d="M8 2.5v1M8 12.5v1M2.5 8h1M12.5 8h1M4.1 4.1l.7.7M11.2 11.2l.7.7M4.1 11.9l.7-.7M11.2 4.8l.7-.7" /></svg>;
+    case 'changes':
+      return <svg {...props}><path d="M4 3v10M12 3v4" /><circle cx="4" cy="13" r="1.5" fill="currentColor" stroke="none" /><circle cx="12" cy="7" r="1.5" fill="currentColor" stroke="none" /><path d="M12 8.5c0 2-2 3-4 4.5" /></svg>;
+    case 'notifications':
+      return <svg {...props}><path d="M12 6.5a4 4 0 0 0-8 0c0 4-1.5 5-1.5 5h11s-1.5-1-1.5-5Z" /><path d="M9.4 13.5a1.6 1.6 0 0 1-2.8 0" /></svg>;
+    case 'web':
+      return <svg {...props}><circle cx="8" cy="8" r="5.5" /><path d="M2.5 8h11" /><path d="M8 2.5a8.5 8.5 0 0 1 0 11 8.5 8.5 0 0 1 0-11Z" /></svg>;
+    default:
+      return <svg {...props}><circle cx="8" cy="8" r="5.5" /></svg>;
+  }
+}

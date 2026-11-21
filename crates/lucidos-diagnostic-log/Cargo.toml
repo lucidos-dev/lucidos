@@ -1,0 +1,20 @@
+[package]
+name = "lucidos-diagnostic-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+http = "1"
+libc = "0.2"
+lucidos-diagnostic-log-macros = { path = "../lucidos-diagnostic-log-macros" }
+lucidos-gateway-constants = { path = "../lucidos-gateway-constants" }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+trybuild = "1"

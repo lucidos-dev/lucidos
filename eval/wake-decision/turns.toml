@@ -1,0 +1,827 @@
+# The wake decision check's labelled set (`lucidos-eval wake-decision`).
+#
+# Every case is synthetic, with placeholder names and paths, because this file
+# ships publicly. Each reaches the gate's call in the shape the engine builds
+# it at a child's turn end: the message that opened the child's turn, the
+# parent's latest reply, the child's reply, its finish, and how many of the
+# parent's other children still run.
+#
+# - message: the message that opened the child's turn, usually the parent's
+#   spawn message.
+# - source: absent means `agent` (the parent wrote the message). `user` means
+#   the user wrote in the child thread itself.
+# - status: `success` or `no-changes`. The gate wakes on every other finish
+#   without a call, so the set holds only these two.
+# - label: `must-wake` when the parent must act now, `file` when it can read
+#   the report on its next turn.
+# - kind: the case's shape, for the per-kind breakdown.
+#
+# A wrong `file` is the costly error: the parent then waits for a wake that
+# never comes.
+
+# --- pipeline: the parent needs the result for its next step ----------------
+
+[[report]]
+kind = "pipeline"
+message = """
+Export last quarter's orders from the backoffice database to `artifacts/data-analysis/orders-q3.csv`. One row per order, with the date, region and total. Reply with the row count when it is written.
+"""
+parent_reply = """
+I've started a thread to export the Q3 orders. Once the CSV is written, I'll build the regional revenue chart from it and send it to you.
+"""
+reply = """
+Done. `artifacts/data-analysis/orders-q3.csv` holds 4,812 orders, one per row, with `date`, `region` and `total`. Three orders had no region; I wrote them as `unknown`.
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "pipeline"
+message = """
+Find the three cheapest flights from Oslo to Lisbon on 14 November, returning 18 November. List airline, times and price.
+"""
+parent_reply = """
+A thread is checking flights now. When it's back, I'll check hotel availability for the cheapest option's arrival time and put the full itinerary together.
+"""
+reply = """
+| Airline | Out | Back | Price |
+|---|---|---|---|
+| Airline A | 07:10 to 11:45 | 18:20 to 22:55 | 1,840 NOK |
+| Airline B | 09:30 to 15:10 (1 stop) | 12:00 to 19:40 | 1,910 NOK |
+| Airline C | 13:05 to 17:35 | 20:10 to 00:40 | 2,250 NOK |
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "pipeline"
+message = """
+Run the migration dry run for `example-repo` against the staging snapshot and tell me which tables it touches.
+"""
+parent_reply = """
+The dry run is going in a sub-thread. I'll write the rollout plan once I know which tables it touches.
+"""
+reply = """
+The dry run touches four tables: `accounts`, `invoices`, `invoice_lines` and `audit_log`. `invoice_lines` gets a new non-null column with a default, which rewrites 2.1 million rows. Everything else is metadata only.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "pipeline"
+message = """
+Transcribe the meeting recording at `artifacts/meetings/planning-call.m4a` to `artifacts/meetings/planning-call.md`.
+"""
+parent_reply = """
+Transcription is running in a sub-thread. After that I'll pull out the action items and draft the follow-up email you asked for.
+"""
+reply = """
+The transcript is in `artifacts/meetings/planning-call.md`: 52 minutes, four speakers, about 7,900 words.
+"""
+status = "success"
+label = "must-wake"
+
+# A child holding an event wait never reaches the call. So a child that ends
+# its turn promising to finish later has stalled, and the parent must act.
+[[report]]
+kind = "stalled-progress"
+message = """
+Download the six monthly sales reports from the shared drive into `artifacts/data-analysis/sales/` and check each one opens.
+"""
+parent_reply = """
+I've asked a sub-thread to fetch the six sales reports. When all six are in, I'll merge them into one sheet.
+"""
+reply = """
+Four of six are downloaded and open fine. The drive is rate-limiting me, so I'll fetch the last two in a few minutes and report again then.
+"""
+status = "success"
+label = "must-wake"
+
+# --- fan-in: the parent combines its children's results ---------------------
+
+[[report]]
+kind = "fan-in-last"
+message = """
+Get opening hours and the price for a group of 12 at Venue C for Saturday 22 November.
+"""
+parent_reply = """
+I've started three threads, one per venue. When all three have answered, I'll compare them and recommend one.
+"""
+reply = """
+Venue C is open 11:00 to 23:00 on Saturdays. A group of 12 costs 450 NOK each with the set menu, and it needs a 20% deposit by 15 November.
+"""
+status = "success"
+siblings_running = 0
+label = "must-wake"
+
+[[report]]
+kind = "fan-in-early"
+message = """
+Get opening hours and the price for a group of 12 at Venue A for Saturday 22 November.
+"""
+parent_reply = """
+I've started three threads, one per venue. When all three have answered, I'll compare them and recommend one.
+"""
+reply = """
+Venue A is open 12:00 to 22:00 on Saturdays. A group of 12 costs 390 NOK each, drinks not included, and no deposit is needed.
+"""
+status = "success"
+siblings_running = 2
+label = "file"
+
+[[report]]
+kind = "fan-in-early"
+message = """
+Review `src/billing/` in `example-repo` for error handling gaps. Write findings as a list with file and line.
+"""
+parent_reply = """
+I split the review across four threads, one per module. I'll merge the findings into one report when they are all done.
+"""
+reply = """
+Three gaps in `src/billing/`:
+
+- `invoice.rs:142`: a failed tax lookup is logged and the invoice is sent without tax.
+- `refund.rs:88`: `unwrap()` on the payment provider's response.
+- `retry.rs:31`: retries forever on a 400.
+"""
+status = "no-changes"
+siblings_running = 3
+label = "file"
+
+[[report]]
+kind = "fan-in-last"
+message = """
+Review `src/reports/` in `example-repo` for error handling gaps. Write findings as a list with file and line.
+"""
+parent_reply = """
+I split the review across four threads, one per module. I'll merge the findings into one report when they are all done.
+"""
+reply = """
+One gap in `src/reports/`: `export.rs:57` swallows a write error and reports the export as finished.
+"""
+status = "no-changes"
+siblings_running = 0
+label = "must-wake"
+
+[[report]]
+kind = "fan-in-early"
+message = """
+Summarise customer feedback for the habit-tracker app from the March survey export, as five themes with a count each.
+"""
+parent_reply = """
+Three threads are summarising one month each. I'll put the quarter's themes side by side once January, February and March are all in.
+"""
+reply = """
+March themes, from 214 responses:
+
+1. Reminders arrive late (61)
+2. Wants a dark theme (44)
+3. Streak reset felt unfair (38)
+4. Sync between phone and laptop (29)
+5. Praise for the weekly summary (21)
+"""
+status = "success"
+siblings_running = 1
+label = "file"
+
+[[report]]
+kind = "fan-in-early-blocker"
+message = """
+Pull the January numbers from the analytics API into `artifacts/data-analysis/jan.json`.
+"""
+parent_reply = """
+Three threads are pulling January, February and March from the analytics API. I'll build the quarterly dashboard when all three files exist.
+"""
+reply = """
+I couldn't pull January. The analytics API rejects the stored key with 401 "key revoked", so the February and March threads will hit the same wall. Someone needs to issue a new key.
+"""
+status = "no-changes"
+siblings_running = 2
+label = "must-wake"
+
+[[report]]
+kind = "fan-in-last"
+message = """
+Translate the onboarding copy in `artifacts/backoffice/onboarding.md` to German.
+"""
+parent_reply = """
+Translations to German, French and Spanish are running in parallel. I'll check that all three keep the same headings and then hand them to you together.
+"""
+reply = """
+German translation written to `artifacts/backoffice/onboarding.de.md`. All 14 headings kept, and the product names left in English.
+"""
+status = "success"
+siblings_running = 0
+label = "must-wake"
+
+# --- Home spawning work for the user ----------------------------------------
+
+[[report]]
+kind = "home-for-user"
+message = """
+The user wants a weekly meal plan for two adults, vegetarian, under 30 minutes per dinner, with a shopping list. Write it to `artifacts/meal-plans/week-46.md` and present it to them.
+"""
+parent_reply = """
+I've started a thread for your meal plan. It will show you the plan and the shopping list when it's ready.
+"""
+reply = """
+Here's your week:
+
+| Day | Dinner | Time |
+|---|---|---|
+| Mon | Chickpea curry with rice | 25 min |
+| Tue | Halloumi wraps | 15 min |
+| Wed | Mushroom risotto | 30 min |
+| Thu | Lentil soup and bread | 25 min |
+| Fri | Homemade pizza | 30 min |
+
+The shopping list is at the bottom of `artifacts/meal-plans/week-46.md`.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "home-for-user"
+message = """
+Set up a habit-tracker app for the user: daily water, reading and a 20-minute walk, with a weekly streak view. Show them the app when it's built.
+"""
+parent_reply = """
+A thread is building your habit tracker. You'll find it in your apps once it's done, and the thread will walk you through it.
+"""
+reply = """
+Your habit tracker is ready under Apps. It tracks water, reading and a walk each day, and the Week tab shows your streaks. Tap a habit to mark it done.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "home-for-user"
+message = """
+The user asked for a reminder trigger: every weekday at 08:30, check their calendar and notify them of any meeting before 10:00. Create it and confirm with them.
+"""
+parent_reply = """
+I've handed the morning-meeting reminder to a sub-thread. It will confirm with you once the trigger is set up.
+"""
+reply = """
+Your trigger is set: every weekday at 08:30 I'll check your calendar and send a notification for any meeting starting before 10:00. Nothing fires on weekends.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "home-for-user-needs-parent"
+message = """
+The user wants a monthly budget summary from `artifacts/backoffice/expenses.csv`. Write it to `artifacts/backoffice/budget-october.md`. Report back to me first: I'll check it against the forecast before the user sees it.
+"""
+parent_reply = """
+A sub-thread is drafting your October budget summary. I'll check it against the forecast and then share it with you.
+"""
+reply = """
+Summary written to `artifacts/backoffice/budget-october.md`. Total spend 38,400 NOK, 6% over the monthly plan, mostly travel (+4,100).
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "home-for-user"
+message = """
+Tidy the user's downloads folder: move PDFs to `artifacts/documents/`, images to `artifacts/images/`, and tell them what moved.
+"""
+parent_reply = """
+I've started a thread to tidy your downloads. It'll tell you what it moved.
+"""
+reply = """
+Moved 23 PDFs to `artifacts/documents/` and 41 images to `artifacts/images/`. Seven files were neither, so I left them where they were.
+"""
+status = "success"
+label = "file"
+
+# --- research the user reads directly ---------------------------------------
+
+[[report]]
+kind = "research-direct"
+message = """
+Research which open-source charting libraries render on the server and export PNG. Compare licence, size and maintenance. The user will read your findings in this thread.
+"""
+parent_reply = """
+I've started a research thread on server-side charting libraries. Its findings will appear there for you.
+"""
+reply = """
+Three candidates fit:
+
+| Library | Licence | Size | Last release |
+|---|---|---|---|
+| Chart Lite | MIT | 40 KB | 3 weeks ago |
+| PlotKit | Apache-2.0 | 120 KB | 2 months ago |
+| VegaMini | BSD-3 | 300 KB | 8 months ago |
+
+Chart Lite is the best fit unless you need maps, where only PlotKit works.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "research-direct"
+message = """
+Look into why the habit-tracker app's reminders arrive late on phones. Write what you find for the user.
+"""
+parent_reply = """
+A thread is investigating the late reminders. It will explain what it finds to you directly.
+"""
+reply = """
+Reminders arrive late because the phone's battery saver defers the app's background timer. On the test phone, the delay was 4 to 18 minutes. Turning off battery optimisation for the app fixes it. A push notification from the server would avoid it altogether.
+"""
+status = "no-changes"
+label = "file"
+
+[[report]]
+kind = "research-direct"
+message = """
+Compare three standing desks under 6,000 NOK for the user: height range, noise and warranty. Present the comparison to them.
+"""
+parent_reply = """
+I've asked a sub-thread to compare standing desks. You'll see its comparison there.
+"""
+reply = """
+| Desk | Height | Noise | Warranty |
+|---|---|---|---|
+| Desk A | 62 to 127 cm | 45 dB | 5 years |
+| Desk B | 70 to 120 cm | 50 dB | 2 years |
+| Desk C | 60 to 125 cm | 42 dB | 7 years |
+
+Desk C is the quietest with the longest warranty, at 5,490 NOK.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "research-for-parent"
+message = """
+Find out whether the payment provider's API supports partial refunds, and what the request looks like. Report back to me: I need it to design the refund flow.
+"""
+parent_reply = """
+I've sent a sub-thread to check partial refund support. Once I know, I'll design the refund flow.
+"""
+reply = """
+Yes. `POST /v2/refunds` takes `payment_id` and an optional `amount` in minor units. Several partial refunds may add up to the captured total. A refund on an uncaptured payment returns 409.
+"""
+status = "no-changes"
+label = "must-wake"
+
+# --- a ready change --------------------------------------------------------
+
+[[report]]
+kind = "ready-change"
+message = """
+Fix the date picker in the habit-tracker app: it shows Sunday as the first day of the week for users whose locale starts on Monday. The user will review and apply the change from this thread.
+"""
+parent_reply = """
+I've started a coding thread for the date picker bug. Its change will be ready for you to apply there.
+"""
+reply = """
+Fixed. The date picker now reads the first day of the week from the locale. Two files changed, with a test for a Monday locale and one for a Sunday locale. The change is ready to apply.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "ready-change"
+message = """
+Add a CSV export button to the backoffice orders page. Hand the change to the user for review.
+"""
+parent_reply = """
+A coding thread is adding the CSV export. You can review its change there when it's done.
+"""
+reply = """
+The orders page has an Export CSV button. It exports the current filter, with the same columns as the table. One component and one test changed. Ready for review.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "ready-change-next-step"
+message = """
+Add the `region` column to the orders table in `example-repo`, with a migration and a backfill script. Don't run the backfill: tell me when the change is ready, and I'll schedule the backfill with the user.
+"""
+parent_reply = """
+A coding thread is writing the migration. When it reports, I'll book the backfill window with you.
+"""
+reply = """
+The change is ready: one migration adding a nullable `region`, and `scripts/backfill-region.sh`, which processes 10,000 rows per batch. I didn't run the backfill.
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "ready-change-next-step"
+message = """
+Bump the HTTP client library in `example-repo` to the next major version and fix what breaks. Report back when the change is ready: the deploy thread waits on it.
+"""
+parent_reply = """
+The dependency bump is running in a coding thread. Once its change is ready, I'll start the deploy thread.
+"""
+reply = """
+Done. The new major version renamed `timeout` to `request_timeout` in four places, and I updated them. All tests pass. The change is ready to apply.
+"""
+status = "success"
+label = "must-wake"
+
+# --- a problem the parent must handle --------------------------------------
+
+[[report]]
+kind = "problem"
+message = """
+Send the weekly status email to the project list using the draft in `artifacts/ticket-workflow/status-week-45.md`.
+"""
+parent_reply = """
+I've asked a sub-thread to send this week's status email.
+"""
+reply = """
+I didn't send it. The draft still has two placeholders, `[NUMBERS]` and `[OWNER]`, and I don't know what should go there.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "problem"
+message = """
+Fix the flaky login test in `example-repo`.
+"""
+parent_reply = """
+A coding thread is on the flaky login test. I'll tell you when it's fixed.
+"""
+reply = """
+I couldn't make a change that fixes it. The test is flaky because the shared staging database is reset by another job every 15 minutes, and that job lives in a repository I can't reach. It needs someone with access to the job's schedule.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "problem"
+message = """
+Book a table for six at Venue A on Friday at 19:00, using the booking form on their website.
+"""
+parent_reply = """
+A sub-thread is booking Venue A for Friday. I'll confirm the details with you once it's done.
+"""
+reply = """
+Friday at 19:00 is full. The form offers 17:30 or 21:00 for six. I haven't booked either.
+"""
+status = "no-changes"
+label = "must-wake"
+
+# --- the user talks to the child directly ----------------------------------
+
+[[report]]
+kind = "user-in-child"
+source = "user"
+message = """
+Can you make the chart's bars blue instead of green?
+"""
+parent_reply = """
+I've started a thread to build your revenue chart. You can ask it for changes there.
+"""
+reply = """
+Done. The bars are blue now, and the legend matches.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "user-in-child"
+source = "user"
+message = """
+What does the 'unknown' region in the export mean?
+"""
+parent_reply = """
+The Q3 export is done, and the regional revenue chart is in your artifacts. Ask me if you want another breakdown.
+"""
+reply = """
+Three orders had no region in the database, so the export wrote them as `unknown`. They total 2,140 NOK, under 0.1% of the quarter.
+"""
+status = "success"
+label = "file"
+
+# --- the parent already moved on --------------------------------------------
+
+[[report]]
+kind = "already-handled"
+message = """
+Check whether the nightly backup job ran last night, and report its duration.
+"""
+parent_reply = """
+I checked the backup log myself in the meantime: it ran at 03:00 and took 14 minutes. The sub-thread's answer is no longer needed.
+"""
+reply = """
+The nightly backup ran at 03:00 and finished at 03:14, 14 minutes. No errors in the log.
+"""
+status = "no-changes"
+label = "file"
+
+# --- held out ----------------------------------------------------------------
+#
+# Written before the first question draft in
+# `docs/plans/2026-10-12-wake-decision-chat-fallback-and-question.md`. Each
+# copies a shape above in a new setting, or a shape the cases above lack. It
+# caught a regression in a later draft, and then tuned the next one.
+
+[[report]]
+kind = "held-out-fan-in-last"
+message = """
+Check the listing at `artifacts/projects/flat-hunt/listing-4.md`: rent, size, distance to the nearest train station, and whether pets are allowed.
+"""
+parent_reply = """
+Four threads are checking one flat each. Once all four have reported, I'll rank them against your budget and send you the shortlist.
+"""
+reply = """
+Listing 4: 14,200 NOK a month, 58 m², a 6-minute walk to the station. Pets are allowed with a 5,000 NOK deposit.
+"""
+status = "no-changes"
+siblings_running = 0
+label = "must-wake"
+
+[[report]]
+kind = "held-out-fan-in-early"
+message = """
+Find the current price of the Model X robot vacuum at Shop B, including delivery.
+"""
+parent_reply = """
+Five threads are checking one shop each. I'll tell you the cheapest once every shop has answered.
+"""
+reply = """
+Shop B sells it for 4,290 NOK with free delivery in 2 to 4 days.
+"""
+status = "no-changes"
+siblings_running = 4
+label = "file"
+
+[[report]]
+kind = "held-out-early-sibling-blocks-the-rest"
+message = """
+Read the schema of the backoffice database and list every table with its row count.
+"""
+parent_reply = """
+Two threads are running: this one reads the schema, the other checks last night's backup. I'll start the per-table data checks as soon as I have the table list.
+"""
+reply = """
+The backoffice database has 9 tables. The largest are `orders` (1.2 million rows), `order_lines` (4.8 million) and `events` (11 million). The full list is in `artifacts/backoffice/schema.md`.
+"""
+status = "no-changes"
+siblings_running = 1
+label = "must-wake"
+
+[[report]]
+kind = "held-out-parallel-for-user"
+message = """
+Find hotels in Lisbon under 1,500 NOK a night for 14 to 18 November, near the old town. Show the user the three best options in this thread.
+"""
+parent_reply = """
+Two threads are on your trip: one for flights and one for hotels. Each will show you its options directly.
+"""
+reply = """
+| Hotel | Per night | Walk to the old town | Rating |
+|---|---|---|---|
+| Hotel A | 1,180 NOK | 5 min | 8.7 |
+| Hotel B | 1,320 NOK | 2 min | 9.1 |
+| Hotel C | 1,450 NOK | 8 min | 8.9 |
+
+Hotel B is the closest and best rated, and it has free cancellation until 10 November.
+"""
+status = "no-changes"
+siblings_running = 1
+label = "file"
+
+[[report]]
+kind = "held-out-home-research-direct"
+message = """
+The user asked whether they need a visa for a two-week holiday in Japan with a Norwegian passport. Find out and explain it to them in this thread.
+"""
+parent_reply = """
+I've started a thread to check the visa rules for your trip. It will explain what it finds there.
+"""
+reply = """
+You don't need a visa. Norwegian passport holders can stay in Japan for up to 90 days as tourists. Your passport must be valid for the whole stay, and you may be asked for a return ticket at the border.
+"""
+status = "no-changes"
+label = "file"
+
+[[report]]
+kind = "held-out-home-research-for-parent"
+message = """
+Find the return policy for online orders at Shop C: how many days, and who pays the return shipping. Report back to me, and I'll answer the user's question with it.
+"""
+parent_reply = """
+I'm checking Shop C's return policy for you, and I'll answer as soon as I have it.
+"""
+reply = """
+Shop C accepts returns of online orders within 30 days. Return shipping is free with the prepaid label in the parcel; otherwise the customer pays.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-ready-change-parent-applies"
+message = """
+Raise the upload size limit in `example-repo` from 10 MB to 50 MB, in the server config and the client check. Tell me when the change is ready: I'll apply it and restart the upload service.
+"""
+parent_reply = """
+A coding thread is raising the upload limit. When its change is ready, I'll apply it and restart the service.
+"""
+reply = """
+The change is ready. The limit is 50 MB in `config/server.toml` and in the client's file check, and the error message now says 50 MB. One test covers a 49 MB and a 51 MB file.
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-no-changes-awaited"
+message = """
+Check whether the domain `habit-tracker-app.example` is available to register. If it is, tell me the price, and I'll register it.
+"""
+parent_reply = """
+A thread is checking the domain. If it's free, I'll register it right away.
+"""
+reply = """
+It isn't available: the domain was registered in 2021 and renews next March. `habit-tracker.example` and `habittracker-app.example` are both free, at 120 NOK a year.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-relayed-report"
+source = "child-report"
+message = """
+The pricing thread reports: all three competitor price lists are in `artifacts/projects/pricing/competitors.md`, with the monthly and yearly price of each plan.
+"""
+parent_reply = """
+A thread is putting together the competitor pricing summary. I'll send it to you once it's ready, with my recommendation.
+"""
+reply = """
+The competitor summary is complete in `artifacts/projects/pricing/summary.md`. Our yearly plan is the cheapest of the four. Our monthly plan is 12% above the average.
+"""
+status = "success"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-background-chore"
+message = """
+Compress the log files older than 30 days in `artifacts/backoffice/logs/` into one archive per month.
+"""
+parent_reply = """
+I've started a thread to archive the old logs in the background. Nothing else waits on it. Now, about your question on the invoice totals: they match the ledger.
+"""
+reply = """
+Archived 412 log files into 5 monthly archives in `artifacts/backoffice/logs/archive/`, saving 1.9 GB.
+"""
+status = "success"
+label = "file"
+
+# --- held out, second batch -------------------------------------------------
+#
+# The first held-out batch caught a regression in a question draft, so it was
+# folded into tuning. This batch was written before the next draft, and never
+# used to tune it.
+
+[[report]]
+kind = "held-out-2-early-sibling-next-step"
+message = """
+Book the community hall for Saturday 6 December, 18:00 to 23:00, through its online form.
+"""
+parent_reply = """
+Two threads are on the party: one books the hall, the other drafts the invitation text. As soon as the hall is booked, I'll send the date and address to the caterer.
+"""
+reply = """
+Booked. The hall is ours on Saturday 6 December from 18:00 to 23:00. The confirmation number is HB-2291, and the address is Example Street 4.
+"""
+status = "no-changes"
+siblings_running = 1
+label = "must-wake"
+
+[[report]]
+kind = "held-out-2-fan-in-early"
+message = """
+Translate the FAQ page in `artifacts/backoffice/faq.md` to Italian.
+"""
+parent_reply = """
+Four threads are translating the FAQ, one language each. I'll publish all four versions together once they are done.
+"""
+reply = """
+The Italian FAQ is in `artifacts/backoffice/faq.it.md`. All 22 questions are translated, and the product names stay in English.
+"""
+status = "success"
+siblings_running = 3
+label = "file"
+
+[[report]]
+kind = "held-out-2-fan-in-last"
+message = """
+Find the bus connections from the airport to the city centre on Friday evening, with travel time and price.
+"""
+parent_reply = """
+Two threads are checking the routes: one for the train, one for the bus. Once both are back, I'll pick the faster route for you.
+"""
+reply = """
+Buses leave every 20 minutes until 23:40. The trip takes 45 minutes and costs 159 NOK. The last bus is often full on Fridays.
+"""
+status = "no-changes"
+siblings_running = 0
+label = "must-wake"
+
+[[report]]
+kind = "held-out-2-home-for-user"
+message = """
+The user wants a shared shopping list app for their household, where anyone can add items and tick them off. Build it and show them how to use it.
+"""
+parent_reply = """
+A thread is building your shopping list app. It will show you how it works when it's ready.
+"""
+reply = """
+Your shopping list app is ready under Apps. Type an item and press Enter to add it, and tap an item to tick it off. Ticked items move to the bottom.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "held-out-2-home-research-for-parent"
+message = """
+Find the Sunday opening hours of the pharmacies near Example Square. Report back to me: I'll tell the user together with the bus times I'm checking.
+"""
+parent_reply = """
+I'm checking which pharmacies are open on Sunday, and the buses to get there. I'll have both for you shortly.
+"""
+reply = """
+Two pharmacies near Example Square open on Sundays: Pharmacy A from 10:00 to 18:00, and Pharmacy B from 12:00 to 16:00.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-2-ready-change"
+message = """
+Fix the typo on the habit-tracker settings page: "Remider time" should read "Reminder time". The user will review and apply the change from this thread.
+"""
+parent_reply = """
+A coding thread is fixing the typo. You can review and apply its change there.
+"""
+reply = """
+Fixed. The settings page now reads "Reminder time". One file changed. The change is ready to apply.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "held-out-2-background-chore-failed"
+message = """
+Delete the temporary files older than 7 days in `artifacts/backoffice/tmp/`.
+"""
+parent_reply = """
+A thread is clearing out the old temporary files in the background. Nothing else waits on it.
+"""
+reply = """
+I couldn't delete them. The folder belongs to another process, and every delete was refused with "permission denied". Nothing was removed.
+"""
+status = "no-changes"
+label = "must-wake"
+
+[[report]]
+kind = "held-out-2-user-in-child"
+source = "user"
+message = """
+Which of those three desks would fit under a window sill that's 95 cm high?
+"""
+parent_reply = """
+I've asked a sub-thread to compare standing desks. You'll see its comparison there.
+"""
+reply = """
+All three go down far enough: Desk A to 62 cm, Desk B to 70 cm and Desk C to 60 cm. At sitting height, any of them fits under a 95 cm sill.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "held-out-2-already-handled"
+message = """
+Export the customer list from the backoffice to `artifacts/backoffice/customers.csv`.
+"""
+parent_reply = """
+You cancelled the customer export, so I've dropped that part of the plan. The rest of the report is done, and it's in your artifacts.
+"""
+reply = """
+The customer list is in `artifacts/backoffice/customers.csv`: 1,904 customers, with name, email and signup date.
+"""
+status = "success"
+label = "file"
+
+[[report]]
+kind = "held-out-2-stalled"
+message = """
+Render the product video from `artifacts/projects/launch/edit.json` to `artifacts/projects/launch/launch.mp4`.
+"""
+parent_reply = """
+A thread is rendering the launch video. When it's done, I'll upload it to the shared folder and send you the link.
+"""
+reply = """
+The render has started. It takes about 20 minutes, so I'll check back on it then and tell you when the file is written.
+"""
+status = "success"
+label = "must-wake"

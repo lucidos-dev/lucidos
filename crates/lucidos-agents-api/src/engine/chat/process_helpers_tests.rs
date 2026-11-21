@@ -1,0 +1,654 @@
+//! Tests for the coding-agent follow-up helpers: the interrupt-and-redirect
+//! routing rule and its arming, and the question-card supersede rules.
+
+use crate::engine::chat::process::ChatProcessExt;
+use std::collections::HashMap;
+use std::time::Duration;
+
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::engine::types::{AgentSession, AgentUserInput};
+
+/// Returns the receiver alongside the session: hold it (`let (s, _rx) = …`) for
+/// the test's lifetime, or the session reads as a phantom, which no helper
+/// treats as live. See `AgentSession::is_live`.
+fn make_test_session(
+    process_exited: bool,
+) -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut session, msg_rx) = AgentSession::for_test();
+    session.is_waiting = !process_exited;
+    session.process_exited = process_exited;
+    (session, msg_rx)
+}
+
+// --- should_redirect_followup ---------------------------------------------
+
+use super::should_redirect_followup;
+use crate::runtime::CodingAgent;
+
+#[test]
+fn redirect_fires_for_codex_user_followup_mid_turn() {
+    // A process without steer support retains interrupt-and-redirect.
+    assert!(should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        false,
+        false
+    ));
+    assert!(should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn redirect_skips_codex_when_idle() {
+    // Idle-but-alive Codex (not in flight): a follow-up routes via turn/start
+    // immediately, no interrupt. Urgency does not manufacture a turn to stop.
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        false,
+        true,
+        false,
+        false
+    ));
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        false,
+        true,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn redirect_skips_codex_child_wake() {
+    // A child-wake (not a user message) resumes a waiting thread and must never
+    // interrupt a turn, even mid-flight and even marked urgent. The flag rides
+    // on the follow-up, and a wake is not one.
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        false,
+        false,
+        false
+    ));
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        false,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn redirect_skips_claude_code_unless_urgent() {
+    // The opt-in half. A plain CC follow-up is forwarded as-is and queues, so a
+    // benign steer never throws away an in-flight build. This is the invariant
+    // `chat.spec.ts` ("mid-turn user message reaches CC during active tool
+    // calls") exercises end to end.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        true,
+        true,
+        false,
+        false
+    ));
+}
+
+#[test]
+fn redirect_fires_for_urgent_claude_code_followup_mid_turn() {
+    // The 2026-08-06 incident: a CC child parked in
+    // `TaskOutput(block: true, timeout: 600000)` did not read a STOP for nine
+    // and a half minutes, because CC surfaces a queued stdin message only at
+    // the next assistant turn boundary and there was not one. An urgent
+    // follow-up interrupts instead of waiting for the tool's own timeout.
+    assert!(should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        true,
+        true,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn redirect_skips_idle_claude_code_even_when_urgent() {
+    // Nothing to interrupt: an idle CC session picks the message up from stdin
+    // at once. Interrupting would cancel a turn that does not exist.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        false,
+        true,
+        true,
+        false
+    ));
+}
+
+#[test]
+fn redirect_skips_urgent_claude_code_child_wake() {
+    // Urgency cannot promote an engine-internal child-wake into an interrupt.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        true,
+        false,
+        true,
+        false
+    ));
+}
+
+// --- arm_followup_redirect -------------------------------------------------
+
+use super::arm_followup_redirect;
+
+/// A live Codex session mid-turn: alive (`process_exited=false`), not at a turn
+/// boundary (`is_waiting=false`).
+fn codex_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut s, msg_rx) = make_test_session(false);
+    s.is_waiting = false; // turn in flight
+    s.coding_agent = CodingAgent::Codex;
+    s.can_steer = false;
+    (s, msg_rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (session, _msg_rx) = codex_in_flight_session();
+    let interrupt = session.interrupt.clone();
+    sessions.insert(thread_id, session);
+
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
+
+    assert!(
+        idle.is_some(),
+        "a Codex mid-turn user follow-up must arm the redirect and return idle_notify"
+    );
+    assert_eq!(
+        sessions.get(&thread_id).unwrap().redirect_cause,
+        Some(crate::engine::thread_events::CancelCause::SupersededByFollowup),
+        "arming the redirect must flag the session so the interrupt arm classifies \
+         the interrupted turn as SupersededByFollowup (neutral), not UserStop"
+    );
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "arming must also reserve the subprocess: the caller routes the message only \
+         after the interrupted turn reaches a boundary, so at the idle decision the \
+         message provably is not in msg_rx yet and this flag is the only thing \
+         standing between it and a terminated subprocess"
+    );
+    // The interrupt fired: notify_one stores a permit, so a notified() created
+    // AFTER the call still resolves immediately.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), interrupt.notified())
+            .await
+            .is_ok(),
+        "the live turn's interrupt must have been fired"
+    );
+}
+
+/// A live Claude Code session mid-turn, the shape the 2026-08-06 incident had:
+/// alive, not at a turn boundary.
+fn claude_code_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut s, msg_rx) = make_test_session(false);
+    s.is_waiting = false; // turn in flight
+    debug_assert_eq!(s.coding_agent, CodingAgent::ClaudeCode);
+    (s, msg_rx)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_skips_plain_claude_code_mid_turn() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (session, _msg_rx) = claude_code_in_flight_session();
+    let interrupt = session.interrupt.clone();
+    sessions.insert(thread_id, session);
+
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
+
+    assert!(
+        idle.is_none(),
+        "a plain (non-urgent) CC follow-up must not be interrupted: it steers via stdin"
+    );
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_cause.is_none(),
+        "a plain CC follow-up must not be flagged for redirect"
+    );
+    assert!(
+        !sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "no interrupt means no reservation: the message goes straight into msg_rx, \
+         where the idle decision can see it for itself"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), interrupt.notified())
+            .await
+            .is_err(),
+        "no interrupt should have been fired for a plain CC follow-up"
+    );
+}
+
+/// I3: no follow-up cuts the ceiling re-entry short, urgent or on Codex. The
+/// input waits in the channel for the successor session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_never_interrupts_the_ceiling_reentry() {
+    for (mut session, _msg_rx) in [codex_in_flight_session(), claude_code_in_flight_session()] {
+        let thread_id = Uuid::new_v4();
+        session.in_ceiling_reentry = true;
+        let mut sessions = HashMap::from([(thread_id, session)]);
+        let idle = arm_followup_redirect(&mut sessions, thread_id, true, true, &None);
+        assert!(idle.is_none());
+        assert!(!sessions[&thread_id].redirect_followup_pending);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (session, _msg_rx) = claude_code_in_flight_session();
+    let interrupt = session.interrupt.clone();
+    sessions.insert(thread_id, session);
+
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, true, &None);
+
+    assert!(
+        idle.is_some(),
+        "an urgent CC mid-turn follow-up must arm the redirect and return idle_notify"
+    );
+    assert_eq!(
+        sessions.get(&thread_id).unwrap().redirect_cause,
+        Some(crate::engine::thread_events::CancelCause::SupersededByFollowup),
+        "the interrupted turn must classify as SupersededByFollowup (neutral), not UserStop"
+    );
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "the interrupted turn's idle must keep the subprocess alive for the reservation"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), interrupt.notified())
+            .await
+            .is_ok(),
+        "the live CC turn's interrupt must have been fired"
+    );
+}
+
+#[test]
+fn arm_redirect_skips_idle_claude_code_even_when_urgent() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    // make_test_session(false) leaves is_waiting=true, i.e. idle but alive.
+    let (session, _msg_rx) = make_test_session(false);
+    sessions.insert(thread_id, session);
+
+    assert!(
+        arm_followup_redirect(&mut sessions, thread_id, true, true, &None).is_none(),
+        "an idle CC session reads stdin at once: there is no turn to interrupt"
+    );
+    assert!(!sessions.get(&thread_id).unwrap().redirect_followup_pending);
+}
+
+#[test]
+fn arm_redirect_skips_idle_codex() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (mut session, _msg_rx) = make_test_session(false); // is_waiting=true → idle, not in flight
+    session.coding_agent = CodingAgent::Codex;
+    sessions.insert(thread_id, session);
+
+    // Idle Codex: route via turn/start immediately, no interrupt.
+    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_none());
+    assert!(!sessions.get(&thread_id).unwrap().redirect_followup_pending);
+}
+
+#[test]
+fn arm_redirect_skips_child_wake() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (session, _msg_rx) = codex_in_flight_session();
+    sessions.insert(thread_id, session);
+
+    // is_user_message=false (child-wake) must never interrupt a live turn.
+    assert!(arm_followup_redirect(&mut sessions, thread_id, false, false, &None).is_none());
+}
+
+#[test]
+fn arm_redirect_none_when_no_session() {
+    let mut sessions = HashMap::new();
+    assert!(arm_followup_redirect(&mut sessions, Uuid::new_v4(), true, false, &None).is_none());
+}
+
+/// The late redirect, replayed step by step in the order the audit traced.
+///
+/// 1. The agent's `Result` is in, and the run loop is still inside the `Result`
+///    arm doing git work. The shared `is_waiting` is still false.
+/// 2. A follow-up arms a redirect. The turn reads in flight, so it stores the
+///    flag, the actor and an interrupt permit.
+/// 3. The loop reaches the boundary, and the idle decision takes the promise.
+///
+/// Nothing aimed at the ended turn may survive into the next one. A stale flag
+/// relabels the next real Stop as superseded. A stale permit interrupts the
+/// follow-up's own turn as soon as `msg_rx` wins the `select!`.
+#[test]
+fn a_redirect_armed_inside_the_result_arm_does_not_outlive_its_turn() {
+    let thread_id = Uuid::new_v4();
+    let (session, _msg_rx) = codex_in_flight_session();
+    let mut sessions = HashMap::from([(thread_id, session)]);
+    let origin = Some(crate::engine::thread_events::MessageOrigin::Device {
+        device_id: "d-1".into(),
+    });
+
+    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &origin).is_some());
+
+    let s = sessions.get_mut(&thread_id).unwrap();
+    crate::engine::agent_session::lifecycle::mark_turn_boundary(s);
+    assert!(
+        std::mem::take(&mut s.redirect_followup_pending),
+        "the follow-up promise survives to the idle decision, which keeps the subprocess"
+    );
+
+    assert!(
+        s.redirect_cause.is_none(),
+        "the next real Stop would render as superseded"
+    );
+    assert_eq!(
+        s.cancel_actor, None,
+        "the next Stop would inherit this device"
+    );
+    assert!(
+        futures::FutureExt::now_or_never(s.interrupt.notified()).is_none(),
+        "the stored permit would interrupt the follow-up's own turn"
+    );
+}
+
+// --- follow_up_keeps_open_question ----------------------------------------
+
+use super::follow_up_keeps_open_question;
+use crate::engine::agent_question::aq_test_helpers::{cc_meta, emit_user_question, seed_cc_thread};
+use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::thread_events::ThreadEvent;
+use crate::engine::PreEmittedOrigin;
+use crate::test_support::{setup_test_db, teardown_test_db};
+
+/// The shape each case below starts from: a coding-agent thread parked on a
+/// question nothing has overtaken yet.
+async fn seed_parked_question(bus: &EventBus) -> Uuid {
+    let thread_id = Uuid::new_v4();
+    seed_cc_thread(bus, thread_id).await;
+    emit_user_question(bus, thread_id, "toolu-parked#q0").await;
+    thread_id
+}
+
+fn live_sessions(thread_id: Uuid) -> (TokioSessions, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (session, msg_rx) = make_test_session(false);
+    let sessions = tokio::sync::Mutex::new(HashMap::from([(thread_id, session)]));
+    (sessions, msg_rx)
+}
+
+type TokioSessions = tokio::sync::Mutex<HashMap<Uuid, AgentSession>>;
+
+/// The reported incident. A child finished while its parent's agent was parked
+/// on a question. The completion wake superseded the question, so the user
+/// never got to answer it. A child report is delivered without a
+/// `CodingAgentPromptSent`, so it cannot kill the card, and the agent reads it
+/// after the answer. The question must stay open. An event-wait delivery is the
+/// same kind of re-entry and gets the same rule.
+#[tokio::test]
+async fn an_engine_reentry_keeps_a_live_question_open() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    for origin in [
+        PreEmittedOrigin::EngineReentry(Uuid::new_v4()),
+        PreEmittedOrigin::WaitReentry(Uuid::new_v4()),
+    ] {
+        assert!(
+            follow_up_keeps_open_question(&pool, &sessions, thread_id, Some(origin)).await,
+            "{origin:?} must not supersede a question the user can still answer"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A real message reaching this point could not answer the question and was not
+/// held: an agent message already on the wire. Its `CodingAgentPromptSent`
+/// overtakes the card, so keeping the question brings back the ADR 0082 deadlock.
+#[tokio::test]
+async fn a_message_still_supersedes_the_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    for origin in [None, Some(PreEmittedOrigin::Message(Uuid::new_v4()))] {
+        assert!(
+            !follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await,
+            "{origin:?} must supersede, or its prompt kills the card and deadlocks the agent"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An overtaken question has dead buttons already. Nobody can answer it, so the
+/// re-entry must close it rather than leave the agent parked behind it.
+#[tokio::test]
+async fn an_engine_reentry_supersedes_an_overtaken_question() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::CodingAgentToolCalled {
+            name: "Bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            description: String::new(),
+            coding_agent: CodingAgent::ClaudeCode,
+            tool_use_id: "toolu-sibling".into(),
+            parent_tool_use_id: None,
+            api_call_id: None,
+        },
+        meta: cc_meta(),
+    })
+    .await
+    .expect("CodingAgentToolCalled emit")
+    .expect("CodingAgentToolCalled persisted");
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+
+    let origin = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+    assert!(!follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// With no live session nothing is parked on the question. The re-entry spawns
+/// a fresh session, and its first step would overtake the card anyway. So the
+/// question is closed now rather than left to die unanswered.
+#[tokio::test]
+async fn an_engine_reentry_supersedes_when_no_session_is_live() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = seed_parked_question(&bus).await;
+    let (exited, _msg_rx) = make_test_session(true);
+
+    for sessions in [
+        TokioSessions::default(),
+        tokio::sync::Mutex::new(HashMap::from([(thread_id, exited)])),
+    ] {
+        let origin = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+        assert!(!follow_up_keeps_open_question(&pool, &sessions, thread_id, origin).await);
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// --- permission supersedes -------------------------------------------------
+
+use super::{chat_follow_up_supersedes_cards, reentry_reaches_live_session};
+use crate::engine::thread_events::ActorMode;
+
+/// A child's completion or a wait delivery reaching a live coding-agent
+/// session parked on a permission card must leave the card to the user.
+#[tokio::test]
+async fn an_engine_reentry_on_a_live_session_keeps_the_permission_card() {
+    let thread_id = Uuid::new_v4();
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+    for origin in [
+        PreEmittedOrigin::EngineReentry(Uuid::new_v4()),
+        PreEmittedOrigin::WaitReentry(Uuid::new_v4()),
+    ] {
+        assert!(reentry_reaches_live_session(&sessions, thread_id, Some(origin)).await);
+    }
+}
+
+/// A message sends its own prompt, and a dead session has no parked card, so
+/// both still supersede.
+#[tokio::test]
+async fn a_message_or_a_dead_session_still_supersedes_the_permission_card() {
+    let thread_id = Uuid::new_v4();
+    let (sessions, _msg_rx) = live_sessions(thread_id);
+    for origin in [None, Some(PreEmittedOrigin::Message(Uuid::new_v4()))] {
+        assert!(!reentry_reaches_live_session(&sessions, thread_id, origin).await);
+    }
+    let (exited, _exited_rx) = make_test_session(true);
+    let reentry = Some(PreEmittedOrigin::EngineReentry(Uuid::new_v4()));
+    for sessions in [
+        TokioSessions::default(),
+        tokio::sync::Mutex::new(HashMap::from([(thread_id, exited)])),
+    ] {
+        assert!(!reentry_reaches_live_session(&sessions, thread_id, reentry).await);
+    }
+}
+
+/// On the chat lane only a person denies a card a live turn waits on. With no
+/// live turn, nothing waits, so any input clears the stale card.
+#[test]
+fn only_a_person_denies_a_card_a_live_chat_turn_waits_on() {
+    assert!(chat_follow_up_supersedes_cards(ActorMode::Human, true));
+    assert!(!chat_follow_up_supersedes_cards(ActorMode::Agent, true));
+    assert!(!chat_follow_up_supersedes_cards(ActorMode::Engine, true));
+    for mode in [ActorMode::Human, ActorMode::Agent, ActorMode::Engine] {
+        assert!(chat_follow_up_supersedes_cards(mode, false));
+    }
+}
+
+#[test]
+fn capable_codex_steers_plain_messages_but_interrupts_urgent_messages() {
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        false,
+        true
+    ));
+    assert!(should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        true,
+        true,
+        true
+    ));
+}
+
+#[tokio::test]
+async fn a_plain_followup_preserves_a_capable_codex_turn() {
+    let thread = Uuid::new_v4();
+    let (mut session, _rx) = codex_in_flight_session();
+    session.can_steer = true;
+    let mut sessions = HashMap::from([(thread, session)]);
+    assert!(arm_followup_redirect(&mut sessions, thread, true, false, &None).is_none());
+    let session = &sessions[&thread];
+    assert!(session.redirect_cause.is_none());
+    assert!(!session.redirect_followup_pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), session.interrupt.notified())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_human_side_request_routes_into_the_live_codex_turn() {
+    use crate::engine::chat::process::OrphanLane;
+    use crate::engine::thread_events::ActorMode;
+    use crate::engine::SessionPhase;
+    use crate::test_support::{
+        boot_mock_engine, in_engine_child, seed_coding_thread, seed_thread_event, setup_test_db,
+        teardown_test_db,
+    };
+    if !in_engine_child("engine::chat::process_helpers::process_helpers_tests::a_human_side_request_routes_into_the_live_codex_turn").await {
+        return;
+    }
+    let (pool, db) = setup_test_db().await;
+    let (engine, _workspace) = boot_mock_engine(&db).await;
+    let thread = seed_coding_thread(&engine.event_bus, None).await;
+    let mut claim = engine
+        .claim_thread_for_spawn(thread, None)
+        .await
+        .unwrap()
+        .unwrap();
+    let (control, _control_rx) = mpsc::unbounded_channel();
+    {
+        let mut sessions = engine.agent_sessions.lock().await;
+        let session = sessions.get_mut(&thread).unwrap();
+        session.phase = SessionPhase::Running {
+            control_tx: control,
+        };
+        session.coding_agent = CodingAgent::Codex;
+        session.can_steer = true;
+        session.is_waiting = false;
+    }
+    let input = seed_thread_event(
+        &engine.event_bus,
+        thread,
+        crate::test_support::message_received("Show me the colors too"),
+    )
+    .await;
+    engine
+        .process_orphan(
+            "Show me the colors too",
+            None,
+            thread,
+            None,
+            ActorMode::Human,
+            Some(PreEmittedOrigin::Message(input)),
+            OrphanLane::CodingAgent(Vec::new()),
+        )
+        .await
+        .unwrap();
+    let forwarded = claim.entry.msg_rx.try_recv().unwrap();
+    assert_eq!(forwarded.text, "Show me the colors too");
+    assert_eq!(forwarded.origin_event_id, Some(input));
+    assert!(claim.entry.msg_rx.try_recv().is_err());
+    let sessions = engine.agent_sessions.lock().await;
+    let session = &sessions[&thread];
+    assert!(session.redirect_cause.is_none());
+    assert!(!session.redirect_followup_pending);
+    drop(sessions);
+    let canceled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM events WHERE thread_id = $1 AND event_type = 'ResponseCanceled'",
+    )
+    .bind(thread)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        canceled, 0,
+        "a side request must preserve the original turn"
+    );
+    drop(claim);
+    teardown_test_db(&db).await;
+}

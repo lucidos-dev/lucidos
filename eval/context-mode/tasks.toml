@@ -1,0 +1,295 @@
+# The task set: fourteen threads, run in this order by every configuration.
+#
+# Each prompt is sent verbatim, with `{marker}` replaced by a per-run token the
+# driver uses to resolve the thread. Nothing in a prompt restates a fact a probe
+# measures, which is what makes the probe a measurement rather than a reading
+# comprehension test.
+#
+# `followup` is a second user message, sent into the same thread once turn one
+# has genuinely finished. Only T14 carries one. The task's timeout covers both
+# turns, and a first turn that times out sends no follow-up.
+#
+# `depends_on` is the precondition graph. A task whose upstream failed has its
+# probes voided rather than failed, so one flake cannot manufacture five
+# regressions.
+#
+# `preconditions` are checked against the workspace before the prompt is
+# sent. They read the data tree and the event store, never the thread, because
+# there is no thread yet.
+#
+# A precondition may gate on the task's INPUTS and on nothing else: a file the
+# seed tree lays down, or a deliverable a depended-on task's completion probe
+# asserts. Never on a fact whose `established_by` is `work`, and never on
+# anything a probe scores. Gating on a scored behaviour voids the task exactly
+# when the miss is the interesting result, and it voids it asymmetrically
+# between arms. `Fixture::validate` refuses the whole class at load.
+#
+# `scope_rule` is appended to every prompt, wherever `{marker}` is substituted.
+# It is central rather than per-task on purpose. Over-delivery is not
+# self-punishing: an agent that invents work reads as the configuration being
+# expensive, and the cost lands on the run. T06 once cost $19.19 against $5.08
+# on exactly that. Fourteen copies of the rule would let one drift and
+# reintroduce the asymmetry silently.
+#
+# It carries no fact, for the same reason no prompt does. A scope rule naming a
+# filename or a threshold would turn a probe into reading comprehension.
+scope_rule = """
+Do what this asks and stop there. Do not extend the work to anything the request
+does not name. If you notice something else worth doing, say so at the end of
+your reply instead of doing it.
+"""
+
+[[task]]
+id = "T01"
+title = "Ground the project"
+timeout_minutes = 10
+depends_on = []
+prompt = """
+{marker} I'm starting a small project to track build health for example-repo.
+
+Create data/artifacts/build-health/ and put a conventions.md in it recording
+two things: reports are named YYYY-MM-DD-health.md, and no table in a report is
+ever wider than four columns.
+
+A few more things about how I want this to run, which you don't need to write
+down. Call the project Build Health, never CI Health. Every timestamp is
+Europe/Oslo. A failure rate is a percentage with one decimal, never a fraction.
+I'm up at six, so anything scheduled runs then.
+"""
+
+[[task]]
+id = "T02"
+title = "Seed and report"
+timeout_minutes = 15
+depends_on = ["T01"]
+preconditions = [
+  { kind = "file_exists", path = "artifacts/build-health/conventions.md" },
+]
+prompt = """
+{marker} Here are the last eight builds. Emit one BuildObserved event for each,
+then write the report.
+
+  1  2026-01-05 08:14  main     pass   412s
+  2  2026-01-05 09:02  main     pass   398s
+  3  2026-01-05 10:31  feat/a   fail   121s
+  4  2026-01-05 11:47  main     pass   405s
+  5  2026-01-05 13:08  feat/b   fail   96s
+  6  2026-01-05 14:22  main     pass   431s
+  7  2026-01-05 15:55  feat/b   fail   88s
+  8  2026-01-05 17:10  main     pass   409s
+
+Report on 2026-01-05. Alert threshold is 25%, and never notify me between
+22:00 and 07:00.
+"""
+
+[[task]]
+id = "T03"
+title = "Build the app"
+timeout_minutes = 25
+depends_on = ["T01", "T02"]
+preconditions = [
+  { kind = "glob_count", path = "artifacts/build-health/*-health.md", min = 1 },
+  { kind = "event_count", event_type = "BuildObserved", count = 8 },
+]
+prompt = """
+{marker} Build me an app that shows this. Id build-health, not build-watch.
+Pull the numbers from the events, don't hardcode them. No external font
+imports, and take every colour from the SDK theme tokens.
+"""
+
+[[task]]
+id = "T04"
+title = "The dead end"
+timeout_minutes = 20
+depends_on = []
+preconditions = [
+  { kind = "file_exists", path = "artifacts/build-health/collect.sh" },
+  { kind = "file_exists", path = "artifacts/build-health/collect.py" },
+]
+prompt = """
+{marker} Collect the raw build data for example-repo and for example-org/api,
+using the scripts in data/artifacts/build-health/. Do them one at a time and
+tell me the row count for each.
+"""
+
+[[task]]
+id = "T05"
+title = "The trigger"
+timeout_minutes = 25
+depends_on = ["T01", "T02", "T04"]
+preconditions = [
+  { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 2 },
+]
+prompt = """
+{marker} Set this up to run on its own every morning, and to notify me when
+the failure rate goes over the threshold we agreed.
+"""
+
+[[task]]
+id = "T06"
+title = "The knowhow round trip"
+timeout_minutes = 15
+depends_on = ["T04", "T05"]
+# The two projects T04 collected, which is what "the same way" refers back to.
+# This gated on a knowhow file, and that is the T11 mistake again:
+# F14 is `established_by = "work"`, so writing the file is the T05 agent's
+# CHOICE, and P05.4 and P06.1 score exactly that choice. An agent that declined
+# lost T06, T07, T08 and T10 instead of one probe. A miss is now a scored
+# result, and the loader refuses the whole class.
+preconditions = [
+  { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 2 },
+]
+prompt = """
+{marker} Collect example-org/web the same way, and add it to the report.
+"""
+
+[[task]]
+id = "T07"
+title = "The sub-thread"
+timeout_minutes = 30
+depends_on = ["T02", "T03", "T06"]
+preconditions = [
+  { kind = "file_exists", path = "apps/build-health/manifest.json" },
+  { kind = "glob_count", path = "artifacts/build-health/*-collected.json", min = 3 },
+]
+prompt = """
+{marker} Two things at once. Spawn a sub-thread to write the weekly summary
+into data/artifacts/build-health/weekly.md, and tell it to end the file with
+the line "prepared-by: sub". While it works, widen the app to show all three
+projects. When it's done, tell me what it concluded.
+"""
+
+[[task]]
+id = "T08"
+title = "Background and wait"
+timeout_minutes = 30
+depends_on = ["T04", "T06"]
+# The collect scripts, which are what the slow collection runs. Seeded, so this
+# gates on an input. It carried the same knowhow precondition T06 did, and the
+# note above T06 explains why that had to go.
+preconditions = [
+  { kind = "file_exists", path = "artifacts/build-health/collect.sh" },
+  { kind = "file_exists", path = "artifacts/build-health/collect.py" },
+]
+prompt = """
+{marker} Run the slow collection for all three projects in the background.
+Don't sit and poll it. When it lands, refresh the daily report.
+"""
+
+[[task]]
+id = "T09"
+title = "The question"
+timeout_minutes = 25
+depends_on = ["T05"]
+preconditions = [
+  { kind = "event_exists", event_type = "TriggerCreated" },
+]
+prompt = """
+{marker} Add a breakdown section to the daily report. You'll have to decide how
+to group it, ask me if it isn't obvious.
+"""
+
+[[task]]
+id = "T10"
+title = "The long run"
+timeout_minutes = 90
+depends_on = ["T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08", "T09"]
+preconditions = [
+  { kind = "glob_count", path = "artifacts/build-health/*-health.md", min = 1 },
+  { kind = "file_exists", path = "apps/build-health/manifest.json" },
+  { kind = "file_exists", path = "artifacts/build-health/weekly.md" },
+]
+prompt = """
+{marker} Do the whole nightly pass. Re-collect all three projects, regenerate
+every report, update the app and capture it, emit a BuildHealthSummarised
+event with the totals, and start a CHANGELOG.md in the project folder with
+today's entry.
+"""
+
+# T11 carried a memory precondition, and it is retired. It voided the task
+# whenever the extractor flaked, which is exactly when the task is interesting,
+# and the pilot voided T11 in every run. F05 is now stated in T01's prompt, so a
+# miss here is a result: the fact was said, and the agent either kept it
+# reachable or did not. Extractor noise is now scored, where voiding deleted the
+# datum.
+[[task]]
+id = "T11"
+title = "Memory only"
+timeout_minutes = 15
+depends_on = ["T01", "T02"]
+prompt = """
+{marker} Give me the one-line status. Nothing else.
+"""
+
+[[task]]
+id = "T12"
+title = "The handover"
+timeout_minutes = 25
+depends_on = ["T01", "T02", "T03", "T04", "T05", "T06", "T07", "T08", "T09", "T10"]
+prompt = """
+{marker} Write data/artifacts/build-health/HANDOVER.md for whoever picks this
+up. What the project is, every convention we follow, what runs when, and where
+things live. Keep it under 60 lines.
+"""
+
+# The last two run against the ledger-migration corpus, and they are the only
+# tasks whose material can fill a context window. Neither depends on anything,
+# so either runs standalone. T13 in particular is cheap to iterate on alone,
+# which T10 is not.
+#
+# Both prompts name the topic and never the number. The corpus states each
+# planted value in exactly one document, so an arm that answers right either
+# still had that document or went back for it.
+
+[[task]]
+id = "T13"
+title = "The five documents"
+timeout_minutes = 60
+depends_on = []
+prompt = """
+{marker} There are five numbered documents in data/artifacts/ledger-migration/,
+01 through 05. Nobody has read them end to end, and the change board wants a
+cutover date from us.
+
+Read all five, in order. As you finish each one, append a row to
+data/artifacts/ledger-migration/INVENTORY.md saying what the document is and
+who on the team needs it, and emit a LedgerDocReviewed event naming the file.
+
+Then three bits of housekeeping, and none of them needs a document open again:
+
+  - Put a byte count and a line count on each row of INVENTORY.md. Get those
+    from the shell, not by opening the files again.
+  - Make a data/artifacts/ledger-migration/cutover/ folder.
+  - Write STATUS.md next to INVENTORY.md, saying the review is done, what we
+    still do not have, and who signs off before a date is picked.
+
+Last, write data/artifacts/ledger-migration/cutover/PLAN.md. It states the two
+limits the vendor's replay specification puts on us, with the numbers in it:
+how far back one replay session may reach, and the largest batch the API takes.
+A plan that describes the limits without giving them is no use to whoever
+schedules this.
+
+Keep to the file names I gave you. The 01 to 05 numbering is the vendor's
+index, so nothing new goes into that series.
+"""
+
+[[task]]
+id = "T14"
+title = "The risk register"
+timeout_minutes = 60
+depends_on = []
+prompt = """
+{marker} Same folder, data/artifacts/ledger-migration/, same five numbered
+documents.
+
+I need a risk register before this goes to the change board. Read all five and
+write data/artifacts/ledger-migration/RISKS.md: one row per document, starting
+with the document's file name, saying what could go wrong that the document is
+our evidence for, and how badly it would hurt. Worst first.
+"""
+followup = """
+The board came back with one question, and it wants the answer in that same
+file. Add a "Cutover hold" section at the end of RISKS.md: how long writes stay
+held once the last replay finishes, and what has to pass before they come back.
+The runbook is where we wrote that down.
+"""

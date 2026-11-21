@@ -1,0 +1,10 @@
+{
+  "description": "A change with no plan fact, such as a simple fix. It is labelled as that: no lead time, and Implementing is unknown.",
+  "observed_at": "2026-11-02T12:00:00Z",
+  "events": [
+    {"seq": 1, "at": "2026-11-02T10:00:00Z", "type": "HardeningStarted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "fast"}},
+    {"seq": 2, "at": "2026-11-02T10:10:00Z", "type": "HardenRunCompleted", "thread": "thread-a", "data": {"head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "iteration": 1, "tier": "fast", "verdict": "pass"}},
+    {"seq": 3, "at": "2026-11-02T10:12:00Z", "type": "ChangeProposed", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": false, "hardened": true}},
+    {"seq": 4, "at": "2026-11-02T10:30:00Z", "type": "ChangeApplied", "thread": "thread-a", "data": {"change_id": "change-a", "content": "code", "requires_restart": false, "client_update": false, "post_merge_sha": "1111111111111111111111111111111111111111", "landing_merge_sha": "1111111111111111111111111111111111111111", "commits": ["fix: keep the streak count on restart"]}}
+  ]
+}

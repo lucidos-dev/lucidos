@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>alert</string>
+	<!-- The composer's attach menu offers Camera, which calls getUserMedia in
+	     the WKWebView. macOS shows this string in the consent prompt, and with
+	     no string there is no prompt: getUserMedia then neither resolves nor
+	     rejects, so the camera overlay sits on a black video with no error.
+	     Under the hardened runtime the usage string is only half of it, the
+	     other half being com.apple.security.device.camera in
+	     Entitlements.plist. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Lucidos uses the camera when you take a photo to attach to a message.</string>
+	<!-- The composer's call toggle opens the microphone for as long as the call
+	     lasts. Same two halves as the camera above: this string is the consent
+	     prompt's copy, and com.apple.security.device.audio-input in
+	     Entitlements.plist is what the hardened runtime reads. With no string
+	     there is no prompt, and getUserMedia never settles. -->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Lucidos uses the microphone while you are on a call, so you can talk to it out loud.</string>
+</dict>
+</plist>

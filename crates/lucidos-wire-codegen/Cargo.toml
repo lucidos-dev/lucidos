@@ -1,0 +1,14 @@
+[package]
+name = "lucidos-wire-codegen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The wire reader: it parses Rust source with `syn` and writes the frontend's
+# wire types. It reads source and compiles none, so it depends on no workspace
+# crate. `the_reader_depends_on_no_workspace_crate` in `src/tests.rs` holds
+# that line.
+
+[dependencies]
+proc-macro2 = "1"
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }

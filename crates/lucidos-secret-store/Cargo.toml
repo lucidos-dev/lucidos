@@ -1,0 +1,17 @@
+[package]
+name = "lucidos-secret-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.22"
+sha2 = "0.10"
+tempfile = "3"
+log = "0.4"
+lucidos-home = { path = "../lucidos-home" }
+lucidos-file-backup-exclusion = { path = "../lucidos-file-backup-exclusion" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"

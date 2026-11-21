@@ -1,0 +1,41 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable",
+      "WebWorker"
+    ],
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "declaration": true,
+    "declarationDir": "./dist",
+    "outDir": "./dist",
+    "jsx": "react-jsx",
+    "jsxImportSource": "preact",
+    "paths": {
+      "@lucidos/motion": ["./src/motion.ts"],
+      "@lucidos/appearance": [
+        "./src/appearance.ts"
+      ],
+      "@lucidos/tap-press": [
+        "./src/tapPress.ts"
+      ],
+      "@lucidos/geometry": [
+        "./src/geometry.ts"
+      ]
+    }
+  },
+  "include": [
+    "src"
+  ]
+}

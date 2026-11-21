@@ -1,0 +1,130 @@
+import { describe, it, expect } from 'vitest';
+import {
+  dropdownMenuClass,
+  dropdownPanelStyle,
+  filterDropdownOptions,
+  openMenuFocusTarget,
+  type DropdownOption,
+} from './Dropdown';
+
+const opts: DropdownOption[] = [
+  { value: 'lucidos-agent', label: 'Lucidos Agent' },
+  { value: 'src', label: 'Lucidos source' },
+  { value: 'habit', label: 'Habit Tracker · app' },
+  { value: 'demo', label: 'Demo Director · app' },
+];
+
+describe('filterDropdownOptions (type-to-search)', () => {
+  it('returns the full list for an empty / whitespace query', () => {
+    expect(filterDropdownOptions(opts, '')).toBe(opts);
+    expect(filterDropdownOptions(opts, '   ')).toBe(opts);
+  });
+
+  it('matches by case-insensitive label substring', () => {
+    expect(filterDropdownOptions(opts, 'habit').map(o => o.value)).toEqual(['habit']);
+    expect(filterDropdownOptions(opts, 'DEMO').map(o => o.value)).toEqual(['demo']);
+    expect(filterDropdownOptions(opts, 'app').map(o => o.value)).toEqual(['habit', 'demo']);
+  });
+
+  it('matches a mid-label substring, not just a prefix', () => {
+    expect(filterDropdownOptions(opts, 'source').map(o => o.value)).toEqual(['src']);
+  });
+
+  it('returns an empty list when nothing matches (renders "No matches")', () => {
+    expect(filterDropdownOptions(opts, 'zzz')).toEqual([]);
+  });
+});
+
+describe('dropdownMenuClass (the portaled menu carries its own context)', () => {
+  /** A trigger whose `closest` matches exactly the given selectors. */
+  const trigger = (...matches: string[]) => ({
+    closest: (selector: string) => (matches.includes(selector) ? {} : null),
+  });
+
+  it('is the plain menu class for a trigger outside any form group', () => {
+    expect(dropdownMenuClass(trigger())).toBe('surface-box dropdown-menu');
+  });
+
+  it('adds the field class for a trigger inside a .form-group', () => {
+    // The menu is portaled to <body>, so `.form-group .dropdown-option` can no
+    // longer reach it through the DOM: the context has to ride on the panel.
+    expect(dropdownMenuClass(trigger('.form-group'))).toBe('surface-box dropdown-menu dropdown-menu-field');
+  });
+
+  it('takes the protected-surface class from a trigger inside a protected surface (ADR 0309)', () => {
+    expect(dropdownMenuClass(trigger('.form-group', '.protected-surface')))
+      .toBe('surface-box dropdown-menu dropdown-menu-field protected-surface');
+  });
+
+  it('is the plain menu class before the wrapper has mounted (no trigger yet)', () => {
+    expect(dropdownMenuClass(null)).toBe('surface-box dropdown-menu');
+  });
+});
+
+describe('dropdownPanelStyle (the panel is measured before it is placed)', () => {
+  it('carries the trigger width BEFORE a position exists, so the measurement is honest', () => {
+    // The panel is portaled to <body>, where the stylesheet's `min-width: 100%`
+    // resolves against the initial containing block. Without an inline
+    // minWidth the first measurement reports a viewport-wide menu and the
+    // computed `left` strands at the viewport margin instead of the trigger.
+    const style = dropdownPanelStyle(180, null);
+    expect(style.minWidth).toBe('180px');
+    expect(style.visibility).toBe('hidden');
+    // Fixed + zeroed offsets keep the hidden box in the viewport rather than
+    // 100vh down the document (the stylesheet's `top: calc(100% + 0.25rem)`).
+    expect(style.position).toBe('fixed');
+    expect(style.top).toBe('0px');
+    expect(style.left).toBe('0px');
+  });
+
+  it('places the panel at the computed offsets once measured, and reveals it', () => {
+    const style = dropdownPanelStyle(180, { top: 42, left: 96, maxHeight: 210 });
+    expect(style).toMatchObject({
+      position: 'fixed',
+      top: '42px',
+      left: '96px',
+      minWidth: '180px',
+      '--anchor-room': '210px',
+    });
+    expect(style.visibility).toBeUndefined();
+  });
+
+  it('stays hidden with no anchor at all', () => {
+    expect(dropdownPanelStyle(null, { top: 1, left: 2, maxHeight: 3 })).toEqual({ visibility: 'hidden' });
+  });
+});
+
+describe('openMenuFocusTarget (who owns keystrokes while the menu is open)', () => {
+  const target = (over: Partial<Parameters<typeof openMenuFocusTarget>[0]> = {}) =>
+    openMenuFocusTarget({ freeText: false, searching: false, positioned: true, touch: false, ...over });
+
+  it('holds focus on the trigger while the menu is open and unsearched', () => {
+    // The trigger's own keydown handler is what seeds the typeahead, so it has
+    // to hold focus however the menu opened. WebKit does not focus a <button>
+    // on click, so a mouse-opened menu left the keystrokes in the prompt.
+    expect(target()).toBe('trigger');
+  });
+
+  it('hands input to the filter box once searching, and the panel is placed', () => {
+    expect(target({ searching: true })).toBe('filter');
+  });
+
+  it('leaves focus alone while the panel is unpositioned, and so unfocusable', () => {
+    expect(target({ searching: true, positioned: false })).toBeNull();
+  });
+
+  it('focuses the freeText input in every state, since its trigger IS the input', () => {
+    expect(target({ freeText: true })).toBe('input');
+    expect(target({ freeText: true, touch: true })).toBe('input');
+    expect(target({ freeText: true, searching: true, positioned: false })).toBe('input');
+  });
+
+  it('never focuses the trigger on a touch device, where a button holds no keyboard', () => {
+    expect(target({ touch: true })).toBeNull();
+  });
+
+  it('hands input to the filter box on a touch device once it is shown', () => {
+    expect(target({ touch: true, searching: true })).toBe('filter');
+    expect(target({ touch: true, searching: true, positioned: false })).toBeNull();
+  });
+});

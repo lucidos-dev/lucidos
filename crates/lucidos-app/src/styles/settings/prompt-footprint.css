@@ -1,0 +1,93 @@
+/* Settings › System › Workspace Prompt Footprint. The shared overview and
+   card (settings-overview.css), then the sections as meters against their
+   ceiling. Hairlines, not boxes. */
+
+.prompt-footprint-meter {
+    flex: 1;
+    height: 0.375rem;
+    border-radius: var(--radius-round);
+    overflow: hidden;
+    background: var(--bg-tertiary);
+}
+
+.prompt-footprint-bar-system,
+.prompt-footprint-bar-workspace {
+    min-width: 0.125rem;
+}
+
+.prompt-footprint-bar-system {
+    background: var(--border-color);
+}
+
+.prompt-footprint-bar-workspace {
+    background: var(--accent);
+}
+
+.prompt-footprint-section-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-sm) 0;
+    font-size: var(--font-size-sm);
+    border-bottom: 0.5px solid var(--border-color);
+}
+
+.prompt-footprint-section-name {
+    flex: 0 1 11rem;
+    min-width: 0;
+    color: var(--text-primary);
+}
+
+.prompt-footprint-meter-fill {
+    height: 100%;
+    border-radius: var(--radius-round);
+    background: var(--accent);
+}
+
+.prompt-footprint-meter-fill.over {
+    background: var(--accent-yellow);
+}
+
+.prompt-footprint-section-chars {
+    flex: 0 0 4.5rem;
+    text-align: right;
+    color: var(--text-secondary);
+    font-variant-numeric: tabular-nums;
+}
+
+.prompt-footprint-section-chars.over,
+.prompt-footprint-warn {
+    color: var(--accent-yellow);
+}
+
+.prompt-footprint-empty-note {
+    margin: var(--space-sm) 0 0;
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+.prompt-footprint-tabs {
+    margin: var(--space-sm) 0;
+}
+
+.prompt-footprint-items > .prompt-footprint-item + .prompt-footprint-item {
+    border-top: 0.5px solid var(--border-color);
+}
+
+.prompt-footprint-item .accent-link {
+    text-decoration: none;
+}
+
+.settings-row:has(> .prompt-footprint-limit) {
+    align-items: center;
+}
+
+.settings-row:has(> .prompt-footprint-limit) > .settings-row-label {
+    padding-top: 0;
+}
+
+.prompt-footprint-limit {
+    flex: 0 0 7rem;
+    width: 7rem;
+    text-align: right;
+}

@@ -1,0 +1,194 @@
+import { test, expect, Page, Locator } from './fixtures';
+import {
+  addTriggerCard, apiRequest, assertHealthy, navigateToApp, openTriggersPanel,
+  pickDropdownOption, waitForModalExitFade,
+} from './helpers';
+
+/** Trigger group lifecycle through the real panel UI (TriggersView +
+ *  TriggerGroupHeader + the TriggerDetails group picker).
+ *
+ *  - Creation: the "New Group" card → inline name field → Enter lands an empty
+ *    section header with a "(0)" badge.
+ *  - Deletion: an EMPTY group's delete button is enabled; clicking it +
+ *    confirming removes the section.
+ *  - The full lifecycle additionally pins the member-count guard: a group with
+ *    a member trigger shows "(1)" and its delete button stays LIVE with a
+ *    "Move triggers out first" tooltip (ADR 0168: a disabled .icon-btn gets
+ *    pointer-events:none and could not show the tooltip stating the block).
+ *    Using it is refused by the server and reported as a toast; the group stays
+ *    and becomes deletable only once the trigger is removed. That guard is the
+ *    server's 409-on-non-empty rule surfaced in the UI, so it's the most
+ *    important thing to keep regression-tested. */
+
+// Every name this spec creates starts with this prefix so afterEach can find
+// and remove them — the e2e DB resets only between Playwright projects, not
+// between tests, so leftovers would pollute sibling tests' /trigger-groups poll.
+const PREFIX = 'e2e-grp';
+
+/** A trigger-group section identified by its header name (dual-layout safe via
+ *  the visible-only DOM; ContentPane mounts the panel once). The filter keys on
+ *  the header's `.trigger-group-name` span — trigger rows inside the section use
+ *  `.list-row-name`, so a member trigger never makes the filter ambiguous. */
+function groupSection(page: Page, name: string): Locator {
+  return page.locator('.trigger-group-section').filter({
+    has: page.locator('.trigger-group-name', { hasText: name }),
+  });
+}
+
+/** Accept whatever confirm dialog is currently open. `showConfirm` guards both
+ *  group and trigger deletes, and its OK button carries `data-role="confirm-ok"`.
+ *  Returns once its exit fade is over, so the next confirm is the only one. */
+async function confirmDialog(page: Page): Promise<void> {
+  await page.locator('.confirm-dialog').waitFor({ state: 'visible', timeout: 10_000 });
+  await page.locator('.confirm-dialog [data-role="confirm-ok"]:visible').first().click();
+  await waitForModalExitFade(page);
+}
+
+/** Clear any open toasts. On mobile the toast container overlays the panel and
+ *  intercepts clicks on the group/trigger action buttons near the top. The
+ *  helper dismisses a toast that waits to be answered from its X. The info "created" toast
+ *  has none, since it leaves by itself after 5s, so wait that out rather than
+ *  let the next click race it. */
+async function clearToasts(page: Page): Promise<void> {
+  for (let i = 0; i < 5; i++) {
+    const close = page.locator('.toast .toast-close').first();
+    if (!(await close.isVisible().catch(() => false))) break;
+    await close.click({ timeout: 2_000 }).catch(() => {});
+  }
+  await page.locator('.toast').first().waitFor({ state: 'detached', timeout: 7_000 }).catch(() => {});
+}
+
+/** Create a group via the "New Group" card and wait for its empty section.
+ *  Clears the resulting "created" toast so callers can click panel buttons. */
+async function createGroup(page: Page, name: string): Promise<void> {
+  await page.locator('.list-row-add-card:visible', { hasText: 'New Group' }).first().click();
+  const input = page.locator('.trigger-group-create-row .trigger-group-name-input');
+  await expect(input).toBeVisible({ timeout: 5_000 });
+  await input.fill(name);
+  await input.press('Enter');
+  await expect(groupSection(page, name)).toBeVisible({ timeout: 10_000 });
+  await clearToasts(page);
+}
+
+test.describe('Trigger groups — create / delete', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    // create_trigger reads the timezone preference; set it so the create path
+    // never falls back to its UTC default mid-test (matches trigger-side-effects).
+    await apiRequest(page).put('/api/v1/preferences?key=timezone', { data: { value: 'UTC' } });
+  });
+
+  test.afterEach(async ({ page }) => {
+    // Best-effort cleanup: triggers first (so their groups become empty), then
+    // groups — a non-empty group refuses deletion (409).
+    try {
+      const tRes = await page.request.get('/api/v1/triggers');
+      const tBody = await tRes.json();
+      for (const t of (tBody.triggers ?? []) as Array<{ id: string; name: string }>) {
+        if (t.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/triggers?id=${t.id}`);
+      }
+      const gRes = await page.request.get('/api/v1/trigger-groups');
+      const gBody = await gRes.json();
+      for (const g of (gBody.groups ?? []) as Array<{ id: string; name: string }>) {
+        if (g.name?.startsWith(PREFIX)) await apiRequest(page).delete(`/api/v1/trigger-groups?id=${g.id}`);
+      }
+    } catch {
+      /* best-effort cleanup */
+    }
+  });
+
+  test('creates an empty group and deletes it', async ({ page }) => {
+    const groupName = `${PREFIX}-${Date.now()}`;
+
+    await navigateToApp(page);
+    await openTriggersPanel(page);
+
+    // Create — empty group lands with a (0) badge.
+    await createGroup(page, groupName);
+    const section = groupSection(page, groupName);
+    await expect(section.locator('.section-count-open')).toHaveText('0');
+
+    // Delete: an empty group's delete icon is enabled; confirm removes the section.
+    const deleteBtn = section.locator('.trigger-group-delete');
+    await expect(deleteBtn).toBeEnabled();
+    await deleteBtn.click();
+    await confirmDialog(page);
+    await expect(section).toHaveCount(0, { timeout: 10_000 });
+  });
+
+  test('create → rename → assign trigger → delete', async ({ page }) => {
+    const groupA = `${PREFIX}-${Date.now()}`;
+    const groupB = `${PREFIX}-renamed-${Date.now()}`;
+    const triggerName = `${PREFIX}-trigger-${Date.now()}`;
+
+    await navigateToApp(page);
+    await openTriggersPanel(page);
+
+    // 1. Create group A.
+    await createGroup(page, groupA);
+
+    // 2. Rename A → B. Clicking the rename icon reveals the edit field over the
+    //    name (so the section can no longer be found by name A). EVERY heading
+    //    carries that field mounted and hidden, which is what lets the tap focus
+    //    it and open the mobile keyboard, so target the one heading that is
+    //    actually renaming rather than the class alone.
+    await groupSection(page, groupA).locator('.trigger-group-rename').click();
+    const renameInput = page.locator('.trigger-group-renaming .trigger-group-name-input');
+    await expect(renameInput).toBeVisible({ timeout: 5_000 });
+    await renameInput.fill(groupB);
+    await renameInput.press('Enter');
+    await expect(groupSection(page, groupB)).toBeVisible({ timeout: 10_000 });
+    await expect(groupSection(page, groupA)).toHaveCount(0);
+
+    // 3. Create a trigger assigned to group B via the form's Group picker.
+    await addTriggerCard(page).click();
+    const form = page.locator('.inline-form:visible').first();
+    await expect(form).toBeVisible({ timeout: 10_000 });
+    await form.locator('input[placeholder="e.g. Morning Brief"]').fill(triggerName);
+    await form.locator('input[placeholder="0 0 8 * * *"]').fill('0 0 8 * * *');
+    await form.locator('.prompt-textarea').fill('Send me a hello every morning');
+    await pickDropdownOption(page, '.trigger-group-select', groupB);
+    await form.locator('.btn-save').click();
+
+    // The trigger lands under group B and the badge flips to (1). Per ADR 0168
+    // the delete stays LIVE with a "why" tooltip. A disabled .icon-btn gets
+    // pointer-events:none, so it could not show the tooltip stating the block.
+    // The guard is the server's refusal, surfaced as a toast.
+    const sectionB = groupSection(page, groupB);
+    await expect(sectionB.locator('.trigger-row .list-row-name', { hasText: triggerName }))
+      .toBeVisible({ timeout: 10_000 });
+    await expect(sectionB.locator('.section-count-open')).toHaveText('1', { timeout: 10_000 });
+    const deleteWhileFull = sectionB.locator('.trigger-group-delete');
+    await expect(deleteWhileFull).toBeEnabled();
+    await expect(deleteWhileFull).toHaveAttribute('data-tooltip', 'Move triggers out first');
+
+    // Using it on a non-empty group is refused by the server and reported as a
+    // toast; the group survives with its member. This is the member-count guard.
+    await clearToasts(page);
+    await deleteWhileFull.click();
+    await confirmDialog(page);
+    await expect(page.locator('.toast', { hasText: 'Move or delete the 1 trigger' }))
+      .toBeVisible({ timeout: 10_000 });
+    await expect(sectionB).toHaveCount(1);
+    await expect(sectionB.locator('.section-count-open')).toHaveText('1');
+
+    // 4. Empty the group by deleting its member trigger.
+    await clearToasts(page);
+    await sectionB.locator('.trigger-row', { hasText: triggerName })
+      .locator('.list-row-actions .action-btn-danger')
+      .click();
+    await confirmDialog(page);
+    await expect(sectionB.locator('.trigger-row', { hasText: triggerName }))
+      .toHaveCount(0, { timeout: 10_000 });
+
+    // Badge back to (0); delete re-enabled.
+    await expect(sectionB.locator('.section-count-open')).toHaveText('0', { timeout: 10_000 });
+    const deleteB = sectionB.locator('.trigger-group-delete');
+    await expect(deleteB).toBeEnabled();
+
+    // 5. Delete the now-empty group.
+    await deleteB.click();
+    await confirmDialog(page);
+    await expect(sectionB).toHaveCount(0, { timeout: 10_000 });
+  });
+});

@@ -1,0 +1,148 @@
+import { randomUUID } from 'crypto';
+import { test, expect } from './fixtures';
+import { assertHealthy, ensureOnThreadPane, navigateToApp, openThreadDrawer, REAL_THREAD_ROW, USER_MSG_SELECTOR } from './helpers';
+import { psql } from './db-helpers';
+
+test.describe('Queued chat messages', () => {
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+  });
+
+  test('stacks multiple persisted queued follow-ups in a collapsed group', async ({ page }) => {
+    const threadId = randomUUID();
+    const activeMessageId = randomUUID();
+    const title = `Queued group e2e ${randomUUID().slice(0, 8)}`;
+    const activeMarker = `active-${randomUUID().slice(0, 8)}`;
+    const queuedOne = `queued-one-${randomUUID().slice(0, 8)}`;
+    const queuedTwo = `queued-two-${randomUUID().slice(0, 8)}`;
+    const t0 = new Date().toISOString();
+    const t1 = new Date(Date.now() + 1000).toISOString();
+    const t2 = new Date(Date.now() + 2000).toISOString();
+    const t3 = new Date(Date.now() + 3000).toISOString();
+
+    psql([
+      `INSERT INTO thread_summaries (` +
+        `thread_id, title, source, last_activity, message_count, is_saved, has_response, status, ` +
+        `archive_state, state, is_coding_agent, active_children_count, total_children_count, ` +
+        `coding_agent_change_state, coding_agent_is_external_repo` +
+      `) VALUES (` +
+        `'${threadId}', '${title}', 'chat', '${t3}', 3, false, false, 'running', ` +
+        `'inbox', 'active', false, 0, 0, 'none', false` +
+      `)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
+        `VALUES ('${activeMessageId}', 'MessageReceived', ` +
+        `'${JSON.stringify({ text: activeMarker, channel: 'chat' })}'::jsonb, '${t0}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
+        `VALUES ('${randomUUID()}', 'TextStreamed', ` +
+        `'${JSON.stringify({ text: 'Still working...', request_event_id: activeMessageId })}'::jsonb, '${t1}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
+        `VALUES ('${randomUUID()}', 'MessageReceived', ` +
+        `'${JSON.stringify({ text: queuedOne, channel: 'chat' })}'::jsonb, '${t2}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) ` +
+        `VALUES ('${randomUUID()}', 'MessageReceived', ` +
+        `'${JSON.stringify({ text: queuedTwo, channel: 'chat' })}'::jsonb, '${t3}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+      const row = page.locator(`${REAL_THREAD_ROW}:visible`, { hasText: title }).first();
+      await expect(row).toBeVisible();
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      const group = page.locator('.queued-message-group:visible').first();
+      await expect(group.locator('.queued-message-group-summary')).toContainText('Queued (2)');
+      await expect(page.locator(`${USER_MSG_SELECTOR}:visible`)).toContainText(activeMarker);
+      await expect(page.locator(`${USER_MSG_SELECTOR}:visible`).filter({ hasText: queuedOne })).toHaveCount(0);
+
+      await group.locator('.queued-message-group-summary').click();
+      await expect(page.locator(`${USER_MSG_SELECTOR}:visible`).filter({ hasText: queuedOne })).toHaveCount(1);
+      await expect(page.locator(`${USER_MSG_SELECTOR}:visible`).filter({ hasText: queuedTwo })).toHaveCount(1);
+      await expect(group.locator('.exchange-status-label:visible')).toHaveCount(2);
+      await expect(group.locator('.response-panel:visible')).toHaveCount(0);
+
+      // The remove button takes its tap target from an overlay, not from its
+      // box (`.icon-btn.inline-icon`, global/host-components.css). That is the
+      // one claim in the rule a source scan cannot make: it is about rendered
+      // boxes, and about where a thumb actually lands.
+      const measured = await group.locator('.queued-message-remove').first().evaluate(el => {
+        const btn = el as HTMLElement;
+        const root = parseFloat(getComputedStyle(document.documentElement).fontSize);
+        const line = getComputedStyle(document.documentElement).getPropertyValue('--turn-header-line');
+        const box = btn.getBoundingClientRect();
+        const cx = box.left + box.width / 2;
+        const cy = box.top + box.height / 2;
+        const hits = (dx: number, dy: number) => {
+          const at = document.elementFromPoint(cx + dx, cy + dy);
+          return !!at && (at === btn || btn.contains(at));
+        };
+        // The overlay is taller than it is wide, so each axis has its own
+        // reach. Read them off the pseudo-element rather than restating the
+        // rule: this test asks where a thumb lands, and the source scan in
+        // styles/__tests__/trash-icon-optical-size.test.ts owns the values.
+        const overlay = getComputedStyle(btn, '::before');
+        const reachX = parseFloat(overlay.width) / 2;
+        const reachY = parseFloat(overlay.height) / 2;
+        const stamp = btn.closest('.initiator-header')!
+          .querySelector('.initiator-timestamp') as HTMLElement;
+        const stampBox = stamp.getBoundingClientRect();
+        const atStampEdge = document.elementFromPoint(stampBox.left + 2, stampBox.top + stampBox.height / 2);
+        // The label on the other side is a bare text node. Measure it with a
+        // range rather than looking for a box it does not have. Measured at the
+        // EDGE: a centre probe passes while the overlay eats the last letters,
+        // and this is the thinnest gap in the layout.
+        const label = document.createRange();
+        label.selectNodeContents(btn.closest('.exchange-status-label')!.firstChild!);
+        const labelRight = label.getBoundingClientRect().right;
+        return {
+          // The field the button sits in, which is what the trash used to
+          // stretch. It wraps on a narrow pane, so measure the field itself
+          // rather than the header around it.
+          fieldHeight: btn.closest('.exchange-status-label')!.getBoundingClientRect().height,
+          lineHeight: parseFloat(line) * root,
+          targetHeight: parseFloat(overlay.height),
+          fullTarget: 2.25 * root,
+          insideTarget: [hits(-(reachX - 2), 0), hits(reachX - 2, 0), hits(0, -(reachY - 2)), hits(0, reachY - 2)],
+          // Both axes stop where the overlay says they do. These probes read
+          // the same box, so they cannot catch a target that grew back over
+          // the words: `labelClearance` below is what does that.
+          pastTarget: [hits(0, -(reachY + 3)), hits(0, reachY + 3), hits(-(reachX + 3), 0), hits(reachX + 3, 0)],
+          stampIsOwnTarget: atStampEdge === stamp || stamp.contains(atStampEdge),
+          labelClearance: (cx - reachX) - labelRight,
+        };
+      });
+
+      // A thumb landing anywhere in the target still hits the trash, which is
+      // what the box used to guarantee and the overlay now does.
+      expect(measured.insideTarget, 'the tap target no longer covers its own box').toEqual([true, true, true, true]);
+      expect(measured.pastTarget, 'the tap target reaches past its own box')
+        .toEqual([false, false, false, false]);
+      // And it spends its whole reach on the axis that has room. Half a pixel
+      // of slack, for the sub-pixel rounding a scaled root can leave.
+      expect(measured.targetHeight, 'the target gave up height it had room for')
+        .toBeCloseTo(measured.fullTarget, 0);
+      // And it takes no space in the line it interrupts. The reported defect
+      // was the button holding this field at 2.25rem, nearly twice the row
+      // unit, with the extra showing as air around the glyph.
+      expect(
+        Math.abs(measured.fieldHeight - measured.lineHeight),
+        `status field ${measured.fieldHeight}px against a row unit of ${measured.lineHeight}px`,
+      ).toBeLessThan(1.5);
+      // Both neighbours keep their own ground. The timestamp is a button of
+      // its own. The label is inert text, so an overlay over it would turn a
+      // tap on a status word into a delete. The label side is the thinner of
+      // the two and the only one nothing else would catch.
+      expect(measured.stampIsOwnTarget, 'the trash overlay swallowed the timestamp button').toBe(true);
+      expect(
+        measured.labelClearance,
+        `the overlay's left edge is ${(-measured.labelClearance).toFixed(2)}px into the Queued label`,
+      ).toBeGreaterThanOrEqual(0);
+    } finally {
+      psql([
+        `DELETE FROM events WHERE thread_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+});

@@ -1,0 +1,5 @@
+# Package and maximum physical lines per compilation target
+lucidos-agents-api	291627
+lucidos-core	271224
+lucidos-engine	365030
+lucidos-gateway	69766

@@ -1,0 +1,23 @@
+[package]
+name = "lucidos-agent-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# The OS sandbox around an agent subprocess (ADR 0645): the policy, the scratch
+# roots, the macOS seatbelt profile and `ps` shim, the Linux Landlock ruleset,
+# the probe and the readers of a refused write. The engine owns the gate, the
+# owner preference and the notification.
+#
+# A crate of its own so it builds for Linux on a Mac, and its tests run in a
+# Linux container. It depends on no other Lucidos crate.
+
+[dependencies]
+chrono = "0.4"
+libc = "0.2"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

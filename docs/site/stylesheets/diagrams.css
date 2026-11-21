@@ -1,0 +1,61 @@
+/* Architecture diagrams (docs/site/architecture.md).
+   The SVGs are inlined into the page, so they inherit these variables and the
+   page font, and they repaint when the reader flips the theme toggle. */
+
+:root {
+  --lx-blue: #0969da;
+  --lx-blue-t: #d8e7f9;
+  --lx-orange: #c26a4a;
+  --lx-orange-t: #f5e7e2;
+  --lx-aqua: #009492;
+  --lx-aqua-t: #d6eeee;
+  --lx-ink: #1f2328;
+  --lx-ink-soft: #656d76;
+  --lx-line: #d0d7de;
+  --lx-panel: #f6f8fa;
+}
+
+/* Re-stepped for Material's slate background (#1e2129), not the Lucidos app
+   surface. Every hue clears 3:1 there. */
+[data-md-color-scheme="slate"] {
+  --lx-blue: #4a94fc;
+  --lx-blue-t: #26364f;
+  --lx-orange: #fc5400;
+  --lx-orange-t: #462a22;
+  --lx-aqua: #009492;
+  --lx-aqua-t: #19363c;
+  --lx-ink: #e6edf3;
+  --lx-ink-soft: #a7adc0;
+  --lx-line: #6b7183;
+  --lx-panel: #2a2e3a;
+}
+
+.lx-diagram {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 1.4rem 0 0.6rem;
+}
+
+/* On a phone the full width would shrink the labels past reading size, so the
+   diagram keeps a floor and the reader pans it instead. */
+.lx-svg {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+@media screen and (max-width: 44em) {
+  .lx-diagram {
+    min-width: 38rem;
+  }
+}
+
+.lx-diagram text {
+  font-family: var(--md-text-font-family, system-ui, sans-serif);
+}
+
+.lx-cap {
+  margin: 0 0 2.6rem;
+  color: var(--lx-ink-soft);
+  font-size: 0.82rem;
+}

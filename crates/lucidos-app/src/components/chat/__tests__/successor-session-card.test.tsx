@@ -1,0 +1,145 @@
+// @vitest-environment jsdom
+import { describe, expect, it } from 'vitest';
+import { HandoffSessionRow } from '../chat-exchange-parts';
+import { drawsResponseRow } from '../../../store/event-rendering';
+import {
+  applyAggregateToMeta, drawsInitiatorPanel, exchangeResponseEvents, makeOptimisticThreadState,
+  type Exchange, type StoredEvent, type ThreadAggregate,
+} from '../../../store/thread-events';
+import type { ResponseEvent } from '../../../store/types';
+
+// A successor session starts in the same thread, behind one card: the card a
+// fresh session gets, saying where the handoff ran, with the opening folded
+// under it.
+
+const OPENING = '# Handoff\n\nPhases 0 to 3 are committed. Continue with phase 4.';
+
+const HANDOFF = { kind: 'handoff', checkpoint: 'phase-commit', progress: '4/7', opening: 'narrative', message: OPENING };
+
+function successorTurn(first: Record<string, unknown>): Exchange {
+  const started = { type: 'SessionStarted', session_id: 's2', channel: 'claude_code', coding_agent: 'codex', continuity: HANDOFF };
+  return {
+    userEvent: { type: 'MessageReceived', channel: 'claude_code', ...first } as StoredEvent,
+    userSeq: 0,
+    steps: [
+      { seq: 1, event: started as StoredEvent },
+      { seq: 2, event: { type: 'CodingAgentTextStreamed', text: 'Picking up phase 4.' } as StoredEvent },
+    ],
+  };
+}
+
+const ENGINE_OPENING = {
+  text: OPENING,
+  model: 'gpt-6.1-sol',
+  reasoning_effort: 'medium',
+  origin: { kind: 'engine', reason: { kind: 'successor_session' } },
+};
+
+const cards = (exchange: Exchange) =>
+  exchangeResponseEvents(exchange).filter((e): e is Extract<ResponseEvent, { type: 'handoff_session' }> => e.type === 'handoff_session');
+
+describe('a successor session draws one card', () => {
+  it('names the checkpoint and carries the opening', () => {
+    expect(cards(successorTurn(ENGINE_OPENING))).toEqual([{
+      type: 'handoff_session',
+      checkpoint: 'phase-commit',
+      progress: '4/7',
+      opening: 'narrative',
+      message: OPENING,
+      seq: 1,
+    }]);
+  });
+
+  it('draws no fresh-session note beside it', () => {
+    expect(exchangeResponseEvents(successorTurn(ENGINE_OPENING)).some((e) => e.type === 'fresh_session')).toBe(false);
+  });
+
+  it('draws no second copy of the engine message that opened it', () => {
+    expect(drawsInitiatorPanel(successorTurn(ENGINE_OPENING))).toBe(false);
+  });
+
+  it('shows the engine message when no session card folds it, as after a failed spawn', () => {
+    const failed = { ...successorTurn(ENGINE_OPENING), steps: [] };
+    expect(drawsInitiatorPanel(failed)).toBe(true);
+  });
+
+  it('keeps your own message when it started the session, and still folds the opening', () => {
+    const turn = successorTurn({ text: 'Also fix the typo.' });
+    expect(drawsInitiatorPanel(turn)).toBe(true);
+    expect(cards(turn)).toHaveLength(1);
+    expect(cards(turn)[0].message).toBe(OPENING);
+  });
+
+  it('draws with the steps control off', () => {
+    expect(drawsResponseRow(cards(successorTurn(ENGINE_OPENING))[0], false)).toBe(true);
+  });
+});
+
+describe('the card reads as a fresh session card', () => {
+  const card = (event: Extract<ResponseEvent, { type: 'handoff_session' }>) => JSON.stringify(HandoffSessionRow({ event }));
+
+  it('says New session, Handed off and where it ran, and leaves the backend and model to the turn header', () => {
+    const s = card(cards(successorTurn(ENGINE_OPENING))[0]);
+    expect(s).toContain('New session');
+    expect(s).toContain('Handed off');
+    expect(s).toContain('Carried on from a handoff at phase-commit 4/7.');
+    expect(s).toContain('What the new session was told');
+    expect(s).not.toContain('Codex');
+  });
+
+  it('names no checkpoint when the handoff ran at none', () => {
+    const s = card({ type: 'handoff_session', opening: 'narrative', message: OPENING });
+    expect(s).toContain('Carried on from a handoff.');
+  });
+
+  it('says Handed off from a brief when the session wrote no narrative', () => {
+    const s = card({ type: 'handoff_session', opening: 'brief', message: OPENING });
+    expect(s).toContain('Handed off from a brief');
+  });
+});
+
+describe('a handoff at the context ceiling', () => {
+  const crossing = { context_tokens: 352_000, ceiling: 300_000, window: 1_000_000 };
+  const card = (event: Extract<ResponseEvent, { type: 'handoff_session' }>) => JSON.stringify(HandoffSessionRow({ event }));
+
+  it('carries the crossing from the session start', () => {
+    const turn = successorTurn(ENGINE_OPENING);
+    const started = turn.steps[0].event as unknown as { continuity: Record<string, unknown> };
+    started.continuity = { ...HANDOFF, checkpoint: undefined, progress: undefined, crossing };
+    expect(cards(turn)[0].crossing).toEqual(crossing);
+  });
+
+  it('names the size and the ceiling, and that the session wrote the narrative', () => {
+    const s = card({ type: 'handoff_session', opening: 'narrative', crossing, message: OPENING });
+    expect(s).toContain("Handed off at the context ceiling: 352k tokens, past this thread's 300k.");
+    expect(s).toContain('The previous session wrote the handoff narrative.');
+    expect(s).toContain('"Handed off"');
+  });
+
+  it('says the session wrote no narrative when it started from a brief', () => {
+    const s = card({ type: 'handoff_session', opening: 'brief', crossing, message: OPENING });
+    expect(s).toContain("Handed off at the context ceiling: 352k tokens, past this thread's 300k.");
+    expect(s).toContain('The previous session did not write a handoff in its one turn, so this session started from a brief.');
+    expect(s).toContain('Handed off from a brief');
+  });
+});
+
+describe('the rung control reads the current session', () => {
+  it('takes the backend a successor session started on', () => {
+    const thread = makeOptimisticThreadState({
+      id: 't1', title: 'Build it', channel: 'claude_code', initiator: 'user',
+      eventsLoaded: true, timestamp: '2026-10-23T08:00:00.000Z', status: 'idle', codingAgent: 'claude-code',
+    });
+    const aggregate = {
+      threadId: 't1', title: 'Build it', channel: 'claude_code', initiator: 'user',
+      createdAt: '2026-10-23T08:00:00.000Z', lastActivity: '2026-10-23T08:00:00.000Z', messageCount: 2,
+      section: 'inbox', status: 'running', summaryVersion: 2, activeChildrenCount: 0, totalChildrenCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0,
+      codingAgentChangeState: { kind: 'none' }, codingAgentIsExternalRepo: false, isSaved: false,
+      hasResponse: true, lastRevivedAt: null, parentThreadId: null, parentThreadTitle: null, state: 'active',
+      codingAgent: 'codex',
+    } as ThreadAggregate;
+    applyAggregateToMeta(thread.meta, aggregate);
+    expect(thread.meta.codingAgent).toBe('codex');
+  });
+});

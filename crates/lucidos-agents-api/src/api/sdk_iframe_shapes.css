@@ -1,0 +1,193 @@
+/* Widget shapes: what a widget draws instead of a table (building-an-app.md
+   § Widgets, js-sdk.md § Widget shapes). Each shape carries its own
+   fill, so it reads on any ground. Colours, corners and timing come from the
+   theme tokens only. */
+
+/* Registered as numbers, so a new value transitions instead of jumping. */
+@property --ring-value {
+    syntax: '<number>';
+    inherits: true;
+    initial-value: 0;
+}
+
+@property --bar-value {
+    syntax: '<number>';
+    inherits: true;
+    initial-value: 0;
+}
+
+/* A ring gauge. `--ring-value` runs from 0 to 1. Its children sit in the hole.
+   The mask cuts the circle, so the ring stays round in a square theme. */
+.ring {
+    --ring-size: 6rem;
+    --ring-weight: 0.5rem;
+    position: relative;
+    display: inline-grid;
+    place-content: center;
+    justify-items: center;
+    flex-shrink: 0;
+    inline-size: var(--ring-size);
+    aspect-ratio: 1;
+    text-align: center;
+    line-height: 1.15;
+    transition: --ring-value var(--duration-emphasis) ease-out;
+    animation: shape-fill-ring var(--duration-emphasis) ease-out backwards;
+}
+
+.ring::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: conic-gradient(
+        var(--ring-color, var(--accent)) calc(var(--ring-value) * 1turn),
+        var(--ring-track, var(--bg-tertiary)) 0
+    );
+    mask: radial-gradient(
+        farthest-side,
+        transparent calc(100% - var(--ring-weight) - 0.0625rem),
+        black calc(100% - var(--ring-weight)),
+        black calc(100% - 0.0625rem),
+        transparent
+    );
+}
+
+.ring > * {
+    position: relative;
+}
+
+.ring-value {
+    color: var(--text-primary);
+    font-size: var(--font-size-3xl);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+}
+
+.ring-label {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+/* A run of bars for a short series, such as seven days. Each item sets
+   `--bar-value` from 0 to 1. `.is-accent` marks the one bar that matters. */
+.bar-run {
+    --bar-run-height: 3.5rem;
+    display: flex;
+    align-items: flex-end;
+    gap: var(--space-sm);
+}
+
+/* Capped, so a wide pane keeps the run compact instead of scattering it. */
+.bar-run-item {
+    flex: 1 1 0;
+    min-inline-size: 0;
+    max-inline-size: 3rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--space-xs);
+}
+
+.bar-run-bar {
+    inline-size: 100%;
+    max-inline-size: 1.25rem;
+    block-size: max(var(--space-xs), calc(var(--bar-value) * var(--bar-run-height)));
+    border-radius: var(--radius-round);
+    background: var(--bar-color, var(--bg-quaternary));
+    transition: --bar-value var(--duration-slow) ease-out, background-color var(--duration-fast);
+    animation: shape-fill-bar var(--duration-slow) ease-out backwards;
+}
+
+.bar-run-item.is-accent .bar-run-bar {
+    background: var(--accent);
+}
+
+.bar-run-label {
+    color: var(--text-muted);
+    font-size: var(--font-size-2xs);
+}
+
+.bar-run-item.is-accent .bar-run-label {
+    color: var(--text-primary);
+}
+
+/* A row of choices: the tap targets for a pick among data items. A choice
+   holds one line, or a line and a `.choice-meta` under it. It wraps, never
+   scrolls. */
+.choice-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-sm);
+}
+
+.choice {
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: calc(var(--space-xs) / 2);
+    min-inline-size: 2.75rem;
+    min-block-size: 2.75rem;
+    padding: var(--space-sm) var(--space-md);
+    border: none;
+    border-radius: var(--radius-round);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
+    line-height: 1.2;
+    cursor: pointer;
+    transition: background-color var(--duration-fast), color var(--duration-fast),
+        transform var(--duration-fast);
+}
+
+.choice[aria-pressed="true"],
+.choice.active {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+/* Press feedback is a squeeze, never a fill (a fill latches on touch). */
+.choice:active {
+    transform: scale(0.95);
+}
+
+.choice:focus-visible {
+    outline: none;
+    box-shadow: var(--focus-ring);
+}
+
+.choice:disabled {
+    background: var(--bg-secondary);
+    opacity: 0.4;
+    cursor: default;
+}
+
+.choice-meta {
+    font-size: var(--font-size-2xs);
+    opacity: 0.75;
+}
+
+/* The fill restated: an app frame's `button:hover` would repaint the choice.
+   A disabled choice keeps its resting fill above for the same reason. */
+@media (hover: hover) {
+    .choice:hover:not([aria-pressed="true"], .active, :disabled) {
+        background: var(--bg-tertiary);
+        color: var(--text-primary);
+    }
+}
+
+@keyframes shape-fill-ring {
+    from { --ring-value: 0; }
+}
+
+@keyframes shape-fill-bar {
+    from { --bar-value: 0; }
+}
+
+:root[data-motion="reduce"] .ring,
+:root[data-motion="reduce"] .bar-run-bar {
+    animation: none;
+}
+
+:root[data-motion="reduce"] .choice:active {
+    transform: none;
+}
